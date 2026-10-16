@@ -1,0 +1,11 @@
+.bin/
+.clusters/
+.talosconfig
+/cephadm-talos
+/talosconfig
+/dashboard
+/controlplane.yaml
+/worker.yaml
+.iso/
+__pycache__/
+demo/demo.raw.cast

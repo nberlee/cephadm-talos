@@ -1,0 +1,269 @@
+// Package state keeps the cluster inventory on the workstation.
+//
+// cephadm keeps the equivalent data in the mon config-key store; this PoC keeps
+// it in ~/.cephadm-talos/<fsid>/state.json instead (see SHORTCOMINGS.md).
+package state
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+)
+
+// Daemon types.
+const (
+	TypeMon = "mon"
+	TypeMgr = "mgr"
+	TypeOSD = "osd"
+)
+
+// Host is a Talos node that is part of the Ceph cluster.
+type Host struct {
+	Name string `json:"name"` // Talos hostname, used as mon/mgr id
+	Addr string `json:"addr"` // node IP, used both for talosctl -n and as Ceph public addr
+	// Maintenance: the host's daemons are stopped (their documents removed) and noout
+	// is set for it, like `ceph orch host maintenance enter`
+	Maintenance bool `json:"maintenance,omitempty"`
+	// NoOut: maintenance enter set `osd set-group noout` on this host's CRUSH bucket
+	NoOut bool `json:"noout,omitempty"`
+}
+
+// Daemon is a Ceph daemon placed on a host.
+type Daemon struct {
+	Type   string `json:"type"`
+	ID     string `json:"id"` // mon/mgr: hostname, osd: device basename until the OSD id is known
+	Host   string `json:"host"`
+	Device string `json:"device,omitempty"`
+	OSDID  *int   `json:"osd_id,omitempty"`
+	// DeployID identifies one incarnation of a daemon (see mon.sh, osd.sh)
+	DeployID string `json:"deploy_id,omitempty"`
+	// OSDUUID tells this OSD apart from a later one that reuses its numeric id
+	OSDUUID string `json:"osd_uuid,omitempty"`
+	// Purged is set once the OSD is gone from the cluster, so a retried rm only wipes
+	Purged bool `json:"purged,omitempty"`
+	// LocalOnly: stopped by a forced `rm` while no mon was reachable; its
+	// cluster-side cleanup (mon remove, osd purge, auth rm) is still pending
+	LocalOnly bool `json:"local_only,omitempty"`
+}
+
+// State is the persisted cluster inventory.
+type State struct {
+	FSID        string            `json:"fsid"`
+	Image       string            `json:"image"`
+	KeyType     string            `json:"key_type,omitempty"` // cephx key type, see cephx.KeyTypeFor
+	Talosconfig string            `json:"talosconfig,omitempty"`
+	Context     string            `json:"context,omitempty"`
+	Hosts       []Host            `json:"hosts"`
+	Daemons     []Daemon          `json:"daemons"`
+	Keys        map[string]string `json:"keys"` // entity -> base64 cephx secret
+	// ConfPending lists hosts whose ceph.conf could not be updated yet; every
+	// command retries them first
+	ConfPending []string `json:"conf_pending,omitempty"`
+
+	path string
+}
+
+// Root returns the base directory for all cephadm-talos state.
+func Root() string {
+	if d := os.Getenv("CEPHADM_TALOS_HOME"); d != "" {
+		return d
+	}
+
+	home, _ := os.UserHomeDir()
+
+	return filepath.Join(home, ".cephadm-talos")
+}
+
+// New creates an empty state for a fresh cluster. It is not written until Save.
+func New(fsid string) *State {
+	return &State{
+		FSID: fsid,
+		Keys: map[string]string{},
+		path: filepath.Join(Root(), fsid, "state.json"),
+	}
+}
+
+// Load reads the state of the given fsid, or the current cluster if fsid is empty.
+func Load(fsid string) (*State, error) {
+	if fsid == "" {
+		b, err := os.ReadFile(filepath.Join(Root(), "current"))
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil, errors.New("no cluster found: run `cephadm-talos bootstrap` first or pass --fsid")
+			}
+
+			return nil, err
+		}
+
+		fsid = strings.TrimSpace(string(b))
+	}
+
+	st := New(fsid)
+
+	b, err := os.ReadFile(st.path)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := json.Unmarshal(b, st); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", st.path, err)
+	}
+
+	return st, nil
+}
+
+// Dir is the per-cluster state directory (also holds ceph.conf and the admin keyring).
+func (s *State) Dir() string { return filepath.Dir(s.path) }
+
+// Save writes the state (0600, it contains every key) and marks it as current.
+func (s *State) Save() error {
+	if err := os.MkdirAll(s.Dir(), 0o700); err != nil {
+		return err
+	}
+
+	b, err := json.MarshalIndent(s, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	if err := os.WriteFile(s.path+".tmp", b, 0o600); err != nil {
+		return err
+	}
+
+	if err := os.Rename(s.path+".tmp", s.path); err != nil {
+		return err
+	}
+
+	return os.WriteFile(filepath.Join(Root(), "current"), []byte(s.FSID+"\n"), 0o600)
+}
+
+// Short is the fsid prefix used in Talos document names (names are limited to 63 chars).
+func (s *State) Short() string { return s.FSID[:8] }
+
+// Host looks up a host by name or address.
+func (s *State) Host(nameOrAddr string) (Host, bool) {
+	for _, h := range s.Hosts {
+		if h.Name == nameOrAddr || h.Addr == nameOrAddr {
+			return h, true
+		}
+	}
+
+	return Host{}, false
+}
+
+// AddHost adds or updates a host.
+func (s *State) AddHost(h Host) {
+	for i := range s.Hosts {
+		if s.Hosts[i].Name == h.Name {
+			s.Hosts[i] = h
+
+			return
+		}
+	}
+
+	s.Hosts = append(s.Hosts, h)
+}
+
+// RemoveHost drops a host from the inventory.
+func (s *State) RemoveHost(name string) {
+	s.Hosts = slices.DeleteFunc(s.Hosts, func(h Host) bool { return h.Name == name })
+}
+
+// DocName is the Talos ContainerConfig name of a daemon.
+//
+// Talos container names are limited to 63 characters of [a-z0-9-], while
+// hostnames may be longer and contain uppercase letters. Names that need
+// changing are lowercased, cut and suffixed with a hash of the full name, so
+// they stay unique; valid names are left as they are.
+func (s *State) DocName(d Daemon) string {
+	name := fmt.Sprintf("ceph-%s-%s-%s", s.Short(), d.Type, d.ID)
+
+	clean := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-':
+			return r
+		case r >= 'A' && r <= 'Z':
+			return r + ('a' - 'A')
+		}
+
+		return '-'
+	}, name)
+
+	// a trailing '-' (hostname "node-") is legal for Talos but not for our own check
+	if clean == name && len(name) <= 63 && !strings.HasSuffix(name, "-") {
+		return name
+	}
+
+	sum := sha256.Sum256([]byte(name))
+	prefix := clean
+	if len(prefix) > 63-9 {
+		prefix = prefix[:63-9]
+	}
+
+	return strings.TrimRight(prefix, "-") + "-" + hex.EncodeToString(sum[:])[:8]
+}
+
+// Find looks a daemon up by "type.id" (as shown by `ps`) or by Talos document name.
+func (s *State) Find(name string) (Daemon, bool) {
+	for _, d := range s.Daemons {
+		if d.Type+"."+d.ID == name || s.DocName(d) == name {
+			return d, true
+		}
+
+		if d.OSDID != nil && name == fmt.Sprintf("osd.%d", *d.OSDID) {
+			return d, true
+		}
+	}
+
+	return Daemon{}, false
+}
+
+// AddDaemon records a daemon, replacing an existing one with the same type and id.
+func (s *State) AddDaemon(d Daemon) {
+	for i := range s.Daemons {
+		if s.Daemons[i].Type == d.Type && s.Daemons[i].ID == d.ID {
+			s.Daemons[i] = d
+
+			return
+		}
+	}
+
+	s.Daemons = append(s.Daemons, d)
+}
+
+// RemoveDaemon drops a daemon from the inventory.
+func (s *State) RemoveDaemon(d Daemon) {
+	s.Daemons = slices.DeleteFunc(s.Daemons, func(x Daemon) bool { return x.Type == d.Type && x.ID == d.ID })
+}
+
+// DaemonsOf returns all daemons of a type, optionally filtered by host.
+func (s *State) DaemonsOf(typ, host string) []Daemon {
+	var out []Daemon
+
+	for _, d := range s.Daemons {
+		if d.Type == typ && (host == "" || d.Host == host) {
+			out = append(out, d)
+		}
+	}
+
+	return out
+}
+
+// MonAddrs returns the addresses of the mon hosts, in placement order.
+func (s *State) MonAddrs() []string {
+	var out []string
+
+	for _, d := range s.DaemonsOf(TypeMon, "") {
+		if h, ok := s.Host(d.Host); ok {
+			out = append(out, h.Addr)
+		}
+	}
+
+	return out
+}
