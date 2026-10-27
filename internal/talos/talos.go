@@ -212,6 +212,45 @@ func (c *Client) HasInstances(ctx context.Context, node, name string) (bool, err
 	return false, nil
 }
 
+// MachineConfig returns the node's current machine config (all documents, YAML).
+func (c *Client) MachineConfig(ctx context.Context, node string) (string, error) {
+	out, err := c.run(ctx, node, "get", "machineconfig", "v1alpha1", "-o", "jsonpath={.spec}")
+
+	return string(out), err
+}
+
+// InstanceGeneration returns the highest ContainerInstanceSpec generation of a
+// container; Talos creates a new generation whenever it replaces the instance.
+func (c *Client) InstanceGeneration(ctx context.Context, node, name string) (uint64, error) {
+	out, err := c.run(ctx, node, "get", "containerinstancespec", "-o", "json")
+	if err != nil {
+		return 0, err
+	}
+
+	var gen uint64
+
+	dec := json.NewDecoder(bytes.NewReader(out))
+
+	for dec.More() {
+		var r struct {
+			Spec struct {
+				ContainerID string `json:"containerID"`
+				Generation  uint64 `json:"generation"`
+			} `json:"spec"`
+		}
+
+		if err := dec.Decode(&r); err != nil {
+			return 0, fmt.Errorf("decode containerinstancespec: %w", err)
+		}
+
+		if r.Spec.ContainerID == name && r.Spec.Generation > gen {
+			gen = r.Spec.Generation
+		}
+	}
+
+	return gen, nil
+}
+
 // Logs returns the full log of a ContainerConfig container.
 func (c *Client) Logs(ctx context.Context, node, name string) (string, error) {
 	if c.DryRun {

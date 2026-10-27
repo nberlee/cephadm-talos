@@ -10,6 +10,7 @@ import (
 	"embed"
 	"encoding/base64"
 	"fmt"
+	"strings"
 
 	"github.com/nberlee/cephadm-talos/internal/spec"
 )
@@ -22,15 +23,22 @@ type Params struct {
 	Name      string // ContainerConfig name
 	Image     string
 	FSID      string
-	ID        string // daemon id (mon/mgr: hostname)
-	Addr      string // public address of the host
-	Keyring   string // keyring file contents for this daemon
-	Device    string // OSD only
-	OSDUUID   string // OSD only: the osd fsid to prepare the device with
-	Mode      string // mon only: "bootstrap" or "join"
-	KeyType   string // mon only: cephx key type of the cluster (cephx.KeyAES...)
-	Addrv     string // mon only: address vector, e.g. [v2:10.5.0.3:3300,v1:10.5.0.3:6789]
-	DeployID  string // changes when the daemon is (re)created, not on redeploy/upgrade
+	ID        string   // daemon id (mon/mgr: hostname)
+	Addr      string   // public address of the host
+	Keyring   string   // keyring file contents for this daemon
+	Device    string   // OSD only
+	OSDUUID   string   // OSD only: the osd fsid to prepare the device with
+	Port      int      // rgw/vip: RGW HTTPS port
+	TLSPEM    string   // rgw: certificate + key
+	VIP       string   // vip: CIDR of the virtual IP
+	VRID      int      // vip: VRRP router id
+	VRRPPass  string   // vip: VRRP password (max 8 chars)
+	Priority  int      // vip: VRRP priority
+	Peers     []string // vip: addresses of the other vip hosts
+	Mode      string   // mon only: "bootstrap" or "join"
+	KeyType   string   // mon only: cephx key type of the cluster (cephx.KeyAES...)
+	Addrv     string   // mon only: address vector, e.g. [v2:10.5.0.3:3300,v1:10.5.0.3:6789]
+	DeployID  string   // changes when the daemon is (re)created, not on redeploy/upgrade
 	DependsOn []string
 }
 
@@ -120,6 +128,45 @@ func OSD(p Params) spec.ContainerConfig {
 		spec.Mount{Tmpfs: &spec.TmpfsMount{Destination: "/var/lib/ceph/osd"}},
 	)
 	c.DependsOn.Paths = append(c.DependsOn.Paths, p.Device)
+
+	return c
+}
+
+// RGW renders a radosgw container serving HTTPS on p.Port.
+func RGW(p Params) spec.ContainerConfig {
+	c := base(p, "rgw")
+	c.Environment = append(c.Environment,
+		fmt.Sprintf("PORT=%d", p.Port),
+		"TLS_PEM="+base64.StdEncoding.EncodeToString([]byte(p.TLSPEM)))
+	// no capabilities except binding a port below 1024 (443)
+	c.Security = &spec.Security{Profile: "restricted", Capabilities: &spec.Capabilities{Add: []string{"NET_BIND_SERVICE"}}}
+
+	return c
+}
+
+// VIP renders a keepalived container holding the RGW virtual IP.
+//
+// It needs NET_ADMIN to add the address and NET_RAW for VRRP and gratuitous ARP.
+// Talos's own VIP can't be used: it elects the holder through etcd.
+func VIP(p Params, image string) spec.ContainerConfig {
+	c := base(p, "vip")
+	c.Image = image
+	c.Environment = append(c.Environment,
+		fmt.Sprintf("PORT=%d", p.Port),
+		"VIP="+p.VIP,
+		fmt.Sprintf("VRID=%d", p.VRID),
+		"VRRP_PASS="+p.VRRPPass,
+		fmt.Sprintf("PRIORITY=%d", p.Priority),
+		"PEERS="+strings.Join(p.Peers, " "))
+	c.Security = &spec.Security{Profile: "restricted", Capabilities: &spec.Capabilities{Add: []string{"NET_ADMIN", "NET_RAW", "NET_BROADCAST"}}}
+	// keepalived needs neither the Ceph volume nor ceph.conf
+	c.Mounts = []spec.Mount{
+		{Tmpfs: &spec.TmpfsMount{Destination: "/tmp"}},
+		{Tmpfs: &spec.TmpfsMount{Destination: "/run"}},
+		{Tmpfs: &spec.TmpfsMount{Destination: "/var/run/ceph"}},
+		{Tmpfs: &spec.TmpfsMount{Destination: "/var/log/ceph"}},
+	}
+	c.DependsOn.Paths = nil
 
 	return c
 }

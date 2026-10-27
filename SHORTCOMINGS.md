@@ -28,7 +28,11 @@ cephadm-talos is a proof of concept. This file lists what is missing or wrong co
 
 - No mgr `orchestrator` backend, so `ceph orch ...` and the dashboard's orchestrator pages do not work. All orchestration is client-side in the cephadm-talos CLI.
 - No service specs, placement, labels, count-per-host or reconciliation loop. Daemons are placed by hand, and nothing re-creates a daemon whose host disappears.
-- Only mon, mgr and OSD. No RGW, MDS/CephFS, NFS, iSCSI/NVMe-oF, monitoring stack (prometheus, grafana, alertmanager, node-exporter), crash collector or ceph-exporter.
+- Only mon, mgr, OSD and RGW. No MDS/CephFS, NFS, iSCSI/NVMe-oF, monitoring stack (prometheus, grafana, alertmanager, node-exporter), crash collector or ceph-exporter.
+- RGW is the default zone only: no realms, zonegroups or multisite, and no `rgw_dns_name` or virtual-hosted-style buckets. Users are created by hand with `cephadm-talos shell -- radosgw-admin`.
+- The VIP is active/passive: keepalived without haproxy, so all S3 traffic goes to one rgw at a time and nothing balances load. It needs layer 2 between the vip hosts (VRRP unicast and gratuitous ARP), one VIP per cluster, and IPv4. Its keepalived runs with `NET_ADMIN`, `NET_RAW` and `NET_BROADCAST`, and the VRRP password is in the machine config. Talos's built-in VIP would avoid all of this, but it needs etcd for its election (observed).
+- The generated RGW certificate comes from a self-signed cluster CA (`~/.cephadm-talos/<fsid>/rgw-ca.crt`); clients must trust it. The CA key and the server key are in `state.json` and, as a PEM bundle, in the rgw documents. Adding a host or the VIP reissues the certificate (only when its names change), and every rgw restarts, one host at a time. The VIP is moved away first, and each step waits until the rgw serves the new certificate (fingerprint check) and its keepalived is ready again. Under continuous S3 GETs through the VIP, a full rotation cost 1 failed request out of 325 (the VRRP handover); requests in flight on a restarting rgw are cut (observed). Certificates are not renewed (2 years).
+- Each rgw restart registers a new instance (gid) in the Ceph service map. After a few certificate reissues `ceph -s` showed `rgw: 5 daemons active (2 hosts)` while exactly one radosgw process ran per host. The stale entries survived a mgr failover and were still listed after more than 10 minutes (observed). They are cosmetic, but they make the rgw count in `ceph -s` unreliable.
 - OSDs are one raw device per OSD: `ceph-volume raw`, bluestore only, no LVM. That means:
   - no separate DB/WAL devices;
   - no dm-crypt;
@@ -83,4 +87,5 @@ On a `talosctl cluster create qemu` cluster running Talos v1.15.0-alpha.1 (1 con
 - `rm` of an OSD: `safe-to-destroy` refused with 3 OSDs at size 3, then `rm --force --zap` and a redeploy on the same disk reused id 2 with a new uuid;
 - `rm` of a mon and re-adding it on the same host (fresh store, quorum restored);
 - `rm-cluster --zap`, which removed all documents, zapped the disks and deleted the data dirs;
+- RGW with TLS on 2 nodes and a keepalived VIP: S3 bucket create, put and get with `curl --aws-sigv4 --cacert` through `https://<vip>`, with matching md5. During `host maintenance enter` of the VIP holder the VIP moved to the other node (gratuitous ARP seen on the client) and S3 kept working; after exit the VIP moved back to the preferred node;
 - `host reboot` (maintenance enter, `talosctl reboot`, exit) of a mon+OSD host, which took about 2 minutes and ended with every daemon back and noout cleared; a second host entering maintenance at the same time was refused by `mon ok-to-stop`.

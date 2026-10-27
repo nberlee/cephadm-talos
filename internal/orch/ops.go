@@ -386,6 +386,8 @@ func (o *Orch) Remove(ctx context.Context, name string, force, zap bool) error {
 	var cleanup string
 
 	switch d.Type {
+	case state.TypeRGW:
+		cleanup = "ceph auth rm client.rgw." + d.ID
 	case state.TypeMgr:
 		cleanup = "ceph auth rm mgr." + d.ID
 	case state.TypeOSD:
@@ -435,6 +437,11 @@ func (o *Orch) Remove(ctx context.Context, name string, force, zap bool) error {
 
 	if d.Type == state.TypeMon {
 		return o.pushConf(ctx)
+	}
+
+	// the remaining keepalived instances drop it from their unicast peers
+	if d.Type == state.TypeVIP {
+		return o.applyRGWAndVIP(ctx, "")
 	}
 
 	return nil
@@ -632,7 +639,7 @@ func (o *Orch) Upgrade(ctx context.Context, image string) error {
 		}
 	}
 
-	order := []string{state.TypeMon, state.TypeMgr, state.TypeOSD}
+	order := []string{state.TypeMon, state.TypeMgr, state.TypeOSD, state.TypeRGW}
 
 	for _, typ := range order {
 		for _, d := range o.St.DaemonsOf(typ, "") {
@@ -642,19 +649,26 @@ func (o *Orch) Upgrade(ctx context.Context, image string) error {
 				continue
 			}
 
-			doc, err := o.redeployDoc(d, h, image)
-			if err != nil {
-				return err
-			}
-
 			o.printf("upgrading %s on %s to %s\n", displayName(d), h.Name, image)
 
-			if err := o.apply(ctx, h.Addr, doc); err != nil {
-				return err
-			}
+			if typ == state.TypeRGW {
+				// rgws roll with the VIP drained, like any other rgw restart
+				if _, err := o.rollRGWHost(ctx, h, image, rollOpts{}); err != nil {
+					return err
+				}
+			} else {
+				doc, err := o.redeployDoc(d, h, image)
+				if err != nil {
+					return err
+				}
 
-			if err := o.waitImage(ctx, h.Addr, o.St.DocName(d), image, 15*time.Minute); err != nil {
-				return err
+				if err := o.apply(ctx, h.Addr, doc); err != nil {
+					return err
+				}
+
+				if err := o.waitImage(ctx, h.Addr, o.St.DocName(d), image, 15*time.Minute); err != nil {
+					return err
+				}
 			}
 
 			// crude health gate: the cluster must answer before we touch the next daemon
@@ -687,6 +701,14 @@ func (o *Orch) Redeploy(ctx context.Context, name string) error {
 
 	if h.Maintenance {
 		return fmt.Errorf("host %s is in maintenance", h.Name)
+	}
+
+	// rgw and keepalived restarts always roll (VIP drained, readiness checked)
+	if d.Type == state.TypeRGW || d.Type == state.TypeVIP {
+		// an explicit redeploy restarts the daemon, like cephadm's stop + start
+		_, err := o.rollRGWHost(ctx, h, o.St.Image, rollOpts{force: d.Type})
+
+		return err
 	}
 
 	doc, err := o.redeployDoc(d, h, o.St.Image)
@@ -741,6 +763,16 @@ func (o *Orch) redeployDoc(d state.Daemon, h state.Host, image string) (spec.Con
 		p.Keyring = daemons.Keyring("client.bootstrap-osd", o.St.Keys["client.bootstrap-osd"])
 
 		return daemons.OSD(p), nil
+	case state.TypeRGW:
+		p.Keyring = daemons.Keyring("client.rgw."+d.ID, o.St.Keys["client.rgw."+d.ID])
+		p.Port, p.TLSPEM = o.St.RGW.Port, o.St.RGW.Cert+o.St.RGW.Key
+
+		return daemons.RGW(p), nil
+	case state.TypeVIP:
+		o.vipParams(&p, d)
+
+		// keepalived has its own image and does not follow `upgrade`
+		return daemons.VIP(p, o.St.RGW.KeepalivedImage), nil
 	}
 
 	return spec.ContainerConfig{}, fmt.Errorf("unknown daemon type %q", d.Type)

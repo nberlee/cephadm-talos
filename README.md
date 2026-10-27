@@ -40,6 +40,7 @@ The demo above runs on 3 Talos v1.15.0-alpha.1 nodes created with `--skip-etcd-k
 | `ceph orch daemon rm`, `ceph orch upgrade` | `cephadm-talos rm`, `cephadm-talos upgrade` |
 | `ceph orch host maintenance enter/exit` (`systemctl disable --now ceph-<fsid>.target`) | `cephadm-talos host maintenance enter/exit` (documents removed and re-applied, as Talos has no stop/disable) |
 | `cephadm rm-cluster` | `cephadm-talos rm-cluster` |
+| `ceph orch apply rgw` (+ `ingress`: haproxy + keepalived) | `cephadm-talos deploy rgw` (HTTPS, generated CA) + `deploy vip` (keepalived only, no haproxy) |
 | cluster state in mon config-key store | `~/.cephadm-talos/<fsid>/state.json` |
 
 Every container entrypoint is idempotent. It does any first-start work (`ceph-mon --mkfs`, `ceph-volume raw prepare`), then `exec`s the daemon in the foreground. Talos restarts an exited container after 5s.
@@ -67,6 +68,14 @@ go build -o cephadm-talos ./cmd/cephadm-talos
 ./cephadm-talos shell -- 'ceph osd tree; ceph df'
 ./cephadm-talos logs -f mon.cephadm-talos-controlplane-1
 
+# S3 over HTTPS behind a virtual IP (keepalived, VRRP unicast + gratuitous ARP)
+./cephadm-talos deploy rgw cephadm-talos-controlplane-1            # beast on :443, cert from a generated cluster CA
+./cephadm-talos deploy rgw cephadm-talos-controlplane-2
+./cephadm-talos deploy vip cephadm-talos-controlplane-1 --vip 10.5.0.200/24
+./cephadm-talos deploy vip cephadm-talos-controlplane-2
+./cephadm-talos shell -- radosgw-admin user create --uid demo --display-name Demo
+curl --cacert ~/.cephadm-talos/<fsid>/rgw-ca.crt https://10.5.0.200/
+
 ./cephadm-talos upgrade --image quay.io/ceph/ceph:v20.2.4
 ./cephadm-talos rm --zap osd.2
 ./cephadm-talos host maintenance enter cephadm-talos-controlplane-3   # ok-to-stop, noout, stop daemons
@@ -74,6 +83,8 @@ go build -o cephadm-talos ./cmd/cephadm-talos
 ./cephadm-talos host reboot cephadm-talos-controlplane-3              # enter + talosctl reboot + exit
 ./cephadm-talos rm-cluster --zap --yes-i-really-mean-it               # remove everything (like cephadm rm-cluster)
 ```
+
+`deploy rgw --cert F --key F` uses your own certificate instead of the generated one. The generated server certificate covers the VIP, every host IP and hostname, and is reissued (and the rgws restarted) when a host or the VIP is added. `deploy vip` places keepalived (`quay.io/ceph/keepalived:2.2.4`, as cephadm's ingress uses). The VIP is held by the first vip host whose local rgw answers, and moves on failure or `host maintenance enter`. Talos's own VIP cannot be used here: it elects its holder through etcd.
 
 `bootstrap --key-type auto|aes|aes256k` selects the cephx key type. `auto` derives it from the image tag: aes256k for v20.2.4+, AES for older releases (see SHORTCOMINGS.md).
 

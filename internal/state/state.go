@@ -21,6 +21,8 @@ const (
 	TypeMon = "mon"
 	TypeMgr = "mgr"
 	TypeOSD = "osd"
+	TypeRGW = "rgw"
+	TypeVIP = "vip" // keepalived holding the RGW virtual IP
 )
 
 // Host is a Talos node that is part of the Ceph cluster.
@@ -32,6 +34,25 @@ type Host struct {
 	Maintenance bool `json:"maintenance,omitempty"`
 	// NoOut: maintenance enter set `osd set-group noout` on this host's CRUSH bucket
 	NoOut bool `json:"noout,omitempty"`
+}
+
+// RGW holds the object gateway settings shared by all rgw and vip daemons.
+type RGW struct {
+	Port int `json:"port"` // HTTPS port of radosgw (beast ssl_port)
+
+	// TLS: a cluster CA and a server certificate for the VIP and all hosts,
+	// unless the user supplied their own (UserCert)
+	CACert   string `json:"ca_cert,omitempty"`
+	CAKey    string `json:"ca_key,omitempty"`
+	Cert     string `json:"cert"`
+	Key      string `json:"key"`
+	UserCert bool   `json:"user_cert,omitempty"`
+
+	// VIP held by keepalived (VRRP, unicast between the vip hosts)
+	VIP             string `json:"vip,omitempty"` // CIDR, e.g. 10.5.0.200/24
+	VRID            int    `json:"vrid,omitempty"`
+	VRRPPass        string `json:"vrrp_pass,omitempty"`
+	KeepalivedImage string `json:"keepalived_image,omitempty"`
 }
 
 // Daemon is a Ceph daemon placed on a host.
@@ -57,6 +78,7 @@ type State struct {
 	FSID        string            `json:"fsid"`
 	Image       string            `json:"image"`
 	KeyType     string            `json:"key_type,omitempty"` // cephx key type, see cephx.KeyTypeFor
+	RGW         *RGW              `json:"rgw,omitempty"`
 	Talosconfig string            `json:"talosconfig,omitempty"`
 	Context     string            `json:"context,omitempty"`
 	Hosts       []Host            `json:"hosts"`
@@ -65,6 +87,9 @@ type State struct {
 	// ConfPending lists hosts whose ceph.conf could not be updated yet; every
 	// command retries them first
 	ConfPending []string `json:"conf_pending,omitempty"`
+	// RGWPending lists hosts whose rgw/vip documents (certificate, peers) could
+	// not be updated yet; retried like ConfPending
+	RGWPending []string `json:"rgw_pending,omitempty"`
 
 	path string
 }

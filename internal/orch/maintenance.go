@@ -132,7 +132,7 @@ func (o *Orch) MaintenanceExit(ctx context.Context, name string) error {
 	daemons := o.hostDaemons(h)
 
 	// mons first, so the OSDs find a local mon again
-	for _, typ := range []string{state.TypeMon, state.TypeMgr, state.TypeOSD} {
+	for _, typ := range []string{state.TypeMon, state.TypeMgr, state.TypeOSD, state.TypeRGW, state.TypeVIP} {
 		for _, d := range daemons {
 			if d.Type != typ {
 				continue

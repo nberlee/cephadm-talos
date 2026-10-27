@@ -33,6 +33,9 @@ Commands:
   host reboot [--force] <host>             maintenance enter, talosctl reboot, maintenance exit
   deploy mon|mgr <host>                    deploy a daemon on a host
   deploy osd <host> <device>               deploy an OSD on a raw device (e.g. /dev/vdb)
+  deploy rgw <host> [--port 443] [--cert F --key F]
+                                           deploy a radosgw serving HTTPS (generated CA by default)
+  deploy vip <host> [--vip IP/PREFIX]      deploy keepalived holding the RGW virtual IP
   ps                                       list daemons with their Talos container status
   logs [-f] <daemon>                       daemon log (daemon: mon.<host>, osd.<id>, ...)
   restart <daemon>                         restart a daemon container
@@ -143,6 +146,10 @@ func run() error {
 		if err := o.RetryPendingConf(ctx); err != nil {
 			fmt.Fprintln(os.Stderr, "warning:", err)
 		}
+
+		if err := o.RetryPendingRGW(ctx); err != nil {
+			fmt.Fprintln(os.Stderr, "warning:", err)
+		}
 	}
 
 	switch cmd {
@@ -204,7 +211,25 @@ func run() error {
 		return fmt.Errorf("unknown host command %q", args[0])
 	case "deploy":
 		if len(args) < 2 {
-			return errors.New("deploy mon|mgr <host> | deploy osd <host> <device>")
+			return errors.New("deploy mon|mgr <host> | deploy osd <host> <device> | deploy rgw|vip <host> [flags]")
+		}
+
+		switch args[0] {
+		case "rgw":
+			fs := flag.NewFlagSet("deploy rgw", flag.ExitOnError)
+			port := fs.Int("port", 443, "HTTPS port (first rgw only)")
+			cert := fs.String("cert", "", "PEM certificate (chain) to use instead of the generated one")
+			key := fs.String("key", "", "PEM private key for --cert")
+			_ = fs.Parse(args[2:])
+
+			return o.DeployRGW(ctx, args[1], orch.RGWOptions{Port: *port, CertFile: *cert, KeyFile: *key})
+		case "vip":
+			fs := flag.NewFlagSet("deploy vip", flag.ExitOnError)
+			vip := fs.String("vip", "", "virtual IP with prefix length, e.g. 10.5.0.200/24 (first vip only)")
+			image := fs.String("image", "", "keepalived image (default "+orch.DefaultKeepalivedImage+")")
+			_ = fs.Parse(args[2:])
+
+			return o.DeployVIP(ctx, args[1], *vip, *image)
 		}
 
 		dev := ""

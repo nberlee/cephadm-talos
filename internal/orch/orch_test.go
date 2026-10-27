@@ -70,3 +70,35 @@ func TestDocNameBounded(t *testing.T) {
 		t.Fatalf("short name changed: %q", got)
 	}
 }
+
+func TestCertCovers(t *testing.T) {
+	ca, caKey, err := newCA("0123abcd-0000-4000-8000-000000000000")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cert, _, err := newServerCert(ca, caKey, []string{"10.5.0.200", "10.5.0.2"}, []string{"node-1", "localhost"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !certCovers(cert, []string{"10.5.0.2", "10.5.0.200"}, []string{"localhost", "node-1"}) {
+		t.Fatal("same SANs in another order must be covered")
+	}
+
+	if certCovers(cert, []string{"10.5.0.2", "10.5.0.200", "10.5.0.3"}, []string{"localhost", "node-1"}) {
+		t.Fatal("a new host must trigger a reissue")
+	}
+}
+
+func TestLastVIPStart(t *testing.T) {
+	logs := "CEPHADM-TALOS-VIP-START 1-1\nEntering BACKUP STATE\nCEPHADM-TALOS-VIP-START 2-7\nStartup complete\n"
+
+	if m, ok := lastVIPStart(logs); m != "2-7" || ok {
+		t.Fatalf("got %q %v, the latest start is not ready yet", m, ok)
+	}
+
+	if m, ok := lastVIPStart(logs + "(rgw) Entering MASTER STATE\n"); m != "2-7" || !ok {
+		t.Fatalf("got %q %v", m, ok)
+	}
+}

@@ -76,7 +76,12 @@ type HostPathMount struct {
 }
 
 type Security struct {
-	Profile string `yaml:"profile,omitempty"`
+	Profile      string        `yaml:"profile,omitempty"`
+	Capabilities *Capabilities `yaml:"capabilities,omitempty"`
+}
+
+type Capabilities struct {
+	Add []string `yaml:"add,omitempty"`
 }
 
 type Network struct {
