@@ -48,6 +48,12 @@ type ContainerConfig struct {
 	Network     *Network   `yaml:"network,omitempty"`
 	Resources   *Resources `yaml:"resources,omitempty"`
 	DependsOn   *DependsOn `yaml:"dependsOn,omitempty"`
+	RunAs       *RunAs     `yaml:"runAs,omitempty"`
+}
+
+type RunAs struct {
+	UID int `yaml:"uid"`
+	GID int `yaml:"gid"`
 }
 
 // Mount has exactly one of its sources set.
@@ -76,8 +82,9 @@ type HostPathMount struct {
 }
 
 type Security struct {
-	Profile      string        `yaml:"profile,omitempty"`
-	Capabilities *Capabilities `yaml:"capabilities,omitempty"`
+	Profile        string        `yaml:"profile,omitempty"`
+	Capabilities   *Capabilities `yaml:"capabilities,omitempty"`
+	MachinedAccess bool          `yaml:"machinedAccess,omitempty"`
 }
 
 type Capabilities struct {

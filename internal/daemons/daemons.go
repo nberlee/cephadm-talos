@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/nberlee/cephadm-talos/internal/agent"
 	"github.com/nberlee/cephadm-talos/internal/spec"
 )
 
@@ -168,6 +169,28 @@ func VIP(p Params, image string) spec.ContainerConfig {
 	c.DependsOn.Paths = nil
 
 	return c
+}
+
+// AgentUID is the uid and gid the agent runs as: the owner of the machined socket.
+const AgentUID = 50
+
+// Agent renders the node agent: read-only Talos access over the machined
+// socket, its status served on the host network (internal/agent).
+func Agent(name, image, caPEM, certPEM, keyPEM string) spec.ContainerConfig {
+	b64 := func(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
+
+	return spec.ContainerConfig{
+		Header: spec.Header{APIVersion: "v1alpha1", Kind: "ContainerConfig", Name: name},
+		Image:  image,
+		Environment: []string{
+			agent.EnvCA + "=" + b64(caPEM),
+			agent.EnvCert + "=" + b64(certPEM),
+			agent.EnvKey + "=" + b64(keyPEM),
+		},
+		RunAs:    &spec.RunAs{UID: AgentUID, GID: AgentUID},
+		Security: &spec.Security{Profile: "restricted", MachinedAccess: true},
+		Network:  &spec.Network{Mode: "host"},
+	}
 }
 
 // Probe renders a container that reports the Ceph version of an image, with

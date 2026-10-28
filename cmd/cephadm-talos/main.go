@@ -26,7 +26,7 @@ Usage:
   cephadm-talos [global flags] <command> [args]
 
 Commands:
-  bootstrap --mon-node <ip> [--image IMG] [--refresh]
+  bootstrap --mon-node <ip> --agent-image IMG [--image IMG] [--refresh]
                                            create a cluster: 1 mon + 1 mgr on the node
   host add <ip>                            add a Talos node (volume + ceph.conf)
   host ls                                  list hosts
@@ -110,13 +110,14 @@ func run() error {
 		node := fs.String("mon-node", "", "IP of the Talos node for the first mon and mgr")
 		image := fs.String("image", orch.DefaultImage, "Ceph container image (pinned to its digest)")
 		refresh := fs.Bool("refresh", false, "pull the image tag again even if the node has it")
+		agentImage := fs.String("agent-image", "", "cephadm-talos agent image (hack/agent-image.sh builds one)")
 		_ = fs.Parse(args)
 
 		if *node == "" {
 			return errors.New("bootstrap needs --mon-node <ip>")
 		}
 
-		return o.Bootstrap(ctx, *node, *image, *refresh)
+		return o.Bootstrap(ctx, *node, *image, *agentImage, *refresh)
 	}
 
 	st, err := state.Load(*fsid)
@@ -134,14 +135,21 @@ func run() error {
 		tc.Hosts[h.Addr] = talos.Conn{Talosconfig: h.Talosconfig, Context: h.Context}
 	}
 
-	// a mon_host change that did not reach every host is finished first
+	// agent certificates are renewed on every command, also read-only ones,
+	// and host documents that did not reach every host (ceph.conf, renewed
+	// certificates) are retried: until plan 03 the CLI is the only place
+	// renewal happens
+	if err := o.RenewAgentCerts(ctx); err != nil {
+		fmt.Fprintln(os.Stderr, "warning:", err)
+	}
+
+	if err := o.RetryPendingConf(ctx); err != nil {
+		fmt.Fprintln(os.Stderr, "warning:", err)
+	}
+
 	switch cmd {
 	case "ps", "ls", "conf", "logs":
 	default:
-		if err := o.RetryPendingConf(ctx); err != nil {
-			fmt.Fprintln(os.Stderr, "warning:", err)
-		}
-
 		if err := o.RetryPendingRGW(ctx); err != nil {
 			fmt.Fprintln(os.Stderr, "warning:", err)
 		}

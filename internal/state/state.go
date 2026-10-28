@@ -43,6 +43,18 @@ type Host struct {
 	// nodes need not share one talosconfig
 	Talosconfig string `json:"talosconfig,omitempty"`
 	Context     string `json:"context,omitempty"`
+	// AgentCert and AgentKey are the agent's server certificate (agent CA)
+	AgentCert string `json:"agent_cert,omitempty"`
+	AgentKey  string `json:"agent_key,omitempty"`
+}
+
+// Agent holds the agent CA, the mgr's client certificate and the agent image.
+type Agent struct {
+	Image   string `json:"image"` // digest reference
+	CACert  string `json:"ca_cert"`
+	CAKey   string `json:"ca_key"`
+	MgrCert string `json:"mgr_cert"`
+	MgrKey  string `json:"mgr_key"`
 }
 
 // RGW holds the object gateway settings shared by all rgw and vip daemons.
@@ -90,6 +102,7 @@ type State struct {
 	CephVersion string            `json:"ceph_version"` // verified by probing Image
 	Arch        string            `json:"arch"`         // uname -m of Image on the probed node
 	RGW         *RGW              `json:"rgw,omitempty"`
+	Agent       *Agent            `json:"agent,omitempty"`
 	Talosconfig string            `json:"talosconfig,omitempty"`
 	Context     string            `json:"context,omitempty"`
 	Hosts       []Host            `json:"hosts"`

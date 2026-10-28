@@ -192,9 +192,10 @@ func (o *Orch) remove(ctx context.Context, node, name string) error {
 	return o.Talos.Patch(ctx, node, del)
 }
 
-// hostDocs are the per-host documents every Ceph node needs: the /var/lib/ceph volume and ceph.conf.
-func (o *Orch) hostDocs() []any {
-	return []any{spec.CephVolume(), spec.CephConf(o.CephConf())}
+// hostDocs are the per-host documents every Ceph node needs: the
+// /var/lib/ceph volume, ceph.conf and the node agent.
+func (o *Orch) hostDocs(h state.Host) []any {
+	return append([]any{spec.CephVolume(), spec.CephConf(o.CephConf())}, o.agentDocs(h)...)
 }
 
 // pushConf rewrites ceph.conf on every host (after the mon set changed).
@@ -207,7 +208,7 @@ func (o *Orch) pushConf(ctx context.Context) error {
 	for _, h := range o.St.Hosts {
 		o.printf("updating ceph.conf on %s\n", h.Name)
 
-		if err := o.apply(ctx, h.Addr, o.hostDocs()...); err != nil {
+		if err := o.apply(ctx, h.Addr, o.hostDocs(h)...); err != nil {
 			o.printf("warning: ceph.conf on %s not updated: %v\n", h.Name, err)
 			failed = append(failed, h.Name)
 		}
@@ -307,6 +308,11 @@ func (o *Orch) addHost(ctx context.Context, addr string, apply bool) (state.Host
 	if old, ok := o.St.Host(name); ok {
 		h.Maintenance, h.NoOut = old.Maintenance, old.NoOut
 		h.Talosconfig, h.Context = old.Talosconfig, old.Context
+		h.AgentCert, h.AgentKey = old.AgentCert, old.AgentKey
+	}
+
+	if err := o.ensureAgentCert(&h); err != nil {
+		return h, err
 	}
 
 	o.St.AddHost(h)
@@ -315,7 +321,7 @@ func (o *Orch) addHost(ctx context.Context, addr string, apply bool) (state.Host
 		return h, nil
 	}
 
-	if err := o.apply(ctx, addr, o.hostDocs()...); err != nil {
+	if err := o.apply(ctx, addr, o.hostDocs(h)...); err != nil {
 		return h, err
 	}
 
@@ -349,6 +355,11 @@ func (o *Orch) RemoveHost(ctx context.Context, name string) error {
 		return fmt.Errorf("host %s is in maintenance; run `cephadm-talos host maintenance exit %s` first, it also clears noout", h.Name, h.Name)
 	}
 
+	// the agent first: a failure leaves the host in the inventory, so rm can be repeated
+	if err := o.removeAgent(ctx, h); err != nil {
+		return err
+	}
+
 	// the UserVolumeConfig is left in place: deleting it does not wipe /var/mnt/ceph anyway
 	if err := o.apply(ctx, h.Addr, spec.Delete("EtcFileConfig", "ceph/ceph.conf")); err != nil {
 		return err
@@ -360,8 +371,12 @@ func (o *Orch) RemoveHost(ctx context.Context, name string) error {
 }
 
 // Bootstrap creates a new cluster with one mon and one mgr on the given node.
-func (o *Orch) Bootstrap(ctx context.Context, addr, image string, refresh bool) error {
+func (o *Orch) Bootstrap(ctx context.Context, addr, image, agentImage string, refresh bool) error {
 	o.St = state.New(newUUID())
+
+	if agentImage == "" {
+		return errors.New("bootstrap needs --agent-image (build one with hack/agent-image.sh)")
+	}
 
 	o.St.Talosconfig = o.Talos.Flags.Talosconfig
 	o.St.Context = o.Talos.Flags.Context
@@ -383,6 +398,17 @@ func (o *Orch) Bootstrap(ctx context.Context, addr, image string, refresh bool) 
 
 	image = img.Ref
 	o.St.Image, o.St.CephVersion, o.St.Arch = img.Ref, img.Version, img.Arch
+
+	if err := o.setupAgent(ctx, addr, agentImage, refresh); err != nil {
+		return err
+	}
+
+	// the host was added before the agent CA existed
+	if err := o.ensureAgentCert(&h); err != nil {
+		return err
+	}
+
+	o.St.AddHost(h)
 
 	o.printf("bootstrapping cluster %s on %s with %s\n", o.St.FSID, h.Name, image)
 
@@ -428,7 +454,7 @@ func (o *Orch) Bootstrap(ctx context.Context, addr, image string, refresh bool) 
 		Keyring: daemons.Keyring("mgr."+h.Name, mgrKey),
 	})
 
-	if err := o.apply(ctx, h.Addr, append(o.hostDocs(), monDoc, mgrDoc)...); err != nil {
+	if err := o.apply(ctx, h.Addr, append(o.hostDocs(h), monDoc, mgrDoc)...); err != nil {
 		return err
 	}
 

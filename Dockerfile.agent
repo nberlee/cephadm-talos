@@ -1,0 +1,14 @@
+# The cephadm-talos node agent: a static binary and nothing else.
+FROM golang:1.27 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd ./cmd
+COPY internal ./internal
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags=-s -o /cephadm-talos ./cmd/cephadm-talos
+
+FROM scratch
+# executable for the agent's uid 50 (the owner of the machined socket)
+COPY --from=build --chmod=0755 /cephadm-talos /cephadm-talos
+USER 50:50
+ENTRYPOINT ["/cephadm-talos", "agent"]

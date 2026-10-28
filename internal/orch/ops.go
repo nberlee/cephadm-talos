@@ -471,6 +471,12 @@ func (o *Orch) RemoveCluster(ctx context.Context, zap bool) error {
 			}
 		}
 
+		// the agent is not a daemon in the inventory; remove and wait for it
+		// even if its status has not appeared (yet)
+		if o.St.Agent != nil {
+			names[o.agentDocName(h)] = true
+		}
+
 		st, err := o.Talos.ContainerStatuses(ctx, h.Addr)
 		if err != nil {
 			return err
