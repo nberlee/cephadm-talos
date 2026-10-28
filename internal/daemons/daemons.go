@@ -101,10 +101,19 @@ func Mon(p Params) *spec.ContainerConfig {
 	return c
 }
 
-// Mgr renders a ceph-mgr container.
-func Mgr(p Params) *spec.ContainerConfig {
+// Mgr renders a ceph-mgr container with the talos mgr module: moduleFiles
+// are its files on the host below /etc/ceph/mgr/cephadm. They are mounted over
+// the image's cephadm module (/usr/share/ceph/mgr/cephadm), which needs SSH and
+// cannot work on Talos: Ceph only accepts cephadm, rook or test_orchestrator
+// as orchestrator backend. The mgr waits for the files.
+func Mgr(p Params, moduleFiles ...string) *spec.ContainerConfig {
 	c := base(p, "mgr")
 	c.SecurityConfig = spec.Restricted()
+	c.MountsConfig = append(c.MountsConfig, spec.HostPath("/etc/ceph/mgr/cephadm", "/usr/share/ceph/mgr/cephadm", "ro"))
+
+	for _, f := range moduleFiles {
+		c.DependsOnConfig.PathsConfig = append(c.DependsOnConfig.PathsConfig, "/etc/ceph/mgr/cephadm/"+f)
+	}
 
 	return c
 }

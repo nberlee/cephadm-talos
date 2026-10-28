@@ -147,6 +147,20 @@ func run() error {
 		fmt.Fprintln(os.Stderr, "warning:", err)
 	}
 
+	// the talos mgr module's inventory follows every change: published now if
+	// an earlier command could not, and again when this command is done
+	if cmd != "rm-cluster" {
+		if err := o.Publish(ctx); err != nil {
+			fmt.Fprintln(os.Stderr, "warning:", err)
+		}
+
+		defer func() {
+			if err := o.Publish(context.WithoutCancel(ctx)); err != nil {
+				fmt.Fprintln(os.Stderr, "warning:", err)
+			}
+		}()
+	}
+
 	switch cmd {
 	case "ps", "ls", "conf", "logs":
 	default:

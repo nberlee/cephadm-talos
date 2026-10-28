@@ -44,8 +44,13 @@ type Node struct {
 	Srv     *grpc.Server
 	OnBoot  func() // called by Reboot, after the boot id changed
 	Images  machine.ImageServiceServer
+	// Restarted lists the containers Restart was called for
+	Restarted []string
 	// VersionTag is what Version reports (default v1.15.0-alpha.2)
 	VersionTag string
+	// FailBeforeApply makes the next ApplyConfiguration fail without storing
+	// the config, like a connection lost before the node got it
+	FailBeforeApply error
 	// FailAfterApply makes the next ApplyConfiguration store the config and
 	// then fail, like a connection lost after the node accepted it
 	FailAfterApply error
@@ -155,6 +160,15 @@ func (f *Node) ApplyConfiguration(_ context.Context, req *machine.ApplyConfigura
 		return nil, errors.New("want NO_REBOOT")
 	}
 
+	f.Mu.Lock()
+	before := f.FailBeforeApply
+	f.FailBeforeApply = nil
+	f.Mu.Unlock()
+
+	if before != nil {
+		return nil, before
+	}
+
 	if bytes.Contains(req.Data, []byte("name: rejected")) {
 		return nil, status.Error(codes.InvalidArgument, "config validation failed")
 	}
@@ -234,6 +248,15 @@ func (f *Node) Version(context.Context, *emptypb.Empty) (*machine.VersionRespons
 	}
 
 	return &machine.VersionResponse{Messages: []*machine.Version{{Version: &machine.VersionInfo{Tag: tag}}}}, nil
+}
+
+func (f *Node) Restart(_ context.Context, req *machine.RestartRequest) (*machine.RestartResponse, error) {
+	f.Mu.Lock()
+	defer f.Mu.Unlock()
+
+	f.Restarted = append(f.Restarted, req.Id)
+
+	return &machine.RestartResponse{}, nil
 }
 
 func (f *Node) Logs(req *machine.LogsRequest, srv machine.MachineService_LogsServer) error {

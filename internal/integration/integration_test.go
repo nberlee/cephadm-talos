@@ -7,6 +7,7 @@
 //	CEPHADM_TALOS_DEVICE       spare disk on every node for an OSD (default /dev/sda)
 //	CEPHADM_TALOS_IMAGE        supported Ceph image (default quay.io/ceph/ceph:v20.2.4)
 //	CEPHADM_TALOS_OLD_IMAGE    an unsupported Ceph image for the gate test (default quay.io/ceph/ceph:v20.2.3)
+//	CEPHADM_TALOS_AGENT_IMAGE  the agent image, pinned by digest (required; hack/agent-image.sh)
 //
 // The upgrade tests need two images of the supported release that differ only
 // in a label, in a registry every node can reach, plus a mutable tag in it
@@ -24,7 +25,10 @@ package integration
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"encoding/json"
 	"errors"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -35,6 +39,8 @@ import (
 
 	"github.com/siderolabs/talos/pkg/machinery/resources/containers"
 
+	"github.com/nberlee/cephadm-talos/internal/pki"
+	"github.com/nberlee/cephadm-talos/internal/spec"
 	"github.com/nberlee/cephadm-talos/internal/state"
 	"github.com/nberlee/cephadm-talos/internal/talos"
 )
@@ -148,6 +154,11 @@ func TestCluster(t *testing.T) {
 	n1, n2, n3 := e.nodes[0], e.nodes[1], e.nodes[2]
 
 	image := getenv("CEPHADM_TALOS_IMAGE", "quay.io/ceph/ceph:v20.2.4")
+
+	agentImage := os.Getenv("CEPHADM_TALOS_AGENT_IMAGE")
+	if agentImage == "" {
+		t.Skip("set CEPHADM_TALOS_AGENT_IMAGE (hack/agent-image.sh)")
+	}
 	fixA, fixB, fixTag := os.Getenv("CEPHADM_TALOS_FIXTURE_A"), os.Getenv("CEPHADM_TALOS_FIXTURE_B"), os.Getenv("CEPHADM_TALOS_FIXTURE_TAG")
 
 	if fixA != "" {
@@ -161,7 +172,7 @@ func TestCluster(t *testing.T) {
 	}
 
 	t.Run("dry-run stays offline", func(t *testing.T) {
-		out := e.ok(t, "--dry-run", "bootstrap", "--mon-node", n1, "--image", image)
+		out := e.ok(t, "--dry-run", "bootstrap", "--mon-node", n1, "--image", image, "--agent-image", agentImage)
 		if !strings.Contains(out, "# pull "+image) {
 			t.Errorf("dry-run does not show the planned pull")
 		}
@@ -176,7 +187,7 @@ func TestCluster(t *testing.T) {
 	})
 
 	t.Run("unsupported image refused", func(t *testing.T) {
-		out, err := e.run(t, "bootstrap", "--mon-node", n1, "--image", getenv("CEPHADM_TALOS_OLD_IMAGE", "quay.io/ceph/ceph:v20.2.3"))
+		out, err := e.run(t, "bootstrap", "--mon-node", n1, "--image", getenv("CEPHADM_TALOS_OLD_IMAGE", "quay.io/ceph/ceph:v20.2.3"), "--agent-image", agentImage)
 		if err == nil || !strings.Contains(out, "supports only Ceph") {
 			t.Fatalf("want a version gate error, got %v", err)
 		}
@@ -191,7 +202,7 @@ func TestCluster(t *testing.T) {
 	}
 
 	t.Run("bootstrap", func(t *testing.T) {
-		e.ok(t, "bootstrap", "--mon-node", n1, "--image", image)
+		e.ok(t, "bootstrap", "--mon-node", n1, "--image", image, "--agent-image", agentImage)
 
 		st := e.state(t)
 		if !strings.Contains(st.Image, "@sha256:") || st.CephVersion == "" || st.Arch != "x86_64" {
@@ -223,6 +234,144 @@ func TestCluster(t *testing.T) {
 	if t.Failed() {
 		t.FailNow()
 	}
+
+	t.Run("orch read path", func(t *testing.T) {
+		cluster := e.state(t)
+
+		var st struct {
+			Available  bool   `json:"available"`
+			Backend    string `json:"backend"`
+			Revision   int    `json:"inventory_revision"`
+			CertExpiry string `json:"agent_cert_expiry"`
+		}
+
+		e.cephJSON(t, &st, "orch", "status")
+
+		if !st.Available || st.Backend != "cephadm" || st.Revision != cluster.Published.Revision {
+			t.Errorf("orch status %+v, want revision %d", st, cluster.Published.Revision)
+		}
+
+		// the earliest of the mgr's and the agents' certificates
+		want, _ := pki.NotAfter(cluster.Agent.MgrCert)
+		for _, h := range cluster.Hosts {
+			if na, err := pki.NotAfter(h.AgentCert); err == nil && na.Before(want) {
+				want = na
+			}
+		}
+
+		if got, err := time.Parse(time.RFC3339, st.CertExpiry); err != nil || !got.Equal(want.UTC().Truncate(time.Second)) {
+			t.Errorf("agent_cert_expiry %q, want %s", st.CertExpiry, want.UTC().Format(time.RFC3339))
+		}
+
+		var hosts []struct {
+			Hostname string `json:"hostname"`
+			Addr     string `json:"addr"`
+		}
+
+		e.cephJSON(t, &hosts, "orch", "host", "ls")
+
+		gotHosts := map[string]string{}
+		for _, h := range hosts {
+			gotHosts[h.Hostname] = h.Addr
+		}
+
+		for _, h := range cluster.Hosts {
+			if gotHosts[h.Name] != h.Addr {
+				t.Errorf("orch host ls: %s at %q, want %s", h.Name, gotHosts[h.Name], h.Addr)
+			}
+		}
+
+		if len(hosts) != len(cluster.Hosts) {
+			t.Errorf("orch host ls lists %d hosts, want %d", len(hosts), len(cluster.Hosts))
+		}
+
+		// every inventory daemon, running, with the digest Talos runs
+		e.waitDaemons(t, func(ds []daemon) bool { return allRunning(ds, "") && len(ds) == len(cluster.Daemons) })
+
+		var ds []daemon
+		e.cephJSON(t, &ds, "orch", "ps")
+
+		byName := map[string]daemon{}
+		for _, d := range ds {
+			byName[d.Name] = d
+		}
+
+		for _, d := range cluster.Daemons {
+			h, _ := cluster.Host(d.Host)
+			name := d.Type + "." + d.ID
+
+			if d.OSDID != nil {
+				name = "osd." + strconv.Itoa(*d.OSDID)
+			}
+
+			got, ok := byName[name]
+			if !ok || got.Hostname != h.Name {
+				t.Errorf("orch ps: %s missing or on the wrong host (%+v)", name, got)
+
+				continue
+			}
+
+			statuses, err := e.tc.ContainerStatuses(context.Background(), h.Addr)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if s := statuses[cluster.DocName(d)]; len(got.Digests) != 1 || got.Digests[0] != s.Image {
+				t.Errorf("orch ps: %s digest %v, Talos runs %s", name, got.Digests, s.Image)
+			}
+		}
+
+		out, err := e.run(t, "shell", "--", "ceph", "orch", "apply", "mon", "3")
+		if err == nil || !strings.Contains(out, "does not support") {
+			t.Errorf("orch apply was not refused as unsupported: %v", err)
+		}
+	})
+
+	t.Run("agent requires a client certificate", func(t *testing.T) {
+		conn, err := tls.Dial("tcp", net.JoinHostPort(n1, "4721"), &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13}) //nolint:gosec // only the agent's side is checked
+		if err == nil {
+			// TLS 1.3 reports a missing client certificate on the first read
+			_, err = conn.Read(make([]byte, 1))
+			conn.Close() //nolint:errcheck
+		}
+
+		if err == nil {
+			t.Error("agent answered a client without a certificate")
+		}
+	})
+
+	t.Run("agent restart and mgr failover", func(t *testing.T) {
+		st := e.state(t)
+		h2, _ := st.Host(n2)
+
+		if err := e.tc.Restart(context.Background(), n2, st.DocName(state.Daemon{Type: "agent", ID: h2.Name})); err != nil {
+			t.Fatal(err)
+		}
+
+		e.ok(t, "shell", "--", "ceph", "mgr", "fail")
+		e.waitDaemons(t, func(ds []daemon) bool { return allRunning(ds, "") })
+	})
+
+	t.Run("agent gone and back", func(t *testing.T) {
+		st := e.state(t)
+		h2, _ := st.Host(n2)
+		agentDoc := st.DocName(state.Daemon{Type: "agent", ID: h2.Name})
+
+		del, err := spec.Render(spec.Delete("ContainerConfig", agentDoc))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := e.tc.Patch(context.Background(), n2, del); err != nil {
+			t.Fatal(err)
+		}
+
+		e.waitDaemons(t, func(ds []daemon) bool { return allStatus(ds, h2.Name, statusUnknown) })
+
+		// host add redeploys the host's documents, the agent with them
+		e.ok(t, "host", "add", n2)
+		e.waitDaemons(t, func(ds []daemon) bool { return allRunning(ds, "") })
+	})
 
 	t.Run("jobs", func(t *testing.T) {
 		// the command's exit status is the CLI's, with its output
@@ -298,6 +447,8 @@ func TestCluster(t *testing.T) {
 		if !strings.Contains(out, "3 osds: 3 up") {
 			t.Errorf("not all OSDs up after the reboot")
 		}
+
+		e.waitDaemons(t, func(ds []daemon) bool { return allRunning(ds, h.Name) })
 	})
 
 	t.Run("data", func(t *testing.T) {
@@ -440,6 +591,43 @@ func TestCluster(t *testing.T) {
 		}
 	})
 
+	t.Run("host rm and add", func(t *testing.T) {
+		st := e.state(t)
+		h3, _ := st.Host(n3)
+
+		for _, d := range st.Daemons {
+			if d.Host != h3.Name {
+				continue
+			}
+
+			name := d.Type + "." + d.ID
+			if d.OSDID != nil {
+				name = "osd." + strconv.Itoa(*d.OSDID)
+			}
+
+			e.ok(t, "rm", "--force", "--zap", name)
+		}
+
+		agentDoc := st.DocName(state.Daemon{Type: "agent", ID: h3.Name})
+
+		e.ok(t, "host", "rm", h3.Name)
+
+		if left := e.containers(t, n3, agentDoc); len(left) > 0 {
+			t.Errorf("agent left on the removed host: %v", left)
+		}
+
+		e.ok(t, "host", "add", n3)
+
+		deadline := time.Now().Add(3 * time.Minute)
+		for len(e.running(t, n3, agentDoc)) == 0 {
+			if time.Now().After(deadline) {
+				t.Fatal("agent not running after host add")
+			}
+
+			time.Sleep(3 * time.Second)
+		}
+	})
+
 	t.Run("rm-cluster --zap", func(t *testing.T) {
 		prefix := "ceph-" + e.state(t).Short() + "-"
 
@@ -451,6 +639,71 @@ func TestCluster(t *testing.T) {
 			}
 		}
 	})
+}
+
+type daemon struct {
+	Name     string   `json:"daemon_name"`
+	Hostname string   `json:"hostname"`
+	Status   int      `json:"status"` // orchestrator DaemonDescriptionStatus
+	Desc     string   `json:"status_desc"`
+	Digests  []string `json:"container_image_digests"`
+}
+
+// DaemonDescriptionStatus values (orchestrator/_interface.py).
+const (
+	statusRunning = 1
+	statusUnknown = -2
+)
+
+// cephJSON runs a ceph command with --format json in a job and decodes it.
+func (e *env) cephJSON(t *testing.T, v any, args ...string) {
+	t.Helper()
+
+	out := e.ok(t, append(append([]string{"shell", "--", "ceph"}, args...), "--format", "json")...)
+
+	start := strings.IndexAny(out, "[{")
+	if start < 0 || json.Unmarshal([]byte(out[start:]), v) != nil {
+		t.Fatalf("ceph %s: not JSON: %s", strings.Join(args, " "), out)
+	}
+}
+
+// waitDaemons polls `ceph orch ps --refresh` until ok or 4 minutes passed.
+func (e *env) waitDaemons(t *testing.T, ok func([]daemon) bool) {
+	t.Helper()
+
+	var ds []daemon
+
+	for deadline := time.Now().Add(4 * time.Minute); time.Now().Before(deadline); time.Sleep(5 * time.Second) {
+		ds = nil
+		e.cephJSON(t, &ds, "orch", "ps", "--refresh")
+
+		if ok(ds) {
+			return
+		}
+	}
+
+	t.Fatalf("orch ps did not reach the expected state: %+v", ds)
+}
+
+func allRunning(ds []daemon, host string) bool { return allStatus(ds, host, statusRunning) }
+
+// allStatus reports whether every daemon (of the host, if given) has the status.
+func allStatus(ds []daemon, host string, status int) bool {
+	n := 0
+
+	for _, d := range ds {
+		if host != "" && d.Hostname != host {
+			continue
+		}
+
+		n++
+
+		if d.Status != status {
+			return false
+		}
+	}
+
+	return n > 0
 }
 
 // running returns the containers with the prefix that are in state running.

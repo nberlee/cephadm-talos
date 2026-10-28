@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/nberlee/cephadm-talos/internal/daemons"
+	"github.com/nberlee/cephadm-talos/internal/mgrmodule"
 	"github.com/nberlee/cephadm-talos/internal/spec"
 	"github.com/nberlee/cephadm-talos/internal/state"
 	"github.com/nberlee/cephadm-talos/internal/talos"
@@ -501,7 +502,7 @@ func (o *Orch) RemoveCluster(ctx context.Context, zap bool) error {
 			}
 		}
 
-		docs := []any{spec.Delete("EtcFileConfig", "ceph/ceph.conf")}
+		docs := append([]any{spec.Delete("EtcFileConfig", "ceph/ceph.conf")}, o.talosFileDeletes()...)
 		for name := range names {
 			docs = append(docs, spec.Delete("ContainerConfig", name))
 		}
@@ -813,7 +814,7 @@ func (o *Orch) redeployDoc(d state.Daemon, h state.Host, image string) (*spec.Co
 	case state.TypeMgr:
 		p.Keyring = daemons.Keyring("mgr."+d.ID, o.St.Keys["mgr."+d.ID])
 
-		return daemons.Mgr(p), nil
+		return daemons.Mgr(p, mgrmodule.Names()...), nil
 	case state.TypeOSD:
 		p.Keyring = daemons.Keyring("client.bootstrap-osd", o.St.Keys["client.bootstrap-osd"])
 

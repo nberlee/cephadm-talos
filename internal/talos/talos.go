@@ -26,6 +26,7 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/resources/block"
 	"github.com/siderolabs/talos/pkg/machinery/resources/config"
 	"github.com/siderolabs/talos/pkg/machinery/resources/containers"
+	"github.com/siderolabs/talos/pkg/machinery/resources/files"
 	"github.com/siderolabs/talos/pkg/machinery/resources/network"
 	"github.com/siderolabs/talos/pkg/machinery/resources/runtime"
 	"github.com/siderolabs/talos/pkg/machinery/role"
@@ -591,7 +592,63 @@ func (c *Client) Restart(ctx context.Context, node, name string) error {
 		return err
 	}
 
-	return wrap("restart "+name+" on "+node, cl.Restart(nctx, Namespace, common.ContainerDriver_CONTAINERD, name))
+	// containerd knows the container by its instance (ContainerInstanceSpec
+	// ID, e.g. <name>-3), not by the ContainerConfig name
+	list, err := safe.StateListAll[*containers.ContainerInstanceSpec](nctx, cl.COSI)
+	if err != nil {
+		return wrap("list containerinstancespec on "+node, err)
+	}
+
+	var (
+		id  string
+		gen uint64
+	)
+
+	for r := range list.All() {
+		if s := r.TypedSpec(); s.ContainerID == name && (id == "" || s.Generation > gen) {
+			id, gen = r.Metadata().ID(), s.Generation
+		}
+	}
+
+	if id == "" {
+		return fmt.Errorf("restart %s on %s: %w: no running instance", name, node, ErrNotFound)
+	}
+
+	return wrap("restart "+name+" on "+node, cl.Restart(nctx, Namespace, common.ContainerDriver_CONTAINERD, id))
+}
+
+// EtcFileWritten reports whether a file below /etc (EtcFileConfig name, e.g.
+// ceph/ceph.conf) has the contents on disk: Talos writes files after it
+// accepted the config, and records the spec version it wrote in EtcFileStatus.
+func (c *Client) EtcFileWritten(ctx context.Context, node, name, contents string) (bool, error) {
+	cl, nctx, err := c.node(ctx, node, "get etcfile "+name)
+	if err != nil {
+		return false, err
+	}
+
+	spec, err := safe.StateGetByID[*files.EtcFileSpec](nctx, cl.COSI, name)
+	if state.IsNotFoundError(err) {
+		return false, nil
+	}
+
+	if err != nil {
+		return false, wrap("get etcfilespec "+name+" on "+node, err)
+	}
+
+	if string(spec.TypedSpec().Contents) != contents {
+		return false, nil
+	}
+
+	st, err := safe.StateGetByID[*files.EtcFileStatus](nctx, cl.COSI, name)
+	if state.IsNotFoundError(err) {
+		return false, nil
+	}
+
+	if err != nil {
+		return false, wrap("get etcfilestatus "+name+" on "+node, err)
+	}
+
+	return st.TypedSpec().SpecVersion == spec.Metadata().Version().String(), nil
 }
 
 // RebootTimeout bounds how long Reboot waits for the node to be back.

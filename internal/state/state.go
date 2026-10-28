@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 )
 
 // SchemaVersion is the state.json schema this build reads and writes. Before
@@ -46,6 +47,18 @@ type Host struct {
 	// AgentCert and AgentKey are the agent's server certificate (agent CA)
 	AgentCert string `json:"agent_cert,omitempty"`
 	AgentKey  string `json:"agent_key,omitempty"`
+}
+
+// Published is the revision of what the talos mgr module reads from the nodes
+// (inventory, module files, mgr TLS); Hash detects changes.
+type Published struct {
+	Hash      string    `json:"hash"`
+	Revision  int       `json:"revision"`
+	UpdatedAt time.Time `json:"updated_at"`
+	// ModuleHash is the published mgr module code; a change needs the mgrs
+	// restarted (MgrRestart lists the hosts still to do)
+	ModuleHash string   `json:"module_hash,omitempty"`
+	MgrRestart []string `json:"mgr_restart,omitempty"`
 }
 
 // Agent holds the agent CA, the mgr's client certificate and the agent image.
@@ -103,6 +116,7 @@ type State struct {
 	Arch        string            `json:"arch"`         // uname -m of Image on the probed node
 	RGW         *RGW              `json:"rgw,omitempty"`
 	Agent       *Agent            `json:"agent,omitempty"`
+	Published   Published         `json:"published"`
 	Talosconfig string            `json:"talosconfig,omitempty"`
 	Context     string            `json:"context,omitempty"`
 	Hosts       []Host            `json:"hosts"`

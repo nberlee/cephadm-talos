@@ -53,6 +53,8 @@ type Leaf struct {
 	// certificate gets exactly one, so a server certificate cannot act as a client
 	Usage x509.ExtKeyUsage
 	Years int
+	// Lifetime, if set, replaces Years
+	Lifetime time.Duration
 }
 
 // Issue signs a leaf certificate with the CA.
@@ -76,7 +78,7 @@ func Issue(caCertPEM, caKeyPEM string, l Leaf) (certPEM, keyPEM string, err erro
 		SerialNumber: serial(),
 		Subject:      pkix.Name{CommonName: l.CommonName},
 		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().AddDate(l.Years, 0, 0),
+		NotAfter:     notAfter(l),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{l.Usage},
 		DNSNames:     l.Names,
@@ -96,6 +98,14 @@ func Issue(caCertPEM, caKeyPEM string, l Leaf) (certPEM, keyPEM string, err erro
 	k, err := encodeKey(key)
 
 	return encodeCert(der), k, err
+}
+
+func notAfter(l Leaf) time.Time {
+	if l.Lifetime > 0 {
+		return time.Now().Add(l.Lifetime)
+	}
+
+	return time.Now().AddDate(l.Years, 0, 0)
 }
 
 // Parse returns the first certificate of a PEM bundle.

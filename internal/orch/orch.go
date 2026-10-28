@@ -19,6 +19,7 @@ import (
 
 	"github.com/nberlee/cephadm-talos/internal/cephx"
 	"github.com/nberlee/cephadm-talos/internal/daemons"
+	"github.com/nberlee/cephadm-talos/internal/mgrmodule"
 	"github.com/nberlee/cephadm-talos/internal/spec"
 	"github.com/nberlee/cephadm-talos/internal/state"
 	"github.com/nberlee/cephadm-talos/internal/talos"
@@ -195,7 +196,10 @@ func (o *Orch) remove(ctx context.Context, node, name string) error {
 // hostDocs are the per-host documents every Ceph node needs: the
 // /var/lib/ceph volume, ceph.conf and the node agent.
 func (o *Orch) hostDocs(h state.Host) []any {
-	return append([]any{spec.CephVolume(), spec.CephConf(o.CephConf())}, o.agentDocs(h)...)
+	docs := append([]any{spec.CephVolume(), spec.CephConf(o.CephConf())}, o.agentDocs(h)...)
+	docs = append(docs, o.inventoryDoc())
+
+	return append(docs, o.mgrFileDocs(o.hasMgr(h))...)
 }
 
 // pushConf rewrites ceph.conf on every host (after the mon set changed).
@@ -361,7 +365,7 @@ func (o *Orch) RemoveHost(ctx context.Context, name string) error {
 	}
 
 	// the UserVolumeConfig is left in place: deleting it does not wipe /var/mnt/ceph anyway
-	if err := o.apply(ctx, h.Addr, spec.Delete("EtcFileConfig", "ceph/ceph.conf")); err != nil {
+	if err := o.apply(ctx, h.Addr, append([]any{spec.Delete("EtcFileConfig", "ceph/ceph.conf")}, o.talosFileDeletes()...)...); err != nil {
 		return err
 	}
 
@@ -452,11 +456,22 @@ func (o *Orch) Bootstrap(ctx context.Context, addr, image, agentImage string, re
 	mgrDoc := daemons.Mgr(daemons.Params{
 		Name: o.St.DocName(mgr), Image: image, FSID: o.St.FSID, ID: h.Name, Addr: h.Addr,
 		Keyring: daemons.Keyring("mgr."+h.Name, mgrKey),
-	})
+	}, mgrmodule.Names()...)
+
+	// the state, the first revision and the pending host are saved before the
+	// node is patched: an interrupted bootstrap leaves a state to clean up from
+	o.bumpPublished()
+	o.St.ConfPending = []string{h.Name}
+
+	if err := o.save(); err != nil {
+		return err
+	}
 
 	if err := o.apply(ctx, h.Addr, append(o.hostDocs(h), monDoc, mgrDoc)...); err != nil {
 		return err
 	}
+
+	o.St.ConfPending = nil
 
 	if err := o.save(); err != nil {
 		return err
@@ -474,6 +489,12 @@ func (o *Orch) Bootstrap(ctx context.Context, addr, image, agentImage string, re
 
 	if _, err := o.Job(ctx, h.Addr, "timeout 300 ceph -s", 10*time.Minute); err != nil {
 		return err
+	}
+
+	if !o.Talos.DryRun {
+		if err := o.enableModule(ctx, h.Addr); err != nil {
+			return err
+		}
 	}
 
 	o.printf("\ncluster %s bootstrapped\n  state: %s\n  next:  cephadm-talos host add <ip>; cephadm-talos deploy osd <host> /dev/<disk>\n", o.St.FSID, o.St.Dir())
@@ -649,9 +670,10 @@ func (o *Orch) deployMgr(ctx context.Context, h state.Host) error {
 	doc := daemons.Mgr(daemons.Params{
 		Name: o.St.DocName(d), Image: o.St.Image, FSID: o.St.FSID, ID: h.Name, Addr: h.Addr,
 		Keyring: daemons.Keyring(entity, k),
-	})
+	}, mgrmodule.Names()...)
 
-	if err := o.apply(ctx, h.Addr, doc); err != nil {
+	// the mgr starts only once the talos module's files are on the host
+	if err := o.apply(ctx, h.Addr, append(o.mgrFileDocs(true), doc)...); err != nil {
 		return err
 	}
 

@@ -26,3 +26,19 @@ jobs:
           git clone --quiet --depth 1 --branch "$CEPH_TAG" --filter=blob:none --sparse https://github.com/ceph/ceph.git ceph
           git -C ceph sparse-checkout set src/pybind/mgr/orchestrator src/pybind/mgr/cephadm src/python-common/ceph/deployment
       - run: python3 -I hack/capabilities.py ceph docs/capabilities.md
+
+  mgrmodule:
+    runs-on: ubuntu-latest
+    env:
+      CEPH_TAG: v20.2.4
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install prettytable pyyaml
+      - name: Fetch the Ceph mgr sources the module is tested against
+        run: |
+          git clone --quiet --depth 1 --branch "$CEPH_TAG" --filter=blob:none --sparse https://github.com/ceph/ceph.git ceph
+          git -C ceph sparse-checkout set src/pybind src/python-common
+      - run: hack/mgrmodule-test.sh ceph

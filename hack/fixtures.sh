@@ -29,14 +29,7 @@ a="$REG/ceph@$(crane digest --insecure "$REG/ceph:fixture-a")"
 b="$REG/ceph@$(crane digest --insecure "$REG/ceph:fixture-b")"
 
 # plain HTTP: Talos uses the http endpoint for this registry
-.bin/talosctl --talosconfig "$TALOSCONFIG" -n "$NODES" patch machineconfig --mode no-reboot --patch "$(cat <<DOC
-apiVersion: v1alpha1
-kind: RegistryMirrorConfig
-name: $REG
-endpoints:
-  - url: http://$REG
-DOC
-)"
+TALOSCONFIG=$TALOSCONFIG CEPHADM_TALOS_NODES=$NODES "$(dirname "$0")/test-registry.sh" "$REG" >/dev/null
 
 cat <<OUT
 export CEPHADM_TALOS_FIXTURE_A=$a
