@@ -19,7 +19,7 @@ cephadm-talos is a proof of concept. This file lists what is missing or wrong co
 - **No init containers, sidecars or pod grouping.** cephadm's init containers, the sidecars (e.g. for iSCSI/NFS) and shared-namespace groups cannot be expressed.
 - **Only `restricted` or `privileged` profiles, no user namespaces.** OSDs run fully privileged with host `/dev`. uid 0 in a container is root on the host.
 - **Secrets live in the machine config in plaintext.** Keyrings are base64 env vars in `ContainerConfig` documents, and anyone with `os:reader` on the Talos API can see them. The mon document carries the admin and bootstrap keys, because they are needed for mkfs/join. There is no Talos "secret" document a container can mount.
-- **Images are not digest-pinned automatically.** `talosctl validate` warns that the running image may change on restart when a tag is used. cephadm resolves tags to digests on upgrade; cephadm-talos does not. You can pass a digest reference yourself (`upgrade --image quay.io/ceph/ceph@sha256:...`), and that was tested.
+- **A cached tag is not re-resolved.** `bootstrap` and `upgrade` pin images to the digest Talos pulled, but Talos skips images it already has, so a moved tag keeps resolving to the old digest until `--refresh`.
 - **Same-digest re-pins are a no-op (observed).** Talos only restarts a container when its resolved spec (digest, env, mounts) changes. An `upgrade` to a reference with the same digest therefore restarts nothing, which is correct but cannot exercise the restart path.
 - **Job containers need a machine config apply each.** Admin commands take about 8s each on the QEMU cluster, so an `upgrade` of 8 daemons, with a `ceph -s` gate after each, took about 2 minutes.
 - **Every change is a machine config change.** Each deploy/rm/job grows the config history and goes through the full apply path. A typo in a document is rejected for the whole patch.
@@ -61,18 +61,16 @@ cephadm-talos is a proof of concept. This file lists what is missing or wrong co
 - Document names that are not valid Talos container names (uppercase, a trailing `-`, longer than 63 characters) are normalized and suffixed with a hash. The Ceph ids keep the raw hostname.
 - A forced `rm` while no mon is reachable only stops the container. The daemon stays in the inventory as `local_only`, and a later `rm` runs the cluster-side cleanup. `--zap` is refused in that case.
 - **A reboot between `ceph osd new` and mkfs leaves the OSD stuck.** If the node reboots inside `ceph-volume raw prepare`, after the id was allocated but before the label was written, the restarted prepare reuses the same uuid with a new key, and Ceph rejects it ("exists but key does not match"). Recovery is manual: run `cephadm-talos shell -- ceph osd purge-new osd.<id> --yes-i-really-mean-it`, then `cephadm-talos redeploy`. ceph-volume's own rollback only covers failures it catches itself, not a crash.
-- **CephX key type follows the image at bootstrap (observed).** v20.2.4 made AES256KRB5 (`aes256k`) the default, and fresh monmaps allow only that type, while v20.2.3 and older cannot parse such keys. `bootstrap --key-type auto` picks the type from the image tag; `aes` or `aes256k` can be forced.
-- **Upgrading an AES cluster to v20.2.4 ends in HEALTH_ERR (observed).** Ceph's new checks flag the "insecure key types" and require rotating every cephx key to aes256k. cephadm-talos has no key rotation; the data path keeps working, as the v20.2.3 to v20.2.4 test showed.
-- **`raw prepare --osd-fsid` is missing before v20.2.4 (observed).** For those releases the OSD falls back to a per-deploy pending marker under `/var/mnt/ceph/<fsid>/` to recognise its own label after a restart.
+- **Only the latest Ceph release.** Keys are always AES256KRB5 (v20.2.4+); older releases are refused.
+- **`raw prepare --osd-fsid` is not in v20.2.4 (observed).** Only Ceph main has it. The OSD falls back to a per-deploy pending marker under `/var/mnt/ceph/<fsid>/` to recognise its own label after a restart; `osd.sh` uses `--osd-fsid` once a release has it.
 - Clock skew warnings appear after the QEMU VMs were suspended (observed). They are not managed, because Talos owns time sync.
 
 ## Implementation shortcuts
 
-- cephadm-talos shells out to `talosctl` instead of using the Talos machinery Go API, so errors are parsed text.
-- Waiting is polling: every 2-3s via `talosctl get containerstatus` and `talosctl logs`, rather than `talosctl get --watch`.
-- The OSD id is discovered by scraping `CEPHADM-TALOS-OSD-ID=` from the container log.
+- Job results and OSD ids are read from container logs (log markers), and the job wait polls the log; result files come with the agent (ROADMAP.md, milestone 3).
+- Waiting for a container to run, change image or go away uses Talos resource watches; waiting for a new instance generation and for a reboot still polls.
 - `--dry-run` does not persist state, so only `bootstrap` can be dry-run on a fresh setup.
-- There are no integration tests in CI. Only unit tests and `talosctl validate` of the rendered documents are run.
+- The integration suite (`go test -tags integration`) needs a QEMU cluster and does not run in CI; CI runs the unit tests and the capability matrix check.
 
 ## Review scope
 

@@ -86,8 +86,9 @@ type Daemon struct {
 type State struct {
 	Schema      int               `json:"schema"`
 	FSID        string            `json:"fsid"`
-	Image       string            `json:"image"`
-	KeyType     string            `json:"key_type,omitempty"` // cephx key type, see cephx.KeyTypeFor
+	Image       string            `json:"image"`        // digest reference, see orch.resolveImage
+	CephVersion string            `json:"ceph_version"` // verified by probing Image
+	Arch        string            `json:"arch"`         // uname -m of Image on the probed node
 	RGW         *RGW              `json:"rgw,omitempty"`
 	Talosconfig string            `json:"talosconfig,omitempty"`
 	Context     string            `json:"context,omitempty"`

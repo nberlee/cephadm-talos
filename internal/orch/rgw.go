@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/siderolabs/talos/pkg/machinery/resources/containers"
 	"gopkg.in/yaml.v3"
 
 	"github.com/nberlee/cephadm-talos/internal/daemons"
@@ -30,6 +31,10 @@ type RGWOptions struct {
 
 // DeployRGW places a radosgw serving HTTPS on a host.
 func (o *Orch) DeployRGW(ctx context.Context, hostName string, opts RGWOptions) error {
+	if err := o.gateCluster(); err != nil {
+		return err
+	}
+
 	h, err := o.deployHost(ctx, hostName)
 	if err != nil {
 		return err
@@ -109,6 +114,10 @@ func (o *Orch) DeployRGW(ctx context.Context, hostName string, opts RGWOptions) 
 // DeployVIP places a keepalived holding the RGW virtual IP on a host. The host
 // should run an rgw: keepalived only holds the VIP while its local rgw answers.
 func (o *Orch) DeployVIP(ctx context.Context, hostName, vip, image string) error {
+	if err := o.gateCluster(); err != nil {
+		return err
+	}
+
 	h, err := o.deployHost(ctx, hostName)
 	if err != nil {
 		return err
@@ -563,7 +572,7 @@ func (o *Orch) waitGeneration(ctx context.Context, h state.Host, name string, ge
 		img, err := o.Talos.ImageStatus(ctx, h.Addr, name)
 		st, serr := o.Talos.ContainerStatuses(ctx, h.Addr)
 
-		if s, ok := st[name]; err == nil && serr == nil && ok && img.Phase == "ready" && sameImage(img.Image, image) && s.State == "running" && s.Image == img.Digest {
+		if s, ok := st[name]; err == nil && serr == nil && ok && img.Phase == containers.ContainerImagePhaseReady && sameImage(img.Image, image) && s.State == containers.ContainerStateRunning && s.Image == img.Digest {
 			if settled.IsZero() {
 				settled = time.Now()
 			} else if time.Since(settled) > 20*time.Second {
@@ -732,6 +741,10 @@ func (o *Orch) deployHost(ctx context.Context, hostName string) (state.Host, err
 
 	if h.Maintenance {
 		return h, fmt.Errorf("host %s is in maintenance, run `cephadm-talos host maintenance exit %s` first", h.Name, h.Name)
+	}
+
+	if err := o.checkTalos(ctx, h.Addr); err != nil {
+		return h, err
 	}
 
 	return h, nil

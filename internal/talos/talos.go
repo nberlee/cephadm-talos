@@ -1,81 +1,174 @@
-// Package talos is a thin wrapper around the talosctl CLI.
-//
-// We shell out instead of using the machinery Go module: ContainerConfig and
-// EtcFileConfig are new in Talos 1.14/1.15 and talosctl is the stable surface.
+// Package talos talks to Talos nodes through the machinery Go client.
 package talos
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
-	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
+	"sync"
+	"time"
+
+	"github.com/cosi-project/runtime/pkg/resource"
+	"github.com/cosi-project/runtime/pkg/resource/protobuf"
+	"github.com/cosi-project/runtime/pkg/safe"
+	"github.com/cosi-project/runtime/pkg/state"
+	"github.com/distribution/reference"
+	"github.com/siderolabs/talos/pkg/machinery/api/common"
+	"github.com/siderolabs/talos/pkg/machinery/api/machine"
+	"github.com/siderolabs/talos/pkg/machinery/client"
+	"github.com/siderolabs/talos/pkg/machinery/config/configpatcher"
+	"github.com/siderolabs/talos/pkg/machinery/resources/block"
+	"github.com/siderolabs/talos/pkg/machinery/resources/config"
+	"github.com/siderolabs/talos/pkg/machinery/resources/containers"
+	"github.com/siderolabs/talos/pkg/machinery/resources/network"
+	"github.com/siderolabs/talos/pkg/machinery/resources/runtime"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"gopkg.in/yaml.v3"
 )
 
-// Client runs talosctl against one Talos cluster.
-type Client struct {
-	Bin         string // talosctl binary, defaults to "talosctl" in PATH
+// Namespace is the containerd namespace of ContainerConfig containers.
+const Namespace = "taloscontainers"
+
+// Conn selects a talosconfig and a context in it; empty fields fall through.
+type Conn struct {
 	Talosconfig string
 	Context     string
-	DryRun      bool
-	Verbose     bool
-	Out         io.Writer // where dry-run patches are printed
 }
 
-func (c *Client) args(node string, args ...string) []string {
-	var out []string
+// Client talks to the Talos nodes of one cluster.
+//
+// The connection for a node is chosen per field: Flags (the command line)
+// first, then Hosts[node] (state.Host overrides), then Default (the cluster).
+type Client struct {
+	Flags   Conn
+	Default Conn
+	Hosts   map[string]Conn
+	DryRun  bool
+	Verbose bool
+	Out     io.Writer // where dry-run patches are printed
 
-	if c.Talosconfig != "" {
-		out = append(out, "--talosconfig", c.Talosconfig)
-	}
-
-	if c.Context != "" {
-		out = append(out, "--context", c.Context)
-	}
-
-	if node != "" {
-		out = append(out, "-n", node)
-	}
-
-	return append(out, args...)
+	mu      sync.Mutex
+	clients map[Conn]*client.Client
+	// Dial connects to a node; nil uses the talosconfig (tests set a fake node)
+	Dial func(ctx context.Context, conn Conn) (*client.Client, error)
 }
 
-func (c *Client) run(ctx context.Context, node string, args ...string) ([]byte, error) {
-	bin := c.Bin
-	if bin == "" {
-		bin = "talosctl"
+// ErrNotFound is returned when a resource does not exist on the node.
+var ErrNotFound = errors.New("not found")
+
+// Effective returns the connection settings used for a node.
+func (c *Client) Effective(node string) Conn {
+	pick := func(vals ...string) string {
+		for _, v := range vals {
+			if v != "" {
+				return v
+			}
+		}
+
+		return ""
 	}
 
-	full := c.args(node, args...)
+	h := c.Hosts[node]
+
+	return Conn{
+		Talosconfig: pick(c.Flags.Talosconfig, h.Talosconfig, c.Default.Talosconfig),
+		Context:     pick(c.Flags.Context, h.Context, c.Default.Context),
+	}
+}
+
+// node returns a client for the node and a context that targets it.
+func (c *Client) node(ctx context.Context, node, what string) (*client.Client, context.Context, error) {
+	if c.DryRun {
+		return nil, nil, errors.New("talos: no node access in dry-run")
+	}
 
 	if c.Verbose {
-		fmt.Fprintln(os.Stderr, "+ talosctl", strings.Join(full, " "))
+		fmt.Fprintf(os.Stderr, "+ talos %s %s\n", node, what)
 	}
 
-	cmd := exec.CommandContext(ctx, bin, full...)
+	conn := c.Effective(node)
 
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	out, err := cmd.Output()
+	if cl, ok := c.clients[conn]; ok {
+		return cl, client.WithNode(ctx, node), nil
+	}
+
+	dial := c.Dial
+	if dial == nil {
+		dial = newClient
+	}
+
+	cl, err := dial(ctx, conn)
 	if err != nil {
-		return out, fmt.Errorf("talosctl %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+		return nil, nil, fmt.Errorf("talos client (%s, context %q): %w", conn.Talosconfig, conn.Context, err)
 	}
 
-	return out, nil
+	if c.clients == nil {
+		c.clients = map[Conn]*client.Client{}
+	}
+
+	c.clients[conn] = cl
+
+	return cl, client.WithNode(ctx, node), nil
 }
 
-// Patch applies a multi-document machine config patch to a node without rebooting it.
+func newClient(ctx context.Context, conn Conn) (*client.Client, error) {
+	opts := []client.OptionFunc{client.WithDefaultConfig()}
+	if conn.Talosconfig != "" {
+		opts = []client.OptionFunc{client.WithConfigFromFile(conn.Talosconfig)}
+	}
+
+	if conn.Context != "" {
+		opts = append(opts, client.WithContextName(conn.Context))
+	}
+
+	return client.New(ctx, opts...)
+}
+
+// Close closes all connections.
+func (c *Client) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var errs []error
+
+	for _, cl := range c.clients {
+		errs = append(errs, cl.Close())
+	}
+
+	c.clients = nil
+
+	return errors.Join(errs...)
+}
+
+// wrap turns a NotFound from the API into ErrNotFound and names the call.
+func wrap(what string, err error) error {
+	if err == nil {
+		return nil
+	}
+
+	if state.IsNotFoundError(err) || status.Code(err) == codes.NotFound {
+		return fmt.Errorf("%s: %w: %w", what, ErrNotFound, err)
+	}
+
+	return fmt.Errorf("%s: %w", what, err)
+}
+
+// Patch applies multi-document machine config patches to a node without rebooting it.
 //
-// Named documents (ContainerConfig, EtcFileConfig, UserVolumeConfig) are added or
-// replaced by kind+name; a document carrying `$patch: delete` removes it.
-//
-// Several patches are applied in order within one machine config apply, so a
-// delete followed by an add replaces a document atomically.
+// Named documents (ContainerConfig, EtcFileConfig, UserVolumeConfig) are
+// strategically merged by kind+name; a document carrying `$patch: delete`
+// removes it. The patches are applied in order to the full active config and
+// sent as one apply, so a delete followed by an add replaces a document
+// atomically, and all other documents are kept.
 func (c *Client) Patch(ctx context.Context, node string, patches ...[]byte) error {
 	if c.DryRun {
 		for _, docs := range patches {
@@ -85,170 +178,299 @@ func (c *Client) Patch(ctx context.Context, node string, patches ...[]byte) erro
 		return nil
 	}
 
-	dir, err := os.MkdirTemp("", "cephadm-talos-patch-")
+	cl, nctx, err := c.node(ctx, node, "patch")
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(dir)
 
-	args := []string{"patch", "machineconfig", "--mode", "no-reboot"}
+	body, err := c.machineConfig(nctx, cl)
+	if err != nil {
+		return err
+	}
+
+	var ps []configpatcher.Patch
 
 	for i, docs := range patches {
-		// the patch contains keyrings: keep it 0600 and remove it right away
-		f := filepath.Join(dir, fmt.Sprintf("patch-%d.yaml", i))
-		if err := os.WriteFile(f, docs, 0o600); err != nil {
-			return err
+		p, err := configpatcher.LoadPatch(docs)
+		if err != nil {
+			return fmt.Errorf("patch %d for %s: %w", i, node, err)
 		}
 
-		args = append(args, "--patch", "@"+f)
+		ps = append(ps, p)
 	}
 
-	_, err = c.run(ctx, node, args...)
-
-	return err
-}
-
-// ContainerStatus is the spec of a ContainerStatuses.containers.talos.dev resource.
-type ContainerStatus struct {
-	ID           string   `json:"-"`
-	State        string   `json:"state"`
-	Health       string   `json:"health"`
-	Image        string   `json:"image"`
-	PID          uint32   `json:"pid"`
-	ExitCode     int32    `json:"exitCode"`
-	RestartCount uint64   `json:"restartCount"`
-	Error        string   `json:"error"`
-	WaitingFor   []string `json:"waitingFor"`
-}
-
-// ContainerStatuses returns the status of every ContainerConfig container on a node, keyed by name.
-func (c *Client) ContainerStatuses(ctx context.Context, node string) (map[string]ContainerStatus, error) {
-	if c.DryRun {
-		return map[string]ContainerStatus{}, nil
+	out, err := configpatcher.Apply(configpatcher.WithBytes(body), ps)
+	if err != nil {
+		return fmt.Errorf("patching the config of %s: %w", node, err)
 	}
 
-	out, err := c.run(ctx, node, "get", "containerstatus", "-o", "json")
+	data, err := out.Bytes()
+	if err != nil {
+		return err
+	}
+
+	resp, err := cl.ApplyConfiguration(nctx, &machine.ApplyConfigurationRequest{
+		Data: data,
+		Mode: machine.ApplyConfigurationRequest_NO_REBOOT,
+	})
+	if err != nil {
+		return wrap("apply config on "+node, err)
+	}
+
+	for _, m := range resp.GetMessages() {
+		if e := m.GetMetadata().GetError(); e != "" {
+			return fmt.Errorf("apply config on %s: %s", node, e)
+		}
+	}
+
+	return nil
+}
+
+// MachineConfig returns the node's active machine config (all documents, YAML).
+func (c *Client) MachineConfig(ctx context.Context, node string) (string, error) {
+	cl, nctx, err := c.node(ctx, node, "get machineconfig")
+	if err != nil {
+		return "", err
+	}
+
+	body, err := c.machineConfig(nctx, cl)
+
+	return string(body), err
+}
+
+// machineConfig reads the raw active config, the same way talosctl patch does:
+// the resource spec is the config as a YAML string.
+func (c *Client) machineConfig(ctx context.Context, cl *client.Client) ([]byte, error) {
+	mc, err := cl.COSI.Get(ctx, resource.NewMetadata(config.NamespaceName, config.MachineConfigType, config.ActiveID, resource.VersionUndefined))
+	if err != nil {
+		return nil, wrap("get machineconfig", err)
+	}
+
+	if mc.Metadata().Annotations().Empty() {
+		// older Talos marshaled the spec as a YAML document, which loses all but the first document
+		if pb, ok := mc.(*protobuf.Resource); ok {
+			p, err := pb.Marshal()
+			if err != nil {
+				return nil, err
+			}
+
+			return []byte(p.GetSpec().GetYamlSpec()), nil
+		}
+
+		return yaml.Marshal(mc.Spec())
+	}
+
+	spec, err := yaml.Marshal(mc.Spec())
 	if err != nil {
 		return nil, err
 	}
 
-	// talosctl -o json emits a stream of JSON objects, one per resource
-	res := map[string]ContainerStatus{}
-	dec := json.NewDecoder(bytes.NewReader(out))
+	var body string
+	if err := yaml.Unmarshal(spec, &body); err != nil {
+		return nil, err
+	}
 
-	for dec.More() {
-		var r struct {
-			Metadata struct {
-				ID string `json:"id"`
-			} `json:"metadata"`
-			Spec ContainerStatus `json:"spec"`
-		}
+	return []byte(body), nil
+}
 
-		if err := dec.Decode(&r); err != nil {
-			return nil, fmt.Errorf("decode containerstatus: %w", err)
-		}
+// ContainerStatuses returns the status of every ContainerConfig container on a node, keyed by name.
+func (c *Client) ContainerStatuses(ctx context.Context, node string) (map[string]containers.ContainerStatusSpec, error) {
+	if c.DryRun {
+		return map[string]containers.ContainerStatusSpec{}, nil
+	}
 
-		r.Spec.ID = r.Metadata.ID
-		res[r.Metadata.ID] = r.Spec
+	cl, nctx, err := c.node(ctx, node, "get containerstatus")
+	if err != nil {
+		return nil, err
+	}
+
+	list, err := safe.StateListAll[*containers.ContainerStatus](nctx, cl.COSI)
+	if err != nil {
+		return nil, wrap("list containerstatus on "+node, err)
+	}
+
+	res := map[string]containers.ContainerStatusSpec{}
+
+	for r := range list.All() {
+		res[r.Metadata().ID()] = *r.TypedSpec()
 	}
 
 	return res, nil
 }
 
-// ImageStatus is the spec of a ContainerImageStatuses.containers.talos.dev resource
-// (one per container, same ID as the container).
-type ImageStatus struct {
-	Phase  string `json:"phase"`
-	Image  string `json:"image"`  // normalized reference, e.g. quay.io/ceph/ceph:v20
-	Digest string `json:"digest"` // sha256:..., what ContainerStatus.Image reports once running
-	Error  string `json:"error"`
+// ImageStatus returns the image pull status of a ContainerConfig container
+// (a ContainerImageStatus has the same ID as its container).
+func (c *Client) ImageStatus(ctx context.Context, node, name string) (containers.ContainerImageStatusSpec, error) {
+	cl, nctx, err := c.node(ctx, node, "get containerimagestatus "+name)
+	if err != nil {
+		return containers.ContainerImageStatusSpec{}, err
+	}
+
+	r, err := safe.StateGetByID[*containers.ContainerImageStatus](nctx, cl.COSI, name)
+	if err != nil {
+		return containers.ContainerImageStatusSpec{}, wrap("get containerimagestatus "+name+" on "+node, err)
+	}
+
+	return *r.TypedSpec(), nil
 }
 
-// ImageStatus returns the image pull status of a ContainerConfig container.
-func (c *Client) ImageStatus(ctx context.Context, node, name string) (ImageStatus, error) {
-	out, err := c.run(ctx, node, "get", "containerimagestatus", name, "-o", "json")
+// instanceGenerations returns the generations of all ContainerInstanceSpecs of a container.
+func (c *Client) instanceGenerations(ctx context.Context, node, name string) ([]uint64, error) {
+	cl, nctx, err := c.node(ctx, node, "get containerinstancespec")
 	if err != nil {
-		return ImageStatus{}, err
+		return nil, err
 	}
 
-	var r struct {
-		Spec ImageStatus `json:"spec"`
+	list, err := safe.StateListAll[*containers.ContainerInstanceSpec](nctx, cl.COSI)
+	if err != nil {
+		return nil, wrap("list containerinstancespec on "+node, err)
 	}
 
-	if err := json.Unmarshal(out, &r); err != nil {
-		return ImageStatus{}, fmt.Errorf("decode containerimagestatus: %w", err)
+	var gens []uint64
+
+	for r := range list.All() {
+		if r.TypedSpec().ContainerID == name {
+			gens = append(gens, r.TypedSpec().Generation)
+		}
 	}
 
-	return r.Spec, nil
+	return gens, nil
+}
+
+// InstanceContainers returns the containers that still have a ContainerInstanceSpec.
+func (c *Client) InstanceContainers(ctx context.Context, node string) ([]string, error) {
+	cl, nctx, err := c.node(ctx, node, "get containerinstancespec")
+	if err != nil {
+		return nil, err
+	}
+
+	list, err := safe.StateListAll[*containers.ContainerInstanceSpec](nctx, cl.COSI)
+	if err != nil {
+		return nil, wrap("list containerinstancespec on "+node, err)
+	}
+
+	var out []string
+
+	for r := range list.All() {
+		if id := r.TypedSpec().ContainerID; !slices.Contains(out, id) {
+			out = append(out, id)
+		}
+	}
+
+	return out, nil
 }
 
 // HasInstances reports whether any ContainerInstanceSpec of a container is left.
 // Instances keep a finalizer until their process is gone, unlike ContainerStatus
 // which disappears as soon as the ContainerConfig is deleted.
 func (c *Client) HasInstances(ctx context.Context, node, name string) (bool, error) {
-	out, err := c.run(ctx, node, "get", "containerinstancespec", "-o", "json")
-	if err != nil {
-		return false, err
-	}
+	gens, err := c.instanceGenerations(ctx, node, name)
 
-	dec := json.NewDecoder(bytes.NewReader(out))
-
-	for dec.More() {
-		var r struct {
-			Spec struct {
-				ContainerID string `json:"containerID"`
-			} `json:"spec"`
-		}
-
-		if err := dec.Decode(&r); err != nil {
-			return false, fmt.Errorf("decode containerinstancespec: %w", err)
-		}
-
-		if r.Spec.ContainerID == name {
-			return true, nil
-		}
-	}
-
-	return false, nil
-}
-
-// MachineConfig returns the node's current machine config (all documents, YAML).
-func (c *Client) MachineConfig(ctx context.Context, node string) (string, error) {
-	out, err := c.run(ctx, node, "get", "machineconfig", "v1alpha1", "-o", "jsonpath={.spec}")
-
-	return string(out), err
+	return len(gens) > 0, err
 }
 
 // InstanceGeneration returns the highest ContainerInstanceSpec generation of a
 // container; Talos creates a new generation whenever it replaces the instance.
 func (c *Client) InstanceGeneration(ctx context.Context, node, name string) (uint64, error) {
-	out, err := c.run(ctx, node, "get", "containerinstancespec", "-o", "json")
-	if err != nil {
-		return 0, err
-	}
+	gens, err := c.instanceGenerations(ctx, node, name)
 
 	var gen uint64
 
-	dec := json.NewDecoder(bytes.NewReader(out))
+	for _, g := range gens {
+		gen = max(gen, g)
+	}
 
-	for dec.More() {
-		var r struct {
-			Spec struct {
-				ContainerID string `json:"containerID"`
-				Generation  uint64 `json:"generation"`
-			} `json:"spec"`
+	return gen, err
+}
+
+// recheck is how often WaitFor re-runs its check without an event.
+var recheck = 10 * time.Second
+
+// Permanent returns err if retrying cannot help (permission denied, not
+// authenticated), and nil for errors a later check may not hit again.
+func Permanent(err error) error {
+	// status.Code also finds a status wrapped by fmt.Errorf
+	switch status.Code(err) {
+	case codes.PermissionDenied, codes.Unauthenticated:
+		return err
+	}
+
+	return nil
+}
+
+// Watched resource types for WaitFor.
+var (
+	StatusTypes   = []resource.Type{containers.ContainerStatusType}
+	ImageTypes    = []resource.Type{containers.ContainerStatusType, containers.ContainerImageStatusType}
+	InstanceTypes = []resource.Type{containers.ContainerStatusType, containers.ContainerInstanceSpecType}
+)
+
+// WaitFor calls check once, then again whenever a resource of one of the types
+// changes on the node, until check reports done, returns an error, or the
+// timeout passes. A broken watch is re-established (and check re-run) after a
+// short pause, so a node that is briefly unreachable does not end the wait.
+func (c *Client) WaitFor(ctx context.Context, node string, types []resource.Type, timeout time.Duration, check func(context.Context) (bool, error)) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	for {
+		done, err := c.watchOnce(ctx, node, types, check)
+		if done || err != nil {
+			return err
 		}
 
-		if err := dec.Decode(&r); err != nil {
-			return 0, fmt.Errorf("decode containerinstancespec: %w", err)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
 		}
+	}
+}
 
-		if r.Spec.ContainerID == name && r.Spec.Generation > gen {
-			gen = r.Spec.Generation
+// watchOnce runs one watch session; it returns (false, nil) when the watch breaks.
+func (c *Client) watchOnce(ctx context.Context, node string, types []resource.Type, check func(context.Context) (bool, error)) (bool, error) {
+	cl, nctx, err := c.node(ctx, node, "watch")
+	if err != nil {
+		return false, err
+	}
+
+	wctx, cancel := context.WithCancel(nctx)
+	defer cancel()
+
+	ch := make(chan state.Event)
+
+	for _, t := range types {
+		md := resource.NewMetadata(containers.NamespaceName, t, "", resource.VersionUndefined)
+		if err := cl.COSI.WatchKind(wctx, md, ch); err != nil {
+			return false, Permanent(err) // anything else is retried by WaitFor
 		}
 	}
 
-	return gen, nil
+	// the watches are in place: anything that changes from now on triggers a re-check
+	if done, err := check(ctx); done || err != nil {
+		return done, err
+	}
+
+	// a check that failed on a transient read error is retried after a while,
+	// also when nothing changes anymore
+	tick := time.NewTicker(recheck)
+	defer tick.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case ev := <-ch:
+			if ev.Type == state.Errored {
+				return false, Permanent(ev.Error)
+			}
+		case <-tick.C:
+		}
+
+		if done, err := check(ctx); done || err != nil {
+			return done, err
+		}
+	}
 }
 
 // Logs returns the full log of a ContainerConfig container.
@@ -257,24 +479,47 @@ func (c *Client) Logs(ctx context.Context, node, name string) (string, error) {
 		return "", nil
 	}
 
-	out, err := c.run(ctx, node, "logs", "--namespace", "taloscontainers", name)
+	var b strings.Builder
 
-	// talosctl prefixes every line with "<node>: "
-	return strings.ReplaceAll("\n"+string(out), "\n"+node+": ", "\n")[1:], err
+	err := c.streamLogs(ctx, node, name, false, &b)
+
+	return b.String(), err
 }
 
 // FollowLogs streams the log of a container to w until ctx is done.
 func (c *Client) FollowLogs(ctx context.Context, node, name string, w io.Writer) error {
-	bin := c.Bin
-	if bin == "" {
-		bin = "talosctl"
+	return c.streamLogs(ctx, node, name, true, w)
+}
+
+func (c *Client) streamLogs(ctx context.Context, node, name string, follow bool, w io.Writer) error {
+	cl, nctx, err := c.node(ctx, node, "logs "+name)
+	if err != nil {
+		return err
 	}
 
-	cmd := exec.CommandContext(ctx, bin, c.args(node, "logs", "--namespace", "taloscontainers", "-f", name)...)
-	cmd.Stdout = w
-	cmd.Stderr = os.Stderr
+	stream, err := cl.Logs(nctx, Namespace, common.ContainerDriver_CONTAINERD, name, follow, -1)
+	if err != nil {
+		return wrap("logs "+name+" on "+node, err)
+	}
 
-	return cmd.Run()
+	for {
+		msg, err := stream.Recv()
+		if errors.Is(err, io.EOF) || (err != nil && ctx.Err() != nil && follow) {
+			return nil
+		}
+
+		if err != nil {
+			return wrap("logs "+name+" on "+node, err)
+		}
+
+		if e := msg.GetMetadata().GetError(); e != "" {
+			return fmt.Errorf("logs %s on %s: %s", name, node, e)
+		}
+
+		if _, err := w.Write(msg.GetBytes()); err != nil {
+			return err
+		}
+	}
 }
 
 // Restart restarts a ContainerConfig container.
@@ -285,25 +530,22 @@ func (c *Client) Restart(ctx context.Context, node, name string) error {
 		return nil
 	}
 
-	_, err := c.run(ctx, node, "restart", "--namespace", "taloscontainers", name)
-
-	return err
-}
-
-// Wipe wipes a block device (e.g. /dev/vdb) that is not used as a Talos volume.
-func (c *Client) Wipe(ctx context.Context, node, device string) error {
-	if c.DryRun {
-		fmt.Fprintf(c.Out, "# wipe %s on %s\n", device, node)
-
-		return nil
+	cl, nctx, err := c.node(ctx, node, "restart "+name)
+	if err != nil {
+		return err
 	}
 
-	_, err := c.run(ctx, node, "wipe", "disk", strings.TrimPrefix(device, "/dev/"))
-
-	return err
+	return wrap("restart "+name+" on "+node, cl.Restart(nctx, Namespace, common.ContainerDriver_CONTAINERD, name))
 }
 
-// Reboot reboots a node and waits until it is back.
+// RebootTimeout bounds how long Reboot waits for the node to be back.
+const RebootTimeout = 20 * time.Minute
+
+// rebootPoll is how often Reboot checks whether the node is back.
+var rebootPoll = 5 * time.Second
+
+// Reboot reboots a node and waits until it is back: a new boot id, and the
+// machine in stage running and ready (like `talosctl reboot --wait`).
 func (c *Client) Reboot(ctx context.Context, node string) error {
 	if c.DryRun {
 		fmt.Fprintf(c.Out, "# reboot %s\n", node)
@@ -311,36 +553,201 @@ func (c *Client) Reboot(ctx context.Context, node string) error {
 		return nil
 	}
 
-	_, err := c.run(ctx, node, "reboot", "--wait", "--timeout", "20m")
+	ctx, cancel := context.WithTimeout(ctx, RebootTimeout)
+	defer cancel()
 
-	return err
+	cl, nctx, err := c.node(ctx, node, "reboot")
+	if err != nil {
+		return err
+	}
+
+	before, err := safe.StateGetByID[*runtime.BootID](nctx, cl.COSI, runtime.BootIDID)
+	if err != nil {
+		return wrap("get boot id of "+node, err)
+	}
+
+	if err := cl.Reboot(nctx); err != nil {
+		return wrap("reboot "+node, err)
+	}
+
+	return c.waitBooted(ctx, node, before.TypedSpec().BootID, RebootTimeout, rebootPoll)
+}
+
+// waitBooted waits for a boot id other than old and a running, ready machine.
+func (c *Client) waitBooted(ctx context.Context, node, old string, timeout, every time.Duration) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	last := "node unreachable"
+
+	for {
+		if ok, why := c.booted(ctx, node, old); ok {
+			return nil
+		} else if why != "" {
+			last = why
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for %s to come back from the reboot (%s): %w", node, last, ctx.Err())
+		case <-time.After(every):
+		}
+	}
+}
+
+func (c *Client) booted(ctx context.Context, node, old string) (bool, string) {
+	cl, nctx, err := c.node(ctx, node, "get bootid,machinestatus")
+	if err != nil {
+		return false, err.Error()
+	}
+
+	// short calls: the node goes away during the reboot
+	nctx, cancel := context.WithTimeout(nctx, 10*time.Second)
+	defer cancel()
+
+	id, err := safe.StateGetByID[*runtime.BootID](nctx, cl.COSI, runtime.BootIDID)
+	if err != nil {
+		return false, ""
+	}
+
+	if id.TypedSpec().BootID == old {
+		return false, "not rebooted yet"
+	}
+
+	ms, err := safe.StateGetByID[*runtime.MachineStatus](nctx, cl.COSI, runtime.MachineStatusID)
+	if err != nil {
+		return false, ""
+	}
+
+	s := ms.TypedSpec()
+	if s.Stage != runtime.MachineStageRunning || !s.Status.Ready {
+		return false, fmt.Sprintf("stage %s, ready %t", s.Stage, s.Status.Ready)
+	}
+
+	return true, ""
 }
 
 // Hostname returns the Talos hostname of a node.
 func (c *Client) Hostname(ctx context.Context, node string) (string, error) {
-	out, err := c.run(ctx, node, "get", "hostnamestatus", "-o", "jsonpath={.spec.hostname}")
+	cl, nctx, err := c.node(ctx, node, "get hostnamestatus")
 	if err != nil {
 		return "", err
 	}
 
-	return strings.TrimSpace(string(out)), nil
+	r, err := safe.StateGetByID[*network.HostnameStatus](nctx, cl.COSI, network.HostnameID)
+	if err != nil {
+		return "", wrap("get hostname of "+node, err)
+	}
+
+	return r.TypedSpec().Hostname, nil
 }
 
 // Version returns the Talos server version tag of a node.
 func (c *Client) Version(ctx context.Context, node string) (string, error) {
-	out, err := c.run(ctx, node, "version", "--short")
+	cl, nctx, err := c.node(ctx, node, "version")
 	if err != nil {
 		return "", err
 	}
 
-	// output contains both Client and Server sections; take the last "Tag:" line
-	tag := ""
+	resp, err := cl.Version(nctx)
+	if err != nil {
+		return "", wrap("version of "+node, err)
+	}
 
-	for _, l := range strings.Split(string(out), "\n") {
-		if t, ok := strings.CutPrefix(strings.TrimSpace(l), "Tag:"); ok {
-			tag = strings.TrimSpace(t)
+	for _, m := range resp.GetMessages() {
+		if e := m.GetMetadata().GetError(); e != "" {
+			return "", fmt.Errorf("version of %s: %s", node, e)
+		}
+
+		return m.GetVersion().GetTag(), nil
+	}
+
+	return "", fmt.Errorf("version of %s: empty response", node)
+}
+
+// Upgrade starts a Talos upgrade of a node to the given installer image.
+// The node reboots when it is done; Upgrade does not wait for that.
+func (c *Client) Upgrade(ctx context.Context, node, installer string) error {
+	if c.DryRun {
+		fmt.Fprintf(c.Out, "# upgrade %s to %s\n", node, installer)
+
+		return nil
+	}
+
+	cl, nctx, err := c.node(ctx, node, "upgrade")
+	if err != nil {
+		return err
+	}
+
+	resp, err := cl.UpgradeWithOptions(nctx, client.WithUpgradeImage(installer))
+	if err != nil {
+		return wrap("upgrade "+node, err)
+	}
+
+	for _, m := range resp.GetMessages() {
+		if e := m.GetMetadata().GetError(); e != "" {
+			return fmt.Errorf("upgrade %s: %s", node, e)
 		}
 	}
 
-	return tag, nil
+	return nil
+}
+
+// Disks returns the block devices of a node (block.Disk resources), sorted by ID.
+func (c *Client) Disks(ctx context.Context, node string) ([]*block.Disk, error) {
+	cl, nctx, err := c.node(ctx, node, "get disks")
+	if err != nil {
+		return nil, err
+	}
+
+	list, err := safe.StateListAll[*block.Disk](nctx, cl.COSI)
+	if err != nil {
+		return nil, wrap("list disks on "+node, err)
+	}
+
+	out := slices.Collect(list.All())
+	sort.Slice(out, func(i, j int) bool { return out[i].Metadata().ID() < out[j].Metadata().ID() })
+
+	return out, nil
+}
+
+// PullImage pulls an image into the ContainerConfig namespace of a node and
+// returns its canonical name@digest reference. Talos skips images it already
+// has, so a floating tag resolves to whatever the node pulled first; refresh
+// removes the node's copy of the reference before pulling.
+func (c *Client) PullImage(ctx context.Context, node, ref string, refresh bool) (string, error) {
+	cl, nctx, err := c.node(ctx, node, "pull "+ref)
+	if err != nil {
+		return "", err
+	}
+
+	ns := &common.ContainerdInstance{Driver: common.ContainerDriver_CONTAINERD, Namespace: common.ContainerdNamespace_NS_TALOSCONTAINERS}
+
+	if refresh {
+		// Talos stores images under their normalized name (ceph/ceph:v20 is docker.io/ceph/ceph:v20)
+		named, err := reference.ParseDockerRef(ref)
+		if err != nil {
+			return "", fmt.Errorf("image reference %q: %w", ref, err)
+		}
+
+		if _, err := cl.ImageClient.Remove(nctx, &machine.ImageServiceRemoveRequest{Containerd: ns, ImageRef: named.String()}); err != nil && status.Code(err) != codes.NotFound {
+			return "", wrap("remove "+ref+" on "+node, err)
+		}
+	}
+
+	stream, err := cl.ImageClient.Pull(nctx, &machine.ImageServicePullRequest{Containerd: ns, ImageRef: ref})
+	if err != nil {
+		return "", wrap("pull "+ref+" on "+node, err)
+	}
+
+	for {
+		msg, err := stream.Recv()
+		if err != nil {
+			return "", wrap("pull "+ref+" on "+node, err)
+		}
+
+		if name := msg.GetName(); name != "" {
+			return name, nil
+		}
+	}
 }

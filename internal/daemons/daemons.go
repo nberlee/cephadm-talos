@@ -36,7 +36,6 @@ type Params struct {
 	Priority  int      // vip: VRRP priority
 	Peers     []string // vip: addresses of the other vip hosts
 	Mode      string   // mon only: "bootstrap" or "join"
-	KeyType   string   // mon only: cephx key type of the cluster (cephx.KeyAES...)
 	Addrv     string   // mon only: address vector, e.g. [v2:10.5.0.3:3300,v1:10.5.0.3:6789]
 	DeployID  string   // changes when the daemon is (re)created, not on redeploy/upgrade
 	DependsOn []string
@@ -95,7 +94,7 @@ func base(p Params, typ string) spec.ContainerConfig {
 // "join" fetches it from the running quorum (the keyring must then hold client.admin).
 func Mon(p Params) spec.ContainerConfig {
 	c := base(p, "mon")
-	c.Environment = append(c.Environment, "MODE="+p.Mode, "ADDRV="+p.Addrv, "KEY_TYPE="+p.KeyType)
+	c.Environment = append(c.Environment, "MODE="+p.Mode, "ADDRV="+p.Addrv)
 	// restricted profile: no capabilities, read-only rootfs
 	c.Security = &spec.Security{Profile: "restricted"}
 
@@ -169,6 +168,24 @@ func VIP(p Params, image string) spec.ContainerConfig {
 	c.DependsOn.Paths = nil
 
 	return c
+}
+
+// Probe renders a container that reports the Ceph version of an image, with
+// the same log markers as a Job. Unlike a Job it needs nothing from a cluster
+// (no keyring, no ceph.conf), so it runs before bootstrap.
+func Probe(name, image, job string) spec.ContainerConfig {
+	return spec.ContainerConfig{
+		Header:      spec.Header{APIVersion: "v1alpha1", Kind: "ContainerConfig", Name: name},
+		Image:       image,
+		Entrypoint:  []string{"/bin/bash", "-c", script("probe")},
+		Environment: []string{"JOB=" + job, "HOME=/tmp"},
+		Security:    &spec.Security{Profile: "restricted"},
+		Mounts: []spec.Mount{
+			{Tmpfs: &spec.TmpfsMount{Destination: "/tmp"}},
+			{Tmpfs: &spec.TmpfsMount{Destination: "/var/run/ceph"}},
+			{Tmpfs: &spec.TmpfsMount{Destination: "/var/log/ceph"}},
+		},
+	}
 }
 
 // Job renders a one-shot admin command container (cephadm-talos's replacement for `cephadm shell`).

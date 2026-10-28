@@ -15,14 +15,14 @@ My main goal was to find out whether [Talos Linux](https://www.talos.dev) can re
 
 cephadm-talos is a small Go CLI that mimics cephadm's orchestration on top of Talos. It covers bootstrap, adding hosts, deploying mon/mgr/OSD daemons, `ps`, `shell`, upgrade, removal and host maintenance.
 
-There is no SSH, no systemd and no python on the hosts. Each Ceph daemon is a Talos `ContainerConfig` machine config document (Talos 1.14+), applied with `talosctl patch machineconfig --mode no-reboot` and run by Talos itself in the containerd namespace `taloscontainers`.
+There is no SSH, no systemd and no python on the hosts. Each Ceph daemon is a Talos `ContainerConfig` machine config document (Talos 1.14+), applied through the Talos API (the machinery Go client, no `talosctl`) in no-reboot mode, and run by Talos itself in the containerd namespace `taloscontainers`.
 
 The demo above runs on 3 Talos v1.15.0-alpha.1 nodes created with `--skip-etcd-k8s`. There is no Kubernetes and no etcd: the machine config's `cluster:` section is empty. The pauses in the recording, mostly image pulls, are shortened.
 
 ## Requirements
 
-- Talos **1.15** or newer on the nodes. It is tested with v1.15.0-alpha.1. cephadm-talos needs `ContainerConfig` (1.14), `EtcFileConfig`, and `talosctl logs/restart --namespace taloscontainers` (1.15).
-- A matching `talosctl`. cephadm-talos looks for `$TALOSCTL`, then `.bin/talosctl` next to the binary, then `talosctl` in `PATH`.
+- Talos **1.15** or newer on the nodes, amd64, and the latest Ceph release (today v20.2.4); see [docs/support.md](docs/support.md). cephadm-talos needs `ContainerConfig`, `EtcFileConfig` and container logs and restart in the `taloscontainers` namespace.
+- A talosconfig for the nodes (`--talosconfig`, `$TALOSCONFIG` or `~/.talos/config`). `talosctl` itself is not needed.
 - Free raw disks on the nodes for OSDs. These must not be claimed by any Talos volume.
 - No Ceph tooling on your workstation. `ceph` commands run in short-lived job containers on the nodes (`cephadm-talos shell`).
 
@@ -30,12 +30,12 @@ The demo above runs on 3 Talos v1.15.0-alpha.1 nodes created with `--skip-etcd-k
 
 | cephadm | cephadm-talos |
 |---|---|
-| SSH + `cephadm` python binary on the host | `talosctl patch machineconfig` (Talos API) |
+| SSH + `cephadm` python binary on the host | machine config patches through the Talos API |
 | systemd unit `ceph-<fsid>@<daemon>` + `unit.run` | `ContainerConfig` `ceph-<fsid8>-<type>-<id>`, run by Talos in containerd namespace `taloscontainers` |
 | `/var/lib/ceph/<fsid>` | `UserVolumeConfig` `ceph` (`volumeType: directory`, `/var/mnt/ceph`), mounted at `/var/lib/ceph` |
 | `/etc/ceph/ceph.conf` written over SSH | `EtcFileConfig` `ceph/ceph.conf` |
 | keyring files written over SSH | base64 env var in the document, written to the daemon dir by the entrypoint |
-| `cephadm shell` / `cephadm ceph-volume` | `cephadm-talos shell`: a short-lived "job" `ContainerConfig`; its output is read with `talosctl logs`, then the document is deleted |
+| `cephadm shell` / `cephadm ceph-volume` | `cephadm-talos shell`: a short-lived "job" `ContainerConfig`; its output is read from the container log, then the document is deleted |
 | `ceph orch ps` / `cephadm ls` | `cephadm-talos ps`: inventory + `ContainerStatus` resources |
 | `ceph orch daemon rm`, `ceph orch upgrade` | `cephadm-talos rm`, `cephadm-talos upgrade` |
 | `ceph orch host maintenance enter/exit` (`systemctl disable --now ceph-<fsid>.target`) | `cephadm-talos host maintenance enter/exit` (documents removed and re-applied, as Talos has no stop/disable) |
@@ -80,15 +80,15 @@ curl --cacert ~/.cephadm-talos/<fsid>/rgw-ca.crt https://10.5.0.200/
 ./cephadm-talos rm --zap osd.2
 ./cephadm-talos host maintenance enter cephadm-talos-controlplane-3   # ok-to-stop, noout, stop daemons
 ./cephadm-talos host maintenance exit cephadm-talos-controlplane-3
-./cephadm-talos host reboot cephadm-talos-controlplane-3              # enter + talosctl reboot + exit
+./cephadm-talos host reboot cephadm-talos-controlplane-3              # enter + Talos reboot + exit
 ./cephadm-talos rm-cluster --zap --yes-i-really-mean-it               # remove everything (like cephadm rm-cluster)
 ```
 
 `deploy rgw --cert F --key F` uses your own certificate instead of the generated one. The generated server certificate covers the VIP, every host IP and hostname, and is reissued (and the rgws restarted) when a host or the VIP is added. `deploy vip` places keepalived (`quay.io/ceph/keepalived:2.2.4`, as cephadm's ingress uses). The VIP is held by the first vip host whose local rgw answers, and moves on failure or `host maintenance enter`. Talos's own VIP cannot be used here: it elects its holder through etcd.
 
-`bootstrap --key-type auto|aes|aes256k` selects the cephx key type. `auto` derives it from the image tag: aes256k for v20.2.4+, AES for older releases (see SHORTCOMINGS.md).
+`bootstrap` and `upgrade` pin the image to its digest: they pull it on one node, read the digest Talos resolved, and run `ceph --version` in it. Only the supported Ceph release is accepted (`--skip-version-check` for testing). A tag the node already has resolves to the digest it pulled before; `--refresh` pulls it again. cephx keys are always AES256KRB5 (`aes256k`).
 
-`--dry-run` prints the machine config patches instead of applying them. `-v` prints every talosctl call. Both are global flags and go before the command.
+`--dry-run` prints the machine config patches instead of applying them. `-v` prints every Talos API call. Both are global flags and go before the command.
 
 ## Local QEMU test cluster without Kubernetes
 
@@ -131,7 +131,7 @@ cmd/cephadm-talos    CLI
 internal/orch        bootstrap/deploy/rm/upgrade/ps/shell/maintenance
 internal/daemons     ContainerConfig per daemon type + embedded entrypoint scripts
 internal/spec        Talos document types (minimal) and rendering
-internal/talos       talosctl wrapper
+internal/talos       Talos API client (machinery)
 internal/cephx       CephX key generation
 internal/state       local inventory
 demo/                asciinema recording scripts and output

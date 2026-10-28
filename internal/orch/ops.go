@@ -17,6 +17,7 @@ import (
 	"github.com/nberlee/cephadm-talos/internal/daemons"
 	"github.com/nberlee/cephadm-talos/internal/spec"
 	"github.com/nberlee/cephadm-talos/internal/state"
+	"github.com/nberlee/cephadm-talos/internal/talos"
 )
 
 func base64Std(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
@@ -91,12 +92,14 @@ func (o *Orch) runJob(ctx context.Context, node string, doc spec.ContainerConfig
 		return JobResult{}, o.apply(ctx, node, doc)
 	}
 
-	// Always clean up, also on timeout, ctrl-c or an apply error (talosctl may
+	// Always clean up, also on timeout, ctrl-c or an apply error (the client may
 	// fail after Talos accepted the config). A job left behind would run again
 	// whenever Talos restarts it (reboot), e.g. zapping a disk that has been
 	// redeployed meanwhile, so failing to remove it is an error of its own.
 	defer func() {
-		cctx := context.WithoutCancel(ctx)
+		// cleanup outlives a cancelled or timed out job, but is bounded itself
+		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 6*time.Minute)
+		defer cancel()
 
 		cerr := o.remove(cctx, node, name)
 		if cerr == nil {
@@ -108,15 +111,18 @@ func (o *Orch) runJob(ctx context.Context, node string, doc spec.ContainerConfig
 		}
 	}()
 
-	if err := o.apply(ctx, node, doc); err != nil {
+	// the timeout covers every call of the job itself: apply and log reads
+	jctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	if err := o.apply(jctx, node, doc); err != nil {
 		return JobResult{}, err
 	}
 
 	begin, end := "CEPHADM-TALOS-BEGIN "+id, "CEPHADM-TALOS-END "+id+" rc="
-	deadline := time.Now().Add(timeout)
 
-	for time.Now().Before(deadline) {
-		logs, _ := o.Talos.Logs(ctx, node, name)
+	for {
+		logs, _ := o.Talos.Logs(jctx, node, name)
 
 		if i := strings.Index(logs, begin); i >= 0 {
 			rest := logs[i+len(begin):]
@@ -134,12 +140,14 @@ func (o *Orch) runJob(ctx context.Context, node string, doc spec.ContainerConfig
 			}
 		}
 
-		if err := sleep(ctx, 2*time.Second); err != nil {
+		if err := sleep(jctx, 2*time.Second); err != nil {
+			if ctx.Err() == nil {
+				return JobResult{}, fmt.Errorf("timed out waiting for job %s (%q)", name, cmd)
+			}
+
 			return JobResult{}, err
 		}
 	}
-
-	return JobResult{}, fmt.Errorf("timed out waiting for job %s (%q)", name, cmd)
 }
 
 // Shell runs a ceph command (or any shell command) as an admin job and prints the output.
@@ -218,7 +226,7 @@ func (o *Orch) PS(ctx context.Context, w io.Writer) error {
 			}
 
 			if ok {
-				stateStr, image, restarts = s.State, s.Image, fmt.Sprint(s.RestartCount)
+				stateStr, image, restarts = s.State.String(), s.Image, fmt.Sprint(s.RestartCount)
 
 				if s.Error != "" {
 					stateStr += " (" + s.Error + ")"
@@ -612,32 +620,60 @@ func (o *Orch) waitGone(ctx context.Context, node, name string, timeout time.Dur
 		return nil
 	}
 
-	deadline := time.Now().Add(timeout)
-
-	for time.Now().Before(deadline) {
+	err := o.Talos.WaitFor(ctx, node, talos.InstanceTypes, timeout, func(ctx context.Context) (bool, error) {
 		// the status goes away with the config; the instance only once the process exited
 		st, err := o.Talos.ContainerStatuses(ctx, node)
-		if _, ok := st[name]; err == nil && !ok {
-			if left, err := o.Talos.HasInstances(ctx, node, name); err == nil && !left {
-				return nil
-			}
+		if err != nil {
+			return false, talos.Permanent(err)
 		}
 
-		if err := sleep(ctx, 2*time.Second); err != nil {
-			return err
+		if _, ok := st[name]; ok {
+			return false, nil
 		}
+
+		left, err := o.Talos.HasInstances(ctx, node, name)
+		if err != nil {
+			return false, talos.Permanent(err)
+		}
+
+		return !left, nil
+	})
+	if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+		return fmt.Errorf("timed out waiting for %s to stop", name)
 	}
 
-	return fmt.Errorf("timed out waiting for %s to stop", name)
+	return err
 }
 
 // Upgrade redeploys all daemons with a new image, one at a time: mons, mgrs, then OSDs.
-func (o *Orch) Upgrade(ctx context.Context, image string) error {
+// The image is pinned to its digest and probed first; refresh re-pulls a tag
+// the probing node already has.
+func (o *Orch) Upgrade(ctx context.Context, image string, refresh bool) error {
 	for _, h := range o.St.Hosts {
 		if h.Maintenance {
 			return fmt.Errorf("host %s is in maintenance; exit maintenance before upgrading", h.Name)
 		}
 	}
+
+	if err := o.gateCluster(); err != nil {
+		return err
+	}
+
+	adm, err := o.adminHost()
+	if err != nil {
+		return err
+	}
+
+	img, err := o.resolveImage(ctx, adm.Addr, image, refresh)
+	if err != nil {
+		return err
+	}
+
+	if err := o.gateImage(img); err != nil {
+		return err
+	}
+
+	image = img.Ref
 
 	order := []string{state.TypeMon, state.TypeMgr, state.TypeOSD, state.TypeRGW}
 
@@ -683,7 +719,7 @@ func (o *Orch) Upgrade(ctx context.Context, image string) error {
 		}
 	}
 
-	o.St.Image = image
+	o.St.Image, o.St.CephVersion, o.St.Arch = img.Ref, img.Version, img.Arch
 
 	return o.save()
 }

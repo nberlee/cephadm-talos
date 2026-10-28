@@ -15,6 +15,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/siderolabs/talos/pkg/machinery/resources/containers"
+
 	"github.com/nberlee/cephadm-talos/internal/cephx"
 	"github.com/nberlee/cephadm-talos/internal/daemons"
 	"github.com/nberlee/cephadm-talos/internal/spec"
@@ -29,11 +31,13 @@ const DefaultImage = "quay.io/ceph/ceph:v20"
 // EtcFileConfig and `--namespace taloscontainers` for logs/restart (1.15).
 const MinTalos = "v1.15.0"
 
-// Orch holds the state of one cluster and a talosctl client for it.
+// Orch holds the state of one cluster and a Talos client for it.
 type Orch struct {
 	St    *state.State
 	Talos *talos.Client
 	Out   io.Writer
+	// SkipVersionCheck skips the Talos and Ceph version gates (testing only)
+	SkipVersionCheck bool
 }
 
 func (o *Orch) printf(format string, args ...any) { fmt.Fprintf(o.Out, format, args...) }
@@ -60,7 +64,7 @@ func (o *Orch) key(entity string) (string, error) {
 		return k, nil
 	}
 
-	k, err := cephx.NewKey(o.St.KeyType)
+	k, err := cephx.NewKey()
 	if err != nil {
 		return "", err
 	}
@@ -239,7 +243,7 @@ func (o *Orch) RetryPendingConf(ctx context.Context) error {
 
 // checkTalos verifies the node runs a Talos version with the container APIs we use.
 func (o *Orch) checkTalos(ctx context.Context, node string) error {
-	if o.Talos.DryRun {
+	if o.Talos.DryRun || o.SkipVersionCheck {
 		return nil
 	}
 
@@ -302,6 +306,7 @@ func (o *Orch) addHost(ctx context.Context, addr string, apply bool) (state.Host
 	// re-adding a known host must not drop its maintenance bookkeeping
 	if old, ok := o.St.Host(name); ok {
 		h.Maintenance, h.NoOut = old.Maintenance, old.NoOut
+		h.Talosconfig, h.Context = old.Talosconfig, old.Context
 	}
 
 	o.St.AddHost(h)
@@ -355,21 +360,11 @@ func (o *Orch) RemoveHost(ctx context.Context, name string) error {
 }
 
 // Bootstrap creates a new cluster with one mon and one mgr on the given node.
-func (o *Orch) Bootstrap(ctx context.Context, addr, image, keyType string) error {
+func (o *Orch) Bootstrap(ctx context.Context, addr, image string, refresh bool) error {
 	o.St = state.New(newUUID())
-	o.St.Image = image
 
-	if keyType == "" || keyType == "auto" {
-		keyType = cephx.KeyTypeFor(image)
-	}
-
-	if keyType != cephx.KeyAES && keyType != cephx.KeyAES256K {
-		return fmt.Errorf("unknown key type %q (auto, %s, %s)", keyType, cephx.KeyAES, cephx.KeyAES256K)
-	}
-
-	o.St.KeyType = keyType
-	o.St.Talosconfig = o.Talos.Talosconfig
-	o.St.Context = o.Talos.Context
+	o.St.Talosconfig = o.Talos.Flags.Talosconfig
+	o.St.Context = o.Talos.Flags.Context
 
 	// host docs are applied together with the mon below, once ceph.conf has a mon_host
 	h, err := o.addHost(ctx, addr, false)
@@ -377,7 +372,19 @@ func (o *Orch) Bootstrap(ctx context.Context, addr, image, keyType string) error
 		return err
 	}
 
-	o.printf("bootstrapping cluster %s on %s with %s (%s keys)\n", o.St.FSID, h.Name, image, keyType)
+	img, err := o.resolveImage(ctx, addr, image, refresh)
+	if err != nil {
+		return err
+	}
+
+	if err := o.gateImage(img); err != nil {
+		return err
+	}
+
+	image = img.Ref
+	o.St.Image, o.St.CephVersion, o.St.Arch = img.Ref, img.Version, img.Arch
+
+	o.printf("bootstrapping cluster %s on %s with %s\n", o.St.FSID, h.Name, image)
 
 	mon := state.Daemon{Type: state.TypeMon, ID: h.Name, Host: h.Name, DeployID: randHex(8)}
 	mgr := state.Daemon{Type: state.TypeMgr, ID: h.Name, Host: h.Name}
@@ -412,7 +419,7 @@ func (o *Orch) Bootstrap(ctx context.Context, addr, image, keyType string) error
 
 	monDoc := daemons.Mon(daemons.Params{
 		Name: o.St.DocName(mon), Image: image, FSID: o.St.FSID, ID: h.Name, Addr: h.Addr,
-		Keyring: monKeyring, Mode: "bootstrap", Addrv: monAddrv(h.Addr), DeployID: mon.DeployID, KeyType: keyType,
+		Keyring: monKeyring, Mode: "bootstrap", Addrv: monAddrv(h.Addr), DeployID: mon.DeployID,
 	})
 	// no dependsOn on the mon: Talos rejects configs referencing a removed container,
 	// which would block removing the bootstrap mon later. ceph-mgr retries by itself.
@@ -450,6 +457,10 @@ func (o *Orch) Bootstrap(ctx context.Context, addr, image, keyType string) error
 
 // Deploy places a daemon of the given type on a host. arg is the device for OSDs.
 func (o *Orch) Deploy(ctx context.Context, typ, hostName, arg string) error {
+	if err := o.gateCluster(); err != nil {
+		return err
+	}
+
 	h, ok := o.St.Host(hostName)
 	if !ok {
 		var err error
@@ -462,6 +473,10 @@ func (o *Orch) Deploy(ctx context.Context, typ, hostName, arg string) error {
 
 	if h.Maintenance {
 		return fmt.Errorf("host %s is in maintenance, run `cephadm-talos host maintenance exit %s` first", h.Name, h.Name)
+	}
+
+	if err := o.checkTalos(ctx, h.Addr); err != nil {
+		return err
 	}
 
 	switch typ {
@@ -512,7 +527,7 @@ func (o *Orch) pickAdminHost(strict bool) (state.Host, error) {
 		}
 
 		st, err := o.Talos.ContainerStatuses(context.Background(), h.Addr)
-		if s, ok := st[o.St.DocName(d)]; err == nil && ok && s.State == "running" {
+		if s, ok := st[o.St.DocName(d)]; err == nil && ok && s.State == containers.ContainerStateRunning {
 			return h, nil
 		}
 	}
@@ -785,32 +800,31 @@ func (o *Orch) waitRunning(ctx context.Context, node, name string, timeout time.
 	o.printf("waiting for %s on %s ", name, node)
 	defer o.printf("\n")
 
-	deadline := time.Now().Add(timeout)
 	last := ""
 
-	for time.Now().Before(deadline) {
+	err := o.Talos.WaitFor(ctx, node, talos.StatusTypes, timeout, func(ctx context.Context) (bool, error) {
 		st, err := o.Talos.ContainerStatuses(ctx, node)
-		if err == nil {
-			if s, ok := st[name]; ok {
-				if s.State != last {
-					o.printf("[%s]", s.State)
-					last = s.State
-				}
-
-				if s.State == "running" {
-					return nil
-				}
-			}
+		if err != nil {
+			return false, talos.Permanent(err)
 		}
 
-		o.printf(".")
-
-		if err := sleep(ctx, 3*time.Second); err != nil {
-			return err
+		s, ok := st[name]
+		if !ok {
+			return false, nil
 		}
+
+		if s.State.String() != last {
+			o.printf("[%s]", s.State)
+			last = s.State.String()
+		}
+
+		return s.State == containers.ContainerStateRunning, nil
+	})
+	if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+		return fmt.Errorf("timed out waiting for %s to run (last state %q)", name, last)
 	}
 
-	return fmt.Errorf("timed out waiting for %s to run (last state %q)", name, last)
+	return err
 }
 
 // waitImage waits until a container runs the given image (after an upgrade patch).
@@ -822,27 +836,38 @@ func (o *Orch) waitImage(ctx context.Context, node, name, image string, timeout 
 		return nil
 	}
 
-	deadline := time.Now().Add(timeout)
-
-	for time.Now().Before(deadline) {
+	err := o.Talos.WaitFor(ctx, node, talos.ImageTypes, timeout, func(ctx context.Context) (bool, error) {
 		img, err := o.Talos.ImageStatus(ctx, node, name)
-		if err == nil && img.Error != "" && sameImage(img.Image, image) {
-			return fmt.Errorf("pulling %s for %s: %s", image, name, img.Error)
+		if err != nil {
+			return false, talos.Permanent(err)
 		}
 
-		if err == nil && img.Phase == "ready" && img.Digest != "" && sameImage(img.Image, image) {
-			st, err := o.Talos.ContainerStatuses(ctx, node)
-			if s, ok := st[name]; err == nil && ok && s.State == "running" && s.Image == img.Digest {
-				return nil
-			}
+		if !sameImage(img.Image, image) {
+			return false, nil
 		}
 
-		if err := sleep(ctx, 3*time.Second); err != nil {
-			return err
+		if img.Error != "" {
+			return false, fmt.Errorf("pulling %s for %s: %s", image, name, img.Error)
 		}
+
+		if img.Phase != containers.ContainerImagePhaseReady || img.Digest == "" {
+			return false, nil
+		}
+
+		st, err := o.Talos.ContainerStatuses(ctx, node)
+		if err != nil {
+			return false, talos.Permanent(err)
+		}
+
+		s, ok := st[name]
+
+		return ok && s.State == containers.ContainerStateRunning && s.Image == img.Digest, nil
+	})
+	if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+		return fmt.Errorf("timed out waiting for %s to run %s", name, image)
 	}
 
-	return fmt.Errorf("timed out waiting for %s to run %s", name, image)
+	return err
 }
 
 // sameImage compares image references; Talos normalizes short references

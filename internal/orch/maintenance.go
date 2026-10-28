@@ -125,10 +125,6 @@ func (o *Orch) MaintenanceExit(ctx context.Context, name string) error {
 		return fmt.Errorf("host %s is not in maintenance", h.Name)
 	}
 
-	if err := o.checkTalos(ctx, h.Addr); err != nil {
-		return err
-	}
-
 	daemons := o.hostDaemons(h)
 
 	// mons first, so the OSDs find a local mon again
@@ -196,7 +192,7 @@ func (o *Orch) MaintenanceExit(ctx context.Context, name string) error {
 	return nil
 }
 
-// HostReboot is maintenance enter, talosctl reboot, maintenance exit.
+// HostReboot is maintenance enter, Talos reboot, maintenance exit.
 func (o *Orch) HostReboot(ctx context.Context, name string, force bool) error {
 	if err := o.MaintenanceEnter(ctx, name, force); err != nil {
 		return err

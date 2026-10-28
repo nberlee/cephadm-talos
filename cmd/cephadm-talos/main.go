@@ -24,13 +24,14 @@ Usage:
   cephadm-talos [global flags] <command> [args]
 
 Commands:
-  bootstrap --mon-node <ip> [--image IMG]  create a cluster: 1 mon + 1 mgr on the node
+  bootstrap --mon-node <ip> [--image IMG] [--refresh]
+                                           create a cluster: 1 mon + 1 mgr on the node
   host add <ip>                            add a Talos node (volume + ceph.conf)
   host ls                                  list hosts
   host rm <host>                           forget a host without daemons
   host maintenance enter|exit [--force] <host>
                                            ok-to-stop + noout + stop the host's daemons, or undo
-  host reboot [--force] <host>             maintenance enter, talosctl reboot, maintenance exit
+  host reboot [--force] <host>             maintenance enter, Talos reboot, maintenance exit
   deploy mon|mgr <host>                    deploy a daemon on a host
   deploy osd <host> <device>               deploy an OSD on a raw device (e.g. /dev/vdb)
   deploy rgw <host> [--port 443] [--cert F --key F]
@@ -41,7 +42,7 @@ Commands:
   restart <daemon>                         restart a daemon container
   redeploy <daemon>                        re-render and re-apply a daemon document
   rm [--force] [--zap] <daemon>            remove a daemon (osd: out, safe-to-destroy, purge)
-  upgrade --image IMG                      rolling image upgrade: mons, mgrs, osds
+  upgrade --image IMG [--refresh]          rolling image upgrade: mons, mgrs, osds
   shell [--host H] -- <cmd...>             run a command with the admin keyring on a node
   rm-cluster [--zap] --yes-i-really-mean-it  remove the whole cluster from all hosts
   conf                                     print the generated ceph.conf
@@ -58,12 +59,12 @@ func main() {
 
 func run() error {
 	global := flag.NewFlagSet("cephadm-talos", flag.ExitOnError)
-	talosconfig := global.String("talosconfig", "", "talosconfig path (default: talosctl default, or the one saved at bootstrap)")
+	talosconfig := global.String("talosconfig", "", "talosconfig path (default: $TALOSCONFIG or ~/.talos/config, or the one saved at bootstrap)")
 	talosContext := global.String("context", "", "talosconfig context (default: saved at bootstrap)")
-	talosctl := global.String("talosctl", "", "talosctl binary (default: $TALOSCTL or talosctl in PATH)")
 	fsid := global.String("fsid", "", "cluster fsid (default: the last bootstrapped cluster)")
 	dryRun := global.Bool("dry-run", false, "print the machine config patches instead of applying them")
-	verbose := global.Bool("v", false, "print talosctl invocations")
+	verbose := global.Bool("v", false, "print Talos API calls")
+	skipVersion := global.Bool("skip-version-check", false, "skip the Talos and Ceph version gates (testing only)")
 	global.Usage = func() {
 		fmt.Fprint(os.Stderr, usage)
 		global.PrintDefaults()
@@ -80,20 +81,6 @@ func run() error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	bin := *talosctl
-	if bin == "" {
-		bin = os.Getenv("TALOSCTL")
-	}
-
-	if bin == "" {
-		// prefer a pinned talosctl next to the binary (.bin/talosctl in the repo)
-		if exe, err := os.Executable(); err == nil {
-			if p := filepath.Join(filepath.Dir(exe), ".bin", "talosctl"); fileExists(p) {
-				bin = p
-			}
-		}
-	}
-
 	// stored in the cluster state at bootstrap: must not depend on the working directory
 	if *talosconfig != "" {
 		abs, err := filepath.Abs(*talosconfig)
@@ -104,23 +91,24 @@ func run() error {
 		*talosconfig = abs
 	}
 
-	tc := &talos.Client{Bin: bin, Talosconfig: *talosconfig, Context: *talosContext, DryRun: *dryRun, Verbose: *verbose, Out: os.Stdout}
-	o := &orch.Orch{Talos: tc, Out: os.Stdout}
+	tc := &talos.Client{Flags: talos.Conn{Talosconfig: *talosconfig, Context: *talosContext}, DryRun: *dryRun, Verbose: *verbose, Out: os.Stdout}
+	defer tc.Close() //nolint:errcheck
+	o := &orch.Orch{Talos: tc, Out: os.Stdout, SkipVersionCheck: *skipVersion}
 
 	cmd, args := args[0], args[1:]
 
 	if cmd == "bootstrap" {
 		fs := flag.NewFlagSet("bootstrap", flag.ExitOnError)
 		node := fs.String("mon-node", "", "IP of the Talos node for the first mon and mgr")
-		image := fs.String("image", orch.DefaultImage, "Ceph container image")
-		keyType := fs.String("key-type", "auto", "cephx key type: auto (from the image tag), aes (<= v20.2.3) or aes256k (>= v20.2.4)")
+		image := fs.String("image", orch.DefaultImage, "Ceph container image (pinned to its digest)")
+		refresh := fs.Bool("refresh", false, "pull the image tag again even if the node has it")
 		_ = fs.Parse(args)
 
 		if *node == "" {
 			return errors.New("bootstrap needs --mon-node <ip>")
 		}
 
-		return o.Bootstrap(ctx, *node, *image, *keyType)
+		return o.Bootstrap(ctx, *node, *image, *refresh)
 	}
 
 	st, err := state.Load(*fsid)
@@ -130,13 +118,12 @@ func run() error {
 
 	o.St = st
 
-	// connection details saved at bootstrap unless overridden
-	if tc.Talosconfig == "" {
-		tc.Talosconfig = st.Talosconfig
-	}
+	// connection details saved in the state, unless overridden on the command line
+	tc.Default = talos.Conn{Talosconfig: st.Talosconfig, Context: st.Context}
+	tc.Hosts = map[string]talos.Conn{}
 
-	if tc.Context == "" {
-		tc.Context = st.Context
+	for _, h := range st.Hosts {
+		tc.Hosts[h.Addr] = talos.Conn{Talosconfig: h.Talosconfig, Context: h.Context}
 	}
 
 	// a mon_host change that did not reach every host is finished first
@@ -265,7 +252,7 @@ func run() error {
 	case "rm":
 		fs := flag.NewFlagSet("rm", flag.ExitOnError)
 		force := fs.Bool("force", false, "skip safety checks")
-		zap := fs.Bool("zap", false, "osd: wipe the device afterwards (talosctl wipe disk)")
+		zap := fs.Bool("zap", false, "osd: wipe the device afterwards (ceph-volume lvm zap)")
 		_ = fs.Parse(args)
 
 		if fs.NArg() != 1 {
@@ -275,14 +262,15 @@ func run() error {
 		return o.Remove(ctx, fs.Arg(0), *force, *zap)
 	case "upgrade":
 		fs := flag.NewFlagSet("upgrade", flag.ExitOnError)
-		image := fs.String("image", "", "new Ceph container image")
+		image := fs.String("image", "", "new Ceph container image (pinned to its digest)")
+		refresh := fs.Bool("refresh", false, "pull the image tag again even if the node has it")
 		_ = fs.Parse(args)
 
 		if *image == "" {
 			return errors.New("upgrade --image <image>")
 		}
 
-		return o.Upgrade(ctx, *image)
+		return o.Upgrade(ctx, *image, *refresh)
 	case "shell":
 		fs := flag.NewFlagSet("shell", flag.ExitOnError)
 		host := fs.String("host", "", "host to run on (default: first mon host)")
@@ -317,10 +305,4 @@ func run() error {
 	}
 
 	return fmt.Errorf("unknown command %q, see cephadm-talos -h (%s)", cmd, strings.Join([]string{"bootstrap", "host", "deploy", "ps", "logs", "rm", "upgrade", "shell"}, ", "))
-}
-
-func fileExists(p string) bool {
-	_, err := os.Stat(p)
-
-	return err == nil
 }

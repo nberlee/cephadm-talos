@@ -8,12 +8,7 @@ if [ "$(cat "$D/cephadm-talos-done" 2>/dev/null)" != "$DEPLOY_ID" ]; then
 	keyring /tmp/mon.keyring
 	if [ "${MODE:-join}" = bootstrap ]; then
 		log "creating initial monmap for $ID $ADDRV"
-		CIPHERS=()
-		# v20.2.4+ monmaps allow only aes256k by default; AES keys need the old ciphers allowed
-		if [ "${KEY_TYPE:-}" = aes ] && monmaptool --help 2>&1 | grep -q -- --auth-service-cipher; then
-			CIPHERS=(--auth-service-cipher aes --auth-allowed-ciphers aes,aes256k --auth-preferred-cipher aes)
-		fi
-		monmaptool --create --clobber --fsid "$FSID" --addv "$ID" "$ADDRV" "${CIPHERS[@]}" /tmp/monmap
+		monmaptool --create --clobber --fsid "$FSID" --addv "$ID" "$ADDRV" /tmp/monmap
 	else
 		log "fetching monmap from the existing quorum"
 		# the mon keyring we were given holds client.admin as well (see internal/orch)
