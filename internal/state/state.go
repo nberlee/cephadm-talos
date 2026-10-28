@@ -1,7 +1,8 @@
 // Package state keeps the cluster inventory on the workstation.
 //
 // cephadm keeps the equivalent data in the mon config-key store; this PoC keeps
-// it in ~/.cephadm-talos/<fsid>/state.json instead (see SHORTCOMINGS.md).
+// it in ~/.cephadm-talos/<fsid>/state.json instead (see SHORTCOMINGS.md) until
+// the agent moves it to config-key (ROADMAP.md, milestone 3).
 package state
 
 import (
@@ -15,6 +16,10 @@ import (
 	"slices"
 	"strings"
 )
+
+// SchemaVersion is the state.json schema this build reads and writes. Before
+// the first tagged release there are no migrations: any other version is refused.
+const SchemaVersion = 1
 
 // Daemon types.
 const (
@@ -34,6 +39,10 @@ type Host struct {
 	Maintenance bool `json:"maintenance,omitempty"`
 	// NoOut: maintenance enter set `osd set-group noout` on this host's CRUSH bucket
 	NoOut bool `json:"noout,omitempty"`
+	// Talosconfig and Context override the cluster defaults for this node, so
+	// nodes need not share one talosconfig
+	Talosconfig string `json:"talosconfig,omitempty"`
+	Context     string `json:"context,omitempty"`
 }
 
 // RGW holds the object gateway settings shared by all rgw and vip daemons.
@@ -75,6 +84,7 @@ type Daemon struct {
 
 // State is the persisted cluster inventory.
 type State struct {
+	Schema      int               `json:"schema"`
 	FSID        string            `json:"fsid"`
 	Image       string            `json:"image"`
 	KeyType     string            `json:"key_type,omitempty"` // cephx key type, see cephx.KeyTypeFor
@@ -108,9 +118,10 @@ func Root() string {
 // New creates an empty state for a fresh cluster. It is not written until Save.
 func New(fsid string) *State {
 	return &State{
-		FSID: fsid,
-		Keys: map[string]string{},
-		path: filepath.Join(Root(), fsid, "state.json"),
+		Schema: SchemaVersion,
+		FSID:   fsid,
+		Keys:   map[string]string{},
+		path:   filepath.Join(Root(), fsid, "state.json"),
 	}
 }
 
@@ -136,8 +147,14 @@ func Load(fsid string) (*State, error) {
 		return nil, err
 	}
 
+	st.Schema = 0
+
 	if err := json.Unmarshal(b, st); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", st.path, err)
+	}
+
+	if st.Schema != SchemaVersion {
+		return nil, fmt.Errorf("%s has state schema %d, this build needs %d: recreate the cluster (no migrations before the first release)", st.path, st.Schema, SchemaVersion)
 	}
 
 	return st, nil

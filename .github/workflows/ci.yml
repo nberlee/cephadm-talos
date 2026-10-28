@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test ./...
+
+  capabilities:
+    runs-on: ubuntu-latest
+    env:
+      CEPH_TAG: v20.2.4
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch the Ceph sources the matrix is checked against
+        run: |
+          git clone --quiet --depth 1 --branch "$CEPH_TAG" --filter=blob:none --sparse https://github.com/ceph/ceph.git ceph
+          git -C ceph sparse-checkout set src/pybind/mgr/orchestrator src/pybind/mgr/cephadm src/python-common/ceph/deployment
+      - run: python3 -I hack/capabilities.py ceph docs/capabilities.md
