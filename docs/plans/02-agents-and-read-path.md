@@ -1,0 +1,59 @@
+# Plan 02: agents and the read path (roadmap milestone 3, part 1)
+
+Status: signed off 2026-10-28; step 0 (spike) in progress.
+
+## Goal
+
+Milestone 3 is split in two. This plan adds the per-node agent and the `talos` mgr module on the **read path only**: `ceph orch status`, `orch host ls` and `orch ps` work, answered from the cluster itself. Nothing new writes to a node's machine config: the CLI stays the only writer and `state.json` stays authoritative. Plan 03 moves the write path: desired state, reconciliation by agents, ownership handoff, leader fencing, journal, quorum behaviour, job result files with replay protection, agent self-upgrade.
+
+Because no new writer is added, this plan needs no ownership handoff, fencing or quorum rules: an agent that cannot reach Talos only reports stale status, and an unreachable agent shows as unknown.
+
+## Design
+
+1. **Agent image**: a multistage build: the static `cephadm-talos agent` binary (`CGO_ENABLED=0`, linux/amd64) is built in a Go stage and copied into a `FROM scratch` image with nothing else; it needs no system CA roots, as it trusts only the agent CA it is given. No Ceph in the image; the agent never talks to the mons. Built by `hack/agent-image.sh` and pushed to a registry (the local test registry for now; publishing is a release item). The CLI pins the agent image by digest like the Ceph image.
+2. **Agent container**, one per Ceph host: `restricted`, `machinedAccess: true`, host network, a tmpfs for its TLS material.
+3. **Authentication**:
+   - Agent to Talos: no credential. `machinedAccess` bind-mounts the local machined socket (`/system/run/machined/machine.sock`) and machined authorizes the container's processes by PID. The agent sends `os:reader` role metadata on every call. The socket is owned by uid/gid 50 and a restricted container has no capabilities, so the agent runs with a uid/gid that may open it; step 0 settles which.
+   - mgr to agent, on port 4721 (cephadm's agent port): mutual TLS. At bootstrap the CLI creates an agent CA (10 years, kept in `state.json`, like the RGW CA). Each agent gets a server certificate for its host IP and name; the mgr gets a client certificate; both are valid 3 years. These are cephadm's defaults (root CA 10 years, `certificate_duration_days` 3 years, `certificate_renewal_threshold_days` 30). The agent completes the handshake only with a client certificate of that CA; the mgr verifies the agent's server certificate against it. Certificates and keys reach the containers through the machine config, like keyrings today (same exposure, see `SHORTCOMINGS.md`).
+   - Agent to Ceph: none.
+   - Renewal: every CLI command checks the agent and mgr certificates; one with 30 days or less left is reissued and pushed with the same pending flag and retry as the inventory, which restarts that agent or mgr (the agent only serves status, so a restart costs one missed poll). Until plan 03 renewal happens only when the CLI runs, so `available()` reports the earliest agent or mgr certificate expiry in its module details (`ceph orch status --format json`), making an idle cluster's expiry visible in time. Plan 03 moves issuing and renewal into the mgr with a daily check, as cephadm's certificate manager does. CA rotation and revoking a removed host's certificate are milestone 4.
+4. **Agent status**: every 30 seconds, and on request, the agent lists `ContainerStatus`, `ContainerImageStatus` and `ContainerInstanceSpec` of its node with a 20 second deadline and replaces its cached record only when all three lists succeeded. `observed_at` is the completion time of the last successful refresh; a failed refresh keeps the previous record and timestamp. It serves the record over mTLS: schema version, hostname, Talos version, `observed_at`, and per container its Talos state, observed image digest, restarts and whether instances exist. At most 32 KiB.
+5. **Inventory for the mgr**: the CLI renders `/etc/ceph/talos/inventory.json` on every host, and the mgr's agent TLS files (`/etc/ceph/talos/agent-ca.crt`, `mgr.crt`, `mgr.key`) only on hosts with a mgr, as `EtcFileConfig` documents, the same way it pushes `ceph.conf`: the change and a pending flag are saved together in `state.json` before any node is patched, the flag is cleared only after every host has the new revision, and the next command retries it (like `ConfPending` today). The mgr containers already mount `/etc/ceph` read-only. No config-key writes and no publication jobs. The inventory schema (version 1):
+   - top level: `schema`, `revision`, `fsid`, `image` (desired), `ceph_version`, `hosts` (name, addr, labels, maintenance), `daemons`;
+   - per daemon: `doc_name` (the exact Talos document name), `host`, `daemon_type` (`mon`, `mgr`, `osd`, `rgw`, `keepalived` for our `vip`), `daemon_id` (never empty and unique: the hostname for mon and mgr, the numeric id for an OSD once known, `pending-<doc_name>` for an OSD whose id is not known yet, with "numeric OSD ID not yet known" in its status description; the stored id for rgw and keepalived), `service_name` (`mon`, `mgr`, `osd`, `rgw.default`, `ingress.rgw.default`), `desired_image` (the cluster image for Ceph daemons, the keepalived image for keepalived), `local_only`.
+6. **Status mapping** (Talos to `DaemonDescriptionStatus`, per daemon by `doc_name`): host in maintenance or daemon `local_only`: `stopped`; agent record missing, invalid, unreachable, of an unknown schema, or with `observed_at` older than 2 minutes: `unknown`; Talos `running`: `running`; `pending`, `pulling`, `starting`: `starting`; `exited`, `backoff`: `error`; `stopping`, or no status but instances left: `stopped`; no status and no instances: `error` ("missing"). `container_image_name` is the daemon's `desired_image`; `container_image_digests` is the observed digest as a list, unset when none is known; the Ceph version is not reported for keepalived. A missing, malformed, oversized, incomplete, unknown-schema or unreachable agent response makes only that host's observations unavailable: all of its inventory daemons stay listed, as `unknown` with the reason (maintenance and `local_only` still win). Nothing is truncated. Only an invalid inventory makes `get_hosts` and `list_daemons` fail explicitly, as the daemon set is then unknown.
+7. **mgr module `talos`**:
+   - `__init__.py` (exports `Module`) and `module.py`, delivered as `EtcFileConfig` documents under `ceph/mgr/talos/` (mode 0644) and bind-mounted read-only into every mgr container at `/usr/share/ceph/mgr/talos`. The mgr documents depend on these files. Changing the module means redeploying the mgrs.
+   - `Module(Orchestrator, MgrModule)`, like other orchestrator backends. Its orchestrator API overrides are limited to `available` (the v20.2.4 three-element result), `get_hosts` and `list_daemons` (returning `OrchResult`, honouring the `list_daemons` filters on the published identities). Inherited helpers and feature detection stay as they are; unsupported operations stay unoverridden, so `ceph orch` reports them as not implemented.
+   - The module implements `serve()` and `shutdown()`. `serve()` polls every inventory host's agent every 30 seconds with bounded parallelism and request timeouts, and caches the records; `refresh=True` polls before answering. `shutdown()` sets an interruptible stop event, prevents further polls and drains outstanding workers within the request timeout, so `serve()` returns. `last_refresh` of a daemon is its host's `observed_at`.
+   - `available()` puts the inventory revision and age and the earliest certificate expiry in its module details, shown by `ceph orch status --format json`; plain `ceph orch status` shows availability only.
+   - `bootstrap` runs `ceph mgr module enable talos` and `ceph orch set backend talos` once the mgr is up, and checks both before reporting success.
+8. **CLI changes** (in cephadm the mgr deploys the agent and issues its certificate; here the CLI does, because it is the only writer until plan 03): `bootstrap` creates the agent CA; `bootstrap` and `host add` deploy the agent with its server certificate. `host rm` removes the agent document and waits for its instance to be gone, then forgets the host; a failed step leaves the host in the inventory so the command can be repeated. `rm-cluster` removes the agents with all other documents. `ps` keeps reading Talos directly.
+
+## Steps
+
+0. Spike on the QEMU cluster before the code: a `FROM scratch` restricted container with `machinedAccess` reading a COSI resource over the socket with `os:reader` metadata, and the uid/gid that needs; a host-network listener on port 4721 reachable from the mgr containers; a hostPath bind onto `/usr/share/ceph/mgr/talos` (not in the image) in the restricted mgr container, and the module loading and enabling. The results go into this plan before step 1.
+1. Agent binary: periodic refresh, status record, the mTLS server; unit tests against the fake node (`internal/talos/talostest`).
+2. Agent image (multistage), agent CA and certificates, agent document, deployment in `bootstrap` and `host add`, removal in `host rm` and `rm-cluster`.
+3. Inventory and mgr TLS files on the nodes with the pending retry, and the mgr module with its poller and status mapping.
+4. `docs/capabilities.md` rows for `available`, `get_hosts`, `list_daemons`, `orch status`, `orch host ls`, `orch ps`, `orch set backend`; `ROADMAP.md` milestone 3 split into plans 02 and 03 (job result files move to plan 03); `README.md` and `SHORTCOMINGS.md`.
+
+## Tests
+
+- Unit: status record (fields, size limit, `observed_at` unchanged after a failed refresh and advancing on an idle healthy node), mTLS (a client certificate of another CA and no certificate are refused), inventory (schema, pending flag saved with the change, retry after an interruption after the save and after the patch), module logic with the v20.2.4 `mgr_module.py` and `orchestrator` stubbed only where the mgr runtime is needed (the status mapping table, filters on published identities, two pending OSDs on one host through `name()`, `to_json()` and the `orch ps` formatting, keepalived as ingress with its own image, one host malformed or oversized while another is healthy with every inventory row kept, certificate renewal at 30 days, earliest certificate expiry in `orch status --format json`, stale, missing, unreachable and unknown-schema records, `refresh`, inventory age in `orch status --format json`, shutdown during a poll of an unreachable agent), using the real v20.2.4 `DaemonDescription` helpers.
+- Integration (QEMU, latest Talos pre-release, agent image from the local registry):
+  - bootstrap deploys agents and enables the module; `ceph orch status`, `orch host ls` and `orch ps` match the inventory and the running containers; an unsupported write command (`orch apply mon`) is refused as not implemented;
+  - an agent refuses a request without a client certificate;
+  - `host rm` and `host add` of a host remove and redeploy its agent;
+  - agent restart, node reboot and a mgr failover recover the status;
+  - a stopped agent shows its host's daemons as unknown, and they recover when it is back.
+
+## Out of scope
+
+The write path and everything in plan 03: desired state in config-key, agents applying documents, ownership handoff, leader incarnations, fencing, grants, journal, job result files and replay protection, agent self-upgrade, agent deployment and certificate issuing and daily renewal by the mgr, `orch host drain`. `ceph orch` write commands. Publishing the agent image.
+
+## Decisions
+
+- Decided: milestone 3 is split into this read-path plan and a write-path plan 03.
+- Decided: job result files move to plan 03.
+- Decided: the agent image is a multistage build `FROM scratch`, without Ceph; the mgr polls agents over mutual TLS (pull, where cephadm's agent pushes), so agents need no Ceph identity.
