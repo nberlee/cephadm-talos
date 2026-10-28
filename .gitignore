@@ -1,6 +1,6 @@
 .bin/
 .clusters/
-.talosconfig
+.talosconfig*
 /cephadm-talos
 /talosconfig
 /dashboard
@@ -9,3 +9,9 @@
 .iso/
 __pycache__/
 demo/demo.raw.cast
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/
+
+# private drafts (security reports), never committed
+/upstream/private/

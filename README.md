@@ -3,7 +3,7 @@
 > [!WARNING]
 > **Not ready for your production data, nowhere near.** This is a proof of concept. Read [SHORTCOMINGS.md](SHORTCOMINGS.md) before you put anything on it that you care about.
 >
-> It also depends on Talos features that are still missing. The workarounds this needs, and the fixes that would remove them, are in [UPSTREAM.md](UPSTREAM.md).
+> It also depends on Talos features that are still missing. The feature requests and their status are in [upstream/talos/README.md](upstream/talos/README.md); the plan towards production is in [ROADMAP.md](ROADMAP.md).
 
 ![demo: bootstrap a Ceph cluster on 3 Talos nodes without Kubernetes, watch the containers in talosctl dashboard, ceph -s](demo/demo.gif)
 
@@ -96,7 +96,7 @@ The demo cluster has 3 control planes, no Kubernetes and no etcd, and a 10 GiB s
 
 ```sh
 mkdir -p .iso && curl -Lo .iso/metal-amd64.iso \
-  https://factory.talos.dev/image/376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba/v1.15.0-alpha.1/metal-amd64.iso
+  https://factory.talos.dev/image/376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba/v1.15.0-alpha.2/metal-amd64.iso
 
 sudo .bin/talosctl cluster create dev --name cephadm-talos \
   --state ./.clusters --talosconfig ./.talosconfig \
@@ -135,4 +135,13 @@ internal/talos       talosctl wrapper
 internal/cephx       CephX key generation
 internal/state       local inventory
 demo/                asciinema recording scripts and output
+upstream/talos       Talos feature requests and their status
 ```
+
+## Credits
+
+Henk Kraal ([@hkraal](https://github.com/hkraal), Exonet) explored the same direction in "Ceph on Talos without Kubernetes". The roadmap adopts his ideas: a Talos raw partition per OSD instead of LVM, digest-pinned images, restricted by default with OSDs as the only privileged daemons, and the cephadm monitoring stack on Talos.
+
+## License
+
+[MPL-2.0](LICENSE). cephadm-talos reimplements cephadm behaviour from the Ceph documentation; it contains no code from cephadm.
