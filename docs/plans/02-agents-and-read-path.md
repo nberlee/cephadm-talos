@@ -1,6 +1,6 @@
 # Plan 02: agents and the read path (roadmap milestone 3, part 1)
 
-Status: signed off 2026-10-28; step 0 (spike) in progress.
+Status: signed off 2026-10-28; step 0 done, blocked on Talos PR #14603 (see Step 0 results).
 
 ## Goal
 
@@ -29,6 +29,13 @@ Because no new writer is added, this plan needs no ownership handoff, fencing or
    - `available()` puts the inventory revision and age and the earliest certificate expiry in its module details, shown by `ceph orch status --format json`; plain `ceph orch status` shows availability only.
    - `bootstrap` runs `ceph mgr module enable talos` and `ceph orch set backend talos` once the mgr is up, and checks both before reporting success.
 8. **CLI changes** (in cephadm the mgr deploys the agent and issues its certificate; here the CLI does, because it is the only writer until plan 03): `bootstrap` creates the agent CA; `bootstrap` and `host add` deploy the agent with its server certificate. `host rm` removes the agent document and waits for its instance to be gone, then forgets the host; a failed step leaves the host in the inventory so the command can be repeated. `rm-cluster` removes the agents with all other documents. `ps` keeps reading Talos directly.
+
+## Step 0 results (QEMU cluster, Talos v1.15.0-alpha.2, 2026-10-28)
+
+- **Machined socket from a restricted container:** the socket is `srwxr-xr-x`, owned by uid 50. As uid 0 the connect fails with "permission denied" (no capabilities); the agent runs as uid/gid 50 (`runAs`). The binary must be executable by uid 50; `COPY --chmod=0755` provides this for the root-owned binary.
+- **Authorization: blocked, consistent with a PID namespace mismatch.** As uid 50, calls returned `PermissionDenied: not authorized` after about 5 seconds, matching the authorizer's timeout. `ServicePID ctr-spike-fresh` and machined's start log recorded PID 50290, while `talosctl processes` showed `/spike` as PID 59072; the `spike-fresh-0` containerd shim was present. The authorizer matches the peer PID or mount namespace against `ServicePID`, whose mount namespace is read using the recorded PID. Open PR #14603 ("fix: record host PID for machinedAccess containers") translates containerd's task PID into the host PID before recording it, which addresses this failure. To confirm: rerun the COSI read on a Talos pre-release that contains the fix.
+- **Port 4721:** a host-network container on one node reaches a host-network listener on another node.
+- **mgr module:** a hostPath bind onto `/usr/share/ceph/mgr/talos`, which does not exist in the Ceph image, works in the restricted mgr; the mgr discovers the module from `EtcFileConfig` files, `ceph mgr module enable talos` works and `serve()` runs. The module class needs a `CLICommand` attribute, or Ceph v20 logs an exception in `_register_commands` at load.
 
 ## Steps
 
