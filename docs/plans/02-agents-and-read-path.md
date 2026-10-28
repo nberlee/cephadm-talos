@@ -1,6 +1,6 @@
 # Plan 02: agents and the read path (roadmap milestone 3, part 1)
 
-Status: signed off 2026-10-28; step 0 done; machinedAccess needs workload isolation off until Talos PR #14603 is released (see Step 0 results).
+Status: signed off 2026-10-28; step 0 done (machinedAccess works with workload isolation off until Talos PR #14603 is released); implementation in progress.
 
 ## Goal
 
@@ -34,7 +34,7 @@ Because no new writer is added, this plan needs no ownership handoff, fencing or
 
 - **Machined socket from a restricted container:** the socket is `srwxr-xr-x`, owned by uid 50. As uid 0 the connect fails with "permission denied" (no capabilities); the agent runs as uid/gid 50 (`runAs`). The binary must be executable by uid 50; `COPY --chmod=0755` provides this for the root-owned binary.
 - **Authorization: blocked, consistent with a PID namespace mismatch.** As uid 50, calls returned `PermissionDenied: not authorized` after about 5 seconds, matching the authorizer's timeout. `ServicePID ctr-spike-fresh` and machined's start log recorded PID 50290, while `talosctl processes` showed `/spike` as PID 59072; the `spike-fresh-0` containerd shim was present. The authorizer matches the peer PID or mount namespace against `ServicePID`, whose mount namespace is read using the recorded PID. Open PR #14603 ("fix: record host PID for machinedAccess containers") translates containerd's task PID into the host PID before recording it, which addresses this failure. To confirm: rerun the COSI read on a Talos pre-release that contains the fix.
-- **Workaround, as the Talos maintainers suggest on PR #14603:** set `SecurityProfileConfig` `workloadIsolation: false` on the Ceph nodes and reboot them. With isolation off, containerd sees container task PIDs in the host PID namespace, so the recorded PID matches the PID used for machined authorization; containers keep their own PID namespaces. This is node-wide and documented as a temporary requirement in `docs/support.md` and `SHORTCOMINGS.md`; it is turned back on once a supported release contains the fix. Verification of the workaround on the cluster is pending.
+- **Workaround, as the Talos maintainers suggest on PR #14603:** set `SecurityProfileConfig` `workloadIsolation: false` on the Ceph nodes and reboot them. With isolation off, containerd sees container task PIDs in the host PID namespace, so the recorded PID matches the PID used for machined authorization; containers keep their own PID namespaces. This is node-wide and documented as a temporary requirement in `docs/support.md` and `SHORTCOMINGS.md`; it is turned back on once a supported release contains the fix. Verified on the cluster after the reboot: as uid 50 the container listed `ContainerStatus` and read the Talos version over the socket, and `ServicePID ctr-<name>` (400) matched the process PID (400).
 - **Port 4721:** a host-network container on one node reaches a host-network listener on another node.
 - **mgr module:** a hostPath bind onto `/usr/share/ceph/mgr/talos`, which does not exist in the Ceph image, works in the restricted mgr; the mgr discovers the module from `EtcFileConfig` files, `ceph mgr module enable talos` works and `serve()` runs. The module class needs a `CLICommand` attribute, or Ceph v20 logs an exception in `_register_commands` at load.
 
