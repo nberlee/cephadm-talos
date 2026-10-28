@@ -11,8 +11,10 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
+	"github.com/nberlee/cephadm-talos/internal/agent"
 	"github.com/nberlee/cephadm-talos/internal/orch"
 	"github.com/nberlee/cephadm-talos/internal/state"
 	"github.com/nberlee/cephadm-talos/internal/talos"
@@ -46,6 +48,7 @@ Commands:
   shell [--host H] -- <cmd...>             run a command with the admin keyring on a node
   rm-cluster [--zap] --yes-i-really-mean-it  remove the whole cluster from all hosts
   conf                                     print the generated ceph.conf
+  agent                                    run the node agent (inside its container)
 
 Global flags:
 `
@@ -78,8 +81,13 @@ func run() error {
 		os.Exit(2)
 	}
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+
+	// the agent runs in a container on every Ceph node and needs no cluster state
+	if args[0] == "agent" {
+		return agent.Main(ctx)
+	}
 
 	// stored in the cluster state at bootstrap: must not depend on the working directory
 	if *talosconfig != "" {

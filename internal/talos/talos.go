@@ -22,12 +22,17 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/api/machine"
 	"github.com/siderolabs/talos/pkg/machinery/client"
 	"github.com/siderolabs/talos/pkg/machinery/config/configpatcher"
+	"github.com/siderolabs/talos/pkg/machinery/constants"
 	"github.com/siderolabs/talos/pkg/machinery/resources/block"
 	"github.com/siderolabs/talos/pkg/machinery/resources/config"
 	"github.com/siderolabs/talos/pkg/machinery/resources/containers"
 	"github.com/siderolabs/talos/pkg/machinery/resources/network"
 	"github.com/siderolabs/talos/pkg/machinery/resources/runtime"
+	"github.com/siderolabs/talos/pkg/machinery/role"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"gopkg.in/yaml.v3"
 )
@@ -57,6 +62,9 @@ type Client struct {
 	clients map[Conn]*client.Client
 	// Dial connects to a node; nil uses the talosconfig (tests set a fake node)
 	Dial func(ctx context.Context, conn Conn) (*client.Client, error)
+	// Roles, if set, are requested on every call (talos-role metadata), e.g.
+	// os:reader for the agent on the local machined socket
+	Roles []role.Role
 }
 
 // ErrNotFound is returned when a resource does not exist on the node.
@@ -98,7 +106,7 @@ func (c *Client) node(ctx context.Context, node, what string) (*client.Client, c
 	defer c.mu.Unlock()
 
 	if cl, ok := c.clients[conn]; ok {
-		return cl, client.WithNode(ctx, node), nil
+		return cl, c.target(ctx, node), nil
 	}
 
 	dial := c.Dial
@@ -117,7 +125,28 @@ func (c *Client) node(ctx context.Context, node, what string) (*client.Client, c
 
 	c.clients[conn] = cl
 
-	return cl, client.WithNode(ctx, node), nil
+	return cl, c.target(ctx, node), nil
+}
+
+// target adds the node to call (none for the local socket) and the requested roles.
+func (c *Client) target(ctx context.Context, node string) context.Context {
+	if node != "" {
+		ctx = client.WithNode(ctx, node)
+	}
+
+	for _, r := range c.Roles {
+		ctx = metadata.AppendToOutgoingContext(ctx, constants.APIAuthzRoleMetadataKey, string(r))
+	}
+
+	return ctx
+}
+
+// DialSocket connects to a local machined socket, as a container with
+// security.machinedAccess sees it (constants.MachineSocketPath).
+func DialSocket(path string) func(ctx context.Context, _ Conn) (*client.Client, error) {
+	return func(ctx context.Context, _ Conn) (*client.Client, error) {
+		return client.New(ctx, client.WithUnixSocket(path), client.WithGRPCDialOptions(grpc.WithTransportCredentials(insecure.NewCredentials())))
+	}
 }
 
 func newClient(ctx context.Context, conn Conn) (*client.Client, error) {
@@ -312,6 +341,27 @@ func (c *Client) ImageStatus(ctx context.Context, node, name string) (containers
 	}
 
 	return *r.TypedSpec(), nil
+}
+
+// ImageStatuses returns the image pull status of every ContainerConfig container, keyed by name.
+func (c *Client) ImageStatuses(ctx context.Context, node string) (map[string]containers.ContainerImageStatusSpec, error) {
+	cl, nctx, err := c.node(ctx, node, "get containerimagestatus")
+	if err != nil {
+		return nil, err
+	}
+
+	list, err := safe.StateListAll[*containers.ContainerImageStatus](nctx, cl.COSI)
+	if err != nil {
+		return nil, wrap("list containerimagestatus on "+node, err)
+	}
+
+	res := map[string]containers.ContainerImageStatusSpec{}
+
+	for r := range list.All() {
+		res[r.Metadata().ID()] = *r.TypedSpec()
+	}
+
+	return res, nil
 }
 
 // instanceGenerations returns the generations of all ContainerInstanceSpecs of a container.
