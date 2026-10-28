@@ -111,6 +111,7 @@ Notes:
 - `--with-apply-config` is needed with `--iso-path`, or the nodes wait in maintenance mode forever.
 - The extra disk is SATA (`/dev/sda`); Talos itself is installed on `/dev/vda`.
 - A host firewall such as ufw has to allow the cluster network (DHCP, DNS and forwarding for 10.5.0.0/24).
+- Until Talos PR #14603 is released, turn workload isolation off on the nodes (see [docs/support.md](docs/support.md)): patch a `SecurityProfileConfig` document with `workloadIsolation: false` (`--mode auto`), then reboot each node; the setting only takes effect after a reboot.
 
 ## Recording the demo
 

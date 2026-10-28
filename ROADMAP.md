@@ -31,6 +31,7 @@ Out of scope for v1: Omni-managed nodes. Omni applies the full config it compose
 | Exec into a running container | [#14729](https://github.com/siderolabs/talos/issues/14729#issuecomment-6445955564), filed | Job documents, about 8s and two config applies per command |
 | Redacted secret config volumes | [#14221](https://github.com/siderolabs/talos/issues/14221#issuecomment-6439662907), filed, maintainers lean yes | Keyrings as env vars in `ContainerConfig`, not redacted |
 | Restart policy, terminal status, backoff | [#14733](https://github.com/siderolabs/talos/issues/14733#issuecomment-6440031175), filed; durable one-shot rejected | Idempotent entrypoints; jobs park after finishing and rerun after a reboot if their document survives; backoff in the entrypoint |
+| Host PID recorded for `machinedAccess` containers | [PR #14603](https://github.com/siderolabs/talos/pull/14603), open | Workload isolation off on Ceph nodes (`docs/support.md`) |
 | Raw volume handed over as a device | [#14730](https://github.com/siderolabs/talos/issues/14730#issuecomment-6467332527), accepted for Talos 1.16 | OSDs run privileged with host `/dev` |
 | `RLIMIT_NOFILE` inherited from the host | [#14551](https://github.com/siderolabs/talos/issues/14551), accepted | 1024 open files per container |
 | Shared namespaces, init (draft 07) | held | No SMB service |

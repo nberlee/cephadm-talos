@@ -4,6 +4,7 @@ cephadm-talos is a proof of concept. This file lists what is missing or wrong co
 
 ## Talos platform limits
 
+- **Workload isolation must be off on Ceph nodes (temporary).** The agent's `machinedAccess` calls are refused while workload isolation is on, because Talos records the container's PID in the wrong PID namespace (open Talos PR #14603). Until a release contains the fix, Ceph nodes need `SecurityProfileConfig` with `workloadIsolation: false` and a reboot; containerd then runs outside the `sandboxd` sandbox, a node-wide loss of that boundary (containers keep their own namespaces). See [docs/support.md](docs/support.md).
 - **No exec into containers.** Talos has no API to run a command in a `ContainerConfig` container. `talosctl debug` cannot use the `taloscontainers` namespace, privileged mode or host mounts. Every admin command therefore runs as a throw-away "job" `ContainerConfig`:
   1. patch the document in;
   2. wait for its output in `talosctl logs`;
