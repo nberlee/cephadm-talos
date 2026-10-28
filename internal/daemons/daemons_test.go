@@ -47,7 +47,7 @@ func TestRenderAll(t *testing.T) {
 
 func TestEntrypointHasCommonPrelude(t *testing.T) {
 	c := OSD(params())
-	if !strings.Contains(c.Entrypoint[2], "set -euo pipefail") || !strings.Contains(c.Entrypoint[2], "ceph-volume raw prepare") {
+	if !strings.Contains(c.ContainerEntrypoint[2], "set -euo pipefail") || !strings.Contains(c.ContainerEntrypoint[2], "ceph-volume raw prepare") {
 		t.Fatal("osd entrypoint not assembled")
 	}
 }

@@ -160,8 +160,8 @@ func (o *Orch) apply(ctx context.Context, node string, docs ...any) error {
 	var dels []any
 
 	for _, d := range docs {
-		if c, ok := d.(spec.ContainerConfig); ok {
-			dels = append(dels, spec.Delete("ContainerConfig", c.Name))
+		if c, ok := d.(*spec.ContainerConfig); ok {
+			dels = append(dels, spec.Delete("ContainerConfig", c.MetaName))
 		}
 	}
 

@@ -46,6 +46,13 @@ func TestParseOSDMarker(t *testing.T) {
 	}
 }
 
+// valid reports whether Talos accepts a container name.
+func valid(name string) error {
+	_, err := spec.Render(spec.Container(name, "docker.io/library/alpine:3"))
+
+	return err
+}
+
 func TestDocNameBounded(t *testing.T) {
 	st := state.New("0123abcd-0000-4000-8000-000000000000")
 	long := strings.Repeat("h", 63)
@@ -53,16 +60,16 @@ func TestDocNameBounded(t *testing.T) {
 	a := st.DocName(state.Daemon{Type: state.TypeOSD, ID: long + "-vdb"})
 	b := st.DocName(state.Daemon{Type: state.TypeOSD, ID: long + "-vdc"})
 
-	if len(a) > 63 || a == b || spec.ValidateName(a) != nil {
+	if len(a) > 63 || a == b || valid(a) != nil {
 		t.Fatalf("bad names %q %q", a, b)
 	}
 
-	if n := st.DocName(state.Daemon{Type: state.TypeMon, ID: "node-"}); spec.ValidateName(n) != nil {
+	if n := st.DocName(state.Daemon{Type: state.TypeMon, ID: "node-"}); valid(n) != nil {
 		t.Fatalf("trailing dash name %q", n)
 	}
 
 	up := st.DocName(state.Daemon{Type: state.TypeMon, ID: "Node-1"})
-	if spec.ValidateName(up) != nil || up == st.DocName(state.Daemon{Type: state.TypeMon, ID: "node-1"}) {
+	if valid(up) != nil || up == st.DocName(state.Daemon{Type: state.TypeMon, ID: "node-1"}) {
 		t.Fatalf("uppercase name %q", up)
 	}
 

@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/siderolabs/talos/pkg/machinery/config/types/container"
+
 	"github.com/nberlee/cephadm-talos/internal/agent"
 	"github.com/nberlee/cephadm-talos/internal/spec"
 )
@@ -58,34 +60,31 @@ func script(name string) string {
 
 func boolPtr(b bool) *bool { return &b }
 
-func base(p Params, typ string) spec.ContainerConfig {
-	c := spec.ContainerConfig{
-		Header:     spec.Header{APIVersion: "v1alpha1", Kind: "ContainerConfig", Name: p.Name},
-		Image:      p.Image,
-		Entrypoint: []string{"/bin/bash", "-c", script(typ)},
-		Environment: []string{
-			"FSID=" + p.FSID,
-			"ID=" + p.ID,
-			"ADDR=" + p.Addr,
-			"CEPHADM_TALOS_KEYRING=" + base64.StdEncoding.EncodeToString([]byte(p.Keyring)),
-			// ceph images print a lot of python warnings when HOME is unset
-			"HOME=/tmp",
-			"DEPLOY_ID=" + p.DeployID,
-		},
-		Mounts: []spec.Mount{
-			{UserVolume: &spec.UserVolumeMount{Name: spec.VolumeName, Destination: "/var/lib/ceph"}},
-			{HostPath: &spec.HostPathMount{Source: "/etc/ceph", Destination: "/etc/ceph", Options: []string{"ro"}}},
-			{Tmpfs: &spec.TmpfsMount{Destination: "/tmp"}},
-			{Tmpfs: &spec.TmpfsMount{Destination: "/var/run/ceph"}},
-			{Tmpfs: &spec.TmpfsMount{Destination: "/var/log/ceph"}},
-		},
-		Network: &spec.Network{Mode: "host"},
-		DependsOn: &spec.DependsOn{
-			Networks:   []string{"addresses"},
-			Time:       boolPtr(true),
-			Paths:      []string{"/etc/ceph/ceph.conf"},
-			Containers: p.DependsOn,
-		},
+func base(p Params, typ string) *spec.ContainerConfig {
+	c := spec.Container(p.Name, p.Image)
+	c.ContainerEntrypoint = []string{"/bin/bash", "-c", script(typ)}
+	c.ContainerEnvironment = []string{
+		"FSID=" + p.FSID,
+		"ID=" + p.ID,
+		"ADDR=" + p.Addr,
+		"CEPHADM_TALOS_KEYRING=" + base64.StdEncoding.EncodeToString([]byte(p.Keyring)),
+		// ceph images print a lot of python warnings when HOME is unset
+		"HOME=/tmp",
+		"DEPLOY_ID=" + p.DeployID,
+	}
+	c.MountsConfig = []spec.Mount{
+		spec.UserVolume(spec.VolumeName, "/var/lib/ceph"),
+		spec.HostPath("/etc/ceph", "/etc/ceph", "ro"),
+		spec.Tmpfs("/tmp"),
+		spec.Tmpfs("/var/run/ceph"),
+		spec.Tmpfs("/var/log/ceph"),
+	}
+	c.NetworkConfig = spec.HostNetwork()
+	c.DependsOnConfig = &container.ContainerDependsOn{
+		NetworksConfig:   []string{"addresses"},
+		TimeConfig:       boolPtr(true),
+		PathsConfig:      []string{"/etc/ceph/ceph.conf"},
+		ContainersConfig: p.DependsOn,
 	}
 
 	return c
@@ -93,19 +92,19 @@ func base(p Params, typ string) spec.ContainerConfig {
 
 // Mon renders a ceph-mon container. Mode "bootstrap" creates a fresh monmap,
 // "join" fetches it from the running quorum (the keyring must then hold client.admin).
-func Mon(p Params) spec.ContainerConfig {
+func Mon(p Params) *spec.ContainerConfig {
 	c := base(p, "mon")
-	c.Environment = append(c.Environment, "MODE="+p.Mode, "ADDRV="+p.Addrv)
+	c.ContainerEnvironment = append(c.ContainerEnvironment, "MODE="+p.Mode, "ADDRV="+p.Addrv)
 	// restricted profile: no capabilities, read-only rootfs
-	c.Security = &spec.Security{Profile: "restricted"}
+	c.SecurityConfig = spec.Restricted()
 
 	return c
 }
 
 // Mgr renders a ceph-mgr container.
-func Mgr(p Params) spec.ContainerConfig {
+func Mgr(p Params) *spec.ContainerConfig {
 	c := base(p, "mgr")
-	c.Security = &spec.Security{Profile: "restricted"}
+	c.SecurityConfig = spec.Restricted()
 
 	return c
 }
@@ -114,32 +113,32 @@ func Mgr(p Params) spec.ContainerConfig {
 //
 // It has to be privileged: ceph-volume reads and labels the device, mounts a
 // tmpfs for the OSD dir and needs udev data for device inspection.
-func OSD(p Params) spec.ContainerConfig {
+func OSD(p Params) *spec.ContainerConfig {
 	c := base(p, "osd")
-	c.Environment = append(c.Environment, "DEVICE="+p.Device, "OSD_UUID="+p.OSDUUID)
-	c.Security = &spec.Security{Profile: "privileged"}
-	c.Mounts = append(c.Mounts,
-		spec.Mount{HostPath: &spec.HostPathMount{Source: "/dev", Destination: "/dev"}},
-		spec.Mount{HostPath: &spec.HostPathMount{Source: "/run/udev", Destination: "/run/udev", Options: []string{"ro"}}},
-		spec.Mount{Tmpfs: &spec.TmpfsMount{Destination: "/run/lock"}},
+	c.ContainerEnvironment = append(c.ContainerEnvironment, "DEVICE="+p.Device, "OSD_UUID="+p.OSDUUID)
+	c.SecurityConfig = spec.Privileged()
+	c.MountsConfig = append(c.MountsConfig,
+		spec.HostPath("/dev", "/dev"),
+		spec.HostPath("/run/udev", "/run/udev", "ro"),
+		spec.Tmpfs("/run/lock"),
 		// not on the host volume: the bootstrap key must not outlive the container, and
 		// `ceph-volume raw activate` rebuilds the OSD dir from the device label on every start
-		spec.Mount{Tmpfs: &spec.TmpfsMount{Destination: "/var/lib/ceph/bootstrap-osd"}},
-		spec.Mount{Tmpfs: &spec.TmpfsMount{Destination: "/var/lib/ceph/osd"}},
+		spec.Tmpfs("/var/lib/ceph/bootstrap-osd"),
+		spec.Tmpfs("/var/lib/ceph/osd"),
 	)
-	c.DependsOn.Paths = append(c.DependsOn.Paths, p.Device)
+	c.DependsOnConfig.PathsConfig = append(c.DependsOnConfig.PathsConfig, p.Device)
 
 	return c
 }
 
 // RGW renders a radosgw container serving HTTPS on p.Port.
-func RGW(p Params) spec.ContainerConfig {
+func RGW(p Params) *spec.ContainerConfig {
 	c := base(p, "rgw")
-	c.Environment = append(c.Environment,
+	c.ContainerEnvironment = append(c.ContainerEnvironment,
 		fmt.Sprintf("PORT=%d", p.Port),
 		"TLS_PEM="+base64.StdEncoding.EncodeToString([]byte(p.TLSPEM)))
 	// no capabilities except binding a port below 1024 (443)
-	c.Security = &spec.Security{Profile: "restricted", Capabilities: &spec.Capabilities{Add: []string{"NET_BIND_SERVICE"}}}
+	c.SecurityConfig = spec.Restricted("NET_BIND_SERVICE")
 
 	return c
 }
@@ -148,25 +147,25 @@ func RGW(p Params) spec.ContainerConfig {
 //
 // It needs NET_ADMIN to add the address and NET_RAW for VRRP and gratuitous ARP.
 // Talos's own VIP can't be used: it elects the holder through etcd.
-func VIP(p Params, image string) spec.ContainerConfig {
+func VIP(p Params, image string) *spec.ContainerConfig {
 	c := base(p, "vip")
-	c.Image = image
-	c.Environment = append(c.Environment,
+	c.ContainerImage = image
+	c.ContainerEnvironment = append(c.ContainerEnvironment,
 		fmt.Sprintf("PORT=%d", p.Port),
 		"VIP="+p.VIP,
 		fmt.Sprintf("VRID=%d", p.VRID),
 		"VRRP_PASS="+p.VRRPPass,
 		fmt.Sprintf("PRIORITY=%d", p.Priority),
 		"PEERS="+strings.Join(p.Peers, " "))
-	c.Security = &spec.Security{Profile: "restricted", Capabilities: &spec.Capabilities{Add: []string{"NET_ADMIN", "NET_RAW", "NET_BROADCAST"}}}
+	c.SecurityConfig = spec.Restricted("NET_ADMIN", "NET_RAW", "NET_BROADCAST")
 	// keepalived needs neither the Ceph volume nor ceph.conf
-	c.Mounts = []spec.Mount{
-		{Tmpfs: &spec.TmpfsMount{Destination: "/tmp"}},
-		{Tmpfs: &spec.TmpfsMount{Destination: "/run"}},
-		{Tmpfs: &spec.TmpfsMount{Destination: "/var/run/ceph"}},
-		{Tmpfs: &spec.TmpfsMount{Destination: "/var/log/ceph"}},
+	c.MountsConfig = []spec.Mount{
+		spec.Tmpfs("/tmp"),
+		spec.Tmpfs("/run"),
+		spec.Tmpfs("/var/run/ceph"),
+		spec.Tmpfs("/var/log/ceph"),
 	}
-	c.DependsOn.Paths = nil
+	c.DependsOnConfig.PathsConfig = nil
 
 	return c
 }
@@ -176,74 +175,69 @@ const AgentUID = 50
 
 // Agent renders the node agent: read-only Talos access over the machined
 // socket, its status served on the host network (internal/agent).
-func Agent(name, image, caPEM, certPEM, keyPEM string) spec.ContainerConfig {
+func Agent(name, image, caPEM, certPEM, keyPEM string) *spec.ContainerConfig {
 	b64 := func(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
 
-	return spec.ContainerConfig{
-		Header: spec.Header{APIVersion: "v1alpha1", Kind: "ContainerConfig", Name: name},
-		Image:  image,
-		Environment: []string{
-			agent.EnvCA + "=" + b64(caPEM),
-			agent.EnvCert + "=" + b64(certPEM),
-			agent.EnvKey + "=" + b64(keyPEM),
-		},
-		RunAs:    &spec.RunAs{UID: AgentUID, GID: AgentUID},
-		Security: &spec.Security{Profile: "restricted", MachinedAccess: true},
-		Network:  &spec.Network{Mode: "host"},
+	c := spec.Container(name, image)
+	c.ContainerEnvironment = []string{
+		agent.EnvCA + "=" + b64(caPEM),
+		agent.EnvCert + "=" + b64(certPEM),
+		agent.EnvKey + "=" + b64(keyPEM),
 	}
+	c.RunAsConfig = spec.RunAs(AgentUID, AgentUID)
+	c.SecurityConfig = spec.Restricted()
+	c.SecurityConfig.SecurityMachinedAccess = true
+	c.NetworkConfig = spec.HostNetwork()
+
+	return c
 }
 
 // Probe renders a container that reports the Ceph version of an image, with
 // the same log markers as a Job. Unlike a Job it needs nothing from a cluster
 // (no keyring, no ceph.conf), so it runs before bootstrap.
-func Probe(name, image, job string) spec.ContainerConfig {
-	return spec.ContainerConfig{
-		Header:      spec.Header{APIVersion: "v1alpha1", Kind: "ContainerConfig", Name: name},
-		Image:       image,
-		Entrypoint:  []string{"/bin/bash", "-c", script("probe")},
-		Environment: []string{"JOB=" + job, "HOME=/tmp"},
-		Security:    &spec.Security{Profile: "restricted"},
-		Mounts: []spec.Mount{
-			{Tmpfs: &spec.TmpfsMount{Destination: "/tmp"}},
-			{Tmpfs: &spec.TmpfsMount{Destination: "/var/run/ceph"}},
-			{Tmpfs: &spec.TmpfsMount{Destination: "/var/log/ceph"}},
-		},
-	}
+func Probe(name, image, job string) *spec.ContainerConfig {
+	c := spec.Container(name, image)
+	c.ContainerEntrypoint = []string{"/bin/bash", "-c", script("probe")}
+	c.ContainerEnvironment = []string{"JOB=" + job, "HOME=/tmp"}
+	c.SecurityConfig = spec.Restricted()
+	c.MountsConfig = []spec.Mount{spec.Tmpfs("/tmp"), spec.Tmpfs("/var/run/ceph"), spec.Tmpfs("/var/log/ceph")}
+
+	return c
 }
 
 // Job renders a one-shot admin command container (cephadm-talos's replacement for `cephadm shell`).
-func Job(p Params, job, cmd string) spec.ContainerConfig {
+func Job(p Params, job, cmd string) *spec.ContainerConfig {
 	c := base(p, "job")
-	c.Environment = append(c.Environment, "JOB="+job, "CMD="+cmd)
-	c.Security = &spec.Security{Profile: "restricted"}
+	c.ContainerEnvironment = append(c.ContainerEnvironment, "JOB="+job, "CMD="+cmd)
+	c.SecurityConfig = spec.Restricted()
 	// jobs only need ceph.conf; no access to the daemon data
-	c.Mounts = []spec.Mount{
-		{HostPath: &spec.HostPathMount{Source: "/etc/ceph", Destination: "/etc/ceph", Options: []string{"ro"}}},
-		{Tmpfs: &spec.TmpfsMount{Destination: "/tmp"}},
-		{Tmpfs: &spec.TmpfsMount{Destination: "/var/run/ceph"}},
-		{Tmpfs: &spec.TmpfsMount{Destination: "/var/log/ceph"}},
+	c.MountsConfig = []spec.Mount{
+		spec.HostPath("/etc/ceph", "/etc/ceph", "ro"),
+		spec.Tmpfs("/tmp"),
+		spec.Tmpfs("/var/run/ceph"),
+		spec.Tmpfs("/var/log/ceph"),
 	}
-	c.DependsOn.Time = nil
+	c.DependsOnConfig.TimeConfig = nil
 
 	return c
 }
 
 // HostJob is a privileged Job with the host's /var/lib/ceph volume, for cleanup.
-func HostJob(p Params, job, cmd string) spec.ContainerConfig {
+func HostJob(p Params, job, cmd string) *spec.ContainerConfig {
 	c := DeviceJob(p, job, cmd)
-	c.Mounts = append(c.Mounts, spec.Mount{UserVolume: &spec.UserVolumeMount{Name: spec.VolumeName, Destination: "/var/lib/ceph"}})
+	c.MountsConfig = append(c.MountsConfig, spec.UserVolume(spec.VolumeName, "/var/lib/ceph"))
 
 	return c
 }
 
 // DeviceJob is a Job with raw device access, for zapping OSD devices.
-func DeviceJob(p Params, job, cmd string) spec.ContainerConfig {
+func DeviceJob(p Params, job, cmd string) *spec.ContainerConfig {
 	c := Job(p, job, cmd)
-	c.Security = &spec.Security{Profile: "privileged"}
-	c.Mounts = append(c.Mounts,
-		spec.Mount{HostPath: &spec.HostPathMount{Source: "/dev", Destination: "/dev"}},
-		spec.Mount{HostPath: &spec.HostPathMount{Source: "/run/udev", Destination: "/run/udev", Options: []string{"ro"}}},
-		spec.Mount{Tmpfs: &spec.TmpfsMount{Destination: "/run/lock"}},
+	c.SecurityConfig = spec.Privileged()
+	c.MountsConfig = append(c.MountsConfig,
+		spec.HostPath("/dev", "/dev"),
+		spec.HostPath("/run/udev", "/run/udev", "ro"),
+		spec.Tmpfs("/run/lock"),
 	)
 
 	return c

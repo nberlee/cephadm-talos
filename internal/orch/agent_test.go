@@ -24,7 +24,7 @@ func agentOrch(t *testing.T) *Orch {
 	t.Helper()
 
 	o := &Orch{Talos: &talos.Client{DryRun: true}, St: state.New("eb8dac3e-0ba7-4795-8feb-a80e8593331f"), Out: io.Discard}
-	if err := o.setupAgent(context.Background(), "10.5.0.2", "registry/agent@sha256:abc", false); err != nil {
+	if err := o.setupAgent(context.Background(), "10.5.0.2", "registry/agent@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -44,8 +44,8 @@ func TestAgentDocument(t *testing.T) {
 	var a *spec.ContainerConfig
 
 	for _, d := range docs {
-		if c, ok := d.(spec.ContainerConfig); ok && c.Name == o.agentDocName(h) {
-			a = &c
+		if c, ok := d.(*spec.ContainerConfig); ok && c.MetaName == o.agentDocName(h) {
+			a = c
 		}
 	}
 
@@ -53,12 +53,13 @@ func TestAgentDocument(t *testing.T) {
 		t.Fatalf("no agent in the host documents")
 	}
 
-	if a.Image != "registry/agent@sha256:abc" || a.RunAs == nil || a.RunAs.UID != 50 || a.RunAs.GID != 50 ||
-		a.Security == nil || a.Security.Profile != "restricted" || !a.Security.MachinedAccess || a.Network == nil || a.Network.Mode != "host" {
+	if a.ContainerImage != "registry/agent@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" || a.RunAsConfig == nil || *a.RunAsConfig.RunAsUID != 50 || *a.RunAsConfig.RunAsGID != 50 ||
+		a.SecurityConfig == nil || a.SecurityConfig.SecurityProfile != "restricted" || !a.SecurityConfig.SecurityMachinedAccess ||
+		a.NetworkConfig == nil || a.NetworkConfig.NetworkMode != "host" {
 		t.Errorf("agent document %+v", a)
 	}
 
-	env := strings.Join(a.Environment, "\n")
+	env := strings.Join(a.ContainerEnvironment, "\n")
 	for _, k := range []string{agent.EnvCA, agent.EnvCert, agent.EnvKey} {
 		if !strings.Contains(env, k+"=") {
 			t.Errorf("agent document misses %s", k)
@@ -93,7 +94,7 @@ func TestAgentDocument(t *testing.T) {
 
 // images is a fake image service that has the test agent image.
 func images() *talostest.ImageService {
-	return &talostest.ImageService{Cache: map[string]string{}, Remote: map[string]string{"docker.io/registry/agent:dev": "sha256:abc"}}
+	return &talostest.ImageService{Cache: map[string]string{}, Remote: map[string]string{"docker.io/registry/agent:dev": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
 }
 
 func TestRenewAgentCerts(t *testing.T) {

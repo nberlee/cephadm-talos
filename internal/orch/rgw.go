@@ -304,7 +304,7 @@ type rollOpts struct {
 }
 
 func (o *Orch) rollRGWHost(ctx context.Context, h state.Host, image string, opts rollOpts) (applied bool, err error) {
-	var rgwDocs, vipDocs []spec.ContainerConfig
+	var rgwDocs, vipDocs []*spec.ContainerConfig
 
 	var rgws []state.Daemon
 
@@ -371,11 +371,11 @@ func (o *Orch) rollRGWHost(ctx context.Context, h state.Host, image string, opts
 		if forceVIP {
 			// same document: replace the instance by removing it first
 			for _, doc := range vipDocs {
-				if err := o.remove(ctx, h.Addr, doc.Name); err != nil {
+				if err := o.remove(ctx, h.Addr, doc.MetaName); err != nil {
 					return false, err
 				}
 
-				if err := o.waitGone(ctx, h.Addr, doc.Name, 2*time.Minute); err != nil {
+				if err := o.waitGone(ctx, h.Addr, doc.MetaName, 2*time.Minute); err != nil {
 					return true, err
 				}
 			}
@@ -386,12 +386,12 @@ func (o *Orch) rollRGWHost(ctx context.Context, h state.Host, image string, opts
 		vgens := map[string]uint64{}
 
 		for _, doc := range vipDocs {
-			g, err := o.Talos.InstanceGeneration(ctx, h.Addr, doc.Name)
+			g, err := o.Talos.InstanceGeneration(ctx, h.Addr, doc.MetaName)
 			if err != nil {
 				return false, err
 			}
 
-			vgens[doc.Name] = g
+			vgens[doc.MetaName] = g
 		}
 
 		if err := o.apply(ctx, h.Addr, asAny(vipDocs)...); err != nil {
@@ -406,7 +406,7 @@ func (o *Orch) rollRGWHost(ctx context.Context, h state.Host, image string, opts
 		// a new keepalived must show it can hold the VIP; one Talos kept (same
 		// digest) already could
 		for _, doc := range vipDocs {
-			replaced, err := o.waitGeneration(ctx, h, doc.Name, vgens[doc.Name], doc.Image)
+			replaced, err := o.waitGeneration(ctx, h, doc.MetaName, vgens[doc.MetaName], doc.ContainerImage)
 			if err != nil {
 				return true, err
 			}
@@ -446,11 +446,11 @@ func (o *Orch) rollRGWHost(ctx context.Context, h state.Host, image string, opts
 			o.printf("moving the VIP away from %s while its rgw restarts\n", h.Name)
 
 			for _, doc := range vipDocs {
-				if err := o.remove(ctx, h.Addr, doc.Name); err != nil {
+				if err := o.remove(ctx, h.Addr, doc.MetaName); err != nil {
 					return false, err
 				}
 
-				if err := o.waitGone(ctx, h.Addr, doc.Name, 2*time.Minute); err != nil {
+				if err := o.waitGone(ctx, h.Addr, doc.MetaName, 2*time.Minute); err != nil {
 					return true, err
 				}
 			}
@@ -462,11 +462,11 @@ func (o *Orch) rollRGWHost(ctx context.Context, h state.Host, image string, opts
 	if forceRGW {
 		// same document: replace the instance by removing it first
 		for _, doc := range rgwDocs {
-			if err := o.remove(ctx, h.Addr, doc.Name); err != nil {
+			if err := o.remove(ctx, h.Addr, doc.MetaName); err != nil {
 				return true, err
 			}
 
-			if err := o.waitGone(ctx, h.Addr, doc.Name, 5*time.Minute); err != nil {
+			if err := o.waitGone(ctx, h.Addr, doc.MetaName, 5*time.Minute); err != nil {
 				return true, err
 			}
 		}
@@ -477,11 +477,11 @@ func (o *Orch) rollRGWHost(ctx context.Context, h state.Host, image string, opts
 	if forceVIP && !drain {
 		// the keepalived replacement asked for must still happen
 		for _, doc := range vipDocs {
-			if err := o.remove(ctx, h.Addr, doc.Name); err != nil {
+			if err := o.remove(ctx, h.Addr, doc.MetaName); err != nil {
 				return true, err
 			}
 
-			if err := o.waitGone(ctx, h.Addr, doc.Name, 2*time.Minute); err != nil {
+			if err := o.waitGone(ctx, h.Addr, doc.MetaName, 2*time.Minute); err != nil {
 				return true, err
 			}
 		}
@@ -500,7 +500,7 @@ func (o *Orch) rollRGWHost(ctx context.Context, h state.Host, image string, opts
 	for i, d := range rgws {
 		// after a forced removal only the new instance can answer at all
 		if !forceRGW {
-			if _, err := o.waitGeneration(ctx, h, o.St.DocName(d), gens[o.St.DocName(d)], rgwDocs[i].Image); err != nil {
+			if _, err := o.waitGeneration(ctx, h, o.St.DocName(d), gens[o.St.DocName(d)], rgwDocs[i].ContainerImage); err != nil {
 				return true, err
 			}
 		}
@@ -592,7 +592,7 @@ func (o *Orch) waitGeneration(ctx context.Context, h state.Host, name string, ge
 
 // docsChanged reports whether any document differs from (or is missing in) the
 // current machine config.
-func docsChanged(current string, docs []spec.ContainerConfig) bool {
+func docsChanged(current string, docs []*spec.ContainerConfig) bool {
 	have := map[string]any{}
 
 	dec := yaml.NewDecoder(strings.NewReader(current))
@@ -621,7 +621,7 @@ func docsChanged(current string, docs []spec.ContainerConfig) bool {
 			return true
 		}
 
-		if !reflect.DeepEqual(have[doc.Name], want) {
+		if !reflect.DeepEqual(have[doc.MetaName], want) {
 			return true
 		}
 	}
@@ -629,7 +629,7 @@ func docsChanged(current string, docs []spec.ContainerConfig) bool {
 	return false
 }
 
-func asAny(docs []spec.ContainerConfig) []any {
+func asAny(docs []*spec.ContainerConfig) []any {
 	out := make([]any, len(docs))
 	for i, d := range docs {
 		out[i] = d

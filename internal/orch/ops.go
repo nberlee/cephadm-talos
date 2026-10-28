@@ -79,10 +79,10 @@ func (o *Orch) Job(ctx context.Context, node, cmd string, timeout time.Duration)
 }
 
 // runJob applies a job document, waits for its result and removes it again.
-func (o *Orch) runJob(ctx context.Context, node string, doc spec.ContainerConfig, id string, timeout time.Duration) (res JobResult, err error) {
-	name, cmd := doc.Name, ""
+func (o *Orch) runJob(ctx context.Context, node string, doc *spec.ContainerConfig, id string, timeout time.Duration) (res JobResult, err error) {
+	name, cmd := doc.MetaName, ""
 
-	for _, e := range doc.Environment {
+	for _, e := range doc.ContainerEnvironment {
 		if v, ok := strings.CutPrefix(e, "CMD="); ok {
 			cmd = v
 		}
@@ -238,6 +238,19 @@ func (o *Orch) PS(ctx context.Context, w io.Writer) error {
 			}
 
 			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", displayName(d), h.Name, stateStr, restarts, image, name)
+		}
+
+		if o.St.Agent != nil {
+			name := o.agentDocName(h)
+			known[h.Name+"/"+name] = true
+
+			stateStr := "missing"
+			if s, ok := st[name]; ok {
+				stateStr = s.State.String()
+				fmt.Fprintf(tw, "agent.%s\t%s\t%s\t%d\t%s\t%s\n", h.Name, h.Name, stateStr, s.RestartCount, s.Image, name)
+			} else {
+				fmt.Fprintf(tw, "agent.%s\t%s\t%s\t-\t-\t%s\n", h.Name, h.Name, stateStr, name)
+			}
 		}
 
 		// containers of this cluster Talos runs but the inventory does not know (e.g. leftover jobs)
@@ -528,8 +541,8 @@ func (o *Orch) RemoveCluster(ctx context.Context, zap bool) error {
 				Name: fmt.Sprintf("ceph-%s-job-%s", o.St.Short(), id), Image: o.St.Image, FSID: o.St.FSID, ID: "job", Keyring: "",
 			}, id, "rm -rf "+shellQuote("/var/lib/ceph/"+o.St.FSID))
 			// no ceph.conf anymore at this point
-			doc.DependsOn.Paths = nil
-			doc.Mounts = slices.DeleteFunc(doc.Mounts, func(m spec.Mount) bool { return m.HostPath != nil && m.HostPath.Source == "/etc/ceph" })
+			doc.DependsOnConfig.PathsConfig = nil
+			doc.MountsConfig = slices.DeleteFunc(doc.MountsConfig, func(m spec.Mount) bool { return m.HostPathMount != nil && m.HostPathMount.MountSource == "/etc/ceph" })
 
 			if _, err := o.runJob(ctx, h.Addr, doc, id, 10*time.Minute); err != nil {
 				return err
@@ -568,8 +581,8 @@ func (o *Orch) zap(ctx context.Context, h state.Host, device string) error {
 		Name: fmt.Sprintf("ceph-%s-job-%s", o.St.Short(), id), Image: o.St.Image, FSID: o.St.FSID, ID: "job", Keyring: adm,
 	}, id, "ceph-volume lvm zap "+shellQuote(device))
 	// zapping needs no cluster access; rm-cluster runs it after ceph.conf is gone
-	doc.DependsOn.Paths = slices.DeleteFunc(doc.DependsOn.Paths, func(p string) bool { return p == "/etc/ceph/ceph.conf" })
-	doc.Mounts = slices.DeleteFunc(doc.Mounts, func(m spec.Mount) bool { return m.HostPath != nil && m.HostPath.Source == "/etc/ceph" })
+	doc.DependsOnConfig.PathsConfig = slices.DeleteFunc(doc.DependsOnConfig.PathsConfig, func(p string) bool { return p == "/etc/ceph/ceph.conf" })
+	doc.MountsConfig = slices.DeleteFunc(doc.MountsConfig, func(m spec.Mount) bool { return m.HostPathMount != nil && m.HostPathMount.MountSource == "/etc/ceph" })
 
 	_, err = o.runJob(ctx, h.Addr, doc, id, 10*time.Minute)
 
@@ -781,12 +794,12 @@ func (o *Orch) Redeploy(ctx context.Context, name string) error {
 
 // redeployDoc re-renders the document of an existing daemon. Its data dir is
 // already initialised, so the mon mode and keyrings only matter for a fresh start.
-func (o *Orch) redeployDoc(d state.Daemon, h state.Host, image string) (spec.ContainerConfig, error) {
+func (o *Orch) redeployDoc(d state.Daemon, h state.Host, image string) (*spec.ContainerConfig, error) {
 	p := daemons.Params{Name: o.St.DocName(d), Image: image, FSID: o.St.FSID, ID: d.ID, Addr: h.Addr, Device: d.Device, DeployID: d.DeployID, OSDUUID: d.OSDUUID}
 
 	adm, err := o.adminKeyring()
 	if err != nil {
-		return spec.ContainerConfig{}, err
+		return nil, err
 	}
 
 	switch d.Type {
@@ -817,7 +830,7 @@ func (o *Orch) redeployDoc(d state.Daemon, h state.Host, image string) (spec.Con
 		return daemons.VIP(p, o.St.RGW.KeepalivedImage), nil
 	}
 
-	return spec.ContainerConfig{}, fmt.Errorf("unknown daemon type %q", d.Type)
+	return nil, fmt.Errorf("unknown daemon type %q", d.Type)
 }
 
 // Hosts prints the host inventory.

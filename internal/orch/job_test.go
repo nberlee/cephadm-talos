@@ -48,7 +48,7 @@ func TestRunJobCleansUpAfterAFailedApply(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if strings.Contains(cfg, doc.Name) {
+	if strings.Contains(cfg, doc.MetaName) {
 		t.Errorf("job document left in the config:\n%s", cfg)
 	}
 }
