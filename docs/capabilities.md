@@ -1,6 +1,6 @@
 # Capability matrix
 
-What cephadm-talos provides of the Ceph orchestrator interface, for Ceph v20.2.4 (tag `v20.2.4`, commit `7f793731f1b39eb4f465e960113d2363c311b964`). Status is `implemented`, `milestone N` (planned in that [roadmap](../ROADMAP.md) milestone) or `unsupported`. Nothing is `implemented` yet: the PoC CLI is not a `ceph orch` backend.
+What cephadm-talos provides of the Ceph orchestrator interface, for Ceph v20.2.4 (tag `v20.2.4`, commit `7f793731f1b39eb4f465e960113d2363c311b964`). Status is `implemented`, `milestone N` (planned in that [roadmap](../ROADMAP.md) milestone) or `unsupported`. The `implemented` rows are the read path of [plan 02](plans/02-agents-and-read-path.md): a mgr module installed as `cephadm` (Ceph accepts only `cephadm`, `rook` and `test_orchestrator` as backend), fed by the cephadm-talos agents. Everything else still goes through the cephadm-talos CLI.
 
 The first four sections are checked against the Ceph source by `hack/capabilities.py <ceph source>`; the last two are maintained by hand.
 
@@ -35,7 +35,7 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `apply_smb` | milestone 5 | needs draft 07 (shared namespaces) |
 | `apply_snmp_gateway` | milestone 5 |  |
 | `apply_tuned_profiles` | milestone 5 |  |
-| `available` | milestone 3 |  |
+| `available` | implemented | read path (plan 02): the talos mgr module, installed as `cephadm` |
 | `blink_device_light` | milestone 5 | to validate on Talos (lsmcli in a privileged job) |
 | `cancel_completions` | milestone 3 |  |
 | `cert_store_cert_check` | milestone 5 |  |
@@ -60,7 +60,7 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `get_alertmanager_access_info` | milestone 5 |  |
 | `get_facts` | milestone 5 |  |
 | `get_feature_set` | milestone 3 |  |
-| `get_hosts` | milestone 5 |  |
+| `get_hosts` | implemented | read path (plan 02): the talos mgr module, installed as `cephadm` |
 | `get_inventory` | milestone 5 |  |
 | `get_prometheus_access_info` | milestone 5 |  |
 | `get_security_config` | milestone 5 |  |
@@ -70,7 +70,7 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `hardware_status` | milestone 5 | to validate on Talos (node-proxy talks to the BMC over Redfish) |
 | `host_ok_to_stop` | milestone 5 |  |
 | `is_orchestrator_module` | milestone 3 |  |
-| `list_daemons` | milestone 5 |  |
+| `list_daemons` | implemented | read path (plan 02): the talos mgr module, installed as `cephadm` |
 | `node_proxy_common` | milestone 5 | to validate on Talos (node-proxy talks to the BMC over Redfish) |
 | `node_proxy_criticals` | milestone 5 | to validate on Talos (node-proxy talks to the BMC over Redfish) |
 | `node_proxy_firmware` | milestone 5 | to validate on Talos (node-proxy talks to the BMC over Redfish) |
@@ -179,7 +179,7 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `orch host drain stop` | milestone 5 |  |
 | `orch host label add` | milestone 5 |  |
 | `orch host label rm` | milestone 5 |  |
-| `orch host ls` | milestone 5 |  |
+| `orch host ls` | implemented | read path (plan 02): the talos mgr module, installed as `cephadm` |
 | `orch host maintenance enter` | milestone 5 |  |
 | `orch host maintenance exit` | milestone 5 |  |
 | `orch host ok-to-stop` | milestone 5 |  |
@@ -197,13 +197,13 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `orch prometheus set-credentials` | milestone 5 |  |
 | `orch prometheus set-custom-alerts` | milestone 5 |  |
 | `orch prometheus set-target` | milestone 5 |  |
-| `orch ps` | milestone 5 |  |
+| `orch ps` | implemented | read path (plan 02): the talos mgr module, installed as `cephadm` |
 | `orch resume` | milestone 5 |  |
 | `orch rm` | milestone 5 |  |
-| `orch set backend` | milestone 3 |  |
+| `orch set backend` | implemented | read path (plan 02): the talos mgr module, installed as `cephadm` |
 | `orch set-managed` | milestone 5 |  |
 | `orch set-unmanaged` | milestone 5 |  |
-| `orch status` | milestone 3 |  |
+| `orch status` | implemented | read path (plan 02): the talos mgr module, installed as `cephadm` |
 | `orch tuned-profile add-setting` | milestone 5 |  |
 | `orch tuned-profile add-settings` | milestone 5 |  |
 | `orch tuned-profile apply` | milestone 5 |  |

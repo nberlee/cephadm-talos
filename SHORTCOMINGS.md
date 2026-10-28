@@ -27,7 +27,8 @@ cephadm-talos is a proof of concept. This file lists what is missing or wrong co
 
 ## Orchestration features missing vs. cephadm
 
-- No mgr `orchestrator` backend, so `ceph orch ...` and the dashboard's orchestrator pages do not work. All orchestration is client-side in the cephadm-talos CLI.
+- `ceph orch` is read-only: `orch status`, `orch host ls` and `orch ps` work (plan 02), and `orch set backend cephadm` selects the module; every other orchestrator operation, including `apply`, is refused as not implemented. All changes go through the cephadm-talos CLI. The module is installed as `cephadm`, so dashboard pages that check for the cephadm backend may call methods that are not implemented yet.
+- Agent certificates are renewed only when the CLI runs (30 days before expiry; `ceph orch status --format json` shows the earliest expiry). An idle cluster's agents lose their certificates after 3 years.
 - No service specs, placement, labels, count-per-host or reconciliation loop. Daemons are placed by hand, and nothing re-creates a daemon whose host disappears.
 - Only mon, mgr, OSD and RGW. No MDS/CephFS, NFS, iSCSI/NVMe-oF, monitoring stack (prometheus, grafana, alertmanager, node-exporter), crash collector or ceph-exporter.
 - RGW is the default zone only: no realms, zonegroups or multisite, and no `rgw_dns_name` or virtual-hosted-style buckets. Users are created by hand with `cephadm-talos shell -- radosgw-admin`.
@@ -52,7 +53,7 @@ cephadm-talos is a proof of concept. This file lists what is missing or wrong co
 
 ## State and safety
 
-- The inventory lives on the workstation (`~/.cephadm-talos/<fsid>/state.json`), not in the cluster. Losing it means re-deriving the state from the machine configs by hand. Two operators cannot share it.
+- The authoritative inventory lives on the workstation (`~/.cephadm-talos/<fsid>/state.json`), not in the cluster; the cluster only gets a derived copy without keys (`/etc/ceph/talos/inventory.json`) for the mgr module. Losing `state.json` means re-deriving the state from the machine configs by hand. Two operators cannot share it.
 - `mon_host` in `/etc/ceph/ceph.conf` is updated on every host only after a mon is added or removed. Running daemons pick up mon changes through the monmap, but anything started in between uses the old list.
 - Removing a host does not clean `/var/mnt/ceph`. Removing the `UserVolumeConfig` does not wipe the directory either. Only `rm-cluster --zap` deletes `/var/mnt/ceph/<fsid>`.
 - `rm --zap` and `rm-cluster --zap` run `ceph-volume lvm zap` in a privileged job on the host. `talosctl wipe disk` (FAST) was tried first, but it only clears the start of the disk; bluestore keeps label copies at 1G, 10G, 100G and 1000G, so the old OSD came back on the next deploy and crash-looped (observed).

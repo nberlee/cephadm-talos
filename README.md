@@ -41,7 +41,8 @@ The demo above runs on 3 Talos v1.15.0-alpha.1 nodes created with `--skip-etcd-k
 | `ceph orch host maintenance enter/exit` (`systemctl disable --now ceph-<fsid>.target`) | `cephadm-talos host maintenance enter/exit` (documents removed and re-applied, as Talos has no stop/disable) |
 | `cephadm rm-cluster` | `cephadm-talos rm-cluster` |
 | `ceph orch apply rgw` (+ `ingress`: haproxy + keepalived) | `cephadm-talos deploy rgw` (HTTPS, generated CA) + `deploy vip` (keepalived only, no haproxy) |
-| cluster state in mon config-key store | `~/.cephadm-talos/<fsid>/state.json` |
+| cluster state in mon config-key store | `~/.cephadm-talos/<fsid>/state.json` (authoritative, on the workstation); a derived inventory without keys goes to every host as `/etc/ceph/talos/inventory.json` |
+| the cephadm mgr module (`ceph orch`) | a read-only module installed under the name `cephadm`; it polls a `cephadm-talos agent` container on every host over mutual TLS (port 4721) for `orch status`, `orch host ls` and `orch ps` |
 
 Every container entrypoint is idempotent. It does any first-start work (`ceph-mon --mkfs`, `ceph-volume raw prepare`), then `exec`s the daemon in the foreground. Talos restarts an exited container after 5s.
 
@@ -50,8 +51,14 @@ Every container entrypoint is idempotent. It does any first-start work (`ceph-mo
 ```sh
 go build -o cephadm-talos ./cmd/cephadm-talos
 
-# create the cluster: 1 mon + 1 mgr
-./cephadm-talos --talosconfig ./.talosconfig bootstrap --mon-node 10.5.0.2
+# the node agent image (FROM scratch): needs docker and crane, and a registry the
+# nodes can pull from; for the QEMU cluster a local one on the bridge:
+#   docker run -d --name registry -p 5000:5000 registry:2 && hack/test-registry.sh
+# hack/agent-image.sh [push-ref [pull-ref]] pushes it and prints the pinned reference
+AGENT=$(hack/agent-image.sh)
+
+# create the cluster: 1 mon + 1 mgr, an agent per host, `ceph orch` backed by the module
+./cephadm-talos --talosconfig ./.talosconfig bootstrap --mon-node 10.5.0.2 --agent-image "$AGENT"
 
 # more hosts and daemons (talosconfig/context are remembered)
 ./cephadm-talos host add 10.5.0.3
@@ -65,6 +72,7 @@ go build -o cephadm-talos ./cmd/cephadm-talos
 
 ./cephadm-talos ps
 ./cephadm-talos shell -- ceph -s
+./cephadm-talos shell -- ceph orch ps                     # from the agents, through the mgr
 ./cephadm-talos shell -- 'ceph osd tree; ceph df'
 ./cephadm-talos logs -f mon.cephadm-talos-controlplane-1
 
