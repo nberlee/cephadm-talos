@@ -488,6 +488,12 @@ func (c *Client) Logs(ctx context.Context, node, name string) (string, error) {
 
 // FollowLogs streams the log of a container to w until ctx is done.
 func (c *Client) FollowLogs(ctx context.Context, node, name string, w io.Writer) error {
+	if c.DryRun {
+		fmt.Fprintf(c.Out, "# follow the log of %s on %s\n", name, node)
+
+		return nil
+	}
+
 	return c.streamLogs(ctx, node, name, true, w)
 }
 
@@ -625,6 +631,21 @@ func (c *Client) booted(ctx context.Context, node, old string) (bool, string) {
 	}
 
 	return true, ""
+}
+
+// BootID returns the boot id of a node; it changes with every boot.
+func (c *Client) BootID(ctx context.Context, node string) (string, error) {
+	cl, nctx, err := c.node(ctx, node, "get bootid")
+	if err != nil {
+		return "", err
+	}
+
+	r, err := safe.StateGetByID[*runtime.BootID](nctx, cl.COSI, runtime.BootIDID)
+	if err != nil {
+		return "", wrap("get boot id of "+node, err)
+	}
+
+	return r.TypedSpec().BootID, nil
 }
 
 // Hostname returns the Talos hostname of a node.

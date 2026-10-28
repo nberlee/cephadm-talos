@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/siderolabs/talos/pkg/machinery/client"
+	"github.com/siderolabs/talos/pkg/machinery/resources/containers"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -25,10 +26,8 @@ func TestRunJobCleansUpAfterAFailedApply(t *testing.T) {
 	f := talostest.New(t)
 	f.FailAfterApply = status.Error(codes.Unavailable, "connection lost")
 
-	tc := &talos.Client{Dial: func(ctx context.Context, _ talos.Conn) (*client.Client, error) { return f.Dial(ctx) }}
-	t.Cleanup(func() { tc.Close() }) //nolint:errcheck
-
-	o := &Orch{Talos: tc, St: state.New("eb8dac3e-0ba7-4795-8feb-a80e8593331f"), Out: io.Discard}
+	o := fakeOrch(t, f)
+	tc := o.Talos
 	doc := daemons.Probe("ceph-eb8dac3e-probe-abc", "quay.io/ceph/ceph:v20.2.4", "abc")
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
@@ -51,5 +50,81 @@ func TestRunJobCleansUpAfterAFailedApply(t *testing.T) {
 
 	if strings.Contains(cfg, doc.Name) {
 		t.Errorf("job document left in the config:\n%s", cfg)
+	}
+}
+
+// fakeOrch returns an Orch whose Talos client talks to the fake node.
+func fakeOrch(t *testing.T, f *talostest.Node) *Orch {
+	t.Helper()
+	t.Setenv("CEPHADM_TALOS_HOME", t.TempDir())
+
+	tc := &talos.Client{Dial: func(ctx context.Context, _ talos.Conn) (*client.Client, error) { return f.Dial(ctx) }}
+	t.Cleanup(func() { tc.Close() }) //nolint:errcheck
+
+	st := state.New("eb8dac3e-0ba7-4795-8feb-a80e8593331f")
+	st.Image, st.CephVersion, st.Arch = "quay.io/ceph/ceph@sha256:abc", SupportedCeph, SupportedArch
+
+	return &Orch{Talos: tc, St: st, Out: io.Discard}
+}
+
+func TestGatesAtOperationBoundaries(t *testing.T) {
+	f := talostest.New(t)
+	f.VersionTag = "v1.14.5"
+
+	o := fakeOrch(t, f)
+	o.St.AddHost(state.Host{Name: "h1", Addr: "node"})
+	o.St.AddHost(state.Host{Name: "h2", Addr: "node", Maintenance: true})
+	o.St.AddDaemon(state.Daemon{Type: state.TypeMon, ID: "h1", Host: "h1"})
+
+	ctx := context.Background()
+
+	// deploying onto a registered host checks its Talos version
+	if err := o.Deploy(ctx, state.TypeMgr, "h1", ""); err == nil || !strings.Contains(err.Error(), "needs v1.15.0") {
+		t.Errorf("deploy on Talos 1.14: got %v", err)
+	}
+
+	// recovery and removal are not gated
+	if err := o.MaintenanceExit(ctx, "h2"); err != nil {
+		t.Errorf("maintenance exit on Talos 1.14: %v", err)
+	}
+
+	if err := o.RemoveHost(ctx, "h2"); err != nil {
+		t.Errorf("host rm on Talos 1.14: %v", err)
+	}
+
+	// an unsupported cluster image refuses deploys before touching a node
+	o.St.CephVersion = "20.2.3"
+
+	if err := o.Deploy(ctx, state.TypeMgr, "h1", ""); err == nil || !strings.Contains(err.Error(), "supports only Ceph") {
+		t.Errorf("deploy on an old cluster image: got %v", err)
+	}
+}
+
+func TestWaitGoneWaitsForTheInstance(t *testing.T) {
+	f := talostest.New(t)
+	o := fakeOrch(t, f)
+	ctx := context.Background()
+
+	// the status is gone already, the instance (its process) only later
+	inst := containers.NewContainerInstanceSpec(containers.NamespaceName, "job-1")
+	inst.TypedSpec().ContainerID = "job"
+
+	if err := f.St.Create(ctx, inst); err != nil {
+		t.Fatal(err)
+	}
+
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		_ = f.St.Destroy(ctx, inst.Metadata())
+	}()
+
+	start := time.Now()
+
+	if err := o.waitGone(ctx, "node", "job", 10*time.Second); err != nil {
+		t.Fatal(err)
+	}
+
+	if time.Since(start) < 400*time.Millisecond {
+		t.Errorf("waitGone returned while the instance was still there")
 	}
 }

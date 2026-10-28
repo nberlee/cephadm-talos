@@ -1,6 +1,6 @@
 # Plan 01: Contract and Foundation (roadmap milestones 1 and 2)
 
-Status: draft, awaiting sign-off.
+Status: implemented on branch `plan-01-contract-foundation` (signed off 2026-10-28). Deviations are listed at the end.
 
 ## Goal
 
@@ -42,8 +42,19 @@ Order: state and connections, then reads and watches, then patch, reboot and the
 
 The agent, the mgr module, config-key state, job result files, leadership and fencing (milestone 3), security changes (milestone 4), new services and OSD layouts (milestone 5). OSD identity stays a log line; the forced paths are not touched.
 
-## Open points for sign-off
+## Decisions at sign-off
 
-- Job result files and completion markers move from milestone 2 to 3 (`ROADMAP.md` updated accordingly): without an agent there is no way to delete them, `rm-cluster --zap` would remove them, and durable completion needs the journal. Recommended.
-- State stays on the workstation until milestone 3?
-- Existing PoC clusters are not migrated; they are recreated (no backwards compatibility before the first release).
+- Job result files and completion markers move from milestone 2 to 3 (`ROADMAP.md` updated accordingly).
+- State stays on the workstation until milestone 3.
+- Existing PoC clusters are recreated, not migrated (no backwards compatibility before the first tagged release).
+
+## Deviations in the implementation
+
+- The `.pending` OSD fallback stays: v20.2.4 `raw prepare` has no `--osd-fsid` (found on the live cluster).
+- Watches use `COSI.WatchKind` per resource type and re-run a check function on every event and every 10 seconds, instead of typed `safe.StateWatch`; the effect is the same, and transient read errors cannot strand a wait.
+- Waiting for a new instance generation (RGW rolls) and for a reboot still poll; both need time to pass, not only events.
+- Two cases are covered by unit tests against the fake node (`internal/talos/talostest`) instead of the live suite: an apply that fails after the node accepted it (the job is still cleaned up), and a Talos 1.14 node (deploy refused, removal and recovery not gated). There is no 1.14 node in the test cluster, and a mid-apply connection loss needs fault injection.
+- Delayed instance teardown is a unit test (`waitGone` waits for the instance after the status is gone); on the live cluster it happens on every stop but cannot be forced.
+- The zap is verified indirectly: an OSD redeployed on a zapped device would refuse to start if a label survived.
+- The upgrade fixtures are built with `crane mutate --label` instead of a Dockerfile `FROM` and `LABEL`, with the same result.
+- The dashboard rows of the capability matrix are maintained by hand; the check script covers methods, commands, service types and spec fields.

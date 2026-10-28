@@ -15,7 +15,7 @@ My main goal was to find out whether [Talos Linux](https://www.talos.dev) can re
 
 cephadm-talos is a small Go CLI that mimics cephadm's orchestration on top of Talos. It covers bootstrap, adding hosts, deploying mon/mgr/OSD daemons, `ps`, `shell`, upgrade, removal and host maintenance.
 
-There is no SSH, no systemd and no python on the hosts. Each Ceph daemon is a Talos `ContainerConfig` machine config document (Talos 1.14+), applied through the Talos API (the machinery Go client, no `talosctl`) in no-reboot mode, and run by Talos itself in the containerd namespace `taloscontainers`.
+There is no SSH, no systemd and no python on the hosts. Each Ceph daemon is a Talos `ContainerConfig` machine config document (Talos 1.15+), applied through the Talos API (the machinery Go client, no `talosctl`) in no-reboot mode, and run by Talos itself in the containerd namespace `taloscontainers`.
 
 The demo above runs on 3 Talos v1.15.0-alpha.1 nodes created with `--skip-etcd-k8s`. There is no Kubernetes and no etcd: the machine config's `cluster:` section is empty. The pauses in the recording, mostly image pulls, are shortened.
 

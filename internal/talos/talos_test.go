@@ -345,3 +345,17 @@ func TestRebootCancelled(t *testing.T) {
 		t.Fatalf("want the context error, got %v", err)
 	}
 }
+
+func TestFollowLogsDryRunHasNoNodeAccess(t *testing.T) {
+	var out bytes.Buffer
+
+	c := &Client{DryRun: true, Out: &out, Dial: func(context.Context, Conn) (*client.Client, error) {
+		t.Fatal("dry-run dialed a node")
+
+		return nil, nil
+	}}
+
+	if err := c.FollowLogs(context.Background(), "node", "app", &out); err != nil {
+		t.Fatal(err)
+	}
+}

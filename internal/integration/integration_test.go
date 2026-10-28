@@ -28,6 +28,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -282,11 +283,84 @@ func TestCluster(t *testing.T) {
 		st := e.state(t)
 		h, _ := st.Host(n3)
 
+		before, err := e.tc.BootID(context.Background(), n3)
+		if err != nil {
+			t.Fatal(err)
+		}
+
 		e.ok(t, "host", "reboot", h.Name)
+
+		if after, err := e.tc.BootID(context.Background(), n3); err != nil || after == before {
+			t.Errorf("node did not reboot: boot id %q, was %q (%v)", after, before, err)
+		}
 
 		out := e.ok(t, "shell", "--", "ceph", "-s")
 		if !strings.Contains(out, "3 osds: 3 up") {
 			t.Errorf("not all OSDs up after the reboot")
+		}
+	})
+
+	t.Run("data", func(t *testing.T) {
+		out := e.ok(t, "shell", "--", "sh", "-c",
+			"ceph osd pool create itest 8 >/dev/null 2>&1; head -c 4194304 /dev/urandom > /tmp/in && rados -p itest put obj /tmp/in && rados -p itest get obj /tmp/out && md5sum /tmp/in /tmp/out")
+		sums := strings.Fields(out)
+		if len(sums) < 4 || sums[0] != sums[2] {
+			t.Errorf("object read back differs: %q", out)
+		}
+	})
+
+	t.Run("rm and redeploy a mon", func(t *testing.T) {
+		h, _ := e.state(t).Host(n3)
+
+		e.ok(t, "rm", "mon."+h.Name)
+		e.ok(t, "deploy", "mon", n3)
+
+		out := e.ok(t, "shell", "--", "ceph", "quorum_status")
+		if !strings.Contains(out, h.Name) {
+			t.Errorf("redeployed mon not in quorum")
+		}
+	})
+
+	t.Run("rm --zap and redeploy an OSD", func(t *testing.T) {
+		st := e.state(t)
+		h, _ := st.Host(n3)
+
+		var osd string
+
+		for _, d := range st.DaemonsOf(state.TypeOSD, h.Name) {
+			if d.OSDID != nil {
+				osd = "osd." + strconv.Itoa(*d.OSDID)
+			}
+		}
+
+		if osd == "" {
+			t.Fatal("no OSD on the third node")
+		}
+
+		e.ok(t, "rm", "--force", "--zap", osd)
+
+		// a label left on the device would make the new OSD refuse to start
+		e.ok(t, "deploy", "osd", n3, e.device)
+
+		out := e.ok(t, "shell", "--", "ceph", "-s")
+		if !strings.Contains(out, "3 osds: 3 up") {
+			t.Errorf("not all OSDs up after the redeploy")
+		}
+	})
+
+	t.Run("rgw behind the vip", func(t *testing.T) {
+		vip := getenv("CEPHADM_TALOS_VIP", "10.5.0.200/24")
+
+		e.ok(t, "deploy", "rgw", n1)
+		e.ok(t, "deploy", "rgw", n2)
+		e.ok(t, "deploy", "vip", n1, "--vip", vip)
+		e.ok(t, "deploy", "vip", n2)
+
+		ip, _, _ := strings.Cut(vip, "/")
+
+		out := e.ok(t, "shell", "--", "sh", "-c", "for i in $(seq 30); do curl -skf https://"+ip+"/ && exit 0; sleep 2; done; exit 1")
+		if !strings.Contains(out, "ListAllMyBucketsResult") {
+			t.Errorf("the VIP does not answer with S3")
 		}
 	})
 
@@ -304,6 +378,11 @@ func TestCluster(t *testing.T) {
 		}
 
 		for name, gen := range e.instanceGens(t) {
+			// keepalived runs its own image, an upgrade of Ceph leaves it alone
+			if strings.Contains(name, "-vip-") {
+				continue
+			}
+
 			if gen <= before[name] {
 				t.Errorf("%s was not restarted (generation %d)", name, gen)
 			}
@@ -331,8 +410,9 @@ func TestCluster(t *testing.T) {
 			t.Skip("set CEPHADM_TALOS_FIXTURE_A, _B and _TAG (hack/fixtures.sh)")
 		}
 
+		// --refresh first: a node may still cache the tag from an earlier run
 		crane(t, "copy", "--insecure", fixA, fixTag)
-		e.ok(t, "upgrade", "--image", fixTag)
+		e.ok(t, "upgrade", "--image", fixTag, "--refresh")
 
 		if st := e.state(t); st.Image != digestOf(fixTag, fixA) {
 			t.Fatalf("tag resolved to %q, want the digest of A", st.Image)

@@ -10,9 +10,10 @@
 
 Gates run at operation boundaries:
 
-- `host add`, `bootstrap` and `deploy` need a supported Talos version on the target node and a verified supported Ceph image. `deploy` on a cluster whose image is older is refused.
+- `host add` needs a supported Talos version on the node.
+- `bootstrap` and `deploy` (mon, mgr, osd, rgw, vip) need a supported Talos version on the target node and a verified supported Ceph image; `deploy` on a cluster whose image is older is refused.
 - `upgrade` needs a supported current version and a verified supported candidate image.
-- `rm`, `rm-cluster` (with `--zap` and `--force`), recovery (`host maintenance exit`) and local commands such as `conf` and `ps` are not gated.
+- `rm`, `rm-cluster` (with `--zap` and `--force`), recovery (`host maintenance exit`), `host rm`, `ps`, `logs` and `conf` are not gated.
 - `--skip-version-check` skips these checks for testing. It does not make older releases work, and it is separate from `--dry-run`, which never contacts a node.
 
 ## Compatibility

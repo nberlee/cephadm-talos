@@ -44,6 +44,8 @@ type Node struct {
 	Srv     *grpc.Server
 	OnBoot  func() // called by Reboot, after the boot id changed
 	Images  machine.ImageServiceServer
+	// VersionTag is what Version reports (default v1.15.0-alpha.2)
+	VersionTag string
 	// FailAfterApply makes the next ApplyConfiguration store the config and
 	// then fail, like a connection lost after the node accepted it
 	FailAfterApply error
@@ -226,7 +228,12 @@ func (f *Node) Reboot(context.Context, *machine.RebootRequest) (*machine.RebootR
 }
 
 func (f *Node) Version(context.Context, *emptypb.Empty) (*machine.VersionResponse, error) {
-	return &machine.VersionResponse{Messages: []*machine.Version{{Version: &machine.VersionInfo{Tag: "v1.15.0-alpha.2"}}}}, nil
+	tag := f.VersionTag
+	if tag == "" {
+		tag = "v1.15.0-alpha.2"
+	}
+
+	return &machine.VersionResponse{Messages: []*machine.Version{{Version: &machine.VersionInfo{Tag: tag}}}}, nil
 }
 
 func (f *Node) Logs(req *machine.LogsRequest, srv machine.MachineService_LogsServer) error {
