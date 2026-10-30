@@ -203,7 +203,7 @@ func TestModuleChangeRestartsTheMgrs(t *testing.T) {
 	// containerd knows the mgr by its instance
 	mgrDoc := o.St.DocName(state.Daemon{Type: state.TypeMgr, ID: "h1"})
 	for gen := range uint64(3) {
-		inst := containers.NewContainerInstanceStatus(containers.NamespaceName, fmt.Sprintf("%s-%d", mgrDoc, gen))
+		inst := containers.NewContainerInstanceSpec(containers.NamespaceName, fmt.Sprintf("%s-%d", mgrDoc, gen))
 		inst.TypedSpec().ContainerID, inst.TypedSpec().Generation = mgrDoc, gen
 
 		if err := f.St.Create(ctx, inst); err != nil {

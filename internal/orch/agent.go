@@ -233,7 +233,7 @@ func (o *Orch) RenewAgentCerts(ctx context.Context) error {
 		}
 	}
 
-	if expiresSoon(o.St.Agent.OperatorCert, now) {
+	if !certValid(o.St.Agent.OperatorCert, o.identity(pki.RoleOperator, "admin"), false, nil, nil) || expiresSoon(o.St.Agent.OperatorCert, now) {
 		if err := o.issueOperatorCert(); err != nil {
 			return err
 		}

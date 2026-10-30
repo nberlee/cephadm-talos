@@ -20,6 +20,7 @@ import (
 	"github.com/nberlee/cephadm-talos/internal/cephx"
 	"github.com/nberlee/cephadm-talos/internal/daemons"
 	"github.com/nberlee/cephadm-talos/internal/mgrmodule"
+	"github.com/nberlee/cephadm-talos/internal/pki"
 	"github.com/nberlee/cephadm-talos/internal/spec"
 	"github.com/nberlee/cephadm-talos/internal/state"
 	"github.com/nberlee/cephadm-talos/internal/talos"
@@ -304,6 +305,11 @@ func (o *Orch) addHost(ctx context.Context, addr string, apply bool) (state.Host
 		}
 
 		name = n
+	}
+
+	// the name is part of the host's certificate identities (plan 03, item 3)
+	if err := pki.ValidName(name); err != nil {
+		return state.Host{}, err
 	}
 
 	h := state.Host{Name: name, Addr: addr}

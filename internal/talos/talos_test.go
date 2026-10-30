@@ -104,7 +104,7 @@ func TestReads(t *testing.T) {
 	must(t, f.St.Create(ctx, is))
 
 	for i, gen := range []uint64{3, 7} {
-		inst := containers.NewContainerInstanceStatus(containers.NamespaceName, "app-"+string(rune('a'+i)))
+		inst := containers.NewContainerInstanceSpec(containers.NamespaceName, "app-"+string(rune('a'+i)))
 		inst.TypedSpec().ContainerID = "app"
 		inst.TypedSpec().Generation = gen
 		must(t, f.St.Create(ctx, inst))

@@ -88,6 +88,10 @@ func Issue(caCertPEM, caKeyPEM string, l Leaf) (certPEM, keyPEM string, err erro
 	}
 
 	if l.Identity != nil {
+		if err := l.Identity.Valid(); err != nil {
+			return "", "", err
+		}
+
 		tmpl.URIs = []*url.URL{l.Identity.URI()}
 	}
 

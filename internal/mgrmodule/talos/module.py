@@ -14,6 +14,7 @@ import datetime
 import http.client
 import json
 import os
+import re
 import ssl
 import socket
 import threading
@@ -109,16 +110,28 @@ def load_inventory(path: Optional[str] = None) -> Dict[str, Any]:
 
 
 IDENTITY_SCHEME = 'cephadm-talos://'
+# the same form internal/pki accepts: no escapes, nothing to canonicalize
+IDENTITY_PART = re.compile(r'\A[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z')
 
 
 def cert_identity(peercert: Optional[Dict[str, Any]]) -> Tuple[str, str, str]:
-    """The (fsid, role, name) of a verified peer certificate's identity URI SAN (plan 03, item 3)."""
+    """The (fsid, role, name) of a verified peer certificate's identity URI SAN (plan 03, item 3).
+
+    Like Go's URL parsing in internal/pki, the scheme is matched in any case; every
+    such SAN counts, and there must be exactly one, in the exact form
+    cephadm-talos://<fsid>/<role>/<name>."""
     found = []
     for kind, value in (peercert or {}).get('subjectAltName', ()):
-        if kind != 'URI' or not value.startswith(IDENTITY_SCHEME):
+        # the scheme alone makes it an identity SAN, as for Go; the form is checked after
+        if kind != 'URI' or value[:len(IDENTITY_SCHEME) - 2].lower() != IDENTITY_SCHEME[:-2]:
             continue
-        parts = value[len(IDENTITY_SCHEME):].split('/')
-        if len(parts) != 3 or not all(parts) or any(c in value for c in '?#@'):
+        if value[:len(IDENTITY_SCHEME)].lower() != IDENTITY_SCHEME:
+            raise ValueError('malformed identity %r' % value)
+        rest = value[len(IDENTITY_SCHEME):]
+        if rest.endswith('#'):  # Go's URL parser drops an empty fragment
+            rest = rest[:-1]
+        parts = rest.split('/')
+        if len(parts) != 3 or not all(IDENTITY_PART.match(p) for p in parts):
             raise ValueError('malformed identity %r' % value)
         found.append((parts[0], parts[1], parts[2]))
     if len(found) != 1:

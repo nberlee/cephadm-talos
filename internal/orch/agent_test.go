@@ -165,7 +165,7 @@ func TestHostRmRemovesTheAgent(t *testing.T) {
 	}
 
 	// the agent's process lingers for a moment after its document is gone
-	inst := containers.NewContainerInstanceStatus(containers.NamespaceName, o.agentDocName(h)+"-0")
+	inst := containers.NewContainerInstanceSpec(containers.NamespaceName, o.agentDocName(h)+"-0")
 	inst.TypedSpec().ContainerID = o.agentDocName(h)
 
 	if err := f.St.Create(ctx, inst); err != nil {
@@ -333,5 +333,33 @@ func TestCertIdentities(t *testing.T) {
 
 	if err := o.ensureMgrCerts(&h, false); err != nil || h.MgrServerCert != "" || h.MgrClientKey != "" {
 		t.Errorf("mgr certificates kept without a mgr (%v)", err)
+	}
+}
+
+func TestRenewRepairsAMismatchedOperatorCert(t *testing.T) {
+	f := talostest.New(t, images())
+	o := fakeOrch(t, f)
+
+	if err := o.setupAgent(context.Background(), "node", "registry/agent:dev", false); err != nil {
+		t.Fatal(err)
+	}
+
+	// valid for years, but another cluster's identity
+	wrong, key, err := pki.Issue(o.St.Agent.CACert, o.St.Agent.CAKey, pki.Leaf{
+		CommonName: "operator", Usage: x509.ExtKeyUsageClientAuth, Years: 3,
+		Identity: &pki.Identity{FSID: "another", Role: pki.RoleOperator, Name: "admin"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	o.St.Agent.OperatorCert, o.St.Agent.OperatorKey = wrong, key
+
+	if err := o.RenewAgentCerts(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if o.St.Agent.OperatorCert == wrong || !certValid(o.St.Agent.OperatorCert, o.identity(pki.RoleOperator, "admin"), false, nil, nil) {
+		t.Error("mismatched operator certificate kept")
 	}
 }

@@ -106,7 +106,7 @@ func TestWaitGoneWaitsForTheInstance(t *testing.T) {
 	ctx := context.Background()
 
 	// the status is gone already, the instance (its process) only later
-	inst := containers.NewContainerInstanceStatus(containers.NamespaceName, "job-1")
+	inst := containers.NewContainerInstanceSpec(containers.NamespaceName, "job-1")
 	inst.TypedSpec().ContainerID = "job"
 
 	if err := f.St.Create(ctx, inst); err != nil {

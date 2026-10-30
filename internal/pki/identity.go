@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"regexp"
 	"strings"
 )
 
@@ -32,6 +33,26 @@ type Identity struct {
 	Name string
 }
 
+// Valid reports whether every part of the identity has the one accepted form.
+func (id Identity) Valid() error {
+	for _, p := range []string{id.FSID, string(id.Role), id.Name} {
+		if !identityPart.MatchString(p) {
+			return fmt.Errorf("%q cannot be part of an identity (letters, digits, '.', '_' and '-', not first)", p)
+		}
+	}
+
+	return nil
+}
+
+// ValidName reports whether a host name can be part of an identity.
+func ValidName(name string) error {
+	if !identityPart.MatchString(name) {
+		return fmt.Errorf("host name %q is not supported: it must start with a letter or digit and contain only letters, digits, '.', '_' and '-'", name)
+	}
+
+	return nil
+}
+
 // URI returns the identity as a URI SAN.
 func (id Identity) URI() *url.URL {
 	return &url.URL{Scheme: identityScheme, Host: id.FSID, Path: "/" + string(id.Role) + "/" + id.Name}
@@ -39,22 +60,27 @@ func (id Identity) URI() *url.URL {
 
 func (id Identity) String() string { return id.URI().String() }
 
-// CertIdentity returns the identity carried by a certificate. A certificate with
-// no identity SAN, or more than one, has none.
+// identityPart is the only form a part of an identity may take, in Go and in
+// the mgr module alike: no escapes, no case folding, nothing to canonicalize.
+var identityPart = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+
+// CertIdentity returns the identity carried by a certificate. Any URI SAN whose
+// scheme is cephadm-talos in any case counts; there must be exactly one, in the
+// exact form cephadm-talos://<fsid>/<role>/<name>.
 func CertIdentity(c *x509.Certificate) (Identity, error) {
 	var found []Identity
 
 	for _, u := range c.URIs {
-		if u.Scheme != identityScheme {
+		if !strings.EqualFold(u.Scheme, identityScheme) {
 			continue
 		}
 
-		role, name, ok := strings.Cut(strings.TrimPrefix(u.Path, "/"), "/")
-		if !ok || u.Host == "" || name == "" || strings.Contains(name, "/") || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
-			return Identity{}, fmt.Errorf("malformed identity %q", u)
+		id, err := parseIdentity(u)
+		if err != nil {
+			return Identity{}, err
 		}
 
-		found = append(found, Identity{FSID: u.Host, Role: Role(role), Name: name})
+		found = append(found, id)
 	}
 
 	switch len(found) {
@@ -65,6 +91,21 @@ func CertIdentity(c *x509.Certificate) (Identity, error) {
 	default:
 		return Identity{}, errors.New("certificate carries more than one cephadm-talos identity")
 	}
+}
+
+func parseIdentity(u *url.URL) (Identity, error) {
+	parts := strings.Split(strings.TrimPrefix(u.String(), identityScheme+"://"), "/")
+	if !strings.HasPrefix(u.String(), identityScheme+"://") || len(parts) != 3 {
+		return Identity{}, fmt.Errorf("malformed identity %q", u)
+	}
+
+	for _, p := range parts {
+		if !identityPart.MatchString(p) {
+			return Identity{}, fmt.Errorf("malformed identity %q", u)
+		}
+	}
+
+	return Identity{FSID: parts[0], Role: Role(parts[1]), Name: parts[2]}, nil
 }
 
 // Require checks that a certificate carries exactly the given identity. An empty

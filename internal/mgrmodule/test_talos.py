@@ -369,6 +369,9 @@ class IdentityTest(unittest.TestCase):
         self.assertEqual(m.cert_identity(c), ('f1', 'agent', 'h1'))
         self.assertEqual(m.require_identity(c, 'f1', 'agent', 'h1'), 'h1')
         self.assertEqual(m.require_identity(c, 'f1', 'agent'), 'h1')
+        # Go lowercases the scheme and drops an empty fragment when it parses a certificate; so does this
+        self.assertEqual(m.cert_identity(self.cert('cephadm-talos://f1/agent/h1#')), ('f1', 'agent', 'h1'))
+        self.assertEqual(m.cert_identity(self.cert('CEPHADM-TALOS://f1/agent/h1')), ('f1', 'agent', 'h1'))
 
     def test_refused(self):
         c = self.cert('cephadm-talos://f1/agent/h1')
@@ -377,6 +380,14 @@ class IdentityTest(unittest.TestCase):
                 m.require_identity(c, fsid, role, name)
         for bad in (None, {}, self.cert(), self.cert('cephadm-talos://f1/agent/h1', 'cephadm-talos://f1/agent/h2'),
                     self.cert('cephadm-talos://f1/agent'), self.cert('cephadm-talos://f1/agent/h1/x'),
-                    self.cert('cephadm-talos:///agent/h1'), self.cert('cephadm-talos://f1/agent/h1?x=1')):
+                    self.cert('cephadm-talos:///agent/h1'), self.cert('cephadm-talos://f1/agent/h1?x=1'),
+                    self.cert('cephadm-talos://f1/agent/h1?'), self.cert('cephadm-talos://f1/agent/h1#x'),
+                    self.cert('cephadm-talos://f1/agent/%68%31'), self.cert('cephadm-talos://f1:1/agent/h1'),
+                    self.cert('cephadm-talos://f1/agent/h1/'),
+                    self.cert('cephadm-talos://f1/agent/h1', 'CEPHADM-TALOS://f1/mgr/h2'),
+                    self.cert('cephadm-talos://f1/agent/h1', 'cephadm-talos:f1/mgr/h2'),
+                    self.cert('cephadm-talos://f1/agent/h1', 'cephadm-talos:/f1/mgr/h2'),
+                    self.cert('cephadm-talos://f1/agent/h1', 'cephadm-talos:'),
+                    self.cert('cephadm-talos://f1/agent/_node')):
             with self.assertRaises(ValueError):
                 m.cert_identity(bad)
