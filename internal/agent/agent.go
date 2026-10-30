@@ -1,7 +1,8 @@
 // Package agent is the per-node cephadm-talos agent: it reads the node's Talos
 // container resources over the local machined socket and serves them to the
-// talos mgr module over mutual TLS. It never writes to Talos and has no Ceph
-// identity (docs/plans/02-agents-and-read-path.md).
+// talos mgr module over mutual TLS, and it is the only writer of its own node's
+// Ceph documents (docs/plans/03-write-path.md, item 7). It reaches no other
+// node's Talos API and has no Ceph identity.
 package agent
 
 import (
@@ -60,6 +61,8 @@ type Record struct {
 	Containers   map[string]Container `json:"containers"`
 	// Records is "ok" or why the agent's records cannot be used
 	Records string `json:"records,omitempty"`
+	// Node is the agent's ownership of its node's Ceph documents (plan 03, item 7)
+	Node *NodeStatus `json:"node,omitempty"`
 }
 
 // Agent keeps the last complete observation of its node.
@@ -82,6 +85,8 @@ type Agent struct {
 	Channel *Channel
 	// Records is the agent's durable records (plan 03); nil in tests that do not need them
 	Records *records.Store
+	// Node applies the node's Ceph documents (plan 03); nil in tests that do not need it
+	Node *Node
 
 	logPrint func(format string, args ...any)
 	// refresh replaces observe in tests
@@ -209,6 +214,11 @@ func (a *Agent) observe(ctx context.Context) error {
 		if err := a.Records.Check(); err != nil {
 			rec.Records = err.Error()
 		}
+	}
+
+	if a.Node != nil {
+		st := a.Node.Status(ctx)
+		rec.Node = &st
 	}
 
 	for name, s := range statuses {
@@ -393,13 +403,19 @@ func Main(ctx context.Context) error {
 		return err
 	}
 
-	tc := &talos.Client{Dial: talos.DialSocket(constants.MachineSocketPath), Roles: []role.Role{role.Reader}}
+	// os:admin on its own node only: the local socket reaches no other node, and
+	// machinedAccess grants every role there anyway (plan 03, "Roles and security")
+	tc := &talos.Client{Dial: talos.DialSocket(constants.MachineSocketPath), Roles: []role.Role{role.Admin}}
 	defer tc.Close() //nolint:errcheck
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	a := &Agent{Talos: tc, Life: ctx, Channel: ch, Records: &records.Store{Dir: filepath.Join(records.Mount, records.RecordsDir)}}
+	recs := &records.Store{Dir: filepath.Join(records.Mount, records.RecordsDir)}
+	a := &Agent{
+		Talos: tc, Life: ctx, Channel: ch, Records: recs,
+		Node: &Node{Talos: tc, Records: recs, FSID: self.FSID, Host: self.Name},
+	}
 
 	var wg sync.WaitGroup
 

@@ -4,11 +4,17 @@ package orch
 
 import (
 	"context"
+	"encoding/json"
+	"io"
+	"net"
+	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/nberlee/cephadm-talos/internal/agent"
 	"github.com/nberlee/cephadm-talos/internal/state"
 	"github.com/nberlee/cephadm-talos/internal/store"
 	"github.com/nberlee/cephadm-talos/internal/talos"
@@ -106,6 +112,47 @@ func TestLiveStore(t *testing.T) {
 
 	if err := b2.Remove(ctx, keys); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestLiveAgentStatus fetches every agent's status record with a mgr's client
+// certificate, as the module polls it.
+//
+//	go test -tags live -run TestLiveAgentStatus -v ./internal/orch/
+func TestLiveAgentStatus(t *testing.T) {
+	o := liveOrch(t)
+
+	mgrs := o.St.DaemonsOf(state.TypeMgr, "")
+	if len(mgrs) == 0 {
+		t.Fatal("no mgr")
+	}
+
+	mgr, _ := o.St.Host(mgrs[0].Host)
+
+	cfg, err := agent.ClientTLSConfig([]byte(o.St.Agent.CACert), []byte(mgr.MgrClientCert), []byte(mgr.MgrClientKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cl := &http.Client{Transport: &http.Transport{TLSClientConfig: cfg}, Timeout: 30 * time.Second}
+
+	for _, h := range o.St.Hosts {
+		resp, err := cl.Get("https://" + net.JoinHostPort(h.Addr, strconv.Itoa(agent.Port)) + "/status?refresh=1")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, agent.MaxRecord))
+		resp.Body.Close() //nolint:errcheck
+
+		var rec agent.Record
+		if resp.StatusCode != http.StatusOK || json.Unmarshal(b, &rec) != nil || rec.Records != "ok" || rec.Node == nil {
+			t.Errorf("%s: %d %s", h.Name, resp.StatusCode, b)
+
+			continue
+		}
+
+		t.Logf("%s: records %s, node %+v, %d containers", h.Name, rec.Records, *rec.Node, len(rec.Containers))
 	}
 }
 
