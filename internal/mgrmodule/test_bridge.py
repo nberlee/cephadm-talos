@@ -1,16 +1,25 @@
 """Tests of bridge.py, the module's side of the agent channel (plan 03, step 1).
 Run with hack/mgrmodule-test.sh."""
 import base64
+import datetime
+import http.client
 import json
+import socket
+import ssl
+import tempfile
 import threading
 import time
 import unittest
+import os
 
 import test_talos  # noqa: F401  (stubs ceph_module before the talos package is imported)
+from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from talos import bridge as b
+from talos import module as m
 
 
 class Log:
@@ -19,30 +28,33 @@ class Log:
 
 
 class Mons:
-    """A fake send_command: answers per prefix, optionally late."""
+    """A fake send_command. Answers mgr dump from `maps` (the last repeats; None:
+    no answer yet), anything else at once, or keeps every result pending when late."""
 
-    def __init__(self, maps):
-        self.maps = maps  # list of mgr dump answers, the last one repeats
-        self.calls = []
-        self.late = False
+    def __init__(self, maps=None):
+        self.maps = list(maps or [])
+        self.sent = []      # (thread name, prefix)
         self.pending = []
+        self.late = False
 
-    def __call__(self, cmd, deadline):
-        self.calls.append(cmd['prefix'])
-        out = b.Outcome()
+    def send(self, res, cmd):
+        prefix = json.loads(cmd)['prefix']
+        self.sent.append((threading.current_thread().name, prefix))
         if self.late:
-            self.pending.append(out)
-            out.ev.wait(min(deadline, 0.05))
-            return out
-        if cmd['prefix'] == 'mgr dump':
-            m = self.maps.pop(0) if len(self.maps) > 1 else self.maps[0]
-            if m is None:
-                out.ev.wait(min(deadline, 0.05))  # no answer within the deadline
-                return out
-            out.complete(0, json.dumps(m), '')
+            self.pending.append(res)
+            return
+        if prefix == 'mgr dump':
+            mm = self.maps.pop(0) if len(self.maps) > 1 else self.maps[0]
+            if mm is None:
+                self.pending.append(res)
+                return
+            res.complete(0, json.dumps(mm), '')
         else:
-            out.complete(0, json.dumps({'status': 'HEALTH_OK'}), '')
-        return out
+            res.complete(0, json.dumps({'status': 'HEALTH_OK'}), '')
+
+    def commands(self, n, name='t'):
+        c = b.Commands(self.send, lambda: b.Job({}), n, name)
+        return c
 
 
 def mgrmap(gid, name, epoch=5):
@@ -62,33 +74,78 @@ def challenge(**kw):
     return req
 
 
-class LeadershipTest(unittest.TestCase):
-    def test_capture_only_when_the_mons_show_this_mgr_active(self):
-        mons = Mons([mgrmap(10, 'other'), None, mgrmap(42, 'h1', 9)])
-        lead = b.Leadership('h1', mons)
-        self.assertFalse(lead.capture())  # another mgr is active
-        self.assertFalse(lead.capture())  # no answer from the mons
-        self.assertTrue(lead.capture())
-        self.assertEqual(lead.captured(), (42, 9))
-        n = len(mons.calls)
-        self.assertTrue(lead.capture())   # captured once, no more lookups
-        self.assertEqual(len(mons.calls), n)
+def wait_until(cond, timeout=2.0):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if cond():
+            return True
+        time.sleep(0.01)
+    return False
 
-    def test_still_active_needs_a_fresh_map_with_the_captured_gid(self):
-        mons = Mons([mgrmap(42, 'h1'), mgrmap(42, 'h1'), mgrmap(43, 'h1'), None])
-        lead = b.Leadership('h1', mons)
+
+class CommandsTest(unittest.TestCase):
+    def test_sent_from_persistent_workers_and_bounded(self):
+        mons = Mons()
+        mons.late = True
+        cmds = mons.commands(2, 'w')
+        self.addCleanup(cmds.stop)
+        j1, j2 = cmds.submit({'prefix': 'health'}), cmds.submit({'prefix': 'status'})
+        self.assertTrue(wait_until(lambda: len(mons.sent) == 2))
+        self.assertIsNone(cmds.submit({'prefix': 'health'}), 'a third outstanding command was accepted')
+        self.assertTrue(all(t.startswith('w-') for t, _ in mons.sent), mons.sent)
+        mons.pending[0].complete(0, 'x', '')
+        self.assertTrue(wait_until(lambda: j1.ev.is_set() or j2.ev.is_set()))
+        self.assertTrue(wait_until(lambda: cmds.submit({'prefix': 'health'}) is not None), 'a completed command kept its slot')
+
+
+class DeadlineBudgetTest(unittest.TestCase):
+    def test_a_bridge_answer_fits_in_its_connection(self):
+        self.assertLess(b.MAX_BRIDGE_DEADLINE + 2, b.REQUEST_DEADLINE)
+
+
+class CommandsStopTest(unittest.TestCase):
+    def test_no_work_after_stop(self):
+        mons = Mons()
+        cmds = mons.commands(2)
+        cmds.stop()
+        self.assertIsNone(cmds.submit({'prefix': 'health'}))
+
+
+class LeadershipTest(unittest.TestCase):
+    def lead(self, activation, maps):
+        mons = Mons(maps)
+        cmds = mons.commands(2)
+        self.addCleanup(cmds.stop)
+        return b.Leadership('h1', activation, cmds), mons
+
+    def test_candidate_from_the_activation_map_only(self):
+        lead, _ = self.lead(mgrmap(10, 'other'), [mgrmap(42, 'h1')])
+        self.assertIsNone(lead.candidate)
+        self.assertFalse(lead.capture(), 'captured without having been activated as h1')
+
+    def test_capture_needs_the_mons_to_agree(self):
+        lead, _ = self.lead(mgrmap(42, 'h1', 9), [mgrmap(10, 'other'), None, mgrmap(42, 'h1', 11)])
+        self.assertFalse(lead.capture())  # another mgr is active
+        self.assertFalse(lead.capture())  # no answer within the deadline
         self.assertTrue(lead.capture())
-        self.assertTrue(lead.still_active())
-        self.assertFalse(lead.still_active())  # restarted under another gid
-        self.assertFalse(lead.still_active())  # mons do not answer
+        self.assertEqual(lead.captured(), (42, 11))
+
+    def test_a_successor_with_the_same_name_is_not_adopted(self):
+        lead, _ = self.lead(mgrmap(42, 'h1'), [mgrmap(43, 'h1')])
+        self.assertFalse(lead.capture())
+        lead2, _ = self.lead(mgrmap(42, 'h1'), [mgrmap(42, 'h1'), mgrmap(43, 'h1')])
+        self.assertTrue(lead2.capture())
+        self.assertFalse(lead2.still_active())
 
 
 class ConfirmTest(unittest.TestCase):
-    def channel(self, maps):
+    def channel(self, maps, activation=None):
         key, pem = key_pair()
-        lead = b.Leadership('h1', Mons(maps))
-        ch = b.Channel('f1', 'h1', lead, Mons([mgrmap(42, 'h1')]), None, pem, None, Log())
-        return ch, lead, key
+        mons = Mons(maps)
+        cmds = mons.commands(2)
+        self.addCleanup(cmds.stop)
+        lead = b.Leadership('h1', activation or mgrmap(42, 'h1'), cmds)
+        return b.Channel('f1', 'h1', lead, mons.commands(2), None, pem, m.require_identity, Log()), lead, key
 
     def test_refused_until_captured(self):
         ch, lead, _ = self.channel([mgrmap(10, 'other')])
@@ -107,9 +164,9 @@ class ConfirmTest(unittest.TestCase):
         self.assertEqual(code, 200)
         payload = base64.b64decode(reply['payload'])
         key.public_key().verify(base64.b64decode(reply['signature']), payload, ec.ECDSA(hashes.SHA256()))
-        conf = json.loads(payload)
-        self.assertEqual(conf, {'version': 1, 'fsid': 'f1', 'mgr': 'h1', 'gid': 42, 'session': 'ab' * 16, 'host': 'h3',
-                                'revision': 7, 'operation': 'op-1', 'inputs_hash': 'cd' * 32, 'challenge': 'ef' * 16})
+        self.assertEqual(json.loads(payload), {'version': 1, 'fsid': 'f1', 'mgr': 'h1', 'gid': 42, 'session': 'ab' * 16,
+                                               'host': 'h3', 'revision': 7, 'operation': 'op-1', 'inputs_hash': 'cd' * 32,
+                                               'challenge': 'ef' * 16})
 
     def test_request_checks(self):
         self.assertEqual(b.check_confirm_request(challenge(), 'f1', 'h3')['host'], 'h3')
@@ -123,11 +180,16 @@ class ConfirmTest(unittest.TestCase):
 
 
 class BridgeTest(unittest.TestCase):
-    def channel(self):
-        lead = b.Leadership('h1', Mons([mgrmap(42, 'h1')]))
+    def channel(self, n=b.BRIDGE_COMMANDS):
+        lmons = Mons([mgrmap(42, 'h1')])
+        lcmds = lmons.commands(2)
+        self.addCleanup(lcmds.stop)
+        lead = b.Leadership('h1', mgrmap(42, 'h1'), lcmds)
         self.assertTrue(lead.capture())
-        mons = Mons([mgrmap(42, 'h1')])
-        return b.Channel('f1', 'h1', lead, mons, None, b'', None, Log()), mons
+        mons = Mons()
+        cmds = mons.commands(n, 'bridge')
+        self.addCleanup(cmds.stop)
+        return b.Channel('f1', 'h1', lead, cmds, None, b'', m.require_identity, Log()), mons
 
     def call(self, ch, **kw):
         req = {'version': 1, 'call': 'health', 'args': {}, 'deadline': 5, 'dispatch_id': '12' * 8}
@@ -138,39 +200,222 @@ class BridgeTest(unittest.TestCase):
         ch, mons = self.channel()
         code, reply = self.call(ch)
         self.assertEqual((code, reply['outcome'], reply['r']), (200, 'done', 0))
-        for kw in ({'call': 'auth get'}, {'args': {'x': 1}}, {'deadline': 0}, {'deadline': 61}, {'deadline': True},
-                   {'dispatch_id': 'nothex'}, {'version': 2}, {'extra': 1}):
+        for i, kw in enumerate(({'call': 'auth get'}, {'args': {'x': 1}}, {'deadline': 0}, {'deadline': 11}, {'deadline': True},
+                                {'dispatch_id': 'nothex'}, {'version': 2}, {'extra': 1})):
+            kw.setdefault('dispatch_id', '%016x' % (100 + i))
             self.assertEqual(self.call(ch, **kw)[0], 400, kw)
-        self.assertEqual(mons.calls, ['health'])  # refused calls never reach the mons
+        self.assertEqual([p for _, p in mons.sent], ['health'])  # refused calls never reach the mons
+        self.assertTrue(all(t.startswith('bridge-') for t, _ in mons.sent))
 
     def test_refused_until_captured(self):
-        lead = b.Leadership('h1', Mons([mgrmap(10, 'other')]))
-        ch = b.Channel('f1', 'h1', lead, Mons([]), None, b'', None, Log())
+        mons = Mons([mgrmap(10, 'other')])
+        cmds = mons.commands(2)
+        self.addCleanup(cmds.stop)
+        lead = b.Leadership('h1', mgrmap(10, 'other'), cmds)
+        ch = b.Channel('f1', 'h1', lead, cmds, None, b'', m.require_identity, Log())
         self.assertEqual(self.call(ch)[0], 503)
 
-    def test_deadline_unknown_then_late_result(self):
+    def test_a_dispatch_id_runs_once(self):
+        ch, mons = self.channel()
+        self.assertEqual(self.call(ch, dispatch_id='aa' * 8)[1]['outcome'], 'done')
+        self.assertEqual(self.call(ch, dispatch_id='aa' * 8)[0], 409)  # also after an immediate completion
+        self.assertEqual(ch.outcome('aa' * 8)[1]['outcome'], 'done')
+        # concurrent reuse: exactly one runs
+        mons.late = True
+        codes = []
+        ts = [threading.Thread(target=lambda: codes.append(self.call(ch, deadline=0.05, dispatch_id='bb' * 8)[0])) for _ in range(5)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        self.assertEqual(sorted(codes), [200, 409, 409, 409, 409])
+        self.assertTrue(wait_until(lambda: len(mons.sent) == 2), mons.sent)
+
+    def test_deadline_unknown_then_outcome(self):
         ch, mons = self.channel()
         mons.late = True
         code, reply = self.call(ch, deadline=0.01, dispatch_id='ab' * 8)
         self.assertEqual((code, reply), (200, {'outcome': 'unknown'}))
-        self.assertEqual(ch.late_result('ab' * 8), (200, {'outcome': 'unknown'}))
-        self.assertEqual(self.call(ch, dispatch_id='ab' * 8)[0], 409)  # a dispatch id is used once
+        self.assertEqual(ch.outcome('ab' * 8), (200, {'outcome': 'unknown'}))
+        self.assertTrue(wait_until(lambda: mons.pending))
         mons.pending[0].complete(0, 'late out', '')
-        self.assertEqual(ch.late_result('ab' * 8), (200, {'outcome': 'done', 'r': 0, 'out': 'late out', 'outs': ''}))
-        self.assertEqual(ch.late_result('cd' * 8)[0], 404)
+        self.assertTrue(wait_until(lambda: ch.outcome('ab' * 8)[1]['outcome'] == 'done'))
+        self.assertEqual(ch.outcome('ab' * 8), (200, {'outcome': 'done', 'r': 0, 'out': 'late out', 'outs': ''}))
+        self.assertEqual(ch.outcome('cd' * 8)[0], 404)
 
-    def test_outstanding_calls_are_bounded(self):
-        ch, mons = self.channel()
+    def test_pending_calls_keep_their_slot_and_record(self):
+        ch, mons = self.channel(n=2)
         mons.late = True
-        for i in range(b.MAX_BRIDGE_CALLS):
+        old = b.LATE_KEEP
+        b.LATE_KEEP = 0.0
+        self.addCleanup(setattr, b, 'LATE_KEEP', old)
+        for i in range(2):
             self.assertEqual(self.call(ch, deadline=0.01, dispatch_id='%016x' % i)[1]['outcome'], 'unknown')
-        self.assertEqual(self.call(ch, deadline=0.01, dispatch_id='%016x' % 99)[0], 429)
+        time.sleep(0.02)
+        self.assertEqual(self.call(ch, deadline=0.01, dispatch_id='%016x' % 9)[0], 429)  # expiry frees nothing pending
+        self.assertEqual(ch.outcome('%016x' % 0)[0], 200)
+        self.assertTrue(wait_until(lambda: len(mons.pending) == 2))
         mons.pending[0].complete(0, '', '')
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline and self.call(ch, deadline=0.01, dispatch_id='%016x' % 100)[0] == 429:
-            time.sleep(0.01)
-        self.assertLess(time.monotonic(), deadline, 'a completed late call did not free its slot')
-        self.assertTrue(threading.active_count() > 0)
+        self.assertTrue(wait_until(lambda: self.call(ch, deadline=0.01, dispatch_id='%016x' % 10)[0] == 200))
+        # completed outcomes do expire
+        self.assertTrue(wait_until(lambda: ch.outcome('%016x' % 0)[0] == 404))
+
+    def test_kept_outcomes_are_bounded(self):
+        ch, mons = self.channel()
+        for i in range(b.MAX_RECORDS):
+            self.assertEqual(self.call(ch, dispatch_id='%016x' % i)[0], 200)
+        self.assertEqual(self.call(ch, dispatch_id='%016x' % 999)[0], 429)
+
+    def test_large_output_is_not_kept_in_full(self):
+        ch, mons = self.channel()
+        mons.send = lambda res, cmd: res.complete(0, 'x' * (b.MAX_OUTPUT + 1), '')
+        cmds = b.Commands(mons.send, lambda: b.Job({}), 1, 'big')
+        self.addCleanup(cmds.stop)
+        ch.commands = cmds
+        reply = self.call(ch, dispatch_id='ee' * 8)[1]
+        self.assertEqual((reply['outcome'], reply['r']), ('done', 0))
+        self.assertNotIn('out', reply)
+        kept = ch.records['ee' * 8].job
+        self.assertEqual((kept.outb, kept.outs, kept.too_large), ('', '', True))
+
+
+def pki():
+    """A CA, an agent client certificate and a mgr server certificate for 127.0.0.1."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    ca_key = ec.generate_private_key(ec.SECP256R1())
+    ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, 'ca')])
+    ca = (x509.CertificateBuilder().subject_name(ca_name).issuer_name(ca_name).public_key(ca_key.public_key())
+          .serial_number(1).not_valid_before(now - datetime.timedelta(hours=1)).not_valid_after(now + datetime.timedelta(days=1))
+          .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+          .add_extension(x509.SubjectKeyIdentifier.from_public_key(ca_key.public_key()), critical=False)
+          .add_extension(x509.KeyUsage(digital_signature=True, content_commitment=False, key_encipherment=False, data_encipherment=False,
+                                       key_agreement=False, key_cert_sign=True, crl_sign=True, encipher_only=False, decipher_only=False),
+                         critical=True)
+          .sign(ca_key, hashes.SHA256()))
+
+    def leaf(uri, usage, ip=False):
+        k = ec.generate_private_key(ec.SECP256R1())
+        sans = [x509.UniformResourceIdentifier(uri)]
+        if ip:
+            import ipaddress
+            sans.append(x509.IPAddress(ipaddress.ip_address('127.0.0.1')))
+        c = (x509.CertificateBuilder().subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, uri)])).issuer_name(ca_name)
+             .public_key(k.public_key()).serial_number(x509.random_serial_number())
+             .not_valid_before(now - datetime.timedelta(hours=1)).not_valid_after(now + datetime.timedelta(days=1))
+             .add_extension(x509.SubjectAlternativeName(sans), critical=False)
+             .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()), critical=False)
+             .add_extension(x509.ExtendedKeyUsage([usage]), critical=False).sign(ca_key, hashes.SHA256()))
+        return (c.public_bytes(serialization.Encoding.PEM),
+                k.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption()))
+
+    d = tempfile.mkdtemp()
+    files = {}
+    for name, data in (('ca.crt', ca.public_bytes(serialization.Encoding.PEM)),) + \
+            tuple(zip(('srv.crt', 'srv.key'), leaf('cephadm-talos://f1/mgr/h1', ExtendedKeyUsageOID.SERVER_AUTH, True))) + \
+            tuple(zip(('cli.crt', 'cli.key'), leaf('cephadm-talos://f1/agent/h1', ExtendedKeyUsageOID.CLIENT_AUTH))):
+        files[name] = os.path.join(d, name)
+        with open(files[name], 'wb') as f:
+            f.write(data)
+    return files
+
+
+class ServerTest(unittest.TestCase):
+    def setUp(self):
+        self.files = pki()
+        lmons = Mons([mgrmap(42, 'h1')])
+        lcmds = lmons.commands(2)
+        self.addCleanup(lcmds.stop)
+        lead = b.Leadership('h1', mgrmap(42, 'h1'), lcmds)
+        ctx = b.server_context(self.files['ca.crt'], self.files['srv.crt'], self.files['srv.key'])
+        mons = Mons()
+        cmds = mons.commands(2)
+        self.addCleanup(cmds.stop)
+        self.ch = b.Channel('f1', 'h1', lead, cmds, ctx, b.read(self.files['srv.key']), m.require_identity, Log())
+        s = socket.socket()
+        s.bind(('127.0.0.1', 0))
+        self.port = s.getsockname()[1]
+        s.close()
+        self.ch.start(self.port)
+        self.addCleanup(self.ch.stop)
+
+    def get(self, path):
+        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=self.files['ca.crt'])
+        ctx.load_cert_chain(self.files['cli.crt'], self.files['cli.key'])
+        conn = http.client.HTTPSConnection('127.0.0.1', self.port, context=ctx, timeout=5)
+        try:
+            conn.request('GET', path)
+            return conn.getresponse().status
+        finally:
+            conn.close()
+
+    def test_a_silent_connection_does_not_block_others(self):
+        silent = socket.create_connection(('127.0.0.1', self.port))
+        self.addCleanup(silent.close)
+        start = time.monotonic()
+        self.assertEqual(self.get('/v1/bridge/' + 'ab' * 8), 404)
+        self.assertLess(time.monotonic() - start, 2)
+
+    def test_stop_closes_open_connections(self):
+        silent = socket.create_connection(('127.0.0.1', self.port))
+        self.addCleanup(silent.close)
+        time.sleep(0.1)
+        start = time.monotonic()
+        self.ch.stop()
+        self.assertLess(time.monotonic() - start, 3)
+        silent.settimeout(3)
+        self.assertEqual(silent.recv(1), b'')  # closed by the server
+        with self.assertRaises(OSError):
+            self.get('/v1/bridge/' + 'ab' * 8)
+
+
+class ServerCloseTest(unittest.TestCase):
+    def test_a_connection_after_close_all_is_refused(self):
+        srv = b.Server(('127.0.0.1', 0), object, ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER))
+        self.addCleanup(srv.server_close)
+        srv.close_all()
+        a, c = socket.socketpair()
+        self.addCleanup(c.close)
+        srv.process_request(a, ('127.0.0.1', 1))
+        self.assertEqual(len(srv.open), 0)
+        c.settimeout(2)
+        self.assertEqual(c.recv(1), b'')  # closed at once
+        self.assertTrue(srv.admit.acquire(blocking=False))  # its admission was returned
+
+
+class PostJSONTest(unittest.TestCase):
+    def test_a_silent_handshake_is_cut_at_the_deadline(self):
+        srv = socket.socket()
+        srv.bind(('127.0.0.1', 0))
+        srv.listen(1)
+        self.addCleanup(srv.close)
+        start = time.monotonic()
+        with self.assertRaises(Exception):
+            b.post_json('127.0.0.1', srv.getsockname()[1], ssl.create_default_context(), '/x', b'{}', 0.5, lambda c: None)
+        self.assertLess(time.monotonic() - start, 1.0)
+
+    def test_absolute_deadline(self):
+        """A peer that trickles bytes forever cannot hold the caller past the deadline."""
+        srv = socket.socket()
+        srv.bind(('127.0.0.1', 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+        stop = threading.Event()
+
+        def trickle():
+            c, _ = srv.accept()
+            while not stop.is_set():
+                try:
+                    c.send(b'\x16')
+                except OSError:
+                    return
+                time.sleep(0.1)
+        threading.Thread(target=trickle, daemon=True).start()
+        self.addCleanup(stop.set)
+        self.addCleanup(srv.close)
+        start = time.monotonic()
+        with self.assertRaises(Exception):
+            b.post_json('127.0.0.1', port, ssl.create_default_context(), '/x', b'{}', 0.5, lambda c: None)
+        self.assertLess(time.monotonic() - start, 2)
 
 
 if __name__ == '__main__':

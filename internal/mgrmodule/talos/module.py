@@ -359,16 +359,16 @@ class Module(orchestrator.Orchestrator, MgrModule):
             raise ValueError('address %s is not one inventory host' % addr)
         return fetch_record(addr, tls_context(), refresh=refresh, expect=(inv['fsid'], names[0]))
 
-    def _mon_command(self, cmd: Dict[str, Any], deadline: float) -> Any:
-        """A mon command with a deadline; the result may complete after it (plan 03, item 2)."""
-        res = CommandResult('')
-        self.send_command(res, 'mon', '', json.dumps(cmd), '')
-        res.ev.wait(deadline)
-        return res
+    def _send_mon(self, result: Any, cmd: str) -> None:
+        self.send_command(result, 'mon', '', cmd, '')
 
-    def _lead(self) -> None:
+    def _lead(self, activation_map: Optional[Dict[str, Any]]) -> None:
         """Capture the incarnation, serve the agent channel, heartbeat the local agent (items 1, 2, 5)."""
-        leadership = bridge.Leadership(self.get_mgr_id(), self._mon_command)
+        leader_cmds = bridge.Commands(self._send_mon, lambda: CommandResult(''), bridge.LEADERSHIP_COMMANDS, 'talos-lead-cmd')
+        bridge_cmds = bridge.Commands(self._send_mon, lambda: CommandResult(''), bridge.BRIDGE_COMMANDS, 'talos-bridge-cmd')
+        leadership = bridge.Leadership(self.get_mgr_id(), activation_map, leader_cmds)
+        if leadership.candidate is None:
+            self.log.warning('this mgr was not active in the map it started with; it confirms nothing')
         channel: Optional[bridge.Channel] = None
         nonce = ''
         try:
@@ -376,12 +376,13 @@ class Module(orchestrator.Orchestrator, MgrModule):
                 try:
                     inv = load_inventory()
                     if channel is None:
-                        channel = bridge.Channel(
-                            inv['fsid'], self.get_mgr_id(), leadership, self._mon_command,
+                        c = bridge.Channel(
+                            inv['fsid'], self.get_mgr_id(), leadership, bridge_cmds,
                             bridge.server_context(os.path.join(TALOS_DIR, 'agent-ca.crt'), os.path.join(TALOS_DIR, 'mgr-server.crt'),
                                                   os.path.join(TALOS_DIR, 'mgr-server.key')),
                             bridge.read(os.path.join(TALOS_DIR, 'mgr-server.key')), require_identity, self.log)
-                        channel.start()
+                        c.start()
+                        channel = c  # only a started channel; a failed start is retried
                     if leadership.capture():
                         gid, epoch = leadership.captured() or (0, 0)
                         nonce = self._heartbeat(inv, gid, epoch, nonce)
@@ -393,31 +394,28 @@ class Module(orchestrator.Orchestrator, MgrModule):
         finally:
             if channel is not None:
                 channel.stop()
+            leader_cmds.stop()
+            bridge_cmds.stop()
 
     def _heartbeat(self, inv: Dict[str, Any], gid: int, epoch: int, nonce: str) -> str:
         """Tell the local agent it is the leader's; returns the agent's session nonce."""
         mine = [h['addr'] for h in inv['hosts'] if h['name'] == self.get_mgr_id()]
         if len(mine) != 1:
             raise ValueError('this mgr\'s host %s is not one inventory host' % self.get_mgr_id())
-        conn = http.client.HTTPSConnection(mine[0], AGENT_PORT, context=tls_context(), timeout=bridge.HEARTBEAT_INTERVAL)
-        try:
-            conn.connect()
-            require_identity(conn.sock.getpeercert(), inv['fsid'], 'agent', self.get_mgr_id())
-            conn.request('POST', '/v1/heartbeat', body=bridge.heartbeat_body(inv['fsid'], self.get_mgr_id(), gid, epoch, nonce),
-                         headers={'Content-Type': 'application/json'})
-            resp = conn.getresponse()
-            body = resp.read(4096)
-            if resp.status != 200:
-                raise ValueError('agent answered %d to the heartbeat' % resp.status)
-            reply = json.loads(body)
-            if not isinstance(reply, dict) or reply.get('version') != bridge.WIRE_VERSION or not isinstance(reply.get('session'), str):
-                raise ValueError('malformed heartbeat reply')
-            return reply['session']
-        finally:
-            conn.close()
+        status, body = bridge.post_json(
+            mine[0], AGENT_PORT, tls_context(), '/v1/heartbeat', bridge.heartbeat_body(inv['fsid'], self.get_mgr_id(), gid, epoch, nonce),
+            bridge.HEARTBEAT_INTERVAL, lambda cert: require_identity(cert, inv['fsid'], 'agent', self.get_mgr_id()))
+        if status != 200:
+            raise ValueError('agent answered %d to the heartbeat' % status)
+        reply = json.loads(body)
+        if not isinstance(reply, dict) or reply.get('version') != bridge.WIRE_VERSION or not isinstance(reply.get('session'), str):
+            raise ValueError('malformed heartbeat reply')
+        return reply['session']
 
     def serve(self) -> None:
-        lead = threading.Thread(target=self._lead, name='talos-lead', daemon=True)
+        # the map this process was activated with names its own gid; later maps may not
+        lead = threading.Thread(target=self._lead, args=(self.get('mgr_map'),), name='talos-lead', daemon=True)
+        self._lead_thread = lead
         lead.start()
         while not self._poller.stop.is_set():
             try:
@@ -430,6 +428,9 @@ class Module(orchestrator.Orchestrator, MgrModule):
 
     def shutdown(self) -> None:
         self._poller.shutdown()
+        lead = getattr(self, '_lead_thread', None)
+        if lead is not None:
+            lead.join(bridge.SHUTDOWN_WAIT + bridge.HEARTBEAT_INTERVAL)
 
     def available(self) -> Tuple[bool, str, Dict[str, Any]]:
         try:
