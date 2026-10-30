@@ -112,11 +112,24 @@ type Daemon struct {
 	// DiskSerial is the OSD device's serial from Talos, recorded before prepare
 	// and checked by the prepare job right before the destructive step
 	DiskSerial string `json:"disk_serial,omitempty"`
+	// DevicePath is the disk's /dev/disk/by-id link carrying its serial, which
+	// the prepare job, the OSD daemon and zap use instead of the kernel name
+	DevicePath string `json:"device_path,omitempty"`
 	// Purged is set once the OSD is gone from the cluster, so a retried rm only wipes
 	Purged bool `json:"purged,omitempty"`
 	// LocalOnly: stopped by a forced `rm` while no mon was reachable; its
 	// cluster-side cleanup (mon remove, osd purge, auth rm) is still pending
 	LocalOnly bool `json:"local_only,omitempty"`
+}
+
+// OSDDevice is the path an OSD's device is used by: its by-id link, or the
+// kernel name for an OSD deployed before links were recorded.
+func (d Daemon) OSDDevice() string {
+	if d.DevicePath != "" {
+		return d.DevicePath
+	}
+
+	return d.Device
 }
 
 // State is the persisted cluster inventory.

@@ -19,25 +19,37 @@ for osd in json.load(sys.stdin).values():
 '
 }
 
-serial=$(lsblk -dno SERIAL "$DEVICE" | tr -d '[:space:]')
+# $DEVICE is the disk's /dev/disk/by-id link, which carries its serial: should
+# the kernel name change, the link still leads to this disk or to none
+serial=$(lsblk -dno SERIAL "$DEVICE" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
 if [ -z "$DISK_SERIAL" ] || [ "$serial" != "$DISK_SERIAL" ]; then
 	log "$DEVICE has serial '$serial', not '$DISK_SERIAL': the disk changed, refusing"
 	exit 66
 fi
 
+# ceph-volume reports an unreadable label as no label: the bluestore magic at the
+# start of the device decides, and both must agree that the device is empty
+magic=$(head -c 22 "$DEVICE" | tr -d '\0')
 before=$(labels)
-if [ -n "$before" ]; then
-	log "$DEVICE already holds an OSD ($before): zap it first, refusing"
+if [ -n "$before" ] || [ "$magic" = "bluestore block device" ]; then
+	log "$DEVICE already holds an OSD (${before:-a bluestore label ceph-volume could not read}): zap it first, refusing"
 	exit 67
 fi
 
 log "preparing $DEVICE (serial $serial) as a new bluestore OSD of $FSID"
-ceph-volume raw prepare --bluestore --data "$DEVICE"
+prep=$(ceph-volume raw prepare --bluestore --data "$DEVICE" 2>&1 | tee /dev/stderr)
 
+# the uuid this very run registered with `ceph osd new`; only that one is adopted
+new=$(sed -n 's/.* osd new \([0-9a-f-]\{36\}\).*/\1/p' <<<"$prep" | tail -1)
 after=$(labels)
 read -r fsid id uuid <<<"$after"
-if [ "$(wc -l <<<"$after")" != 1 ] || [ "$fsid" != "$FSID" ] || [ -z "$id" ] || [ -z "$uuid" ]; then
-	log "after prepare $DEVICE holds '$after': not exactly one OSD of this cluster, leaving it for reconciliation"
+if [ "$(wc -l <<<"$after")" != 1 ] || [ "$fsid" != "$FSID" ] || [ -z "$id" ] || [ -z "$uuid" ] || [ "$uuid" != "$new" ]; then
+	log "after prepare $DEVICE holds '$after' (this run registered '$new'): not the OSD this run created, leaving it for reconciliation"
+	exit 68
+fi
+
+if [ "$(lsblk -dno SERIAL "$DEVICE" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')" != "$DISK_SERIAL" ]; then
+	log "$DEVICE changed its disk during prepare, leaving it for reconciliation"
 	exit 68
 fi
 

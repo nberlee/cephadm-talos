@@ -1,6 +1,6 @@
 # ceph-osd on a raw device prepared by an osd-prepare job: activate and run.
 # No LVM: nothing to activate on the host after a reboot, the device label is the source of truth.
-keyring /var/lib/ceph/bootstrap-osd/ceph.keyring
+# no Ceph key of its own in the document: activation takes the OSD's key from the label
 mkdir -p /run/lock/lvm
 chmod 0755 /var/lib/ceph/osd
 

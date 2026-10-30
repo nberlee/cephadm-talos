@@ -710,12 +710,12 @@ func (o *Orch) deployOSD(ctx context.Context, h state.Host, device string) error
 		return fmt.Errorf("device must be a /dev path, got %q", device)
 	}
 
-	serial, err := o.diskSerial(ctx, h.Addr, device)
+	serial, byID, err := o.diskIdentity(ctx, h.Addr, device)
 	if err != nil {
 		return err
 	}
 
-	d := state.Daemon{Type: state.TypeOSD, ID: h.Name + "-" + filepath.Base(device), Host: h.Name, Device: device, DeployID: randHex(8), DiskSerial: serial}
+	d := state.Daemon{Type: state.TypeOSD, ID: h.Name + "-" + filepath.Base(device), Host: h.Name, Device: device, DeployID: randHex(8), DiskSerial: serial, DevicePath: byID}
 	if _, ok := o.St.Find("osd." + d.ID); ok {
 		return fmt.Errorf("osd on %s:%s already exists", h.Name, device)
 	}
@@ -734,11 +734,11 @@ func (o *Orch) deployOSD(ctx context.Context, h state.Host, device string) error
 	}
 
 	job := daemons.OSDPrepare(daemons.Params{
-		Name: o.St.DocName(state.Daemon{Type: "osd-prepare", ID: d.DeployID}), Image: o.St.Image, FSID: o.St.FSID, ID: "job",
-		Keyring: daemons.Keyring("client.bootstrap-osd", k), Device: device, DiskSerial: serial,
+		Name: o.osdPrepareDocName(d), Image: o.St.Image, FSID: o.St.FSID, ID: "job",
+		Keyring: daemons.Keyring("client.bootstrap-osd", k), Device: byID, DiskSerial: serial,
 	}, d.DeployID, o.osdPrepareInputs(h, d))
 
-	o.printf("preparing %s:%s (serial %s)\n", h.Name, device, serial)
+	o.printf("preparing %s:%s (%s)\n", h.Name, device, byID)
 
 	res, err := o.runJob(ctx, h.Addr, job, d.DeployID, 15*time.Minute)
 	if err != nil {
@@ -746,9 +746,11 @@ func (o *Orch) deployOSD(ctx context.Context, h state.Host, device string) error
 			h.Name, device, displayName(d), err)
 	}
 
-	id, uuid, err := parsePrepared(res.Output)
-	if err != nil {
-		return fmt.Errorf("preparing %s:%s: %w", h.Name, device, err)
+	id, uuid := 0, "dry-run"
+	if !o.Talos.DryRun {
+		if id, uuid, err = parsePrepared(res.Output); err != nil {
+			return fmt.Errorf("preparing %s:%s: %w", h.Name, device, err)
+		}
 	}
 
 	d.OSDID, d.OSDUUID = &id, uuid
@@ -760,7 +762,7 @@ func (o *Orch) deployOSD(ctx context.Context, h state.Host, device string) error
 
 	doc := daemons.OSD(daemons.Params{
 		Name: o.St.DocName(d), Image: o.St.Image, FSID: o.St.FSID, ID: d.ID, Addr: h.Addr,
-		Keyring: daemons.Keyring("client.bootstrap-osd", k), Device: device, DeployID: d.DeployID, OSDID: id, OSDUUID: uuid,
+		Device: byID, DeployID: d.DeployID, OSDID: id, OSDUUID: uuid,
 	})
 
 	if err := o.apply(ctx, h.Addr, doc); err != nil {
@@ -789,32 +791,48 @@ func (o *Orch) deployOSD(ctx context.Context, h state.Host, device string) error
 // osdPrepareInputs binds an OSD's prepare job to its cluster, host, device,
 // disk and deployment.
 func (o *Orch) osdPrepareInputs(h state.Host, d state.Daemon) string {
-	return jobInputs("osd-prepare", o.St.FSID, h.Name, d.Device, d.DiskSerial, d.DeployID)
+	return jobInputs("osd-prepare", o.St.FSID, h.Name, d.OSDDevice(), d.DiskSerial, d.DeployID)
 }
 
-// diskSerial returns the serial Talos reports for a device; a disk without one
-// cannot be bound to an OSD.
-func (o *Orch) diskSerial(ctx context.Context, node, device string) (string, error) {
+// osdPrepareDocName is the document of an OSD deployment's prepare job.
+func (o *Orch) osdPrepareDocName(d state.Daemon) string {
+	return o.St.DocName(state.Daemon{Type: "osd-prepare", ID: d.DeployID})
+}
+
+// diskIdentity returns the serial Talos reports for a device and its
+// /dev/disk/by-id link that carries that serial. A disk without both cannot be
+// bound to an OSD.
+func (o *Orch) diskIdentity(ctx context.Context, node, device string) (string, string, error) {
 	if o.Talos.DryRun {
-		return "dry-run", nil
+		return "dry-run", device, nil
 	}
 
 	disks, err := o.Talos.Disks(ctx, node)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	for _, disk := range disks {
-		if disk.TypedSpec().DevPath == device {
-			if s := strings.TrimSpace(disk.TypedSpec().Serial); s != "" {
-				return s, nil
-			}
-
-			return "", fmt.Errorf("%s has no serial number: an OSD cannot be bound to it", device)
+		ds := disk.TypedSpec()
+		if ds.DevPath != device {
+			continue
 		}
+
+		serial := strings.TrimSpace(ds.Serial)
+		if serial == "" {
+			return "", "", fmt.Errorf("%s has no serial number: an OSD cannot be bound to it", device)
+		}
+
+		for _, l := range ds.Symlinks {
+			if strings.HasPrefix(l, "/dev/disk/by-id/") && strings.Contains(l, serial) {
+				return serial, l, nil
+			}
+		}
+
+		return "", "", fmt.Errorf("%s (serial %s) has no /dev/disk/by-id link with its serial: an OSD cannot be bound to it", device, serial)
 	}
 
-	return "", fmt.Errorf("no disk %s on %s", device, node)
+	return "", "", fmt.Errorf("no disk %s on %s", device, node)
 }
 
 // parsePrepared reads the id and uuid an osd-prepare job reported.

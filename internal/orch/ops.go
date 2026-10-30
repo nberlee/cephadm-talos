@@ -525,6 +525,18 @@ func (o *Orch) Remove(ctx context.Context, name string, force, zap bool) error {
 	}
 
 	if d.Type == state.TypeOSD {
+		// a prepare job of this deployment left behind (an interrupted deploy) must
+		// be gone before its result is read, the device zapped or the deployment forgotten
+		if d.DeployID != "" {
+			if err := o.remove(ctx, h.Addr, o.osdPrepareDocName(d)); err != nil {
+				return err
+			}
+
+			if err := o.waitGone(ctx, h.Addr, o.osdPrepareDocName(d), 5*time.Minute); err != nil {
+				return err
+			}
+		}
+
 		if err := o.ensureOSDID(ctx, &d, h, force, zap); err != nil {
 			return err
 		}
@@ -617,7 +629,7 @@ func (o *Orch) Remove(ctx context.Context, name string, force, zap bool) error {
 
 		// ceph-volume zap, not `talosctl wipe disk`: bluestore keeps label copies
 		// at 1G/10G/100G/1000G that a FAST wipe of the disk start leaves behind
-		if err := o.zap(ctx, h, d.Device); err != nil {
+		if err := o.zap(ctx, h, d.OSDDevice()); err != nil {
 			return fmt.Errorf("osd removed, but wiping %s failed; re-run `cephadm-talos rm --zap %s`: %w", d.Device, name, err)
 		}
 	}
@@ -653,6 +665,11 @@ func (o *Orch) RemoveCluster(ctx context.Context, zap bool) error {
 		for _, d := range o.St.Daemons {
 			if d.Host == h.Name {
 				names[o.St.DocName(d)] = true
+
+				// an interrupted deploy's prepare job, also before its status appears
+				if d.Type == state.TypeOSD && d.DeployID != "" {
+					names[o.osdPrepareDocName(d)] = true
+				}
 			}
 		}
 
@@ -701,7 +718,7 @@ func (o *Orch) RemoveCluster(ctx context.Context, zap bool) error {
 
 			o.printf("zapping %s on %s\n", d.Device, h.Name)
 
-			if err := o.zap(ctx, h, d.Device); err != nil {
+			if err := o.zap(ctx, h, d.OSDDevice()); err != nil {
 				return err
 			}
 		}
@@ -982,7 +999,8 @@ func (o *Orch) redeployDoc(d state.Daemon, h state.Host, image string) (*spec.Co
 
 		return daemons.Mgr(p, mgrmodule.Names()...), nil
 	case state.TypeOSD:
-		p.Keyring = daemons.Keyring("client.bootstrap-osd", o.St.Keys["client.bootstrap-osd"])
+		// no key: activation takes the OSD's own key from the label
+		p.Device = d.OSDDevice()
 
 		return daemons.OSD(p), nil
 	case state.TypeRGW:

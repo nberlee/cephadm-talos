@@ -145,9 +145,7 @@ func OSD(p Params) *spec.ContainerConfig {
 		spec.HostPath("/dev", "/dev"),
 		spec.HostPath("/run/udev", "/run/udev", "ro"),
 		spec.Tmpfs("/run/lock"),
-		// not on the host volume: the bootstrap key must not outlive the container, and
 		// `ceph-volume raw activate` rebuilds the OSD dir from the device label on every start
-		spec.Tmpfs("/var/lib/ceph/bootstrap-osd"),
 		spec.Tmpfs("/var/lib/ceph/osd"),
 	)
 	c.DependsOnConfig.PathsConfig = append(c.DependsOnConfig.PathsConfig, p.Device)
