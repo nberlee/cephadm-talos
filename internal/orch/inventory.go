@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -126,13 +125,11 @@ func (o *Orch) earliestCertExpiry() (time.Time, bool) {
 	return first, !first.IsZero()
 }
 
-// publishedContent is everything the mgr module reads from the nodes, without
-// the revision: a change bumps the revision and makes every host pending.
+// publishedContent is everything the mgr module reads from the nodes (its code
+// and TLS files; the inventory is a record in the store), without the revision:
+// a change bumps the revision and makes every host pending.
 func (o *Orch) publishedContent() string {
-	b, _ := json.Marshal(o.inventory())
-
 	h := sha256.New()
-	h.Write(b)
 
 	files := mgrmodule.Files()
 
@@ -284,16 +281,6 @@ func (o *Orch) Publish(ctx context.Context) error {
 	return o.restartMgrs(ctx)
 }
 
-// inventoryDoc is the inventory file of the current published revision.
-func (o *Orch) inventoryDoc() any {
-	inv := o.inventory()
-	inv.Revision, inv.UpdatedAt = o.St.Published.Revision, o.St.Published.UpdatedAt
-
-	b, _ := json.MarshalIndent(inv, "", "  ")
-
-	return spec.EtcFile(inventoryFile, 0o644, string(b)+"\n")
-}
-
 // mgrFileDocs are the module and its TLS files on a mgr host, or their removal elsewhere.
 func (o *Orch) mgrFileDocs(h state.Host, withMgr bool) []any {
 	files := mgrmodule.Files()
@@ -338,7 +325,9 @@ func (o *Orch) hasMgr(h state.Host) bool {
 func (o *Orch) enableModule(ctx context.Context, node string) error {
 	o.printf("enabling the talos mgr module\n")
 
-	check := `ceph mgr module enable cephadm && ceph orch set backend cephadm && ` +
+	// a mgr that just started has not reported its modules yet: enabling waits for it
+	check := `for i in $(seq 60); do ceph mgr module enable cephadm 2>/dev/null && break; sleep 2; done; ` +
+		`ceph mgr module enable cephadm || exit 1; ceph orch set backend cephadm || exit 1; ` +
 		`for i in $(seq 60); do ceph orch status --format json 2>/dev/null | grep -q '"available": true' && exit 0; sleep 2; done; ` +
 		`echo "the talos orchestrator did not become available" >&2; ceph orch status >&2; exit 1`
 

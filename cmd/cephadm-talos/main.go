@@ -142,6 +142,13 @@ func run() error {
 		tc.Hosts[h.Addr] = talos.Conn{Talosconfig: h.Talosconfig, Context: h.Context}
 	}
 
+	// the cluster's state is in its mons (plan 03, item 4)
+	if !*dryRun {
+		if err := o.Open(ctx); err != nil {
+			return err
+		}
+	}
+
 	// agent certificates are renewed on every command, also read-only ones,
 	// and host documents that did not reach every host (ceph.conf, renewed
 	// certificates) are retried: until plan 03 the CLI is the only place

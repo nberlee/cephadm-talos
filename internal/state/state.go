@@ -1,8 +1,8 @@
-// Package state keeps the cluster inventory on the workstation.
-//
-// cephadm keeps the equivalent data in the mon config-key store; this PoC keeps
-// it in ~/.cephadm-talos/<fsid>/state.json instead (see SHORTCOMINGS.md) until
-// the agent moves it to config-key (ROADMAP.md, milestone 3).
+// Package state is the cluster inventory (plan 03, item 4). It lives in the mon
+// config-key store as records (internal/store), like cephadm's module store;
+// the workstation keeps only what a cephadm admin host keeps, in local.json:
+// the fsid, how to reach each node (talosconfig, context, address), the
+// operator certificate and the admin key. Daemon keys live only in mon auth.
 package state
 
 import (
@@ -134,19 +134,21 @@ func (d Daemon) OSDDevice() string {
 
 // State is the persisted cluster inventory.
 type State struct {
-	Schema      int               `json:"schema"`
-	FSID        string            `json:"fsid"`
-	Image       string            `json:"image"`        // digest reference, see orch.resolveImage
-	CephVersion string            `json:"ceph_version"` // verified by probing Image
-	Arch        string            `json:"arch"`         // uname -m of Image on the probed node
-	RGW         *RGW              `json:"rgw,omitempty"`
-	Agent       *Agent            `json:"agent,omitempty"`
-	Published   Published         `json:"published"`
-	Talosconfig string            `json:"talosconfig,omitempty"`
-	Context     string            `json:"context,omitempty"`
-	Hosts       []Host            `json:"hosts"`
-	Daemons     []Daemon          `json:"daemons"`
-	Keys        map[string]string `json:"keys"` // entity -> base64 cephx secret
+	Schema      int       `json:"schema"`
+	FSID        string    `json:"fsid"`
+	Image       string    `json:"image"`        // digest reference, see orch.resolveImage
+	CephVersion string    `json:"ceph_version"` // verified by probing Image
+	Arch        string    `json:"arch"`         // uname -m of Image on the probed node
+	RGW         *RGW      `json:"rgw,omitempty"`
+	Agent       *Agent    `json:"agent,omitempty"`
+	Published   Published `json:"published"`
+	Talosconfig string    `json:"talosconfig,omitempty"`
+	Context     string    `json:"context,omitempty"`
+	Hosts       []Host    `json:"hosts"`
+	Daemons     []Daemon  `json:"daemons"`
+	// Keys caches cephx secrets for one command (entity -> base64 secret); mon
+	// auth is authoritative, only client.admin is kept on the workstation
+	Keys map[string]string `json:"-"`
 	// ConfPending lists hosts whose ceph.conf could not be updated yet; every
 	// command retries them first
 	ConfPending []string `json:"conf_pending,omitempty"`
@@ -174,11 +176,34 @@ func New(fsid string) *State {
 		Schema: SchemaVersion,
 		FSID:   fsid,
 		Keys:   map[string]string{},
-		path:   filepath.Join(Root(), fsid, "state.json"),
+		path:   filepath.Join(Root(), fsid, "local.json"),
 	}
 }
 
-// Load reads the state of the given fsid, or the current cluster if fsid is empty.
+// Local is what the workstation keeps of a cluster.
+type Local struct {
+	Schema      int         `json:"schema"`
+	FSID        string      `json:"fsid"`
+	Talosconfig string      `json:"talosconfig,omitempty"`
+	Context     string      `json:"context,omitempty"`
+	Hosts       []LocalHost `json:"hosts"`
+	// OperatorCert and OperatorKey are the CLI's client certificate (agent CA)
+	OperatorCert string `json:"operator_cert,omitempty"`
+	OperatorKey  string `json:"operator_key,omitempty"`
+	// AdminKey is the client.admin secret, as on a cephadm admin host
+	AdminKey string `json:"admin_key,omitempty"`
+}
+
+// LocalHost is how the workstation reaches a node.
+type LocalHost struct {
+	Name        string `json:"name"`
+	Addr        string `json:"addr"`
+	Talosconfig string `json:"talosconfig,omitempty"`
+	Context     string `json:"context,omitempty"`
+}
+
+// Load reads the workstation's part of the given fsid's state, or of the current
+// cluster if fsid is empty. The cluster's part comes from the store (ApplyRecords).
 func Load(fsid string) (*State, error) {
 	if fsid == "" {
 		b, err := os.ReadFile(filepath.Join(Root(), "current"))
@@ -200,14 +225,28 @@ func Load(fsid string) (*State, error) {
 		return nil, err
 	}
 
-	st.Schema = 0
-
-	if err := json.Unmarshal(b, st); err != nil {
+	var l Local
+	if err := json.Unmarshal(b, &l); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", st.path, err)
 	}
 
-	if st.Schema != SchemaVersion {
-		return nil, fmt.Errorf("%s has state schema %d, this build needs %d: recreate the cluster (no migrations before the first release)", st.path, st.Schema, SchemaVersion)
+	if l.Schema != SchemaVersion || l.FSID != fsid {
+		return nil, fmt.Errorf("%s has schema %d for %s, this build needs %d for %s: recreate the cluster (no migrations before the first release)",
+			st.path, l.Schema, l.FSID, SchemaVersion, fsid)
+	}
+
+	st.Talosconfig, st.Context = l.Talosconfig, l.Context
+
+	for _, h := range l.Hosts {
+		st.Hosts = append(st.Hosts, Host{Name: h.Name, Addr: h.Addr, Talosconfig: h.Talosconfig, Context: h.Context})
+	}
+
+	if l.OperatorCert != "" {
+		st.Agent = &Agent{OperatorCert: l.OperatorCert, OperatorKey: l.OperatorKey}
+	}
+
+	if l.AdminKey != "" {
+		st.Keys["client.admin"] = l.AdminKey
 	}
 
 	return st, nil
@@ -216,13 +255,25 @@ func Load(fsid string) (*State, error) {
 // Dir is the per-cluster state directory (also holds ceph.conf and the admin keyring).
 func (s *State) Dir() string { return filepath.Dir(s.path) }
 
-// Save writes the state (0600, it contains every key) and marks it as current.
+// Save writes the workstation's part (0600: it holds the admin key and the
+// operator key) and marks the cluster as current. The cluster's part is
+// published to the store by the caller (Records).
 func (s *State) Save() error {
 	if err := os.MkdirAll(s.Dir(), 0o700); err != nil {
 		return err
 	}
 
-	b, err := json.MarshalIndent(s, "", "  ")
+	l := Local{Schema: SchemaVersion, FSID: s.FSID, Talosconfig: s.Talosconfig, Context: s.Context, AdminKey: s.Keys["client.admin"]}
+
+	for _, h := range s.Hosts {
+		l.Hosts = append(l.Hosts, LocalHost{Name: h.Name, Addr: h.Addr, Talosconfig: h.Talosconfig, Context: h.Context})
+	}
+
+	if s.Agent != nil {
+		l.OperatorCert, l.OperatorKey = s.Agent.OperatorCert, s.Agent.OperatorKey
+	}
+
+	b, err := json.MarshalIndent(l, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -236,6 +287,106 @@ func (s *State) Save() error {
 	}
 
 	return os.WriteFile(filepath.Join(Root(), "current"), []byte(s.FSID+"\n"), 0o600)
+}
+
+// cluster is the cluster-wide record: everything but hosts and daemons.
+type cluster struct {
+	Schema      int       `json:"schema"`
+	FSID        string    `json:"fsid"`
+	Image       string    `json:"image"`
+	CephVersion string    `json:"ceph_version"`
+	Arch        string    `json:"arch"`
+	RGW         *RGW      `json:"rgw,omitempty"`
+	Agent       *Agent    `json:"agent,omitempty"`
+	Published   Published `json:"published"`
+	ConfPending []string  `json:"conf_pending,omitempty"`
+	RGWPending  []string  `json:"rgw_pending,omitempty"`
+}
+
+// Records returns the cluster's part of the state as store records: what the
+// workstation keeps (how to reach nodes, the operator certificate, keys) is not
+// in them.
+func (s *State) Records() (map[string][]byte, error) {
+	c := cluster{
+		Schema: SchemaVersion, FSID: s.FSID, Image: s.Image, CephVersion: s.CephVersion, Arch: s.Arch,
+		RGW: s.RGW, Published: s.Published, ConfPending: s.ConfPending, RGWPending: s.RGWPending,
+	}
+
+	if s.Agent != nil {
+		a := *s.Agent
+		a.OperatorCert, a.OperatorKey = "", ""
+		c.Agent = &a
+	}
+
+	hosts := make([]Host, len(s.Hosts))
+	for i, h := range s.Hosts {
+		h.Talosconfig, h.Context = "", ""
+		hosts[i] = h
+	}
+
+	out := map[string][]byte{}
+
+	for name, v := range map[string]any{"cluster": c, "hosts": hosts, "daemons": s.Daemons} {
+		b, err := json.Marshal(v)
+		if err != nil {
+			return nil, err
+		}
+
+		out[name] = b
+	}
+
+	return out, nil
+}
+
+// ApplyRecords replaces the cluster's part of the state with the store's records,
+// keeping what the workstation holds (node connections, operator certificate, keys).
+func (s *State) ApplyRecords(recs map[string][]byte) error {
+	var (
+		c       cluster
+		hosts   []Host
+		daemons []Daemon
+	)
+
+	for name, v := range map[string]any{"cluster": &c, "hosts": &hosts, "daemons": &daemons} {
+		b, ok := recs[name]
+		if !ok {
+			return fmt.Errorf("state: record %s missing", name)
+		}
+
+		if err := json.Unmarshal(b, v); err != nil {
+			return fmt.Errorf("state: record %s: %w", name, err)
+		}
+	}
+
+	if c.Schema != SchemaVersion || c.FSID != s.FSID {
+		return fmt.Errorf("state: the store holds schema %d for %s, this build needs %d for %s", c.Schema, c.FSID, SchemaVersion, s.FSID)
+	}
+
+	local := map[string]Host{}
+	for _, h := range s.Hosts {
+		local[h.Name] = h
+	}
+
+	for i := range hosts {
+		if l, ok := local[hosts[i].Name]; ok {
+			hosts[i].Talosconfig, hosts[i].Context = l.Talosconfig, l.Context
+		}
+	}
+
+	var operator *Agent
+	if s.Agent != nil {
+		operator = s.Agent
+	}
+
+	s.Image, s.CephVersion, s.Arch, s.RGW, s.Published = c.Image, c.CephVersion, c.Arch, c.RGW, c.Published
+	s.ConfPending, s.RGWPending, s.Hosts, s.Daemons = c.ConfPending, c.RGWPending, hosts, daemons
+	s.Agent = c.Agent
+
+	if s.Agent != nil && operator != nil {
+		s.Agent.OperatorCert, s.Agent.OperatorKey = operator.OperatorCert, operator.OperatorKey
+	}
+
+	return nil
 }
 
 // Short is the fsid prefix used in Talos document names (names are limited to 63 chars).

@@ -997,14 +997,24 @@ func (o *Orch) redeployDoc(d state.Daemon, h state.Host, image string) (*spec.Co
 
 	switch d.Type {
 	case state.TypeMon:
-		p.Keyring = daemons.Keyring("mon.", o.St.Keys["mon."], "mon", "allow *") + adm
+		monKey, err := o.key("mon.")
+		if err != nil {
+			return nil, err
+		}
+
+		p.Keyring = daemons.Keyring("mon.", monKey, "mon", "allow *") + adm
 		p.Mode = "join"
 		p.Addrv = monAddrv(h.Addr)
 		p.DeployID = d.DeployID
 
 		return daemons.Mon(p), nil
 	case state.TypeMgr:
-		p.Keyring = daemons.Keyring("mgr."+d.ID, o.St.Keys["mgr."+d.ID])
+		k, err := o.key("mgr." + d.ID)
+		if err != nil {
+			return nil, err
+		}
+
+		p.Keyring = daemons.Keyring("mgr."+d.ID, k)
 
 		return daemons.Mgr(p, mgrmodule.Names()...), nil
 	case state.TypeOSD:
@@ -1013,7 +1023,12 @@ func (o *Orch) redeployDoc(d state.Daemon, h state.Host, image string) (*spec.Co
 
 		return daemons.OSD(p), nil
 	case state.TypeRGW:
-		p.Keyring = daemons.Keyring("client.rgw."+d.ID, o.St.Keys["client.rgw."+d.ID])
+		k, err := o.key("client.rgw." + d.ID)
+		if err != nil {
+			return nil, err
+		}
+
+		p.Keyring = daemons.Keyring("client.rgw."+d.ID, k)
 		p.Port, p.TLSPEM = o.St.RGW.Port, o.St.RGW.Cert+o.St.RGW.Key
 
 		return daemons.RGW(p), nil

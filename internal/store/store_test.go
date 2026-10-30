@@ -6,95 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
 	"strconv"
-	"strings"
-	"sync"
 	"testing"
 	"time"
 )
 
-// mem is a config-key store in memory that enforces the entry size.
-type mem struct {
-	mu    sync.Mutex
-	m     map[string][]byte
-	limit int
-}
-
-func (b *mem) EntryLimit() int {
-	if b.limit == 0 {
-		return 64 << 10
-	}
-
-	return b.limit
-}
-
-func (b *mem) Get(_ context.Context, k string) ([]byte, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	v, ok := b.m[k]
-	if !ok {
-		return nil, ErrNotFound
-	}
-
-	return append([]byte(nil), v...), nil
-}
-
-func (b *mem) Set(_ context.Context, k string, v []byte) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	if len(v) > b.EntryLimit() {
-		return errors.New("entry too large")
-	}
-
-	if b.m == nil {
-		b.m = map[string][]byte{}
-	}
-
-	b.m[k] = append([]byte(nil), v...)
-
-	return nil
-}
-
-func (b *mem) SetMany(ctx context.Context, kvs []KV) error {
-	for _, kv := range kvs {
-		if err := b.Set(ctx, kv.Key, kv.Value); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (b *mem) Remove(_ context.Context, keys []string) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	for _, k := range keys {
-		delete(b.m, k)
-	}
-
-	return nil
-}
-
-func (b *mem) List(_ context.Context, prefix string) ([]string, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	var out []string
-
-	for k := range b.m {
-		if strings.HasPrefix(k, prefix) {
-			out = append(out, k)
-		}
-	}
-
-	sort.Strings(out)
-
-	return out, nil
-}
+// mem is the in-memory backend with the limit field the tests set.
+type mem = Memory
 
 func TestPublishAndRead(t *testing.T) {
 	ctx := context.Background()
@@ -226,7 +144,7 @@ func TestNamesAreChecked(t *testing.T) {
 
 func TestChunksFollowTheConfiguredLimit(t *testing.T) {
 	ctx := context.Background()
-	b := &mem{limit: 8 << 10}
+	b := &mem{Limit: 8 << 10}
 	s := Store{B: b, Incarnation: "cli"}
 
 	m, err := s.Publish(ctx, map[string][]byte{"big": bytes.Repeat([]byte("y"), 50<<10)})
@@ -238,7 +156,7 @@ func TestChunksFollowTheConfiguredLimit(t *testing.T) {
 		t.Fatalf("%d bytes %v", len(v), err)
 	}
 
-	if _, err := (Store{B: &mem{limit: 1024}, Incarnation: "cli"}).Publish(ctx, map[string][]byte{"a": nil}); err == nil {
+	if _, err := (Store{B: &mem{Limit: 1024}, Incarnation: "cli"}).Publish(ctx, map[string][]byte{"a": nil}); err == nil {
 		t.Error("published below the minimum entry size")
 	}
 }

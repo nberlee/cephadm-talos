@@ -225,10 +225,7 @@ func TestRenewalPushIsRetriedAfterAFailure(t *testing.T) {
 	}
 
 	// the renewed certificate and the pending host survive a reload of the state
-	st, err := state.Load(o.St.FSID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	st := reload(t, o)
 
 	h, _ := st.Host("due")
 	if h.AgentCert == due.AgentCert || len(st.ConfPending) != 1 {

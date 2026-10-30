@@ -118,8 +118,9 @@ func TestMgrFilesOnlyOnMgrHosts(t *testing.T) {
 		}
 	}
 
-	if on[inventoryFile] != "write" || off[inventoryFile] != "write" {
-		t.Errorf("inventory not on every host: %q %q", on[inventoryFile], off[inventoryFile])
+	// the inventory is a record in the store (plan 03, item 4), on no host
+	if on[inventoryFile] != "" || off[inventoryFile] != "" {
+		t.Errorf("inventory file on a host: %q %q", on[inventoryFile], off[inventoryFile])
 	}
 }
 
@@ -150,18 +151,31 @@ func TestPublishBumpsAndRetries(t *testing.T) {
 		t.Fatalf("unchanged inventory republished (%d -> %d, %v)", rev, o.St.Published.Revision, err)
 	}
 
-	// a change whose push fails stays pending, saved with the new revision
+	// a daemon change is a store record only: nothing to push
 	o.St.AddDaemon(state.Daemon{Type: state.TypeMon, ID: "h1", Host: "h1"})
+
+	if err := o.Publish(ctx); err != nil || o.St.Published.Revision != rev {
+		t.Fatalf("a daemon change republished (%d -> %d, %v)", rev, o.St.Published.Revision, err)
+	}
+
+	// a change of the mgr's files (its certificates) whose push fails stays
+	// pending, saved with the new revision
+	o.St.AddDaemon(state.Daemon{Type: state.TypeMgr, ID: "h1", Host: "h1"})
+
+	h, _ = o.St.Host("h1")
+	if err := o.ensureMgrCerts(&h, true); err != nil {
+		t.Fatal(err)
+	}
+
+	o.St.AddHost(h)
+
 	f.FailAfterApply = status.Error(codes.Unavailable, "connection lost")
 
 	if err := o.Publish(ctx); err == nil {
 		t.Fatal("failed push not reported")
 	}
 
-	st, err := state.Load(o.St.FSID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	st := reload(t, o)
 
 	if st.Published.Revision != rev+1 || len(st.ConfPending) != 1 {
 		t.Fatalf("after reload: revision %d (want %d), pending %v", st.Published.Revision, rev+1, st.ConfPending)
@@ -178,8 +192,8 @@ func TestPublishBumpsAndRetries(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !strings.Contains(cfg, `"revision": 2`) && !strings.Contains(cfg, `\"revision\": 2`) {
-		t.Errorf("node does not have revision %d:\n%s", rev+1, cfg)
+	if !strings.Contains(cfg, mgrServerCertFile) {
+		t.Errorf("node does not have the mgr's new files:\n%s", cfg)
 	}
 }
 
@@ -359,10 +373,7 @@ func TestPublishInterruptedBeforeThePatch(t *testing.T) {
 		t.Fatal("failed push not reported")
 	}
 
-	st, err := state.Load(o.St.FSID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	st := reload(t, o)
 
 	if st.Published.Revision != 1 || len(st.ConfPending) != 1 {
 		t.Fatalf("after reload: revision %d, pending %v", st.Published.Revision, st.ConfPending)
@@ -375,7 +386,7 @@ func TestPublishInterruptedBeforeThePatch(t *testing.T) {
 	}
 
 	cfg, err := o.Talos.MachineConfig(ctx, "node")
-	if err != nil || !strings.Contains(cfg, "ceph/talos/inventory.json") {
-		t.Errorf("inventory not on the node after the retry (%v)", err)
+	if err != nil || !strings.Contains(cfg, "ceph/ceph.conf") {
+		t.Errorf("host documents not on the node after the retry (%v)", err)
 	}
 }

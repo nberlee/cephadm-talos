@@ -31,6 +31,25 @@ from talos import module as m  # noqa: E402
 NOW = datetime.datetime(2026, 10, 28, 12, 0, tzinfo=datetime.timezone.utc)
 
 
+def store_entries(inv, seq=1, chunk=60 << 10, incarnation='cli'):
+    """The module store entries internal/store writes for an inventory record,
+    keyed as get_store_prefix returns them (without mgr/cephadm/)."""
+    import base64
+    import hashlib
+    data = (inv if isinstance(inv, str) else json.dumps(inv)).encode()
+    enc = base64.b64encode(data).decode()
+    base = 'talos/inc/%s/' % incarnation
+    entries, chunks = {}, []
+    for i in range(max(1, -(-len(enc) // chunk))):
+        key = '%srec/%d/inventory.%d' % (base, seq, i)
+        entries[key] = enc[i * chunk:(i + 1) * chunk]
+        chunks.append('mgr/cephadm/' + key)
+    entries['%smanifest/%020d' % (base, seq)] = json.dumps({
+        'schema': 1, 'incarnation': incarnation, 'seq': seq,
+        'records': {'inventory': {'chunks': chunks, 'sha256': hashlib.sha256(data).hexdigest(), 'size': len(data)}}})
+    return entries
+
+
 def inventory(**extra):
     inv = {
         'schema': 1, 'revision': 3, 'updated_at': '2026-10-28T11:59:00.123456789Z', 'fsid': 'f',
@@ -136,33 +155,40 @@ class Daemons(unittest.TestCase):
 
 
 class Inventory(unittest.TestCase):
-    def write(self, obj):
-        f = tempfile.NamedTemporaryFile('w', suffix='.json', delete=False)
-        json.dump(obj, f) if not isinstance(obj, str) else f.write(obj)
-        f.close()
-        self.addCleanup(os.unlink, f.name)
-        return f.name
-
     def test_invalid_inventory_fails(self):
         for bad in ('not json', {'schema': 2, 'hosts': [], 'daemons': []}, {'schema': 1, 'hosts': []},
                     inventory(daemons=[{'doc_name': 'x'}])):
             with self.assertRaises(m.InventoryError):
-                m.load_inventory(self.write(bad))
+                m.inventory_from_store(store_entries(bad))
 
     def test_valid_inventory(self):
-        self.assertEqual(m.load_inventory(self.write(inventory()))['revision'], 3)
+        self.assertEqual(m.inventory_from_store(store_entries(inventory()))['revision'], 3)
+
+    def test_store_reading(self):
+        entries = store_entries(inventory(), seq=5, chunk=40)
+        entries.update(store_entries(inventory(revision=9), seq=7, chunk=40))
+        self.assertEqual(m.inventory_from_store(entries)['revision'], 9)  # the latest manifest
+        with self.assertRaises(m.InventoryError):
+            m.inventory_from_store({})
+        with self.assertRaises(m.InventoryError):
+            m.inventory_from_store(store_entries(inventory(), incarnation='other'))
+        broken = store_entries(inventory(), chunk=40)
+        first = sorted(k for k in broken if '/rec/' in k)[0]
+        broken[first] = broken[first][:-4] + 'AAAA'
+        with self.assertRaises(m.InventoryError):
+            m.inventory_from_store(broken)
 
     def test_available_details(self):
-        path = self.write(inventory(cert_expiry='2029-10-28T00:00:00Z'))
+        entries = store_entries(inventory(cert_expiry='2029-10-28T00:00:00Z'))
         mod = object.__new__(m.Module)
-        old = (m.INVENTORY, m.utcnow)
-        m.INVENTORY = path
+        mod.get_store_prefix = lambda prefix: {k: v for k, v in entries.items() if k.startswith(prefix)}
+        old = m.utcnow
         # updated_at is 11:59:00.123 and the clock says 12:00:00
         m.utcnow = lambda: NOW
         try:
             ok, why, details = m.Module.available(mod)
         finally:
-            m.INVENTORY, m.utcnow = old
+            m.utcnow = old
         self.assertTrue(ok, why)
         self.assertEqual(details['inventory_revision'], 3)
         self.assertEqual(details['inventory_age_seconds'], 59)
@@ -198,12 +224,8 @@ class BadParts(unittest.TestCase):
                     inventory(hosts=[{'name': 'h1', 'addr': 1}]),
                     inventory(hosts=[{'name': 'h1', 'addr': 'a'}, {'name': 'h1', 'addr': 'b'}]),
                     inventory(hosts=[{'name': 'h1', 'addr': 'a'}])):  # daemons on unknown hosts
-            f = tempfile.NamedTemporaryFile('w', suffix='.json', delete=False)
-            json.dump(bad, f)
-            f.close()
-            self.addCleanup(os.unlink, f.name)
             with self.assertRaises(m.InventoryError):
-                m.load_inventory(f.name)
+                m.inventory_from_store(store_entries(bad))
 
 
 @unittest.skipUnless(shutil.which('openssl'), 'needs openssl')

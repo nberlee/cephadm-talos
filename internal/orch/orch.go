@@ -3,8 +3,10 @@
 package orch
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -23,6 +25,7 @@ import (
 	"github.com/nberlee/cephadm-talos/internal/pki"
 	"github.com/nberlee/cephadm-talos/internal/spec"
 	"github.com/nberlee/cephadm-talos/internal/state"
+	"github.com/nberlee/cephadm-talos/internal/store"
 	"github.com/nberlee/cephadm-talos/internal/talos"
 )
 
@@ -40,6 +43,66 @@ type Orch struct {
 	Out   io.Writer
 	// SkipVersionCheck skips the Talos and Ceph version gates (testing only)
 	SkipVersionCheck bool
+
+	// st is the cluster's state in the store, once a mon answers (plan 03, item 4)
+	st *store.Store
+	// StoreBackend replaces config-key through exec (tests)
+	StoreBackend store.Backend
+	// AuthGet replaces `auth get` through exec (tests)
+	AuthGet func(entity string) (key string, found bool, err error)
+}
+
+// Incarnation is the store namespace the CLI publishes in until the leader
+// takes over (plan 03, step 4).
+const Incarnation = "cli"
+
+// Open reads the cluster's state from the store through the first node that
+// answers, after state.Load read the workstation's part.
+func (o *Orch) Open(ctx context.Context) error {
+	var errs []error
+
+	for _, h := range o.St.Hosts {
+		if err := o.openStore(ctx, h.Addr); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", h.Name, err))
+
+			continue
+		}
+
+		m, err := o.st.Latest(ctx)
+		if err != nil {
+			return fmt.Errorf("reading the cluster state: %w", err)
+		}
+
+		recs := map[string][]byte{}
+
+		for name := range m.Records {
+			if recs[name], err = o.st.Read(ctx, m, name); err != nil {
+				return fmt.Errorf("reading the cluster state: %w", err)
+			}
+		}
+
+		return o.St.ApplyRecords(recs)
+	}
+
+	return fmt.Errorf("no node with a running Ceph daemon and a mon answers; the cluster state is in its mons: %w", errors.Join(errs...))
+}
+
+// openStore opens the store through a Ceph container on node.
+func (o *Orch) openStore(ctx context.Context, node string) error {
+	if o.StoreBackend != nil {
+		o.st = &store.Store{B: o.StoreBackend, Incarnation: Incarnation}
+
+		return nil
+	}
+
+	ck, err := o.configKeys(ctx, node, store.Prefix+"inc/"+Incarnation+"/")
+	if err != nil {
+		return err
+	}
+
+	o.st = &store.Store{B: ck, Incarnation: Incarnation}
+
+	return nil
 }
 
 func (o *Orch) printf(format string, args ...any) { fmt.Fprintf(o.Out, format, args...) }
@@ -61,9 +124,30 @@ func randHex(n int) string {
 }
 
 // key returns the secret of an entity, generating it on first use.
+// key returns an entity's cephx secret: mon auth is authoritative (plan 03,
+// item 4), read with `auth get` once a mon answers; a new entity, or any before
+// the first mon exists (bootstrap), gets a new secret, which its caller imports.
 func (o *Orch) key(entity string) (string, error) {
 	if k, ok := o.St.Keys[entity]; ok {
 		return k, nil
+	}
+
+	if o.st != nil && !o.Talos.DryRun {
+		get := o.authGet
+		if o.AuthGet != nil {
+			get = o.AuthGet
+		}
+
+		k, found, err := get(entity)
+		if err != nil {
+			return "", err
+		}
+
+		if found {
+			o.St.Keys[entity] = k
+
+			return k, nil
+		}
 	}
 
 	k, err := cephx.NewKey()
@@ -74,6 +158,43 @@ func (o *Orch) key(entity string) (string, error) {
 	o.St.Keys[entity] = k
 
 	return k, nil
+}
+
+// authGet reads an entity's secret from mon auth.
+func (o *Orch) authGet(entity string) (string, bool, error) {
+	adm, err := o.adminHost()
+	if err != nil {
+		return "", false, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), configKeyTimeout)
+	defer cancel()
+
+	var out, errb bytes.Buffer
+
+	rc, _, err := o.execAdmin(ctx, adm.Addr, []string{"ceph", "auth", "get", entity, "--format", "json"}, nil, &out, &errb)
+	if err != nil {
+		return "", false, err
+	}
+
+	if rc == 2 { // ENOENT
+		return "", false, nil
+	}
+
+	if rc != 0 {
+		return "", false, fmt.Errorf("auth get %s: rc %d: %s", entity, rc, strings.TrimSpace(errb.String()))
+	}
+
+	var ents []struct {
+		Entity string `json:"entity"`
+		Key    string `json:"key"`
+	}
+
+	if err := json.Unmarshal(out.Bytes(), &ents); err != nil || len(ents) != 1 || ents[0].Entity != entity || ents[0].Key == "" {
+		return "", false, fmt.Errorf("auth get %s: unexpected answer", entity)
+	}
+
+	return ents[0].Key, true, nil
 }
 
 // monAddrv is the mon address vector; IPv6 addresses need brackets.
@@ -198,7 +319,6 @@ func (o *Orch) remove(ctx context.Context, node, name string) error {
 // /var/lib/ceph volume, ceph.conf and the node agent.
 func (o *Orch) hostDocs(h state.Host) []any {
 	docs := append([]any{spec.CephVolume(), spec.CephConf(o.CephConf())}, o.agentDocs(h)...)
-	docs = append(docs, o.inventoryDoc())
 
 	return append(docs, o.mgrFileDocs(h, o.hasMgr(h))...)
 }
@@ -341,12 +461,42 @@ func (o *Orch) addHost(ctx context.Context, addr string, apply bool) (state.Host
 	return h, o.save()
 }
 
+// save writes the workstation's part and, once a mon answers, publishes the
+// cluster's part (with the mgr module's inventory) to the store.
 func (o *Orch) save() error {
 	if o.Talos.DryRun {
 		return nil
 	}
 
-	return o.St.Save()
+	if err := o.St.Save(); err != nil {
+		return err
+	}
+
+	if o.st == nil {
+		return nil // bootstrap, before the first mon: published once it answers
+	}
+
+	recs, err := o.St.Records()
+	if err != nil {
+		return err
+	}
+
+	// the mgr module's inventory (plan 02's schema), now a record of the state
+	inv := o.inventory()
+	inv.Revision, inv.UpdatedAt = o.St.Published.Revision, time.Now().UTC()
+
+	if recs["inventory"], err = json.Marshal(inv); err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), configKeyTimeout)
+	defer cancel()
+
+	if _, err := o.st.Publish(ctx, recs); err != nil {
+		return fmt.Errorf("publishing the cluster state: %w", err)
+	}
+
+	return nil
 }
 
 // RemoveHost forgets a host. It refuses while daemons are still placed on it.
@@ -501,6 +651,17 @@ func (o *Orch) Bootstrap(ctx context.Context, addr, image, agentImage string, re
 
 	if _, err := o.Job(ctx, h.Addr, "timeout 300 ceph -s", 10*time.Minute); err != nil {
 		return err
+	}
+
+	// from here on the cluster's state lives in the mons: the first publication
+	if !o.Talos.DryRun {
+		if err := o.openStore(ctx, h.Addr); err != nil {
+			return err
+		}
+
+		if err := o.save(); err != nil {
+			return err
+		}
 	}
 
 	if !o.Talos.DryRun {

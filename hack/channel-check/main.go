@@ -23,8 +23,10 @@ import (
 	"time"
 
 	"github.com/nberlee/cephadm-talos/internal/agent"
+	"github.com/nberlee/cephadm-talos/internal/orch"
 	"github.com/nberlee/cephadm-talos/internal/pki"
 	"github.com/nberlee/cephadm-talos/internal/state"
+	"github.com/nberlee/cephadm-talos/internal/talos"
 	"github.com/nberlee/cephadm-talos/internal/wire"
 )
 
@@ -38,6 +40,14 @@ func main() {
 func run(mgrHost, agentHost string) error {
 	st, err := state.Load("") // the current cluster
 	if err != nil {
+		return err
+	}
+
+	tc := &talos.Client{Default: talos.Conn{Talosconfig: st.Talosconfig, Context: st.Context}}
+	defer tc.Close() //nolint:errcheck
+
+	// the certificates are in the cluster's state, in its mons
+	if err := (&orch.Orch{Talos: tc, St: st, Out: os.Stderr}).Open(context.Background()); err != nil {
 		return err
 	}
 

@@ -15,6 +15,7 @@ import (
 
 	"github.com/nberlee/cephadm-talos/internal/daemons"
 	"github.com/nberlee/cephadm-talos/internal/state"
+	"github.com/nberlee/cephadm-talos/internal/store"
 	"github.com/nberlee/cephadm-talos/internal/talos"
 	"github.com/nberlee/cephadm-talos/internal/talos/talostest"
 )
@@ -64,7 +65,37 @@ func fakeOrch(t *testing.T, f *talostest.Node) *Orch {
 	st := state.New("eb8dac3e-0ba7-4795-8feb-a80e8593331f")
 	st.Image, st.CephVersion, st.Arch = "quay.io/ceph/ceph@sha256:abc", SupportedCeph, SupportedArch
 
-	return &Orch{Talos: tc, St: st, Out: io.Discard}
+	o := &Orch{Talos: tc, St: st, Out: io.Discard, StoreBackend: &store.Memory{}, AuthGet: noAuth}
+	if err := o.openStore(context.Background(), ""); err != nil {
+		t.Fatal(err)
+	}
+
+	return o
+}
+
+// noAuth is mon auth without entities: every key is new.
+func noAuth(string) (string, bool, error) { return "", false, nil }
+
+// reload reads the state back as the next command would: the workstation's
+// part from disk, the cluster's part from the (memory) store.
+func reload(t *testing.T, o *Orch) *state.State {
+	t.Helper()
+
+	st, err := state.Load(o.St.FSID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	next := &Orch{Talos: o.Talos, St: st, Out: io.Discard, StoreBackend: o.StoreBackend, AuthGet: noAuth}
+	if len(st.Hosts) == 0 {
+		st.Hosts = []state.Host{{Name: "contact"}} // Open needs a node to go through
+	}
+
+	if err := next.Open(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	return st
 }
 
 func TestGatesAtOperationBoundaries(t *testing.T) {

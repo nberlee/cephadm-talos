@@ -10,7 +10,9 @@ ls` and `orch ps`. Everything else stays unimplemented: writes go through the
 cephadm-talos CLI (docs/plans/02-agents-and-read-path.md).
 """
 
+import base64
 import datetime
+import hashlib
 import http.client
 import json
 import os
@@ -32,7 +34,6 @@ from . import bridge
 TalosCLICommand = CLICommandBase.make_registry_subtype("TalosCLICommand")
 
 TALOS_DIR = '/etc/ceph/talos'
-INVENTORY = os.path.join(TALOS_DIR, 'inventory.json')
 INVENTORY_SCHEMA = 1
 RECORD_SCHEMA = 1
 AGENT_PORT = 4721
@@ -70,14 +71,50 @@ def _str(v: Any) -> bool:
     return isinstance(v, str) and v != ''
 
 
-def load_inventory(path: Optional[str] = None) -> Dict[str, Any]:
-    """Read and check the inventory; every problem is an InventoryError."""
-    path = path or INVENTORY
+# The cluster state lives in the module's store (plan 03, item 4, internal/store):
+# talos/inc/<incarnation>/manifest/<seq> names base64 chunks of each record.
+STORE_PREFIX = 'talos/inc/'
+STORE_SCHEMA = 1
+# the CLI publishes until the leader takes over (plan 03, step 4)
+INCARNATION = 'cli'
+MODULE_PREFIX = 'mgr/cephadm/'
+
+
+def inventory_from_store(entries: Dict[str, str], incarnation: str = INCARNATION) -> Dict[str, Any]:
+    """Read the inventory record of an incarnation's latest manifest from a snapshot
+    of the module's store (get_store_prefix); every problem is an InventoryError."""
+    base = STORE_PREFIX + incarnation + '/'
+    seqs = {}
+    for k in entries:
+        if k.startswith(base + 'manifest/'):
+            try:
+                seqs[int(k[len(base) + len('manifest/'):])] = k
+            except ValueError:
+                continue
+    if not seqs:
+        raise InventoryError('no cluster state published in the store (%s)' % base)
+    key = seqs[max(seqs)]
     try:
-        with open(path) as f:
-            inv = json.load(f)
-    except (OSError, ValueError) as e:
-        raise InventoryError('cannot read %s: %s' % (path, e))
+        m = json.loads(entries[key])
+        if m.get('schema') != STORE_SCHEMA or m.get('incarnation') != incarnation or m.get('seq') != max(seqs):
+            raise ValueError('unexpected manifest %r' % {k: m.get(k) for k in ('schema', 'incarnation', 'seq')})
+        e = m['records']['inventory']
+        enc = ''
+        for c in e['chunks']:
+            if not c.startswith(MODULE_PREFIX + base + 'rec/'):
+                raise ValueError('chunk %s outside the incarnation' % c)
+            enc += entries[c[len(MODULE_PREFIX):]]
+        data = base64.b64decode(enc, validate=True)
+        if hashlib.sha256(data).hexdigest() != e['sha256'] or len(data) != e['size']:
+            raise ValueError('inventory does not match its manifest')
+        inv = json.loads(data)
+    except (KeyError, TypeError, ValueError) as e:
+        raise InventoryError('cannot read the inventory from %s: %s' % (key, e))
+    return check_inventory(inv, key)
+
+
+def check_inventory(inv: Any, path: str) -> Dict[str, Any]:
+    """Check an inventory; every problem is an InventoryError."""
     if not isinstance(inv, dict) or inv.get('schema') != INVENTORY_SCHEMA:
         raise InventoryError('%s has schema %r, this module needs %d' % (
             path, inv.get('schema') if isinstance(inv, dict) else None, INVENTORY_SCHEMA))
@@ -353,11 +390,14 @@ class Module(orchestrator.Orchestrator, MgrModule):
         self._poller = Poller(self._fetch)
 
     def _fetch(self, addr: str, refresh: bool) -> Dict[str, Any]:
-        inv = load_inventory()
+        inv = self._inventory()
         names = [h['name'] for h in inv['hosts'] if h['addr'] == addr]
         if len(names) != 1:
             raise ValueError('address %s is not one inventory host' % addr)
         return fetch_record(addr, tls_context(), refresh=refresh, expect=(inv['fsid'], names[0]))
+
+    def _inventory(self) -> Dict[str, Any]:
+        return inventory_from_store(self.get_store_prefix(STORE_PREFIX))
 
     def _send_mon(self, result: Any, cmd: str) -> None:
         self.send_command(result, 'mon', '', cmd, '')
@@ -374,7 +414,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
         try:
             while not self._poller.stop.is_set():
                 try:
-                    inv = load_inventory()
+                    inv = self._inventory()
                     if channel is None:
                         c = bridge.Channel(
                             inv['fsid'], self.get_mgr_id(), leadership, bridge_cmds,
@@ -419,7 +459,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
         lead.start()
         while not self._poller.stop.is_set():
             try:
-                self._poller.poll(load_inventory()['hosts'])
+                self._poller.poll(self._inventory()['hosts'])
             except InventoryError as e:
                 self.log.warning('%s', e)
             except Exception:  # polling must survive anything
@@ -434,7 +474,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
 
     def available(self) -> Tuple[bool, str, Dict[str, Any]]:
         try:
-            inv = load_inventory()
+            inv = self._inventory()
         except InventoryError as e:
             return False, str(e), {}
         details: Dict[str, Any] = {'inventory_revision': inv.get('revision')}
@@ -447,13 +487,13 @@ class Module(orchestrator.Orchestrator, MgrModule):
 
     @handle_orch_error
     def get_hosts(self) -> List[HostSpec]:
-        return build_hosts(load_inventory())
+        return build_hosts(self._inventory())
 
     @handle_orch_error
     def list_daemons(self, service_name: Optional[str] = None, daemon_type: Optional[str] = None,
                      daemon_id: Optional[str] = None, host: Optional[str] = None,
                      refresh: bool = False) -> List[DaemonDescription]:
-        inv = load_inventory()
+        inv = self._inventory()
         if refresh:
             self._poller.poll(inv['hosts'], refresh=True)
         daemons = build_daemons(inv, self._poller.snapshot(), utcnow())
