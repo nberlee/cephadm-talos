@@ -33,16 +33,16 @@ func TestShellJoin(t *testing.T) {
 	}
 }
 
-func TestParseOSDMarker(t *testing.T) {
-	logs := "CEPHADM-TALOS-OSD-ID=old 1 uuid-old\nnoise\nCEPHADM-TALOS-OSD-ID=new 4 uuid-a\nCEPHADM-TALOS-OSD-ID=new 4 uuid-b\n"
-
-	id, uuid, ok := parseOSDMarker(logs, "new")
-	if !ok || id != 4 || uuid != "uuid-b" {
-		t.Fatalf("got %d %q %v", id, uuid, ok)
+func TestParsePrepared(t *testing.T) {
+	id, uuid, err := parsePrepared("cephadm-talos: preparing\nRunning command: ...\nosd_id 4\nosd_uuid 9b1c\n")
+	if err != nil || id != 4 || uuid != "9b1c" {
+		t.Fatalf("got %d %q %v", id, uuid, err)
 	}
 
-	if _, _, ok := parseOSDMarker(logs, "other"); ok {
-		t.Fatal("matched a foreign deploy id")
+	for _, bad := range []string{"", "osd_id 4\n", "osd_uuid x\n", "osd_id -1\nosd_uuid x\n", "osd_id x\nosd_uuid x\n"} {
+		if _, _, err := parsePrepared(bad); err == nil {
+			t.Errorf("accepted %q", bad)
+		}
 	}
 }
 

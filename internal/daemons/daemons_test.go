@@ -48,8 +48,45 @@ func TestRenderAll(t *testing.T) {
 
 func TestEntrypointHasCommonPrelude(t *testing.T) {
 	c := OSD(params())
-	if !strings.Contains(c.ContainerEntrypoint[2], "set -euo pipefail") || !strings.Contains(c.ContainerEntrypoint[2], "ceph-volume raw prepare") {
+	if !strings.Contains(c.ContainerEntrypoint[2], "set -euo pipefail") || !strings.Contains(c.ContainerEntrypoint[2], "ceph-volume raw activate") {
 		t.Fatal("osd entrypoint not assembled")
+	}
+
+	// the OSD daemon only activates; preparing is the prepare job's
+	if strings.Contains(c.ContainerEntrypoint[2], "raw prepare") {
+		t.Fatal("the osd daemon prepares devices")
+	}
+}
+
+func TestOSDPrepareJob(t *testing.T) {
+	p := params()
+	p.Keyring, p.DiskSerial = "[client.bootstrap-osd]\n\tkey = K\n", "QM00001"
+	c := OSDPrepare(p, "j1", "inputs")
+
+	env := strings.Join(c.ContainerEnvironment, "\n")
+	for _, want := range []string{"JOB_IGNORE_TERM=1", "DISK_SERIAL=QM00001", "DEVICE=" + p.Device, "JOB=j1", "JOB_INPUTS=inputs"} {
+		if !strings.Contains(env, want) {
+			t.Errorf("environment misses %s", want)
+		}
+	}
+
+	if n := strings.Count(env, "CEPHADM_TALOS_KEYRING="); n != 1 {
+		t.Errorf("%d keyring variables", n)
+	}
+
+	if c.RestartConfig == nil || c.RestartConfig.RestartPolicy != "never" || c.ContainerStopTimeout != MaxStopTimeout {
+		t.Errorf("restart %+v, stop timeout %s", c.RestartConfig, c.ContainerStopTimeout)
+	}
+
+	cmd := ""
+	for _, e := range c.ContainerEnvironment {
+		if v, ok := strings.CutPrefix(e, "CMD="); ok {
+			cmd = v
+		}
+	}
+
+	if !strings.Contains(cmd, "ceph-volume raw prepare") || !strings.Contains(cmd, "DISK_SERIAL") {
+		t.Error("the job's command is not the prepare script")
 	}
 }
 

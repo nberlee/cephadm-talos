@@ -109,6 +109,9 @@ type Daemon struct {
 	DeployID string `json:"deploy_id,omitempty"`
 	// OSDUUID tells this OSD apart from a later one that reuses its numeric id
 	OSDUUID string `json:"osd_uuid,omitempty"`
+	// DiskSerial is the OSD device's serial from Talos, recorded before prepare
+	// and checked by the prepare job right before the destructive step
+	DiskSerial string `json:"disk_serial,omitempty"`
 	// Purged is set once the OSD is gone from the cluster, so a retried rm only wipes
 	Purged bool `json:"purged,omitempty"`
 	// LocalOnly: stopped by a forced `rm` while no mon was reachable; its

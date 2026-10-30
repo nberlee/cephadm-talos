@@ -710,7 +710,12 @@ func (o *Orch) deployOSD(ctx context.Context, h state.Host, device string) error
 		return fmt.Errorf("device must be a /dev path, got %q", device)
 	}
 
-	d := state.Daemon{Type: state.TypeOSD, ID: h.Name + "-" + filepath.Base(device), Host: h.Name, Device: device, DeployID: randHex(8), OSDUUID: newUUID()}
+	serial, err := o.diskSerial(ctx, h.Addr, device)
+	if err != nil {
+		return err
+	}
+
+	d := state.Daemon{Type: state.TypeOSD, ID: h.Name + "-" + filepath.Base(device), Host: h.Name, Device: device, DeployID: randHex(8), DiskSerial: serial}
 	if _, ok := o.St.Find("osd." + d.ID); ok {
 		return fmt.Errorf("osd on %s:%s already exists", h.Name, device)
 	}
@@ -720,37 +725,49 @@ func (o *Orch) deployOSD(ctx context.Context, h state.Host, device string) error
 		return err
 	}
 
+	// the deployment, cluster and disk identity are recorded before anything
+	// touches the disk (plan 03, item 8)
+	o.St.AddDaemon(d)
+
+	if err := o.save(); err != nil {
+		return err
+	}
+
+	job := daemons.OSDPrepare(daemons.Params{
+		Name: o.St.DocName(state.Daemon{Type: "osd-prepare", ID: d.DeployID}), Image: o.St.Image, FSID: o.St.FSID, ID: "job",
+		Keyring: daemons.Keyring("client.bootstrap-osd", k), Device: device, DiskSerial: serial,
+	}, d.DeployID, o.osdPrepareInputs(h, d))
+
+	o.printf("preparing %s:%s (serial %s)\n", h.Name, device, serial)
+
+	res, err := o.runJob(ctx, h.Addr, job, d.DeployID, 15*time.Minute)
+	if err != nil {
+		return fmt.Errorf("preparing %s:%s did not finish; nothing is retried automatically: check the device and the cluster, then `cephadm-talos rm --force %s`: %w",
+			h.Name, device, displayName(d), err)
+	}
+
+	id, uuid, err := parsePrepared(res.Output)
+	if err != nil {
+		return fmt.Errorf("preparing %s:%s: %w", h.Name, device, err)
+	}
+
+	d.OSDID, d.OSDUUID = &id, uuid
+	o.St.AddDaemon(d)
+
+	if err := o.save(); err != nil {
+		return err
+	}
+
 	doc := daemons.OSD(daemons.Params{
 		Name: o.St.DocName(d), Image: o.St.Image, FSID: o.St.FSID, ID: d.ID, Addr: h.Addr,
-		Keyring: daemons.Keyring("client.bootstrap-osd", k), Device: device, DeployID: d.DeployID, OSDUUID: d.OSDUUID,
+		Keyring: daemons.Keyring("client.bootstrap-osd", k), Device: device, DeployID: d.DeployID, OSDID: id, OSDUUID: uuid,
 	})
 
 	if err := o.apply(ctx, h.Addr, doc); err != nil {
 		return err
 	}
 
-	o.St.AddDaemon(d)
-
-	if err := o.save(); err != nil {
-		return err
-	}
-
 	if err := o.waitRunning(ctx, h.Addr, o.St.DocName(d), 10*time.Minute); err != nil {
-		return err
-	}
-
-	// the OSD id is allocated by `ceph osd new` inside the container; it reports it on stdout
-	id, uuid, err := o.waitOSDID(ctx, h.Addr, d, 10*time.Minute)
-	if err != nil {
-		return err
-	}
-
-	// older ceph-volume cannot prepare with a given uuid; the marker carries our
-	// deploy id, so the uuid it reports is the one this deployment created
-	d.OSDID, d.OSDUUID = &id, uuid
-	o.St.AddDaemon(d)
-
-	if err := o.save(); err != nil {
 		return err
 	}
 
@@ -769,84 +786,81 @@ func (o *Orch) deployOSD(ctx context.Context, h state.Host, device string) error
 	return nil
 }
 
-// waitOSDID reads the id and uuid an OSD container reports for this deployment.
-func (o *Orch) waitOSDID(ctx context.Context, node string, d state.Daemon, timeout time.Duration) (int, string, error) {
+// osdPrepareInputs binds an OSD's prepare job to its cluster, host, device,
+// disk and deployment.
+func (o *Orch) osdPrepareInputs(h state.Host, d state.Daemon) string {
+	return jobInputs("osd-prepare", o.St.FSID, h.Name, d.Device, d.DiskSerial, d.DeployID)
+}
+
+// diskSerial returns the serial Talos reports for a device; a disk without one
+// cannot be bound to an OSD.
+func (o *Orch) diskSerial(ctx context.Context, node, device string) (string, error) {
 	if o.Talos.DryRun {
-		return 0, "", nil
+		return "dry-run", nil
 	}
 
-	name := o.St.DocName(d)
-	deadline := time.Now().Add(timeout)
-
-	for {
-		if logs, err := o.Talos.Logs(ctx, node, name); err == nil {
-			if id, uuid, ok := parseOSDMarker(logs, d.DeployID); ok {
-				return id, uuid, nil
-			}
-
-			if msg, ok := parseMarker(logs, "CEPHADM-TALOS-OSD-ERROR=", d.DeployID); ok {
-				return 0, "", fmt.Errorf("%s: %s", name, msg)
-			}
-		}
-
-		if time.Now().After(deadline) {
-			return 0, "", fmt.Errorf("timed out waiting for %s to report its OSD id, see `cephadm-talos logs`", name)
-		}
-
-		if err := sleep(ctx, 3*time.Second); err != nil {
-			return 0, "", err
-		}
+	disks, err := o.Talos.Disks(ctx, node)
+	if err != nil {
+		return "", err
 	}
-}
 
-// osdUpLoop waits (inside a job) until osd <id> with this uuid is up, judged
-// from one osd map snapshot per try; anything else fails after ~5 minutes.
-func osdUpLoop(id int, uuid string) string {
-	check := fmt.Sprintf(`import json,sys; sys.exit(0 if any(o["osd"]==%d and o["uuid"]=="%s" and o["up"] for o in json.load(sys.stdin)["osds"]) else 1)`, id, uuid)
-
-	return fmt.Sprintf(`for i in $(seq 100); do ceph osd dump --format json | python3 -c '%s' && exit 0; sleep 3; done; echo "osd.%d (%s) not up" >&2; exit 1`, check, id, uuid)
-}
-
-// parseMarker returns the rest of the last "<prefix><deploy id> <msg>" line.
-func parseMarker(logs, prefix, deployID string) (string, bool) {
-	msg, found := "", false
-
-	for _, l := range strings.Split(logs, "\n") {
-		if _, v, ok := strings.Cut(l, prefix); ok {
-			if id, rest, ok := strings.Cut(v, " "); ok && id == deployID {
-				msg, found = rest, true
+	for _, disk := range disks {
+		if disk.TypedSpec().DevPath == device {
+			if s := strings.TrimSpace(disk.TypedSpec().Serial); s != "" {
+				return s, nil
 			}
+
+			return "", fmt.Errorf("%s has no serial number: an OSD cannot be bound to it", device)
 		}
 	}
 
-	return msg, found
+	return "", fmt.Errorf("no disk %s on %s", device, node)
 }
 
-// parseOSDMarker finds the last "CEPHADM-TALOS-OSD-ID=<deploy id> <osd id> <uuid>" line of a deployment.
-func parseOSDMarker(logs, deployID string) (int, string, bool) {
+// parsePrepared reads the id and uuid an osd-prepare job reported.
+func parsePrepared(out string) (int, string, error) {
 	var (
-		id    int
-		uuid  string
-		found bool
+		id   = -1
+		uuid string
 	)
 
-	for _, l := range strings.Split(logs, "\n") {
-		_, v, ok := strings.Cut(l, "CEPHADM-TALOS-OSD-ID=")
-		if !ok {
-			continue
+	for _, l := range strings.Split(out, "\n") {
+		if v, ok := strings.CutPrefix(strings.TrimSpace(l), "osd_id "); ok {
+			if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+				id = n
+			}
 		}
 
-		f := strings.Fields(v)
-		if len(f) != 3 || f[0] != deployID {
-			continue
-		}
-
-		if n, err := strconv.Atoi(f[1]); err == nil {
-			id, uuid, found = n, f[2], true
+		if v, ok := strings.CutPrefix(strings.TrimSpace(l), "osd_uuid "); ok {
+			uuid = v
 		}
 	}
 
-	return id, uuid, found
+	if id < 0 || uuid == "" {
+		return 0, "", fmt.Errorf("the prepare job reported no OSD id and uuid")
+	}
+
+	return id, uuid, nil
+}
+
+// preparedOSD recovers an OSD's identity from its own deployment's prepare
+// result on the host, for a deploy that was interrupted after prepare.
+func (o *Orch) preparedOSD(ctx context.Context, h state.Host, d state.Daemon) (int, string, error) {
+	b, err := o.Talos.ReadFile(ctx, h.Addr, jobsHostDir+"/"+o.St.FSID+"."+d.DeployID+".result", maxJobResult)
+	if err != nil {
+		return 0, "", fmt.Errorf("no prepare result for %s: %w", displayName(d), err)
+	}
+
+	res, inputs, err := parseJobResult(b)
+	if err != nil {
+		return 0, "", err
+	}
+
+	if inputs != o.osdPrepareInputs(h, d) || res.RC != 0 {
+		return 0, "", fmt.Errorf("the prepare result of %s is not a successful one of this deployment", displayName(d))
+	}
+
+	return parsePrepared(res.Output)
 }
 
 func sleep(ctx context.Context, d time.Duration) error {
@@ -941,4 +955,12 @@ func (o *Orch) waitImage(ctx context.Context, node, name, image string, timeout 
 // (ceph/ceph:v20 becomes docker.io/ceph/ceph:v20).
 func sameImage(normalized, want string) bool {
 	return normalized == want || strings.HasSuffix(normalized, "/"+want)
+}
+
+// osdUpLoop waits (as an admin command) until osd <id> with this uuid is up, judged
+// from one osd map snapshot per try; anything else fails after ~5 minutes.
+func osdUpLoop(id int, uuid string) string {
+	check := fmt.Sprintf(`import json,sys; sys.exit(0 if any(o["osd"]==%d and o["uuid"]=="%s" and o["up"] for o in json.load(sys.stdin)["osds"]) else 1)`, id, uuid)
+
+	return fmt.Sprintf(`for i in $(seq 100); do ceph osd dump --format json | python3 -c '%s' && exit 0; sleep 3; done; echo "osd.%d (%s) not up" >&2; exit 1`, check, id, uuid)
 }

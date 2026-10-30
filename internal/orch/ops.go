@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/hex"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -172,12 +172,11 @@ const maxJobResult = 1 << 20
 // the document again. The result file stays on the node as the job's replay
 // record; the agent removes it once the outcome is acknowledged (plan 03, item 8).
 func (o *Orch) runJob(ctx context.Context, node string, doc *spec.ContainerConfig, id string, timeout time.Duration) (res JobResult, err error) {
-	name, cmd := doc.MetaName, ""
+	name, cmd := doc.MetaName, jobEnv(doc, "CMD")
 
-	for _, e := range doc.ContainerEnvironment {
-		if v, ok := strings.CutPrefix(e, "CMD="); ok {
-			cmd = v
-		}
+	// a script is named by its job, a one-line command by itself
+	if strings.Contains(cmd, "\n") || len(cmd) > 200 {
+		cmd = name
 	}
 
 	if o.Talos.DryRun {
@@ -770,11 +769,9 @@ func (o *Orch) ensureOSDID(ctx context.Context, d *state.Daemon, h state.Host, f
 		return nil
 	}
 
-	// the uuid is assigned by cephadm-talos at deploy time; only the numeric id may be missing
-
-	// only trust what this very deployment reported: ids are reused by Ceph
-	if d.DeployID != "" && d.OSDUUID != "" {
-		if id, uuid, err := o.waitOSDID(ctx, h.Addr, *d, 30*time.Second); err == nil {
+	// only trust what this very deployment's prepare job reported: ids are reused by Ceph
+	if d.DeployID != "" {
+		if id, uuid, err := o.preparedOSD(ctx, h, *d); err == nil {
 			d.OSDID, d.OSDUUID = &id, uuid
 			o.St.AddDaemon(*d)
 
@@ -783,8 +780,8 @@ func (o *Orch) ensureOSDID(ctx context.Context, d *state.Daemon, h state.Host, f
 	}
 
 	if !force {
-		return fmt.Errorf("the OSD id/uuid of %s is unknown (did it ever start? see `cephadm-talos logs %s`); "+
-			"refusing to remove without --force, as the device may hold an OSD that was never marked out", displayName(*d), displayName(*d))
+		return fmt.Errorf("the OSD id/uuid of %s is unknown (its prepare did not finish); "+
+			"refusing to remove without --force, as the device may hold an OSD that was never marked out", displayName(*d))
 	}
 
 	// with --force and no verified identity, never touch the cluster: the id may belong to another OSD now
@@ -930,6 +927,23 @@ func (o *Orch) Redeploy(ctx context.Context, name string) error {
 		return err
 	}
 
+	// an interrupted deploy may not have recorded the OSD identity yet: only its
+	// own prepare result can tell it, prepare is never run again here
+	if d.Type == state.TypeOSD && d.OSDID == nil && !o.Talos.DryRun {
+		id, uuid, err := o.preparedOSD(ctx, h, d)
+		if err != nil {
+			return fmt.Errorf("%s was never prepared successfully, so it cannot be redeployed; remove it with --force: %w", name, err)
+		}
+
+		d.OSDID, d.OSDUUID = &id, uuid
+		o.St.AddDaemon(d)
+		o.printf("%s is osd.%d (%s)\n", name, id, uuid)
+
+		if err := o.save(); err != nil {
+			return err
+		}
+	}
+
 	doc, err := o.redeployDoc(d, h, o.St.Image)
 	if err != nil {
 		return err
@@ -939,20 +953,6 @@ func (o *Orch) Redeploy(ctx context.Context, name string) error {
 		return err
 	}
 
-	// an interrupted deploy may not have recorded the OSD identity yet
-	if d.Type == state.TypeOSD && d.OSDID == nil && !o.Talos.DryRun {
-		id, uuid, err := o.waitOSDID(ctx, h.Addr, d, 10*time.Minute)
-		if err != nil {
-			return err
-		}
-
-		d.OSDID, d.OSDUUID = &id, uuid
-		o.St.AddDaemon(d)
-		o.printf("%s is osd.%d (%s)\n", name, id, uuid)
-
-		return o.save()
-	}
-
 	return nil
 }
 
@@ -960,6 +960,9 @@ func (o *Orch) Redeploy(ctx context.Context, name string) error {
 // already initialised, so the mon mode and keyrings only matter for a fresh start.
 func (o *Orch) redeployDoc(d state.Daemon, h state.Host, image string) (*spec.ContainerConfig, error) {
 	p := daemons.Params{Name: o.St.DocName(d), Image: image, FSID: o.St.FSID, ID: d.ID, Addr: h.Addr, Device: d.Device, DeployID: d.DeployID, OSDUUID: d.OSDUUID}
+	if d.OSDID != nil {
+		p.OSDID = *d.OSDID
+	}
 
 	adm, err := o.adminKeyring()
 	if err != nil {

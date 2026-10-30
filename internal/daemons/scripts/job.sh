@@ -66,6 +66,13 @@ case $c in
 *) exit 70 ;;
 esac
 
+# Talos sends SIGTERM to every process of the container: a job that must not be
+# cut short ignores it for its whole process tree (an ignored signal is
+# inherited), so only the SIGKILL after its stop timeout ends it
+if [ "${JOB_IGNORE_TERM:-}" = 1 ]; then
+	trap '' TERM
+fi
+
 set +e
 out=$(bash -c "$CMD" 2>&1)
 rc=$?

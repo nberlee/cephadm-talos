@@ -10,7 +10,9 @@ import (
 	"embed"
 	"encoding/base64"
 	"fmt"
+	"slices"
 	"strings"
+	"time"
 
 	"github.com/siderolabs/talos/pkg/machinery/config/types/container"
 
@@ -24,25 +26,37 @@ var scripts embed.FS
 
 // Params describes one daemon instance.
 type Params struct {
-	Name      string // ContainerConfig name
-	Image     string
-	FSID      string
-	ID        string   // daemon id (mon/mgr: hostname)
-	Addr      string   // public address of the host
-	Keyring   string   // keyring file contents for this daemon
-	Device    string   // OSD only
-	OSDUUID   string   // OSD only: the osd fsid to prepare the device with
-	Port      int      // rgw/vip: RGW HTTPS port
-	TLSPEM    string   // rgw: certificate + key
-	VIP       string   // vip: CIDR of the virtual IP
-	VRID      int      // vip: VRRP router id
-	VRRPPass  string   // vip: VRRP password (max 8 chars)
-	Priority  int      // vip: VRRP priority
-	Peers     []string // vip: addresses of the other vip hosts
-	Mode      string   // mon only: "bootstrap" or "join"
-	Addrv     string   // mon only: address vector, e.g. [v2:10.5.0.3:3300,v1:10.5.0.3:6789]
-	DeployID  string   // changes when the daemon is (re)created, not on redeploy/upgrade
-	DependsOn []string
+	Name       string // ContainerConfig name
+	Image      string
+	FSID       string
+	ID         string   // daemon id (mon/mgr: hostname)
+	Addr       string   // public address of the host
+	Keyring    string   // keyring file contents for this daemon
+	Device     string   // OSD only
+	OSDUUID    string   // OSD only: the uuid of the prepared OSD
+	OSDID      int      // OSD only: the id of the prepared OSD
+	DiskSerial string   // OSD prepare only: the serial the device must have
+	Port       int      // rgw/vip: RGW HTTPS port
+	TLSPEM     string   // rgw: certificate + key
+	VIP        string   // vip: CIDR of the virtual IP
+	VRID       int      // vip: VRRP router id
+	VRRPPass   string   // vip: VRRP password (max 8 chars)
+	Priority   int      // vip: VRRP priority
+	Peers      []string // vip: addresses of the other vip hosts
+	Mode       string   // mon only: "bootstrap" or "join"
+	Addrv      string   // mon only: address vector, e.g. [v2:10.5.0.3:3300,v1:10.5.0.3:6789]
+	DeployID   string   // changes when the daemon is (re)created, not on redeploy/upgrade
+	DependsOn  []string
+}
+
+// rawScript returns an embedded script without common.sh, for a job's command.
+func rawScript(name string) string {
+	b, err := scripts.ReadFile("scripts/" + name + ".sh")
+	if err != nil {
+		panic(err)
+	}
+
+	return string(b)
 }
 
 func script(name string) string {
@@ -125,7 +139,7 @@ func Mgr(p Params, moduleFiles ...string) *spec.ContainerConfig {
 // tmpfs for the OSD dir and needs udev data for device inspection.
 func OSD(p Params) *spec.ContainerConfig {
 	c := base(p, "osd")
-	c.ContainerEnvironment = append(c.ContainerEnvironment, "DEVICE="+p.Device, "OSD_UUID="+p.OSDUUID)
+	c.ContainerEnvironment = append(c.ContainerEnvironment, "DEVICE="+p.Device, fmt.Sprintf("OSD_ID=%d", p.OSDID), "OSD_UUID="+p.OSDUUID)
 	c.SecurityConfig = spec.Privileged()
 	c.MountsConfig = append(c.MountsConfig,
 		spec.HostPath("/dev", "/dev"),
@@ -258,6 +272,34 @@ func Job(p Params, job, inputs, cmd string) *spec.ContainerConfig {
 
 	return c
 }
+
+// OSDPrepare renders the job that prepares a raw device as a new OSD (plan 03,
+// item 8): privileged, with the device, ceph.conf, the Ceph volume and the
+// bootstrap-osd key only. It ignores SIGTERM for its whole process tree and has
+// the longest stop timeout, so a reboot during prepare waits for it.
+func OSDPrepare(p Params, job, inputs string) *spec.ContainerConfig {
+	key := p.Keyring
+	c := DeviceJob(p, job, inputs, rawScript("osd-prepare"))
+	// a job's environment has an empty key; this one carries the bootstrap-osd key
+	c.ContainerEnvironment = slices.DeleteFunc(c.ContainerEnvironment, func(e string) bool { return strings.HasPrefix(e, "CEPHADM_TALOS_KEYRING=") })
+	c.ContainerEnvironment = append(c.ContainerEnvironment,
+		"CEPHADM_TALOS_KEYRING="+base64.StdEncoding.EncodeToString([]byte(key)),
+		"DEVICE="+p.Device, "DISK_SERIAL="+p.DiskSerial, "JOB_IGNORE_TERM=1")
+	c.MountsConfig = append(c.MountsConfig,
+		spec.UserVolume(spec.VolumeName, "/var/lib/ceph"),
+		spec.HostPath("/etc/ceph", "/etc/ceph", "ro"),
+		// the bootstrap key must not outlive the job; the OSD dir is rebuilt on activation
+		spec.Tmpfs("/var/lib/ceph/bootstrap-osd"),
+		spec.Tmpfs("/var/lib/ceph/osd"),
+	)
+	c.DependsOnConfig.PathsConfig = []string{"/etc/ceph/ceph.conf", p.Device}
+	c.ContainerStopTimeout = MaxStopTimeout
+
+	return c
+}
+
+// MaxStopTimeout is the longest stop timeout Talos accepts.
+const MaxStopTimeout = 4 * time.Minute
 
 // HostJob is a privileged Job with the host's /var/lib/ceph volume, for cleanup.
 func HostJob(p Params, job, inputs, cmd string) *spec.ContainerConfig {
