@@ -67,15 +67,8 @@ type JobResult struct {
 
 // Job runs a shell command with the admin key in a running Ceph container on
 // node, through Talos exec (plan 03, item 11), and returns its output (stdout
-// and stderr together). The key goes over stdin into the CEPH_ARGS environment
-// of this exec only: it is in no file, no machine config and no process's
-// arguments, and Talos audits only the command line.
+// and stderr together).
 func (o *Orch) Job(ctx context.Context, node, cmd string, timeout time.Duration) (JobResult, error) {
-	k, err := o.key("client.admin")
-	if err != nil {
-		return JobResult{}, err
-	}
-
 	if o.Talos.DryRun {
 		o.printf("# exec on %s: %s\n", node, cmd)
 
@@ -85,17 +78,9 @@ func (o *Orch) Job(ctx context.Context, node, cmd string, timeout time.Duration)
 	jctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	target, err := o.execTarget(jctx, node)
-	if err != nil {
-		return JobResult{}, err
-	}
-
 	var out syncBuffer
 
-	// $1 is the command, never the key; `exec` keeps the shell from lingering
-	script := `IFS= read -r key || exit 70; export CEPH_ARGS="-n client.admin --key $key"; unset key; exec bash -c "$1"`
-
-	rc, err := o.Talos.Exec(jctx, node, target, []string{"bash", "-c", script, "cephadm-talos-exec", cmd}, strings.NewReader(k+"\n"), &out, &out)
+	rc, target, err := o.execAdmin(jctx, node, []string{"bash", "-c", cmd}, nil, &out, &out)
 	if err != nil {
 		if jctx.Err() != nil && ctx.Err() == nil {
 			return JobResult{}, fmt.Errorf("timed out running %q in %s", cmd, target)
@@ -110,6 +95,30 @@ func (o *Orch) Job(ctx context.Context, node, cmd string, timeout time.Duration)
 	}
 
 	return res, nil
+}
+
+// execAdmin runs argv in a running Ceph container on node with the admin key.
+// The key goes over stdin, as its first line, into the CEPH_ARGS environment of
+// this exec only: it is in no file, no machine config and no process's
+// arguments, and Talos audits only the command line. input follows the key on
+// stdin, for the command itself.
+func (o *Orch) execAdmin(ctx context.Context, node string, argv []string, input []byte, stdout, stderr io.Writer) (int, string, error) {
+	k, err := o.key("client.admin")
+	if err != nil {
+		return 0, "", err
+	}
+
+	target, err := o.execTarget(ctx, node)
+	if err != nil {
+		return 0, "", err
+	}
+
+	script := `IFS= read -r key || exit 70; export CEPH_ARGS="-n client.admin --key $key"; unset key; exec "$@"`
+	stdin := io.MultiReader(strings.NewReader(k+"\n"), bytes.NewReader(input))
+
+	rc, err := o.Talos.Exec(ctx, node, target, append([]string{"bash", "-c", script, "cephadm-talos-exec"}, argv...), stdin, stdout, stderr)
+
+	return rc, target, err
 }
 
 // execTarget picks the running Ceph container on node that admin commands run

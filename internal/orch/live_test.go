@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/nberlee/cephadm-talos/internal/state"
+	"github.com/nberlee/cephadm-talos/internal/store"
 	"github.com/nberlee/cephadm-talos/internal/talos"
 )
 
@@ -51,4 +52,74 @@ func TestLiveJobs(t *testing.T) {
 	}
 
 	t.Logf("probe: Ceph %s %s, took %s", info.Version, info.Arch, time.Since(start).Round(time.Millisecond))
+}
+
+// TestLiveStore publishes and reads back records through config-key on the
+// mon host of the current state, then removes them again.
+//
+//	go test -tags live -run TestLiveStore ./internal/orch/
+func TestLiveStore(t *testing.T) {
+	st, err := state.Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tc := &talos.Client{Default: talos.Conn{Talosconfig: st.Talosconfig, Context: st.Context}}
+	defer tc.Close() //nolint:errcheck
+
+	o := &Orch{Talos: tc, St: st, Out: os.Stdout}
+
+	adm, err := o.adminHost()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	prefix := store.Prefix + "inc/live-test/"
+
+	start := time.Now()
+
+	b, err := o.configKeys(ctx, adm.Addr, prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := store.Store{B: b, Incarnation: "live-test"}
+	big := strings.Repeat("0123456789", 20000) // 200 KB: several chunks
+
+	var m store.Manifest
+
+	for i := range 3 {
+		if m, err = s.Publish(ctx, map[string][]byte{"big": []byte(big), "n": []byte{byte('0' + i)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Logf("3 publications in %s", time.Since(start).Round(time.Millisecond))
+
+	// a fresh snapshot, as the next command would read it
+	b2, err := o.configKeys(ctx, adm.Addr, prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s2 := store.Store{B: b2, Incarnation: "live-test"}
+
+	latest, err := s2.Latest(ctx)
+	if err != nil || latest.Seq != m.Seq {
+		t.Fatalf("latest %+v %v", latest, err)
+	}
+
+	if v, err := s2.Read(ctx, latest, "big"); err != nil || string(v) != big {
+		t.Fatalf("big: %d bytes %v", len(v), err)
+	}
+
+	keys, _ := b2.List(ctx, prefix)
+	t.Logf("%d keys after compaction", len(keys))
+
+	if err := b2.Remove(ctx, keys); err != nil {
+		t.Fatal(err)
+	}
 }
