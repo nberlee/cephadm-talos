@@ -222,47 +222,54 @@ func RecordsInit(name, image string) *spec.ContainerConfig {
 	return c
 }
 
-// Probe renders a container that reports the Ceph version of an image, with
-// the same log markers as a Job. Unlike a Job it needs nothing from a cluster
-// (no keyring, no ceph.conf), so it runs before bootstrap.
-func Probe(name, image, job string) *spec.ContainerConfig {
+// Probe renders a container that prints the Ceph version and architecture of
+// an image and exits, read back from its log. Unlike a Job it needs nothing from
+// a cluster (no records volume, no ceph.conf), so it runs before bootstrap.
+func Probe(name, image string) *spec.ContainerConfig {
 	c := spec.Container(name, image)
 	c.ContainerEntrypoint = []string{"/bin/bash", "-c", script("probe")}
-	c.ContainerEnvironment = []string{"JOB=" + job, "HOME=/tmp"}
+	c.ContainerEnvironment = []string{"HOME=/tmp"}
 	c.SecurityConfig = spec.Restricted()
 	c.MountsConfig = []spec.Mount{spec.Tmpfs("/tmp"), spec.Tmpfs("/var/run/ceph"), spec.Tmpfs("/var/log/ceph")}
+	c.RestartConfig = spec.RestartNever()
 
 	return c
 }
 
-// Job renders a one-shot admin command container (cephadm-talos's replacement for `cephadm shell`).
-func Job(p Params, job, cmd string) *spec.ContainerConfig {
+// Job renders a one-shot job (plan 03, item 8): a `never` container with the
+// cephadm-talos volume's jobs directory, which claims its id, records that it
+// started and writes its result there. inputs identifies what it does: the same
+// id with other inputs is refused. Jobs get no Ceph key.
+func Job(p Params, job, inputs, cmd string) *spec.ContainerConfig {
+	p.Keyring = ""
 	c := base(p, "job")
-	c.ContainerEnvironment = append(c.ContainerEnvironment, "JOB="+job, "CMD="+cmd)
+	c.ContainerEnvironment = append(c.ContainerEnvironment, "JOB="+job, "JOB_INPUTS="+inputs, "CMD="+cmd,
+		"JOBS="+records.Mount+"/"+records.JobsDir)
 	c.SecurityConfig = spec.Restricted()
-	// jobs only need ceph.conf; no access to the daemon data
 	c.MountsConfig = []spec.Mount{
-		spec.HostPath("/etc/ceph", "/etc/ceph", "ro"),
+		spec.UserVolume(spec.RecordsVolumeName, records.Mount),
 		spec.Tmpfs("/tmp"),
 		spec.Tmpfs("/var/run/ceph"),
 		spec.Tmpfs("/var/log/ceph"),
 	}
 	c.DependsOnConfig.TimeConfig = nil
+	c.DependsOnConfig.PathsConfig = nil
+	c.RestartConfig = spec.RestartNever()
 
 	return c
 }
 
 // HostJob is a privileged Job with the host's /var/lib/ceph volume, for cleanup.
-func HostJob(p Params, job, cmd string) *spec.ContainerConfig {
-	c := DeviceJob(p, job, cmd)
+func HostJob(p Params, job, inputs, cmd string) *spec.ContainerConfig {
+	c := DeviceJob(p, job, inputs, cmd)
 	c.MountsConfig = append(c.MountsConfig, spec.UserVolume(spec.VolumeName, "/var/lib/ceph"))
 
 	return c
 }
 
 // DeviceJob is a Job with raw device access, for zapping OSD devices.
-func DeviceJob(p Params, job, cmd string) *spec.ContainerConfig {
-	c := Job(p, job, cmd)
+func DeviceJob(p Params, job, inputs, cmd string) *spec.ContainerConfig {
+	c := Job(p, job, inputs, cmd)
 	c.SecurityConfig = spec.Privileged()
 	c.MountsConfig = append(c.MountsConfig,
 		spec.HostPath("/dev", "/dev"),

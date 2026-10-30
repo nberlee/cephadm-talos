@@ -28,7 +28,7 @@ func TestRunJobCleansUpAfterAFailedApply(t *testing.T) {
 
 	o := fakeOrch(t, f)
 	tc := o.Talos
-	doc := daemons.Probe("ceph-eb8dac3e-probe-abc", "quay.io/ceph/ceph:v20.2.4", "abc")
+	doc := daemons.Probe("ceph-eb8dac3e-probe-abc", "quay.io/ceph/ceph:v20.2.4")
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
@@ -126,5 +126,18 @@ func TestWaitGoneWaitsForTheInstance(t *testing.T) {
 
 	if time.Since(start) < 400*time.Millisecond {
 		t.Errorf("waitGone returned while the instance was still there")
+	}
+}
+
+func TestParseJobResult(t *testing.T) {
+	res, in, err := parseJobResult([]byte("rc 3\ninputs abc\nline 1\nline 2"))
+	if err != nil || res.RC != 3 || in != "abc" || res.Output != "line 1\nline 2" {
+		t.Fatalf("%+v %q %v", res, in, err)
+	}
+
+	for _, bad := range []string{"", "rc x\ninputs a\n", "rc 0\n", "rc 0\nnot inputs\n", "rc 0\ninputs \n"} {
+		if _, _, err := parseJobResult([]byte(bad)); err == nil {
+			t.Errorf("accepted %q", bad)
+		}
 	}
 }

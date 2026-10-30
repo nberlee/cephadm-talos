@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"slices"
 	"sort"
@@ -526,6 +527,37 @@ func (c *Client) watchOnce(ctx context.Context, node string, types []resource.Ty
 			return done, err
 		}
 	}
+}
+
+// ReadFile reads a file on the node through the Talos API, at most limit bytes;
+// a missing file is fs.ErrNotExist.
+func (c *Client) ReadFile(ctx context.Context, node, path string, limit int64) ([]byte, error) {
+	cl, nctx, err := c.node(ctx, node, "read "+path)
+	if err != nil {
+		return nil, err
+	}
+
+	r, err := cl.Read(nctx, path)
+	if err != nil {
+		return nil, wrap("read "+path, err)
+	}
+
+	defer r.Close() //nolint:errcheck
+
+	b, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		if status.Code(err) == codes.NotFound || strings.Contains(err.Error(), "no such file") {
+			return nil, fs.ErrNotExist
+		}
+
+		return nil, wrap("read "+path, err)
+	}
+
+	if int64(len(b)) > limit {
+		return nil, fmt.Errorf("%s is larger than %d bytes", path, limit)
+	}
+
+	return b, nil
 }
 
 // Logs returns the full log of a ContainerConfig container.

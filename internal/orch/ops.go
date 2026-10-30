@@ -1,21 +1,27 @@
 package orch
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"text/tabwriter"
 	"time"
 
+	"github.com/siderolabs/talos/pkg/machinery/resources/containers"
+
 	"github.com/nberlee/cephadm-talos/internal/daemons"
 	"github.com/nberlee/cephadm-talos/internal/mgrmodule"
+	"github.com/nberlee/cephadm-talos/internal/records"
 	"github.com/nberlee/cephadm-talos/internal/spec"
 	"github.com/nberlee/cephadm-talos/internal/state"
 	"github.com/nberlee/cephadm-talos/internal/talos"
@@ -59,27 +65,112 @@ type JobResult struct {
 	RC     int
 }
 
-// Job runs a shell command with the admin keyring in a throw-away container on
-// node and returns its output. This replaces `cephadm shell`: Talos has no exec,
-// so the command runs as a ContainerConfig whose log we read back, after which
-// the document is deleted again.
+// Job runs a shell command with the admin key in a running Ceph container on
+// node, through Talos exec (plan 03, item 11), and returns its output (stdout
+// and stderr together). The key goes over stdin into the CEPH_ARGS environment
+// of this exec only: it is in no file, no machine config and no process's
+// arguments, and Talos audits only the command line.
 func (o *Orch) Job(ctx context.Context, node, cmd string, timeout time.Duration) (JobResult, error) {
-	id := randHex(3)
-	name := fmt.Sprintf("ceph-%s-job-%s", o.St.Short(), id)
-
-	adm, err := o.adminKeyring()
+	k, err := o.key("client.admin")
 	if err != nil {
 		return JobResult{}, err
 	}
 
-	doc := daemons.Job(daemons.Params{
-		Name: name, Image: o.St.Image, FSID: o.St.FSID, ID: "job", Keyring: adm,
-	}, id, cmd)
+	if o.Talos.DryRun {
+		o.printf("# exec on %s: %s\n", node, cmd)
 
-	return o.runJob(ctx, node, doc, id, timeout)
+		return JobResult{}, nil
+	}
+
+	jctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	target, err := o.execTarget(jctx, node)
+	if err != nil {
+		return JobResult{}, err
+	}
+
+	var out syncBuffer
+
+	// $1 is the command, never the key; `exec` keeps the shell from lingering
+	script := `IFS= read -r key || exit 70; export CEPH_ARGS="-n client.admin --key $key"; unset key; exec bash -c "$1"`
+
+	rc, err := o.Talos.Exec(jctx, node, target, []string{"bash", "-c", script, "cephadm-talos-exec", cmd}, strings.NewReader(k+"\n"), &out, &out)
+	if err != nil {
+		if jctx.Err() != nil && ctx.Err() == nil {
+			return JobResult{}, fmt.Errorf("timed out running %q in %s", cmd, target)
+		}
+
+		return JobResult{}, err
+	}
+
+	res := JobResult{Output: out.String(), RC: rc}
+	if rc != 0 {
+		return res, fmt.Errorf("command %q failed with rc=%d:\n%s", cmd, rc, res.Output)
+	}
+
+	return res, nil
 }
 
-// runJob applies a job document, waits for its result and removes it again.
+// execTarget picks the running Ceph container on node that admin commands run
+// in: a mgr, else a mon, an rgw or an OSD (all have the ceph CLI and ceph.conf).
+func (o *Orch) execTarget(ctx context.Context, node string) (string, error) {
+	st, err := o.Talos.ContainerStatuses(ctx, node)
+	if err != nil {
+		return "", err
+	}
+
+	prefix := fmt.Sprintf("ceph-%s-", o.St.Short())
+
+	for _, typ := range []string{state.TypeMgr, state.TypeMon, state.TypeRGW, state.TypeOSD} {
+		var names []string
+
+		for name, s := range st {
+			if strings.HasPrefix(name, prefix+typ+"-") && s.State == containers.ContainerStateRunning {
+				names = append(names, name)
+			}
+		}
+
+		if len(names) > 0 {
+			sort.Strings(names)
+
+			return names[0], nil
+		}
+	}
+
+	return "", fmt.Errorf("no running Ceph container on %s to run the command in", node)
+}
+
+// syncBuffer collects stdout and stderr, which Talos writes concurrently.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.b.String()
+}
+
+// jobsHostDir is the jobs directory of the cephadm-talos volume on the host.
+const jobsHostDir = "/var/mnt/" + spec.RecordsVolumeName + "/" + records.JobsDir
+
+// maxJobResult bounds a job's result file and log.
+const maxJobResult = 1 << 20
+
+// runJob applies a `never` job document, waits until it finished, reads its
+// result file (or, for a job without the records volume, its log) and removes
+// the document again. The result file stays on the node as the job's replay
+// record; the agent removes it once the outcome is acknowledged (plan 03, item 8).
 func (o *Orch) runJob(ctx context.Context, node string, doc *spec.ContainerConfig, id string, timeout time.Duration) (res JobResult, err error) {
 	name, cmd := doc.MetaName, ""
 
@@ -94,9 +185,9 @@ func (o *Orch) runJob(ctx context.Context, node string, doc *spec.ContainerConfi
 	}
 
 	// Always clean up, also on timeout, ctrl-c or an apply error (the client may
-	// fail after Talos accepted the config). A job left behind would run again
-	// whenever Talos restarts it (reboot), e.g. zapping a disk that has been
-	// redeployed meanwhile, so failing to remove it is an error of its own.
+	// fail after Talos accepted the config). A `never` job left behind runs again
+	// on the next boot, where its claim keeps it from repeating its work; a
+	// document left behind is still an error of its own.
 	defer func() {
 		// cleanup outlives a cancelled or timed out job, but is bounded itself
 		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 6*time.Minute)
@@ -112,7 +203,7 @@ func (o *Orch) runJob(ctx context.Context, node string, doc *spec.ContainerConfi
 		}
 	}()
 
-	// the timeout covers every call of the job itself: apply and log reads
+	// the timeout covers every call of the job itself
 	jctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -120,35 +211,116 @@ func (o *Orch) runJob(ctx context.Context, node string, doc *spec.ContainerConfi
 		return JobResult{}, err
 	}
 
-	begin, end := "CEPHADM-TALOS-BEGIN "+id, "CEPHADM-TALOS-END "+id+" rc="
+	var st containers.ContainerStatusSpec
 
-	for {
-		logs, _ := o.Talos.Logs(jctx, node, name)
-
-		if i := strings.Index(logs, begin); i >= 0 {
-			rest := logs[i+len(begin):]
-
-			if j := strings.Index(rest, end); j >= 0 {
-				var rc int
-				fmt.Sscanf(rest[j+len(end):], "%d", &rc)
-
-				res := JobResult{Output: strings.TrimPrefix(rest[:j], "\n"), RC: rc}
-				if rc != 0 {
-					return res, fmt.Errorf("command %q failed with rc=%d:\n%s", cmd, rc, res.Output)
-				}
-
-				return res, nil
-			}
+	if err := o.Talos.WaitFor(jctx, node, talos.InstanceTypes, timeout, func(ctx context.Context) (bool, error) {
+		all, err := o.Talos.ContainerStatuses(ctx, node)
+		if err != nil {
+			// a transient failure is retried; only a permanent one ends the wait
+			return false, talos.Permanent(err)
 		}
 
-		if err := sleep(jctx, 2*time.Second); err != nil {
-			if ctx.Err() == nil {
-				return JobResult{}, fmt.Errorf("timed out waiting for job %s (%q)", name, cmd)
-			}
+		s, ok := all[name]
+		st = s
 
+		return ok && (s.State == containers.ContainerStateCompleted || s.State == containers.ContainerStateFailed), nil
+	}); err != nil {
+		if ctx.Err() == nil {
+			return JobResult{}, fmt.Errorf("job %s (%q) did not finish: %w", name, cmd, err)
+		}
+
+		return JobResult{}, err
+	}
+
+	if !usesRecords(doc) {
+		out, err := o.Talos.Logs(jctx, node, name)
+		if err != nil {
 			return JobResult{}, err
 		}
+
+		res := JobResult{Output: out, RC: int(st.ExitCode)}
+		if st.State == containers.ContainerStateFailed {
+			return res, fmt.Errorf("job %s failed: %s", name, st.Error)
+		}
+
+		return res, nil
 	}
+
+	b, rerr := o.Talos.ReadFile(jctx, node, jobsHostDir+"/"+o.St.FSID+"."+id+".result", maxJobResult)
+	if rerr != nil {
+		// no result: refused (other inputs, uncertain) or failed before running
+		return JobResult{RC: int(st.ExitCode)}, fmt.Errorf("job %s (%q) left no result (%s, exit %d): %s", name, cmd, st.State, st.ExitCode, st.Error)
+	}
+
+	res, inputs, err := parseJobResult(b)
+	if err != nil {
+		return JobResult{}, fmt.Errorf("job %s: %w", name, err)
+	}
+
+	if want := jobEnv(doc, "JOB_INPUTS"); inputs != want {
+		return JobResult{}, fmt.Errorf("job %s: the result is for other inputs (%s, want %s)", name, inputs, want)
+	}
+
+	// a job that wrote its result exits with its command's code, or 0 when it
+	// replays an earlier result; any other failure (e.g. 70: the result could
+	// not be made durable) means the result is not to be trusted
+	if st.State == containers.ContainerStateFailed && int(st.ExitCode) != res.RC {
+		return JobResult{}, fmt.Errorf("job %s ended with exit %d after writing a result with rc %d: %s", name, st.ExitCode, res.RC, st.Error)
+	}
+
+	if res.RC != 0 {
+		return res, fmt.Errorf("command %q failed with rc=%d:\n%s", cmd, res.RC, res.Output)
+	}
+
+	return res, nil
+}
+
+// usesRecords reports whether a job document mounts the records volume, i.e.
+// writes a result file.
+func usesRecords(doc *spec.ContainerConfig) bool {
+	for _, m := range doc.MountsConfig {
+		if m.VolumeMount != nil && m.VolumeMount.VolumeName == spec.RecordsVolumeName {
+			return true
+		}
+	}
+
+	return false
+}
+
+// parseJobResult reads a job's result file: "rc <n>", "inputs <hash>", then its output.
+func parseJobResult(b []byte) (JobResult, string, error) {
+	head, rest, _ := strings.Cut(string(b), "\n")
+	in, out, _ := strings.Cut(rest, "\n")
+
+	var rc int
+	if _, err := fmt.Sscanf(head, "rc %d", &rc); err != nil {
+		return JobResult{}, "", fmt.Errorf("malformed result %q", head)
+	}
+
+	inputs, ok := strings.CutPrefix(in, "inputs ")
+	if !ok || inputs == "" {
+		return JobResult{}, "", fmt.Errorf("result without inputs: %q", in)
+	}
+
+	return JobResult{Output: out, RC: rc}, inputs, nil
+}
+
+// jobEnv returns a job document's environment variable.
+func jobEnv(doc *spec.ContainerConfig, key string) string {
+	for _, e := range doc.ContainerEnvironment {
+		if v, ok := strings.CutPrefix(e, key+"="); ok {
+			return v
+		}
+	}
+
+	return ""
+}
+
+// jobInputs identifies what a job does, so the same id with other inputs is refused.
+func jobInputs(parts ...string) string {
+	h := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
+
+	return hex.EncodeToString(h[:])
 }
 
 // Shell runs a ceph command (or any shell command) as an admin job and prints the output.
@@ -539,12 +711,10 @@ func (o *Orch) RemoveCluster(ctx context.Context, zap bool) error {
 			o.printf("deleting /var/mnt/ceph/%s on %s\n", o.St.FSID, h.Name)
 
 			id := randHex(3)
+			dir := "/var/lib/ceph/" + o.St.FSID
 			doc := daemons.HostJob(daemons.Params{
-				Name: fmt.Sprintf("ceph-%s-job-%s", o.St.Short(), id), Image: o.St.Image, FSID: o.St.FSID, ID: "job", Keyring: "",
-			}, id, "rm -rf "+shellQuote("/var/lib/ceph/"+o.St.FSID))
-			// no ceph.conf anymore at this point
-			doc.DependsOnConfig.PathsConfig = nil
-			doc.MountsConfig = slices.DeleteFunc(doc.MountsConfig, func(m spec.Mount) bool { return m.HostPathMount != nil && m.HostPathMount.MountSource == "/etc/ceph" })
+				Name: fmt.Sprintf("ceph-%s-job-%s", o.St.Short(), id), Image: o.St.Image, FSID: o.St.FSID, ID: "job",
+			}, id, jobInputs("rm-data", h.Name, dir), "rm -rf "+shellQuote(dir))
 
 			if _, err := o.runJob(ctx, h.Addr, doc, id, 10*time.Minute); err != nil {
 				return err
@@ -573,20 +743,12 @@ func (o *Orch) RemoveCluster(ctx context.Context, zap bool) error {
 // zap destroys all Ceph signatures on a device, from a privileged job on its host.
 func (o *Orch) zap(ctx context.Context, h state.Host, device string) error {
 	id := randHex(3)
-
-	adm, err := o.adminKeyring()
-	if err != nil {
-		return err
-	}
-
+	cmd := "ceph-volume lvm zap " + shellQuote(device)
 	doc := daemons.DeviceJob(daemons.Params{
-		Name: fmt.Sprintf("ceph-%s-job-%s", o.St.Short(), id), Image: o.St.Image, FSID: o.St.FSID, ID: "job", Keyring: adm,
-	}, id, "ceph-volume lvm zap "+shellQuote(device))
-	// zapping needs no cluster access; rm-cluster runs it after ceph.conf is gone
-	doc.DependsOnConfig.PathsConfig = slices.DeleteFunc(doc.DependsOnConfig.PathsConfig, func(p string) bool { return p == "/etc/ceph/ceph.conf" })
-	doc.MountsConfig = slices.DeleteFunc(doc.MountsConfig, func(m spec.Mount) bool { return m.HostPathMount != nil && m.HostPathMount.MountSource == "/etc/ceph" })
-
-	_, err = o.runJob(ctx, h.Addr, doc, id, 10*time.Minute)
+		Name: fmt.Sprintf("ceph-%s-job-%s", o.St.Short(), id), Image: o.St.Image, FSID: o.St.FSID, ID: "job",
+	}, id, jobInputs("zap", h.Name, device), cmd)
+	// zapping needs no cluster access: jobs mount neither ceph.conf nor a key
+	_, err := o.runJob(ctx, h.Addr, doc, id, 10*time.Minute)
 
 	return err
 }

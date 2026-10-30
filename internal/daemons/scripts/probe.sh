@@ -1,10 +1,6 @@
-# Image probe: reports the Ceph version and CPU architecture of an image.
-# Runs before a cluster exists: no keyring, no ceph.conf, no cluster access.
+# Image probe: prints the Ceph version and CPU architecture of an image and exits
+# (restart policy never); cephadm-talos reads them from its log. Runs before a
+# cluster exists: no keyring, no ceph.conf, no cluster access.
 trap - EXIT
-echo "CEPHADM-TALOS-BEGIN $JOB"
-set +e
-ceph --version 2>&1
-rc=$?
+ceph --version
 echo "arch $(uname -m)"
-echo "CEPHADM-TALOS-END $JOB rc=$rc"
-park

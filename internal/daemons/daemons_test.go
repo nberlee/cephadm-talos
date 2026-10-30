@@ -25,14 +25,15 @@ func TestRenderAll(t *testing.T) {
 
 	out, err := spec.Render(
 		spec.CephVolume(), spec.CephConf("[global]\nfsid = x\n"),
-		Mon(mon), Mgr(mgr), OSD(p), Job(Params{Name: "ceph-0123abcd-job-abc123", Image: p.Image, FSID: p.FSID, Keyring: "k"}, "abc123", "ceph -s"),
+		Mon(mon), Mgr(mgr), OSD(p), Job(Params{Name: "ceph-0123abcd-job-abc123", Image: p.Image, FSID: p.FSID, Keyring: "k"}, "abc123", "inputs", "ceph -s"),
+		RecordsInit("ceph-0123abcd-records-init-h1", p.Image), spec.RecordsVolume(),
 		spec.Delete("ContainerConfig", "ceph-0123abcd-job-abc123"),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	for _, want := range []string{"profile: privileged", "source: /dev", "volumeType: directory", "$patch: delete", "mode: host", "name: ceph/ceph.conf", "mode: 0o644"} {
+	for _, want := range []string{"profile: privileged", "source: /dev", "volumeType: directory", "$patch: delete", "mode: host", "name: ceph/ceph.conf", "mode: 0o644", "policy: never", "policy: on-failure", "name: cephadm-talos"} {
 		if !strings.Contains(string(out), want) {
 			t.Errorf("rendered docs miss %q", want)
 		}
