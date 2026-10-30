@@ -959,10 +959,7 @@ func (o *Orch) deployOSD(ctx context.Context, h state.Host, device string) error
 		return err
 	}
 
-	job := daemons.OSDPrepare(daemons.Params{
-		Name: o.osdPrepareDocName(d), Image: o.St.Image, FSID: o.St.FSID, ID: "job",
-		Keyring: daemons.Keyring("client.bootstrap-osd", k), Device: byID, DiskSerial: serial,
-	}, d.DeployID, o.osdPrepareInputs(h, d))
+	job := o.osdPrepareDoc(h, d, k)
 
 	o.printf("preparing %s:%s (%s)\n", h.Name, device, byID)
 
@@ -1021,6 +1018,15 @@ func (o *Orch) osdPrepareInputs(h state.Host, d state.Daemon) string {
 }
 
 // osdPrepareDocName is the document of an OSD deployment's prepare job.
+// osdPrepareDoc renders the job that prepares an OSD's disk, with the
+// bootstrap-osd key.
+func (o *Orch) osdPrepareDoc(h state.Host, d state.Daemon, bootstrapKey string) *spec.ContainerConfig {
+	return daemons.OSDPrepare(daemons.Params{
+		Name: o.osdPrepareDocName(d), Image: o.St.Image, FSID: o.St.FSID, ID: "job",
+		Keyring: daemons.Keyring("client.bootstrap-osd", bootstrapKey), Device: d.DevicePath, DiskSerial: d.DiskSerial,
+	}, d.DeployID, o.osdPrepareInputs(h, d))
+}
+
 func (o *Orch) osdPrepareDocName(d state.Daemon) string {
 	return o.St.DocName(state.Daemon{Type: "osd-prepare", ID: d.DeployID})
 }

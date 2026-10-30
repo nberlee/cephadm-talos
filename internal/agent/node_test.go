@@ -9,7 +9,9 @@ import (
 	"testing"
 
 	"github.com/siderolabs/talos/pkg/machinery/client"
+	"github.com/siderolabs/talos/pkg/machinery/config/types/runtime"
 
+	"github.com/nberlee/cephadm-talos/internal/daemons"
 	"github.com/nberlee/cephadm-talos/internal/records"
 	"github.com/nberlee/cephadm-talos/internal/spec"
 	"github.com/nberlee/cephadm-talos/internal/talos"
@@ -32,7 +34,9 @@ func testNode(t *testing.T) (*Node, *talos.Client) {
 	tc := &talos.Client{Dial: func(ctx context.Context, _ talos.Conn) (*client.Client, error) { return f.Dial(ctx) }}
 	t.Cleanup(func() { tc.Close() }) //nolint:errcheck
 
-	return &Node{Talos: tc, Records: &records.Store{Dir: t.TempDir()}, FSID: testFSID, Host: "h1"}, tc
+	pol := &Policy{FSID: testFSID, Host: "h1", Repos: []string{"quay.io/ceph/ceph"}}
+
+	return &Node{Talos: tc, Records: &records.Store{Dir: t.TempDir()}, FSID: testFSID, Host: "h1", Policy: pol}, tc
 }
 
 func render(t *testing.T, d any) []byte {
@@ -71,10 +75,10 @@ func TestNodeOwnership(t *testing.T) {
 		t.Fatal("adopted twice")
 	}
 
-	probe := n.prefix() + "probe-a"
+	probe := n.prefix() + "probe-aaaaaa"
 	docs := []Doc{
-		{Kind: "ContainerConfig", Name: probe, YAML: render(t, container(probe, "quay.io/ceph/ceph:v20.2.4"))},
-		{Kind: "EtcFileConfig", Name: "ceph/ceph.conf", YAML: render(t, spec.CephConf("[global]\nfsid = x\n"))},
+		{Kind: "ContainerConfig", Name: probe, YAML: render(t, daemons.Probe(probe, testImage))},
+		{Kind: "EtcFileConfig", Name: "ceph/ceph.conf", YAML: render(t, conf("10.5.0.3"))},
 	}
 
 	if own, err = n.Apply(ctx, 2, docs); err != nil {
@@ -88,7 +92,7 @@ func TestNodeOwnership(t *testing.T) {
 	cfg, err := tc.MachineConfig(ctx, "")
 	must(t, err)
 
-	if !strings.Contains(cfg, "fsid = x") || !strings.Contains(cfg, "name: app") || !strings.Contains(cfg, agentDoc) {
+	if !strings.Contains(cfg, "fsid = "+testFSID) || !strings.Contains(cfg, "name: app") || !strings.Contains(cfg, agentDoc) {
 		t.Fatalf("config after the apply:\n%s", cfg)
 	}
 
@@ -129,7 +133,7 @@ func TestNodeDrift(t *testing.T) {
 	_, err := n.Adopt(ctx, 1)
 	must(t, err)
 
-	conf := []Doc{{Kind: "EtcFileConfig", Name: "ceph/ceph.conf", YAML: render(t, spec.CephConf("[global]\n"))}}
+	conf := []Doc{{Kind: "EtcFileConfig", Name: "ceph/ceph.conf", YAML: render(t, conf("10.5.0.4"))}}
 
 	// someone else changes an owned document
 	must(t, tc.Patch(ctx, "", render(t, spec.CephConf("[global]\nedited = 1\n"))))
@@ -161,7 +165,7 @@ func TestNodeUncertainApply(t *testing.T) {
 
 	n.Talos = failingPatch{tc}
 
-	conf := []Doc{{Kind: "EtcFileConfig", Name: "ceph/ceph.conf", YAML: render(t, spec.CephConf("[global]\n"))}}
+	conf := []Doc{{Kind: "EtcFileConfig", Name: "ceph/ceph.conf", YAML: render(t, conf("10.5.0.4"))}}
 	if _, err := n.Apply(ctx, 2, conf); err == nil {
 		t.Fatal("failed patch reported as applied")
 	}
@@ -199,8 +203,8 @@ func TestNodeChecksTheDocumentsYAML(t *testing.T) {
 	cp := &countingPatch{Client: tc}
 	n.Talos = cp
 
-	probe := n.prefix() + "probe-a"
-	ok := render(t, container(probe, "quay.io/ceph/ceph:v20.2.4"))
+	probe := n.prefix() + "probe-aaaaaa"
+	ok := render(t, daemons.Probe(probe, testImage))
 	app := render(t, container("app", "docker.io/library/alpine:3"))
 
 	for name, yamlDoc := range map[string][]byte{
@@ -253,7 +257,7 @@ func TestAnotherWriterBetweenPatchAndReadBack(t *testing.T) {
 
 	n.Talos = racingPatch{Client: tc, t: t}
 
-	conf := []Doc{{Kind: "EtcFileConfig", Name: "ceph/ceph.conf", YAML: render(t, spec.CephConf("[global]\nmine = 1\n"))}}
+	conf := []Doc{{Kind: "EtcFileConfig", Name: "ceph/ceph.conf", YAML: render(t, conf("10.5.0.3"))}}
 	if _, err := n.Apply(ctx, 2, conf); !errors.Is(err, ErrDrift) {
 		t.Fatalf("apply overtaken by another writer: %v", err)
 	}
@@ -273,8 +277,8 @@ func TestUntouchedDocumentsKeepTheirHash(t *testing.T) {
 	_, err := n.Adopt(ctx, 1)
 	must(t, err)
 
-	probe := n.prefix() + "probe-a"
-	if _, err := n.Apply(ctx, 2, []Doc{{Kind: "ContainerConfig", Name: probe, YAML: render(t, container(probe, "quay.io/ceph/ceph:v20.2.4"))}}); err != nil {
+	probe := n.prefix() + "probe-aaaaaa"
+	if _, err := n.Apply(ctx, 2, []Doc{{Kind: "ContainerConfig", Name: probe, YAML: render(t, daemons.Probe(probe, testImage))}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -296,8 +300,8 @@ func TestConcurrentApplies(t *testing.T) {
 
 	for i := range 3 {
 		wg.Go(func() {
-			name := n.prefix() + "probe-" + string(rune('a'+i))
-			_, errs[i] = n.Apply(ctx, int64(2+i), []Doc{{Kind: "ContainerConfig", Name: name, YAML: render(t, container(name, "quay.io/ceph/ceph:v20.2.4"))}})
+			name := n.prefix() + "probe-" + strings.Repeat(string(rune('a'+i)), 6)
+			_, errs[i] = n.Apply(ctx, int64(2+i), []Doc{{Kind: "ContainerConfig", Name: name, YAML: render(t, daemons.Probe(name, testImage))}})
 		})
 	}
 
@@ -325,6 +329,14 @@ func TestConcurrentApplies(t *testing.T) {
 	}
 }
 
+// testImage is a cluster image the test policy admits.
+var testImage = "quay.io/ceph/ceph@sha256:" + strings.Repeat("ab", 32)
+
+// conf is the cluster's ceph.conf with the given mons.
+func conf(mons ...string) *runtime.EtcFileConfigV1Alpha1 {
+	return spec.CephConf(daemons.CephConf(testFSID, mons))
+}
+
 func container(name, image string) *spec.ContainerConfig {
 	c := spec.Container(name, image)
 	c.ContainerEntrypoint = []string{"/bin/true"}
@@ -341,4 +353,30 @@ func keys(m map[string]string) []string {
 	slices.Sort(out)
 
 	return out
+}
+
+func TestApplyRunsThePolicy(t *testing.T) {
+	n, tc := testNode(t)
+	ctx := context.Background()
+
+	_, err := n.Adopt(ctx, 1)
+	must(t, err)
+
+	cp := &countingPatch{Client: tc}
+	n.Talos = cp
+
+	// an IPv6 zone smuggling options into ceph.conf through carriage returns
+	evil := conf("::1%x\rmon_host = 10.5.0.3\rdebug_ms = 20\r#")
+	if _, err := n.Apply(ctx, 2, []Doc{{Kind: "EtcFileConfig", Name: "ceph/ceph.conf", YAML: render(t, evil)}}); err == nil {
+		t.Fatal("ceph.conf with a zone admitted")
+	}
+
+	n.Policy = nil
+	if _, err := n.Apply(ctx, 2, []Doc{{Kind: "EtcFileConfig", Name: "ceph/ceph.conf", YAML: render(t, conf("10.5.0.3"))}}); err == nil {
+		t.Fatal("applied without a policy")
+	}
+
+	if cp.n != 0 {
+		t.Fatalf("%d patches reached Talos", cp.n)
+	}
 }

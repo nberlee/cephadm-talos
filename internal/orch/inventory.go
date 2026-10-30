@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/nberlee/cephadm-talos/internal/daemons"
 	"github.com/nberlee/cephadm-talos/internal/mgrmodule"
 	"github.com/nberlee/cephadm-talos/internal/pki"
 	"github.com/nberlee/cephadm-talos/internal/spec"
@@ -22,14 +23,12 @@ const InventorySchema = 1
 // Files the talos mgr module reads (EtcFileConfig names, below /etc).
 const (
 	inventoryFile     = "ceph/talos/inventory.json"
-	agentCAFile       = "ceph/talos/agent-ca.crt"
-	mgrCertFile       = "ceph/talos/mgr-client.crt"
-	mgrKeyFile        = "ceph/talos/mgr-client.key"
-	mgrServerCertFile = "ceph/talos/mgr-server.crt"
-	mgrServerKeyFile  = "ceph/talos/mgr-server.key"
-	// the module is installed as "cephadm": Ceph accepts only cephadm, rook and
-	// test_orchestrator as orchestrator backend (orchestrator/module.py)
-	mgrModuleDir = "ceph/mgr/cephadm"
+	agentCAFile       = daemons.AgentCAFile
+	mgrCertFile       = daemons.MgrCertFile
+	mgrKeyFile        = daemons.MgrKeyFile
+	mgrServerCertFile = daemons.MgrServerCertFile
+	mgrServerKeyFile  = daemons.MgrServerKeyFile
+	mgrModuleDir      = daemons.MgrModuleDir
 )
 
 type invHost struct {

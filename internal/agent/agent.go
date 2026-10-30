@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -404,7 +405,11 @@ func Main(ctx context.Context) error {
 	recs := &records.Store{Dir: filepath.Join(records.Mount, records.RecordsDir)}
 	a := &Agent{
 		Talos: tc, Life: ctx, Channel: ch, Records: recs,
-		Node: &Node{Talos: tc, Records: recs, FSID: self.FSID, Host: self.Name},
+		Node: &Node{Talos: tc, Records: recs, FSID: self.FSID, Host: self.Name, Policy: &Policy{
+			// from the agent's own document, which only the CLI writes; no
+			// repositories admit no image
+			FSID: self.FSID, Host: self.Name, CACert: string(pems[0]), Repos: strings.Fields(os.Getenv(daemons.EnvImageRepos)),
+		}},
 	}
 
 	var wg sync.WaitGroup

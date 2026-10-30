@@ -16,6 +16,7 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/config/config"
 	"github.com/siderolabs/talos/pkg/machinery/config/configloader"
 	"github.com/siderolabs/talos/pkg/machinery/config/encoder"
+	"github.com/siderolabs/talos/pkg/machinery/resources/block"
 	"gopkg.in/yaml.v3"
 
 	"github.com/nberlee/cephadm-talos/internal/records"
@@ -89,8 +90,11 @@ type Node struct {
 	Talos interface {
 		MachineConfig(ctx context.Context, node string) (string, error)
 		Patch(ctx context.Context, node string, patches ...[]byte) error
+		Disks(ctx context.Context, node string) ([]*block.Disk, error)
 	}
 	Records *records.Store
+	// Policy admits the documents Apply applies; nil admits nothing
+	Policy *Policy
 	// FSID is the cluster's, Host the agent's host
 	FSID string
 	Host string
@@ -106,6 +110,40 @@ func (n *Node) docName(typ string) string {
 
 // prefix is the name prefix of the cluster's ContainerConfig documents.
 func (n *Node) prefix() string { return "ceph-" + (&state.State{FSID: n.FSID}).Short() + "-" }
+
+// admit runs the admission policy over a revision's documents; without a
+// policy nothing is applied. Errors name the document, never a value in it.
+func (n *Node) admit(ctx context.Context, docs []Doc, typed map[string]typedDoc, cur, sent map[string]string) error {
+	if n.Policy == nil {
+		return errors.New("no admission policy: nothing is applied")
+	}
+
+	disks, err := n.Talos.Disks(ctx, "")
+	if err != nil {
+		return err
+	}
+
+	f := facts{containers: map[string]bool{}}
+
+	for _, d := range disks {
+		f.disks = append(f.disks, Disk{Serial: d.TypedSpec().Serial, Symlinks: d.TypedSpec().Symlinks})
+	}
+
+	// the node's containers after this revision: what it has and adds, minus removals
+	for k := range cur {
+		if name, ok := strings.CutPrefix(k, "ContainerConfig/"); ok {
+			f.containers[name] = true
+		}
+	}
+
+	for k, h := range sent {
+		if name, ok := strings.CutPrefix(k, "ContainerConfig/"); ok {
+			f.containers[name] = h != ""
+		}
+	}
+
+	return n.Policy.check(docs, typed, f)
+}
 
 // handoff reports whether a document stays the CLI's: the agent's own
 // document, its records-init and their volume (plan 03, item 11).
@@ -142,7 +180,8 @@ func (n *Node) cluster(kind, name string) bool {
 func parseDocs(cfg string) (map[string]string, error) {
 	docs, err := typedDocs([]byte(cfg))
 	if err != nil {
-		return nil, fmt.Errorf("machine config: %w", err)
+		// the decoder's message may quote a value, a key among them
+		return nil, errors.New("machine config: does not decode")
 	}
 
 	out := make(map[string]string, len(docs))
@@ -153,8 +192,9 @@ func parseDocs(cfg string) (map[string]string, error) {
 	return out, nil
 }
 
-// typedDoc is one named document in Talos's encoding.
+// typedDoc is one named document, decoded and in Talos's encoding.
 type typedDoc struct {
+	doc  config.Document
 	yaml []byte
 	hash string
 }
@@ -196,11 +236,15 @@ func typedDocs(data []byte) (map[string]typedDoc, error) {
 			return nil, fmt.Errorf("%s twice", k)
 		}
 
-		out[k] = typedDoc{yaml: b, hash: h}
+		out[k] = typedDoc{doc: d, yaml: b, hash: h}
 	}
 
 	return out, nil
 }
+
+// errNotYAML is the error for a document that does not parse; the parser's
+// message may quote the document.
+var errNotYAML = errors.New("not YAML")
 
 // checkDoc validates a revision's document: exactly one YAML document, of the
 // kind and name the Doc says, in Talos's encoding.
@@ -218,7 +262,7 @@ func checkDoc(d Doc) (typedDoc, error) {
 		}
 
 		if err != nil {
-			return typedDoc{}, err
+			return typedDoc{}, errNotYAML
 		}
 
 		if v != nil {
@@ -232,7 +276,8 @@ func checkDoc(d Doc) (typedDoc, error) {
 
 	docs, err := typedDocs(d.YAML)
 	if err != nil {
-		return typedDoc{}, err
+		// the decoder's message may quote a value, a key among them
+		return typedDoc{}, errors.New("not a valid Talos document")
 	}
 
 	td, ok := docs[d.Key()]
@@ -453,6 +498,7 @@ func (n *Node) Apply(ctx context.Context, revision int64, docs []Doc) (Ownership
 	}
 
 	sent := map[string]string{}
+	typed := map[string]typedDoc{}
 
 	var dels, adds bytes.Buffer
 
@@ -487,6 +533,7 @@ func (n *Node) Apply(ctx context.Context, revision int64, docs []Doc) (Ownership
 
 			// what is sent is Talos's own encoding of the checked document
 			sent[k] = td.hash
+			typed[k] = td
 
 			adds.WriteString("---\n")
 			adds.Write(td.yaml)
@@ -505,6 +552,11 @@ func (n *Node) Apply(ctx context.Context, revision int64, docs []Doc) (Ownership
 
 	if d := n.drift(own, cur); len(d) > 0 {
 		return Ownership{}, fmt.Errorf("%w: %s", ErrDrift, strings.Join(d, ", "))
+	}
+
+	// every document must pass the admission policy (plan 03, item 13)
+	if err := n.admit(ctx, docs, typed, cur, sent); err != nil {
+		return Ownership{}, err
 	}
 
 	if err := n.writeJSON(applyRecord, applyIntent{Schema: ownershipSchema, Revision: revision, Before: own.Docs, Sent: sent}); err != nil {

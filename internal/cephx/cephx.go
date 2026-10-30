@@ -5,6 +5,8 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
+	"strings"
 	"time"
 )
 
@@ -34,4 +36,37 @@ func encode(typ uint16, secret []byte, created time.Time) string {
 	buf = append(buf, secret...)
 
 	return base64.StdEncoding.EncodeToString(buf)
+}
+
+// cryptoAES is CEPH_CRYPTO_AES, a 16 byte secret, the type of older keys.
+const cryptoAES = 1
+
+// Valid checks that a base64 string is a CephX secret in the wire format
+// NewKey produces: an AES (16 byte) or AES256KRB5 (32 byte) key. It never
+// returns the key in its error.
+func Valid(key string) error {
+	// the decoder skips newlines, which would end a keyring line
+	if strings.Trim(key, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=") != "" {
+		return errors.New("cephx: key is not base64")
+	}
+
+	b, err := base64.StdEncoding.Strict().DecodeString(key)
+	if err != nil {
+		return errors.New("cephx: key is not base64")
+	}
+
+	if len(b) < 12 {
+		return errors.New("cephx: key too short")
+	}
+
+	typ, n := binary.LittleEndian.Uint16(b), int(binary.LittleEndian.Uint16(b[10:]))
+
+	switch {
+	case len(b) != 12+n:
+		return errors.New("cephx: key length does not match its header")
+	case typ == cryptoAES && n == 16, typ == cryptoAES256KRB5 && n == 32:
+		return nil
+	}
+
+	return errors.New("cephx: unknown key type")
 }

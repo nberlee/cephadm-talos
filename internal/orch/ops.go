@@ -811,14 +811,18 @@ func (o *Orch) zap(ctx context.Context, h state.Host, device, serial string) err
 	}
 
 	id := randHex(3)
-	doc := daemons.Zap(daemons.Params{
-		Name: fmt.Sprintf("ceph-%s-job-%s", o.St.Short(), id), Image: o.St.Image, FSID: o.St.FSID, ID: "job",
-		Device: device, DiskSerial: serial,
-	}, id, jobInputs("zap", h.Name, device, serial))
 	// zapping needs no cluster access: jobs mount neither ceph.conf nor a key
-	_, err := o.runJob(ctx, h.Addr, doc, id, 10*time.Minute)
+	_, err := o.runJob(ctx, h.Addr, o.zapDoc(h, id, device, serial), id, 10*time.Minute)
 
 	return err
+}
+
+// zapDoc renders the job that zaps a device, bound to its serial.
+func (o *Orch) zapDoc(h state.Host, id, device, serial string) *spec.ContainerConfig {
+	return daemons.Zap(daemons.Params{
+		Name: o.St.DocName(state.Daemon{Type: "job", ID: id}), Image: o.St.Image, FSID: o.St.FSID, ID: "job",
+		Device: device, DiskSerial: serial,
+	}, id, jobInputs("zap", h.Name, device, serial))
 }
 
 // osdIfExists runs a command for an OSD only if that very OSD (id and uuid)

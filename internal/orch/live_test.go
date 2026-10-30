@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/nberlee/cephadm-talos/internal/agent"
 	"github.com/nberlee/cephadm-talos/internal/state"
 	"github.com/nberlee/cephadm-talos/internal/store"
@@ -158,6 +160,79 @@ func TestLiveAgentStatus(t *testing.T) {
 		}
 
 		t.Logf("%s: records %s, node %+v, %d containers", h.Name, rec.Records, *rec.Node, len(rec.Containers))
+	}
+}
+
+// TestLivePolicyAdmitsTheCluster runs the agents' admission policy over the
+// documents deployed on every node, with the node's disks: everything a grant
+// could carry must pass. The CLI's own documents are skipped, and the first
+// mon's bootstrap document is expected to be refused.
+//
+//	go test -tags live -run TestLivePolicyAdmitsTheCluster -v ./internal/orch/
+func TestLivePolicyAdmitsTheCluster(t *testing.T) {
+	o := liveOrch(t)
+	ctx := context.Background()
+
+	for _, h := range o.St.Hosts {
+		cfg, err := o.Talos.MachineConfig(ctx, h.Addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		disks, err := o.Talos.Disks(ctx, h.Addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var ds []agent.Disk
+		for _, d := range disks {
+			ds = append(ds, agent.Disk{Serial: d.TypedSpec().Serial, Symlinks: d.TypedSpec().Symlinks})
+		}
+
+		var docs []agent.Doc
+
+		var names []string
+
+		dec := yaml.NewDecoder(strings.NewReader(cfg))
+
+		for {
+			var m map[string]any
+			if err := dec.Decode(&m); err != nil {
+				break
+			}
+
+			kind, _ := m["kind"].(string)
+			name, _ := m["name"].(string)
+
+			if kind == "ContainerConfig" {
+				names = append(names, name)
+			}
+
+			cluster := strings.HasPrefix(name, "ceph-"+o.St.Short()+"-") || strings.HasPrefix(name, "ceph/") || name == "ceph"
+			if !cluster || name == o.agentDocName(h) || name == o.recordsInitDocName(h) {
+				continue
+			}
+
+			b, _ := yaml.Marshal(m)
+			docs = append(docs, agent.Doc{Kind: kind, Name: name, YAML: b})
+		}
+
+		pol := &agent.Policy{FSID: o.St.FSID, Host: h.Name, Repos: o.imageRepos(), CACert: o.St.Agent.CACert}
+
+		for _, d := range docs {
+			err := pol.Check([]agent.Doc{d}, ds, names)
+
+			bootstrap := strings.Contains(string(d.YAML), "MODE=bootstrap")
+
+			switch {
+			case err != nil && !bootstrap:
+				t.Errorf("%s: %s: %v", h.Name, d.Key(), err)
+			case err == nil && bootstrap:
+				t.Errorf("%s: %s: the bootstrap mon was admitted", h.Name, d.Key())
+			default:
+				t.Logf("%s: %s: %v", h.Name, d.Key(), err)
+			}
+		}
 	}
 }
 

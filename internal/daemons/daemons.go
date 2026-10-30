@@ -195,6 +195,19 @@ func VIP(p Params, image string) *spec.ContainerConfig {
 	return c
 }
 
+// Files a mgr host has besides ceph.conf (EtcFileConfig names, below /etc): the
+// mgr module and its TLS identity for the agent channel.
+const (
+	AgentCAFile       = "ceph/talos/agent-ca.crt"
+	MgrCertFile       = "ceph/talos/mgr-client.crt"
+	MgrKeyFile        = "ceph/talos/mgr-client.key"
+	MgrServerCertFile = "ceph/talos/mgr-server.crt"
+	MgrServerKeyFile  = "ceph/talos/mgr-server.key"
+	// the module is installed as "cephadm": Ceph accepts only cephadm, rook and
+	// test_orchestrator as orchestrator backend (orchestrator/module.py)
+	MgrModuleDir = "ceph/mgr/cephadm"
+)
+
 // The agent's environment: its TLS identity (base64 PEM) and the image
 // repositories its admission policy allows (plan 03, item 13), space-separated.
 const (
