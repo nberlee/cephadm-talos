@@ -24,8 +24,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import orchestrator
 from ceph.deployment.hostspec import HostSpec
-from mgr_module import CLICommandBase, MgrModule
+from mgr_module import CLICommandBase, CommandResult, MgrModule
 from orchestrator import DaemonDescription, DaemonDescriptionStatus, handle_orch_error
+
+from . import bridge
 
 TalosCLICommand = CLICommandBase.make_registry_subtype("TalosCLICommand")
 
@@ -357,7 +359,66 @@ class Module(orchestrator.Orchestrator, MgrModule):
             raise ValueError('address %s is not one inventory host' % addr)
         return fetch_record(addr, tls_context(), refresh=refresh, expect=(inv['fsid'], names[0]))
 
+    def _mon_command(self, cmd: Dict[str, Any], deadline: float) -> Any:
+        """A mon command with a deadline; the result may complete after it (plan 03, item 2)."""
+        res = CommandResult('')
+        self.send_command(res, 'mon', '', json.dumps(cmd), '')
+        res.ev.wait(deadline)
+        return res
+
+    def _lead(self) -> None:
+        """Capture the incarnation, serve the agent channel, heartbeat the local agent (items 1, 2, 5)."""
+        leadership = bridge.Leadership(self.get_mgr_id(), self._mon_command)
+        channel: Optional[bridge.Channel] = None
+        nonce = ''
+        try:
+            while not self._poller.stop.is_set():
+                try:
+                    inv = load_inventory()
+                    if channel is None:
+                        channel = bridge.Channel(
+                            inv['fsid'], self.get_mgr_id(), leadership, self._mon_command,
+                            bridge.server_context(os.path.join(TALOS_DIR, 'agent-ca.crt'), os.path.join(TALOS_DIR, 'mgr-server.crt'),
+                                                  os.path.join(TALOS_DIR, 'mgr-server.key')),
+                            bridge.read(os.path.join(TALOS_DIR, 'mgr-server.key')), require_identity, self.log)
+                        channel.start()
+                    if leadership.capture():
+                        gid, epoch = leadership.captured() or (0, 0)
+                        nonce = self._heartbeat(inv, gid, epoch, nonce)
+                except InventoryError as e:
+                    self.log.warning('%s', e)
+                except Exception:  # leadership must survive anything
+                    self.log.exception('agent channel failed')
+                self._poller.stop.wait(bridge.HEARTBEAT_INTERVAL)
+        finally:
+            if channel is not None:
+                channel.stop()
+
+    def _heartbeat(self, inv: Dict[str, Any], gid: int, epoch: int, nonce: str) -> str:
+        """Tell the local agent it is the leader's; returns the agent's session nonce."""
+        mine = [h['addr'] for h in inv['hosts'] if h['name'] == self.get_mgr_id()]
+        if len(mine) != 1:
+            raise ValueError('this mgr\'s host %s is not one inventory host' % self.get_mgr_id())
+        conn = http.client.HTTPSConnection(mine[0], AGENT_PORT, context=tls_context(), timeout=bridge.HEARTBEAT_INTERVAL)
+        try:
+            conn.connect()
+            require_identity(conn.sock.getpeercert(), inv['fsid'], 'agent', self.get_mgr_id())
+            conn.request('POST', '/v1/heartbeat', body=bridge.heartbeat_body(inv['fsid'], self.get_mgr_id(), gid, epoch, nonce),
+                         headers={'Content-Type': 'application/json'})
+            resp = conn.getresponse()
+            body = resp.read(4096)
+            if resp.status != 200:
+                raise ValueError('agent answered %d to the heartbeat' % resp.status)
+            reply = json.loads(body)
+            if not isinstance(reply, dict) or reply.get('version') != bridge.WIRE_VERSION or not isinstance(reply.get('session'), str):
+                raise ValueError('malformed heartbeat reply')
+            return reply['session']
+        finally:
+            conn.close()
+
     def serve(self) -> None:
+        lead = threading.Thread(target=self._lead, name='talos-lead', daemon=True)
+        lead.start()
         while not self._poller.stop.is_set():
             try:
                 self._poller.poll(load_inventory()['hosts'])

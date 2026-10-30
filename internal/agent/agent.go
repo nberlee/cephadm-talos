@@ -74,6 +74,9 @@ type Agent struct {
 	Life context.Context
 	jobs sync.WaitGroup
 
+	// Channel is the agent's side of the agent channel (plan 03); nil serves status only
+	Channel *Channel
+
 	logPrint func(format string, args ...any)
 	// refresh replaces observe in tests
 	refresh func(context.Context) error
@@ -244,6 +247,10 @@ func (a *Agent) Run(ctx context.Context) {
 // was attempted in the last 5 seconds.
 func (a *Agent) Handler() http.Handler {
 	mux := http.NewServeMux()
+	if a.Channel != nil {
+		mux.HandleFunc("POST /v1/heartbeat", a.Channel.HandleHeartbeat)
+	}
+
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("refresh") == "1" {
 			if err := a.Refresh(r.Context(), true); err != nil {
@@ -357,13 +364,28 @@ func Main(ctx context.Context) error {
 		return err
 	}
 
+	leaf, err := x509.ParseCertificate(cfg.Certificates[0].Certificate[0])
+	if err != nil {
+		return err
+	}
+
+	self, err := pki.CertIdentity(leaf)
+	if err != nil {
+		return err
+	}
+
+	ch, err := NewChannel(self)
+	if err != nil {
+		return err
+	}
+
 	tc := &talos.Client{Dial: talos.DialSocket(constants.MachineSocketPath), Roles: []role.Role{role.Reader}}
 	defer tc.Close() //nolint:errcheck
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	a := &Agent{Talos: tc, Life: ctx}
+	a := &Agent{Talos: tc, Life: ctx, Channel: ch}
 
 	var wg sync.WaitGroup
 
