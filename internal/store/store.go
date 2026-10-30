@@ -34,11 +34,13 @@ const MaxEntry = 60 << 10
 // Schema is the version of the manifest and record layout.
 const Schema = 1
 
-// Backend is a config-key store: the CLI reaches it through exec, the leader
-// through the module's bridge. Get and List read one consistent snapshot, so a
-// reader of a manifest finds its chunks even while a writer compacts (a backend
-// without snapshots must make its callers retry on a fresh Latest). An
-// incarnation has one writer at a time; its publications are serialized.
+// Backend is a config-key store: the CLI reaches it through exec (a Snapshot),
+// the leader through the module's bridge. A Snapshot's Get and List read one
+// consistent snapshot, so a reader of a manifest finds its chunks even while a
+// writer compacts. A backend without snapshots (the bridge) serves only
+// readers that cannot race a compaction: an incarnation's own writer, and
+// readers of a frozen incarnation. An incarnation has one writer at a time;
+// its publications are serialized.
 type Backend interface {
 	Get(ctx context.Context, key string) ([]byte, error) // ErrNotFound if missing
 	List(ctx context.Context, prefix string) ([]string, error)

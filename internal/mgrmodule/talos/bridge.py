@@ -47,9 +47,13 @@ LEADERSHIP_COMMANDS = 2
 # a bridge call answers within its connection's deadline; longer ones are
 # fetched later by dispatch id
 MAX_BRIDGE_DEADLINE = 10.0
-# kept outcomes: pending ones are kept until they complete, completed ones for
-# LATE_KEEP; at most MAX_RECORDS, each output at most MAX_OUTPUT bytes
+# kept outcomes, by dispatch id: pending ones until they complete; completed
+# ones for LATE_KEEP if their call's answer was "unknown", for ANSWERED_KEEP if
+# the call answered "done" (in case that answer was lost), not at all for an
+# answered read-only call, which can be repeated. At most MAX_RECORDS, each
+# output at most MAX_OUTPUT bytes.
 LATE_KEEP = 3600.0
+ANSWERED_KEEP = 60.0
 MAX_RECORDS = 64
 MAX_OUTPUT = 256 << 10
 SHUTDOWN_WAIT = 5.0
@@ -61,8 +65,10 @@ HEX_RE = re.compile(r'\A[0-9a-f]{16,128}\Z')
 class Job:
     """One mon command; complete() may come after any deadline."""
 
-    def __init__(self, cmd: Dict[str, Any]) -> None:
+    def __init__(self, cmd: Dict[str, Any], reduce: Optional[Callable[[str], str]] = None) -> None:
         self.cmd = cmd
+        # reduce shrinks the output before it is kept (a dump to its keys)
+        self.reduce = reduce
         self.ev = threading.Event()
         self.r = 0
         self.outb = ''
@@ -101,6 +107,12 @@ class Commands:
                 res = self.new_result()
                 self.send(res, json.dumps(job.cmd))
                 res.ev.wait()  # until Ceph completes it, however long that takes
+                if job.reduce is not None and res.r == 0:
+                    try:
+                        res.outb = job.reduce(res.outb or '')
+                    except Exception as e:
+                        job.complete(-22, '', 'unexpected output: %s' % e)  # EINVAL
+                        continue
                 if len(res.outb or '') + len(res.outs or '') > MAX_OUTPUT:
                     job.too_large = True  # not kept: only the return code
                     job.complete(res.r, '', '')
@@ -112,11 +124,11 @@ class Commands:
                 res = None  # an idle worker keeps no result
                 self.slots.release()
 
-    def submit(self, cmd: Dict[str, Any]) -> Optional[Job]:
+    def submit(self, cmd: Dict[str, Any], reduce: Optional[Callable[[str], str]] = None) -> Optional[Job]:
         with self.lock:  # never behind the stop sentinels
             if self.stopped or not self.slots.acquire(blocking=False):
                 return None
-            job = Job(cmd)
+            job = Job(cmd, reduce)
             self.jobs.put(job)
         return job
 
@@ -129,8 +141,12 @@ class Commands:
 
 
 # Bridge allowlist: call name -> function(args) -> mon command dict. Argument
-# shapes are fixed; anything else is refused before it is sent. Later steps add
-# config-key and auth calls here.
+# shapes are fixed; anything else is refused before it is sent.
+def _args(args: Dict[str, Any], names: Set[str]) -> None:
+    if set(args) != names:
+        raise ValueError('arguments must be exactly %s' % sorted(names))
+
+
 def _no_args(prefix: str) -> Callable[[Dict[str, Any]], Dict[str, Any]]:
     def build(args: Dict[str, Any]) -> Dict[str, Any]:
         if args:
@@ -139,10 +155,126 @@ def _no_args(prefix: str) -> Callable[[Dict[str, Any]], Dict[str, Any]]:
     return build
 
 
+# the leader's store: config-key entries of cephadm-talos only (internal/store)
+STORE_PREFIX_FULL = 'mgr/cephadm/talos/'
+STORE_KEY_RE = re.compile(r'\Amgr/cephadm/talos/(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+\Z')
+STORE_DUMP_RE = re.compile(r'\Amgr/cephadm/talos/(?:[A-Za-z0-9._-]+/)*\Z')
+MAX_KEY = 256
+# one value per call, below the request body limit with room for the envelope
+MAX_VALUE = 48 << 10
+
+
+def _store_key(v: Any, pattern: 're.Pattern[str]') -> str:
+    if not isinstance(v, str) or len(v) > MAX_KEY or not pattern.match(v) \
+            or any(p in ('.', '..') for p in v.split('/')):
+        raise ValueError('key outside %s' % STORE_PREFIX_FULL)
+    return v
+
+
+# a page of 'config-key keys' stays well below MAX_OUTPUT
+KEYS_PAGE = 128 << 10
+
+
+def _config_key_keys(args: Dict[str, Any]) -> Dict[str, Any]:
+    _args(args, {'prefix', 'after'})
+    prefix = _store_key(args['prefix'], STORE_DUMP_RE)
+    after = args['after']
+    if after != '' and (_store_key(after, STORE_KEY_RE) and not after.startswith(prefix)):
+        raise ValueError('after must be empty or a key below the prefix')
+    # config-key ls returns keys only; prefix and page are applied in the mgr (REDUCE)
+    return {'prefix': 'config-key ls', 'format': 'json'}
+
+
+def _keys_page(prefix: str, after: str) -> Callable[[str], str]:
+    """config-key ls reduced to one page of the sorted keys below prefix, after
+    the key `after`: {"keys": [...], "more": bool}."""
+    def reduce(out: str) -> str:
+        keys = json.loads(out)
+        if not isinstance(keys, list) or not all(isinstance(k, str) for k in keys):
+            raise ValueError('config-key ls is not a list of keys')
+        page: List[str] = []
+        size = 0
+        rest = sorted(k for k in keys if k.startswith(prefix) and k > after)
+        for k in rest:
+            size += len(k) + 4  # quotes, comma, space
+            if size > KEYS_PAGE:
+                break
+            page.append(k)
+        return json.dumps({'keys': page, 'more': len(page) < len(rest)})
+    return reduce
+
+
+def _config_key_get(args: Dict[str, Any]) -> Dict[str, Any]:
+    _args(args, {'key'})
+    return {'prefix': 'config-key get', 'key': _store_key(args['key'], STORE_KEY_RE)}
+
+
+def _config_key_set(args: Dict[str, Any]) -> Dict[str, Any]:
+    _args(args, {'key', 'value'})
+    v = args['value']
+    if not isinstance(v, str) or len(v.encode()) > MAX_VALUE:
+        raise ValueError('value must be a string of at most %d bytes' % MAX_VALUE)
+    return {'prefix': 'config-key set', 'key': _store_key(args['key'], STORE_KEY_RE), 'val': v}
+
+
+def _config_key_rm(args: Dict[str, Any]) -> Dict[str, Any]:
+    _args(args, {'key'})
+    return {'prefix': 'config-key rm', 'key': _store_key(args['key'], STORE_KEY_RE)}
+
+
+def _entry_limit(args: Dict[str, Any]) -> Dict[str, Any]:
+    if args:
+        raise ValueError('config get takes no arguments')
+    return {'prefix': 'config get', 'who': 'mon', 'key': 'mon_config_key_max_entry_size', 'format': 'json'}
+
+
+# keys the leader renders into daemon documents (item 4): never client.admin
+DAEMON_ID_RE = r'[a-z0-9][a-z0-9-]{0,62}'
+AUTH_GET_RE = re.compile(r'\A(?:mon\.|client\.bootstrap-osd|osd\.(?:0|[1-9][0-9]{0,8})|mgr\.%s|client\.rgw\.%s)\Z' % (DAEMON_ID_RE, DAEMON_ID_RE))
+# identities the leader creates, with the caps the CLI gives them (internal/orch)
+CREATE_CAPS = {
+    'mgr': ['mon', 'profile mgr', 'osd', 'allow *', 'mds', 'allow *'],
+    'client.rgw': ['mon', 'allow rw', 'osd', 'allow rwx', 'mgr', 'allow rw'],
+}
+CREATE_RE = re.compile(r'\A(mgr|client\.rgw)\.%s\Z' % DAEMON_ID_RE)
+
+
+def _auth_get(args: Dict[str, Any]) -> Dict[str, Any]:
+    _args(args, {'entity'})
+    e = args['entity']
+    if not isinstance(e, str) or not AUTH_GET_RE.match(e):
+        raise ValueError('entity not allowed')
+    return {'prefix': 'auth get', 'entity': e, 'format': 'json'}
+
+
+def _auth_get_or_create(args: Dict[str, Any]) -> Dict[str, Any]:
+    _args(args, {'entity'})
+    e = args['entity']
+    m = CREATE_RE.match(e) if isinstance(e, str) else None
+    if m is None:
+        raise ValueError('entity not allowed')
+    return {'prefix': 'auth get-or-create', 'entity': e, 'caps': list(CREATE_CAPS[m.group(1)]), 'format': 'json'}
+
+
+# calls whose output is reduced in the mgr before it is kept and returned
+REDUCE: Dict[str, Callable[[Dict[str, Any]], Callable[[str], str]]] = {
+    'config-key keys': lambda args: _keys_page(args['prefix'], args['after']),
+}
+
+# calls that change nothing: an answered one is not kept
+READ_ONLY = {'status', 'health', 'mgr dump', 'config-key keys', 'config-key get', 'entry limit', 'auth get'}
+
 ALLOWLIST: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     'status': _no_args('status'),
     'health': _no_args('health'),
     'mgr dump': _no_args('mgr dump'),
+    'config-key keys': _config_key_keys,
+    'config-key get': _config_key_get,
+    'config-key set': _config_key_set,
+    'config-key rm': _config_key_rm,
+    'entry limit': _entry_limit,
+    'auth get': _auth_get,
+    'auth get-or-create': _auth_get_or_create,
 }
 
 
@@ -225,6 +357,7 @@ class Record:
     def __init__(self) -> None:
         self.job: Optional[Job] = None
         self.done_at: Optional[float] = None
+        self.answered = False  # the call itself returned "done"
 
 
 class Server(ThreadingHTTPServer):
@@ -368,9 +501,13 @@ class Channel:
             if dispatch in self.records:
                 return 409, {'error': 'dispatch id already used; fetch its outcome'}
             if len(self.records) >= MAX_RECORDS:
-                return 429, {'error': 'too many kept outcomes'}
+                # an answered call's outcome is a courtesy: the oldest one makes room
+                answered = [(r.done_at, k) for k, r in self.records.items() if r.answered and r.done_at is not None]
+                if not answered:
+                    return 429, {'error': 'too many kept outcomes'}
+                del self.records[min(answered)[1]]
             self.records[dispatch] = rec  # registered before anything is sent
-        job = self.commands.submit(cmd)
+        job = self.commands.submit(cmd, REDUCE[call](args) if call in REDUCE else None)
         if job is None:
             with self.lock:
                 del self.records[dispatch]  # nothing was sent
@@ -378,7 +515,13 @@ class Channel:
         with self.lock:
             rec.job = job
         if job.ev.wait(float(deadline)):
-            return 200, self._outcome(dispatch, rec)
+            out = self._outcome(dispatch, rec)
+            with self.lock:
+                if call in READ_ONLY:
+                    self.records.pop(dispatch, None)
+                else:
+                    rec.answered = True
+            return 200, out
         return 200, {'outcome': 'unknown'}
 
     def _outcome(self, dispatch: str, rec: Record) -> Dict[str, Any]:
@@ -401,12 +544,12 @@ class Channel:
         return 200, self._outcome(dispatch, rec)
 
     def _expire(self) -> None:
-        """Drop completed outcomes after LATE_KEEP; pending ones stay. Under self.lock."""
+        """Drop completed outcomes after their keep time; pending ones stay. Under self.lock."""
         now = time.monotonic()
         for k, rec in list(self.records.items()):
             if rec.job is not None and rec.job.ev.is_set() and rec.done_at is None:
                 rec.done_at = now
-            if rec.done_at is not None and now - rec.done_at > LATE_KEEP:
+            if rec.done_at is not None and now - rec.done_at > (ANSWERED_KEEP if rec.answered else LATE_KEEP):
                 del self.records[k]
 
     # --- server -------------------------------------------------------------

@@ -36,6 +36,7 @@ class Mons:
         self.sent = []      # (thread name, prefix)
         self.pending = []
         self.late = False
+        self.keys = []      # answer to config-key ls
 
     def send(self, res, cmd):
         prefix = json.loads(cmd)['prefix']
@@ -49,6 +50,8 @@ class Mons:
                 self.pending.append(res)
                 return
             res.complete(0, json.dumps(mm), '')
+        elif prefix == 'config-key ls':
+            res.complete(0, json.dumps(self.keys), '')
         else:
             res.complete(0, json.dumps({'status': 'HEALTH_OK'}), '')
 
@@ -207,6 +210,104 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual([p for _, p in mons.sent], ['health'])  # refused calls never reach the mons
         self.assertTrue(all(t.startswith('bridge-') for t, _ in mons.sent))
 
+    def test_store_and_key_calls(self):
+        k = 'mgr/cephadm/talos/inc/4242/rec/1/hosts.0'
+        good = {
+            'config-key keys': ({'prefix': 'mgr/cephadm/talos/inc/4242/', 'after': ''}, {'prefix': 'config-key ls', 'format': 'json'}),
+            'config-key get': ({'key': k}, {'prefix': 'config-key get', 'key': k}),
+            'config-key set': ({'key': k, 'value': 'abc='}, {'prefix': 'config-key set', 'key': k, 'val': 'abc='}),
+            'config-key rm': ({'key': k}, {'prefix': 'config-key rm', 'key': k}),
+            'entry limit': ({}, {'prefix': 'config get', 'who': 'mon', 'key': 'mon_config_key_max_entry_size', 'format': 'json'}),
+            'auth get': ({'entity': 'osd.12'}, {'prefix': 'auth get', 'entity': 'osd.12', 'format': 'json'}),
+            'auth get-or-create': ({'entity': 'client.rgw.h1-a'}, {'prefix': 'auth get-or-create', 'entity': 'client.rgw.h1-a',
+                                                                  'caps': ['mon', 'allow rw', 'osd', 'allow rwx', 'mgr', 'allow rw'],
+                                                                  'format': 'json'}),
+        }
+        for call, (args, cmd) in good.items():
+            self.assertEqual(b.ALLOWLIST[call](args), cmd, call)
+        for e in ('mon.', 'mgr.h1', 'osd.0', 'client.rgw.h2', 'client.bootstrap-osd'):
+            b.ALLOWLIST['auth get']({'entity': e})
+        bad = [
+            ('config-key keys', {'prefix': 'mgr/cephadm/', 'after': ''}),
+            ('config-key keys', {'prefix': 'mgr/cephadm/talos/inc', 'after': ''}),
+            ('config-key keys', {'prefix': 'mgr/cephadm/talos/../x/', 'after': ''}),
+            ('config-key keys', {'prefix': 'mgr/cephadm/talos/inc/4242/'}),
+            ('config-key keys', {'prefix': 'mgr/cephadm/talos/inc/4242/', 'after': 'mgr/cephadm/talos/inc/1/x'}),
+            ('config-key keys', {'prefix': 'mgr/cephadm/talos/inc/4242/', 'after': 7}),
+            ('config-key get', {'key': 'mgr/cephadm/talos/inc/'}),
+            ('config-key get', {'key': 'mgr/cephadm/cert_store.cert.x'}),
+            ('config-key set', {'key': 'mgr/cephadm/inventory', 'value': 'x'}),
+            ('config-key set', {'key': 'mgr/cephadm/talos/a/../../b', 'value': 'x'}),
+            ('config-key set', {'key': 'mgr/cephadm/talos//a', 'value': 'x'}),
+            ('config-key set', {'key': 'mgr/cephadm/talos/a/', 'value': 'x'}),
+            ('config-key set', {'key': k, 'value': 1}),
+            ('config-key set', {'key': k, 'value': 'x' * (b.MAX_VALUE + 1)}),
+            ('config-key set', {'key': k}),
+            ('config-key set', {'key': 'mgr/cephadm/talos/' + 'a' * 300, 'value': 'x'}),
+            ('config-key rm', {'key': 'config/global/x'}),
+            ('config-key rm', {'key': k, 'value': 'x'}),
+            ('entry limit', {'who': 'osd'}),
+            ('auth get', {'entity': 'client.admin'}),
+            ('auth get', {'entity': 'client.rgw.H1'}),
+            ('auth get', {'entity': 'osd.01'}),
+            ('auth get', {'entity': 'mgr.h1', 'caps': []}),
+            ('auth get-or-create', {'entity': 'client.admin'}),
+            ('auth get-or-create', {'entity': 'osd.1'}),
+            ('auth get-or-create', {'entity': 'mon.'}),
+            ('auth get-or-create', {'entity': 'mgr.h1', 'caps': ['mon', 'allow *']}),
+        ]
+        for call, args in bad:
+            with self.assertRaises(ValueError, msg=(call, args)):
+                b.ALLOWLIST[call](args)
+        # the caps given out are copies: a caller cannot change the table
+        b.ALLOWLIST['auth get-or-create']({'entity': 'mgr.h1'})['caps'].append('x')
+        self.assertEqual(b.CREATE_CAPS['mgr'][-1], 'allow *')
+
+    def test_keys_below_the_prefix_in_pages(self):
+        ch, mons = self.channel()
+        base = 'mgr/cephadm/talos/inc/42/'
+        mine = sorted(base + 'rec/%d/orphan.%d' % (i, j) for i in range(100) for j in range(60))  # 6000 keys, about 280 KiB
+        mons.keys = ['mgr/cephadm/inventory', 'mgr/cephadm/talos/inc/420/manifest/1', 'config/global/x'] + mine[::-1]
+        got, after, pages = [], '', 0
+        while True:
+            code, reply = self.call(ch, call='config-key keys', args={'prefix': base, 'after': after}, dispatch_id='%016x' % (500 + pages))
+            self.assertEqual((code, reply['outcome'], reply['r']), (200, 'done', 0), reply)
+            self.assertLess(len(reply['out']), b.MAX_OUTPUT)
+            page = json.loads(reply['out'])
+            got += page['keys']
+            pages += 1
+            if not page['more']:
+                break
+            after = page['keys'][-1]
+        self.assertEqual(got, mine)
+        self.assertGreater(pages, 1)
+        self.assertEqual(mons.sent[-1][1], 'config-key ls')  # keys only: no value reaches the mgr
+        mons.keys = {'not': 'a list'}
+        code, reply = self.call(ch, call='config-key keys', args={'prefix': base, 'after': ''}, dispatch_id='ce' * 8)
+        self.assertEqual((reply['outcome'], reply['r']), ('done', -22))
+
+    def test_answered_calls_are_not_kept_long(self):
+        ch, mons = self.channel()
+        k = 'mgr/cephadm/talos/inc/42/manifest/1'
+        for i in range(2 * b.MAX_RECORDS):  # reads are dropped once answered
+            self.assertEqual(self.call(ch, call='config-key get', args={'key': k}, dispatch_id='%016x' % i)[0], 200)
+        self.assertEqual(ch.outcome('%016x' % 0)[0], 404)
+        self.assertEqual(self.call(ch, call='config-key rm', args={'key': k}, dispatch_id='ef' * 8)[1]['outcome'], 'done')
+        self.assertEqual(ch.outcome('ef' * 8)[1]['outcome'], 'done')  # a write's answer may have been lost
+        old = b.ANSWERED_KEEP
+        b.ANSWERED_KEEP = 0.0
+        self.addCleanup(setattr, b, 'ANSWERED_KEEP', old)
+        time.sleep(0.01)
+        self.assertEqual(ch.outcome('ef' * 8)[0], 404)
+        # an unknown outcome stays for LATE_KEEP after it completes
+        mons.late = True
+        self.assertEqual(self.call(ch, call='config-key rm', args={'key': k}, deadline=0.01, dispatch_id='fe' * 8)[1]['outcome'], 'unknown')
+        self.assertTrue(wait_until(lambda: mons.pending))
+        mons.pending[0].complete(0, '', '')
+        self.assertTrue(wait_until(lambda: ch.outcome('fe' * 8)[1]['outcome'] == 'done'))
+        time.sleep(0.01)
+        self.assertEqual(ch.outcome('fe' * 8)[1]['outcome'], 'done')
+
     def test_refused_until_captured(self):
         mons = Mons([mgrmap(10, 'other')])
         cmds = mons.commands(2)
@@ -217,8 +318,9 @@ class BridgeTest(unittest.TestCase):
 
     def test_a_dispatch_id_runs_once(self):
         ch, mons = self.channel()
-        self.assertEqual(self.call(ch, dispatch_id='aa' * 8)[1]['outcome'], 'done')
-        self.assertEqual(self.call(ch, dispatch_id='aa' * 8)[0], 409)  # also after an immediate completion
+        rm = {'call': 'config-key rm', 'args': {'key': 'mgr/cephadm/talos/x'}}
+        self.assertEqual(self.call(ch, dispatch_id='aa' * 8, **rm)[1]['outcome'], 'done')
+        self.assertEqual(self.call(ch, dispatch_id='aa' * 8, **rm)[0], 409)  # also after an immediate completion
         self.assertEqual(ch.outcome('aa' * 8)[1]['outcome'], 'done')
         # concurrent reuse: exactly one runs
         mons.late = True
@@ -262,9 +364,20 @@ class BridgeTest(unittest.TestCase):
 
     def test_kept_outcomes_are_bounded(self):
         ch, mons = self.channel()
+        rm = {'call': 'config-key rm', 'args': {'key': 'mgr/cephadm/talos/x'}}
         for i in range(b.MAX_RECORDS):
-            self.assertEqual(self.call(ch, dispatch_id='%016x' % i)[0], 200)
-        self.assertEqual(self.call(ch, dispatch_id='%016x' % 999)[0], 429)
+            self.assertEqual(self.call(ch, dispatch_id='%016x' % i, **rm)[0], 200)
+        # answered outcomes make room, oldest first
+        self.assertEqual(self.call(ch, dispatch_id='%016x' % 999, **rm)[0], 200)
+        self.assertEqual(ch.outcome('%016x' % 0)[0], 404)
+        self.assertEqual(ch.outcome('%016x' % 1)[0], 200)
+        # unknown outcomes do not
+        mons.late = True
+        for k in list(ch.records):
+            del ch.records[k]
+        for i in range(b.MAX_RECORDS):
+            ch.records['%016x' % (2000 + i)] = b.Record()
+        self.assertEqual(self.call(ch, dispatch_id='%016x' % 998, deadline=0.01, **rm)[0], 429)
 
     def test_large_output_is_not_kept_in_full(self):
         ch, mons = self.channel()
@@ -272,7 +385,7 @@ class BridgeTest(unittest.TestCase):
         cmds = b.Commands(mons.send, lambda: b.Job({}), 1, 'big')
         self.addCleanup(cmds.stop)
         ch.commands = cmds
-        reply = self.call(ch, dispatch_id='ee' * 8)[1]
+        reply = self.call(ch, dispatch_id='ee' * 8, call='auth get-or-create', args={'entity': 'mgr.h1'})[1]
         self.assertEqual((reply['outcome'], reply['r']), ('done', 0))
         self.assertNotIn('out', reply)
         kept = ch.records['ee' * 8].job

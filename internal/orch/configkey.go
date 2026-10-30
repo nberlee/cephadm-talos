@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 
@@ -17,22 +16,18 @@ import (
 // configKeyTimeout bounds one config-key exec.
 const configKeyTimeout = 2 * time.Minute
 
-// configKeys is the CLI's store backend: the mon config-key store through exec
-// in a Ceph container on one node (plan 03, step 3). It reads one prefix at a
-// time with a single `config-key dump` and serves Get and List from that
-// snapshot; writes go out in one exec each, through librados in the container.
-type configKeys struct {
-	o      *Orch
-	node   string
-	prefix string
-	snap   map[string]string // nil after a write whose outcome is unknown
-	limit  int
+// execKeys is the CLI's channel to the mon config-key store (plan 03, step 3):
+// exec in a Ceph container on one node, another node if that one has none
+// running. A prefix is read with a single `config-key dump`; writes go out in
+// one exec each, through librados in the container.
+type execKeys struct {
+	o    *Orch
+	node string
 }
 
-func (o *Orch) configKeys(ctx context.Context, node, prefix string) (*configKeys, error) {
-	c := &configKeys{o: o, node: node, prefix: prefix}
-
-	return c, c.load(ctx)
+// configKeys is the CLI's store backend: a snapshot of prefix through exec.
+func (o *Orch) configKeys(ctx context.Context, node, prefix string) (*store.Snapshot, error) {
+	return store.NewSnapshot(ctx, &execKeys{o: o, node: node}, prefix, 0)
 }
 
 // readScript prints the entry limit and the keys below a prefix as one JSON
@@ -55,19 +50,19 @@ finally:
     r.shutdown()
 `
 
-func (c *configKeys) load(ctx context.Context) error {
+func (c *execKeys) Dump(ctx context.Context, prefix string) (int, map[string]string, error) {
 	ctx, cancel := context.WithTimeout(ctx, configKeyTimeout)
 	defer cancel()
 
 	var out, errb bytes.Buffer
 
-	rc, err := c.exec(ctx, []string{"python3", "-c", readScript, c.prefix}, nil, &out, &errb)
+	rc, err := c.exec(ctx, []string{"python3", "-c", readScript, prefix}, nil, &out, &errb)
 	if err != nil {
-		return err
+		return 0, nil, err
 	}
 
 	if rc != 0 {
-		return fmt.Errorf("config-key dump %s: rc %d: %s", c.prefix, rc, strings.TrimSpace(errb.String()))
+		return 0, nil, fmt.Errorf("config-key dump %s: rc %d: %s", prefix, rc, strings.TrimSpace(errb.String()))
 	}
 
 	var res struct {
@@ -76,32 +71,13 @@ func (c *configKeys) load(ctx context.Context) error {
 	}
 
 	if err := json.Unmarshal(out.Bytes(), &res); err != nil {
-		return fmt.Errorf("config-key dump %s: %w", c.prefix, err)
+		return 0, nil, fmt.Errorf("config-key dump %s: %w", prefix, err)
 	}
 
-	if res.Keys == nil {
-		res.Keys = map[string]string{}
-	}
-
-	c.snap, c.limit = res.Keys, res.Limit
-
-	return nil
+	return res.Limit, res.Keys, nil
 }
 
-// fresh reloads the snapshot after a write whose outcome is unknown.
-func (c *configKeys) fresh(ctx context.Context) error {
-	if c.snap != nil {
-		return nil
-	}
-
-	return c.load(ctx)
-}
-
-func (c *configKeys) EntryLimit() int { return c.limit }
-
-// exec runs a command for the store on its node, or on another host with a
-// running Ceph container once this one has none (its last daemon removed).
-func (c *configKeys) exec(ctx context.Context, argv []string, input []byte, stdout, stderr *bytes.Buffer) (int, error) {
+func (c *execKeys) exec(ctx context.Context, argv []string, input []byte, stdout, stderr *bytes.Buffer) (int, error) {
 	nodes := []string{c.node}
 
 	for _, h := range c.o.St.Hosts {
@@ -133,53 +109,6 @@ func (c *configKeys) exec(ctx context.Context, argv []string, input []byte, stdo
 	return 0, fmt.Errorf("no host with a running Ceph container for the cluster state: %w", lastErr)
 }
 
-func (c *configKeys) inside(key string) error {
-	if !strings.HasPrefix(key, c.prefix) {
-		return fmt.Errorf("config-key %s is outside %s", key, c.prefix)
-	}
-
-	return nil
-}
-
-func (c *configKeys) Get(ctx context.Context, key string) ([]byte, error) {
-	if err := c.inside(key); err != nil {
-		return nil, err
-	}
-
-	if err := c.fresh(ctx); err != nil {
-		return nil, err
-	}
-
-	v, ok := c.snap[key]
-	if !ok {
-		return nil, store.ErrNotFound
-	}
-
-	return []byte(v), nil
-}
-
-func (c *configKeys) List(ctx context.Context, prefix string) ([]string, error) {
-	if err := c.inside(prefix); err != nil {
-		return nil, err
-	}
-
-	if err := c.fresh(ctx); err != nil {
-		return nil, err
-	}
-
-	var out []string
-
-	for k := range c.snap {
-		if strings.HasPrefix(k, prefix) {
-			out = append(out, k)
-		}
-	}
-
-	sort.Strings(out)
-
-	return out, nil
-}
-
 // mutate runs set and rm operations in order in one librados process.
 const mutateScript = `
 import json, sys, rados
@@ -200,7 +129,7 @@ finally:
     r.shutdown()
 `
 
-func (c *configKeys) mutate(ctx context.Context, ops []map[string]string) error {
+func (c *execKeys) Mutate(ctx context.Context, ops []store.Op) error {
 	ctx, cancel := context.WithTimeout(ctx, configKeyTimeout)
 	defer cancel()
 
@@ -208,58 +137,26 @@ func (c *configKeys) mutate(ctx context.Context, ops []map[string]string) error 
 
 	enc := json.NewEncoder(&in)
 	for _, op := range ops {
-		if err := c.inside(op["key"]); err != nil {
-			return err
+		line := map[string]string{"op": "set", "key": op.Key, "value": op.Value}
+		if op.Remove {
+			line = map[string]string{"op": "rm", "key": op.Key}
 		}
 
-		if err := enc.Encode(op); err != nil {
+		if err := enc.Encode(line); err != nil {
 			return err
 		}
-	}
-
-	if err := c.fresh(ctx); err != nil {
-		return err
 	}
 
 	var errb bytes.Buffer
 
 	rc, err := c.exec(ctx, []string{"python3", "-c", mutateScript}, in.Bytes(), &errb, &errb)
-	if err != nil || rc != 0 {
-		// some of the writes may have happened: the next read starts from a fresh snapshot
-		c.snap = nil
+	if err != nil {
+		return err
+	}
 
-		if err != nil {
-			return err
-		}
-
+	if rc != 0 {
 		return fmt.Errorf("config-key update: rc %d: %s", rc, strings.TrimSpace(errb.String()))
 	}
 
-	for _, op := range ops {
-		if op["op"] == "set" {
-			c.snap[op["key"]] = op["value"]
-		} else {
-			delete(c.snap, op["key"])
-		}
-	}
-
 	return nil
-}
-
-func (c *configKeys) SetMany(ctx context.Context, kvs []store.KV) error {
-	ops := make([]map[string]string, 0, len(kvs))
-	for _, kv := range kvs {
-		ops = append(ops, map[string]string{"op": "set", "key": kv.Key, "value": string(kv.Value)})
-	}
-
-	return c.mutate(ctx, ops)
-}
-
-func (c *configKeys) Remove(ctx context.Context, keys []string) error {
-	ops := make([]map[string]string, 0, len(keys))
-	for _, k := range keys {
-		ops = append(ops, map[string]string{"op": "rm", "key": k})
-	}
-
-	return c.mutate(ctx, ops)
 }
