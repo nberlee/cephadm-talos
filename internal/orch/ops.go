@@ -660,7 +660,7 @@ func (o *Orch) Remove(ctx context.Context, name string, force, zap bool) error {
 
 		// ceph-volume zap, not `talosctl wipe disk`: bluestore keeps label copies
 		// at 1G/10G/100G/1000G that a FAST wipe of the disk start leaves behind
-		if err := o.zap(ctx, h, d.OSDDevice()); err != nil {
+		if err := o.zap(ctx, h, d.OSDDevice(), d.DiskSerial); err != nil {
 			return fmt.Errorf("osd removed, but wiping %s failed; re-run `cephadm-talos rm --zap %s`: %w", d.Device, name, err)
 		}
 	}
@@ -766,7 +766,7 @@ func (o *Orch) RemoveCluster(ctx context.Context, zap bool) error {
 
 			o.printf("zapping %s on %s\n", d.Device, h.Name)
 
-			if err := o.zap(ctx, h, d.OSDDevice()); err != nil {
+			if err := o.zap(ctx, h, d.OSDDevice(), d.DiskSerial); err != nil {
 				return err
 			}
 		}
@@ -805,12 +805,16 @@ func (o *Orch) RemoveCluster(ctx context.Context, zap bool) error {
 }
 
 // zap destroys all Ceph signatures on a device, from a privileged job on its host.
-func (o *Orch) zap(ctx context.Context, h state.Host, device string) error {
+func (o *Orch) zap(ctx context.Context, h state.Host, device, serial string) error {
+	if serial == "" {
+		return fmt.Errorf("the serial of %s is unknown: zap is bound to the disk's serial", device)
+	}
+
 	id := randHex(3)
-	cmd := "ceph-volume lvm zap " + shellQuote(device)
-	doc := daemons.DeviceJob(daemons.Params{
+	doc := daemons.Zap(daemons.Params{
 		Name: fmt.Sprintf("ceph-%s-job-%s", o.St.Short(), id), Image: o.St.Image, FSID: o.St.FSID, ID: "job",
-	}, id, jobInputs("zap", h.Name, device), cmd)
+		Device: device, DiskSerial: serial,
+	}, id, jobInputs("zap", h.Name, device, serial))
 	// zapping needs no cluster access: jobs mount neither ceph.conf nor a key
 	_, err := o.runJob(ctx, h.Addr, doc, id, 10*time.Minute)
 
@@ -1024,14 +1028,9 @@ func (o *Orch) Redeploy(ctx context.Context, name string) error {
 // redeployDoc re-renders the document of an existing daemon. Its data dir is
 // already initialised, so the mon mode and keyrings only matter for a fresh start.
 func (o *Orch) redeployDoc(d state.Daemon, h state.Host, image string) (*spec.ContainerConfig, error) {
-	p := daemons.Params{Name: o.St.DocName(d), Image: image, FSID: o.St.FSID, ID: d.ID, Addr: h.Addr, Device: d.Device, DeployID: d.DeployID, OSDUUID: d.OSDUUID}
+	p := daemons.Params{Name: o.St.DocName(d), Image: image, FSID: o.St.FSID, ID: d.ID, Addr: h.Addr, Device: d.OSDDevice(), DeployID: d.DeployID, OSDUUID: d.OSDUUID}
 	if d.OSDID != nil {
 		p.OSDID = *d.OSDID
-	}
-
-	adm, err := o.adminKeyring()
-	if err != nil {
-		return nil, err
 	}
 
 	switch d.Type {
@@ -1041,7 +1040,7 @@ func (o *Orch) redeployDoc(d state.Daemon, h state.Host, image string) (*spec.Co
 			return nil, err
 		}
 
-		p.Keyring = daemons.Keyring("mon.", monKey, "mon", "allow *") + adm
+		p.Keyring = daemons.MonKeyring(monKey)
 		p.Mode = "join"
 		p.Addrv = monAddrv(h.Addr)
 		p.DeployID = d.DeployID

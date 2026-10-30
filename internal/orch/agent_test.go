@@ -12,7 +12,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/nberlee/cephadm-talos/internal/agent"
+	"github.com/nberlee/cephadm-talos/internal/daemons"
 	"github.com/nberlee/cephadm-talos/internal/pki"
 	"github.com/nberlee/cephadm-talos/internal/spec"
 	"github.com/nberlee/cephadm-talos/internal/state"
@@ -60,7 +60,7 @@ func TestAgentDocument(t *testing.T) {
 	}
 
 	env := strings.Join(a.ContainerEnvironment, "\n")
-	for _, k := range []string{agent.EnvCA, agent.EnvCert, agent.EnvKey} {
+	for _, k := range []string{daemons.EnvCA, daemons.EnvCert, daemons.EnvKey} {
 		if !strings.Contains(env, k+"=") {
 			t.Errorf("agent document misses %s", k)
 		}

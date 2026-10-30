@@ -12,7 +12,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -295,49 +294,10 @@ func (o *Orch) authGet(entity string) (string, bool, error) {
 	return ents[0].Key, true, nil
 }
 
-// monAddrv is the mon address vector; IPv6 addresses need brackets.
-func monAddrv(ip string) string {
-	return fmt.Sprintf("[v2:%s,v1:%s]", net.JoinHostPort(ip, "3300"), net.JoinHostPort(ip, "6789"))
-}
-
 // CephConf renders the minimal ceph.conf shared by all daemons on all hosts.
-func (o *Orch) CephConf() string {
-	var addrs []string
+func (o *Orch) CephConf() string { return daemons.CephConf(o.St.FSID, o.St.MonAddrs()) }
 
-	v4, v6 := false, false
-
-	for _, a := range o.St.MonAddrs() {
-		addrs = append(addrs, monAddrv(a))
-
-		if ip := net.ParseIP(a); ip != nil && ip.To4() == nil {
-			v6 = true
-		} else {
-			v4 = true
-		}
-	}
-
-	// mgr/osd pick their bind address by family; follow the mon addresses
-	if !v4 && !v6 {
-		v4 = true
-	}
-
-	return fmt.Sprintf(`# managed by cephadm-talos, do not edit
-[global]
-fsid = %s
-mon_host = %s
-log_to_file = false
-log_to_stderr = true
-err_to_stderr = true
-mon_cluster_log_to_file = false
-mon_cluster_log_to_stderr = true
-auth_allow_insecure_global_id_reclaim = false
-ms_bind_ipv4 = %t
-ms_bind_ipv6 = %t
-# small Talos VMs: do not let bluestore autotune into an OOM
-osd_memory_target = 1073741824
-osd_memory_target_autotune = false
-`, o.St.FSID, strings.Join(addrs, ","), v4, v6)
-}
+func monAddrv(ip string) string { return daemons.MonAddrv(ip) }
 
 // adminKeyring is the client.admin keyring with full caps.
 func (o *Orch) adminKeyring() (string, error) {
@@ -891,15 +851,10 @@ func (o *Orch) deployMon(ctx context.Context, h state.Host) error {
 		return err
 	}
 
-	adm, err := o.adminKeyring()
-	if err != nil {
-		return err
-	}
-
 	doc := daemons.Mon(daemons.Params{
 		Name: o.St.DocName(d), Image: o.St.Image, FSID: o.St.FSID, ID: h.Name, Addr: h.Addr,
-		// mon. to mkfs, client.admin to fetch the monmap from the quorum
-		Keyring: daemons.Keyring("mon.", monKey, "mon", "allow *") + adm,
+		// the mon. key only (plan 03, item 13): no mon document carries client.admin
+		Keyring: daemons.MonKeyring(monKey),
 		Mode:    "join", Addrv: monAddrv(h.Addr), DeployID: d.DeployID,
 	})
 

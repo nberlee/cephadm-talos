@@ -10,13 +10,14 @@ import (
 	"embed"
 	"encoding/base64"
 	"fmt"
+	"net"
 	"slices"
 	"strings"
 	"time"
 
+	"github.com/distribution/reference"
 	"github.com/siderolabs/talos/pkg/machinery/config/types/container"
 
-	"github.com/nberlee/cephadm-talos/internal/agent"
 	"github.com/nberlee/cephadm-talos/internal/records"
 	"github.com/nberlee/cephadm-talos/internal/spec"
 )
@@ -105,8 +106,10 @@ func base(p Params, typ string) *spec.ContainerConfig {
 	return c
 }
 
-// Mon renders a ceph-mon container. Mode "bootstrap" creates a fresh monmap,
-// "join" fetches it from the running quorum (the keyring must then hold client.admin).
+// Mon renders a ceph-mon container. Mode "bootstrap" creates a fresh monmap
+// (the first mon, whose keyring also seeds mon auth); "join" makes the mon's
+// store from ceph.conf's mon_host and the mon. key alone, as cephadm does, and
+// the mon joins the quorum on its own.
 func Mon(p Params) *spec.ContainerConfig {
 	c := base(p, "mon")
 	c.ContainerEnvironment = append(c.ContainerEnvironment, "MODE="+p.Mode, "ADDRV="+p.Addrv)
@@ -192,21 +195,45 @@ func VIP(p Params, image string) *spec.ContainerConfig {
 	return c
 }
 
+// The agent's environment: its TLS identity (base64 PEM) and the image
+// repositories its admission policy allows (plan 03, item 13), space-separated.
+const (
+	EnvCA         = "CEPHADM_TALOS_AGENT_CA"
+	EnvCert       = "CEPHADM_TALOS_AGENT_CERT"
+	EnvKey        = "CEPHADM_TALOS_AGENT_KEY"
+	EnvClientCert = "CEPHADM_TALOS_AGENT_CLIENT_CERT"
+	EnvClientKey  = "CEPHADM_TALOS_AGENT_CLIENT_KEY"
+	EnvImageRepos = "CEPHADM_TALOS_IMAGE_REPOS"
+)
+
+// ImageRepository is the repository of an image reference, normalized as
+// Talos pulls it (docker.io/library/... for short names).
+func ImageRepository(ref string) (string, error) {
+	n, err := reference.ParseNormalizedNamed(ref)
+	if err != nil {
+		return "", err
+	}
+
+	return n.Name(), nil
+}
+
 // AgentUID is the uid and gid the agent runs as: the owner of the machined socket.
 const AgentUID = 50
 
-// Agent renders the node agent: read-only Talos access over the machined
-// socket, its status served on the host network (internal/agent).
-func Agent(name, recordsInit, image, caPEM, certPEM, keyPEM, clientCertPEM, clientKeyPEM string) *spec.ContainerConfig {
+// Agent renders the node agent: Talos access to its own node over the machined
+// socket, its status served on the host network (internal/agent). repos are
+// the image repositories its admission policy allows.
+func Agent(name, recordsInit, image string, repos []string, caPEM, certPEM, keyPEM, clientCertPEM, clientKeyPEM string) *spec.ContainerConfig {
 	b64 := func(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
 
 	c := spec.Container(name, image)
 	c.ContainerEnvironment = []string{
-		agent.EnvCA + "=" + b64(caPEM),
-		agent.EnvCert + "=" + b64(certPEM),
-		agent.EnvKey + "=" + b64(keyPEM),
-		agent.EnvClientCert + "=" + b64(clientCertPEM),
-		agent.EnvClientKey + "=" + b64(clientKeyPEM),
+		EnvCA + "=" + b64(caPEM),
+		EnvCert + "=" + b64(certPEM),
+		EnvKey + "=" + b64(keyPEM),
+		EnvClientCert + "=" + b64(clientCertPEM),
+		EnvClientKey + "=" + b64(clientKeyPEM),
+		EnvImageRepos + "=" + strings.Join(repos, " "),
 	}
 	c.RunAsConfig = spec.RunAs(AgentUID, AgentUID)
 	c.SecurityConfig = spec.Restricted()
@@ -299,6 +326,15 @@ func OSDPrepare(p Params, job, inputs string) *spec.ContainerConfig {
 // MaxStopTimeout is the longest stop timeout Talos accepts.
 const MaxStopTimeout = 4 * time.Minute
 
+// Zap renders the job that wipes an OSD device (plan 03, item 8), bound to the
+// disk's serial like OSDPrepare.
+func Zap(p Params, job, inputs string) *spec.ContainerConfig {
+	c := DeviceJob(p, job, inputs, rawScript("zap"))
+	c.ContainerEnvironment = append(c.ContainerEnvironment, "DEVICE="+p.Device, "DISK_SERIAL="+p.DiskSerial)
+
+	return c
+}
+
 // HostJob is a privileged Job with the host's /var/lib/ceph volume, for cleanup.
 func HostJob(p Params, job, inputs, cmd string) *spec.ContainerConfig {
 	c := DeviceJob(p, job, inputs, cmd)
@@ -318,6 +354,55 @@ func DeviceJob(p Params, job, inputs, cmd string) *spec.ContainerConfig {
 	)
 
 	return c
+}
+
+// MonKeyring is a joining mon's keyring: the mon. key with its fixed caps.
+func MonKeyring(key string) string { return Keyring("mon.", key, "mon", "allow *") }
+
+// MonAddrv is the mon address vector; IPv6 addresses need brackets.
+func MonAddrv(ip string) string {
+	return fmt.Sprintf("[v2:%s,v1:%s]", net.JoinHostPort(ip, "3300"), net.JoinHostPort(ip, "6789"))
+}
+
+// CephConf renders the minimal ceph.conf shared by all daemons on all hosts,
+// from the fsid and the mon addresses. The agent renders it the same way to
+// admit a granted ceph.conf (plan 03, item 13).
+func CephConf(fsid string, monAddrs []string) string {
+	var addrs []string
+
+	v4, v6 := false, false
+
+	for _, a := range monAddrs {
+		addrs = append(addrs, MonAddrv(a))
+
+		if ip := net.ParseIP(a); ip != nil && ip.To4() == nil {
+			v6 = true
+		} else {
+			v4 = true
+		}
+	}
+
+	// mgr/osd pick their bind address by family; follow the mon addresses
+	if !v4 && !v6 {
+		v4 = true
+	}
+
+	return fmt.Sprintf(`# managed by cephadm-talos, do not edit
+[global]
+fsid = %s
+mon_host = %s
+log_to_file = false
+log_to_stderr = true
+err_to_stderr = true
+mon_cluster_log_to_file = false
+mon_cluster_log_to_stderr = true
+auth_allow_insecure_global_id_reclaim = false
+ms_bind_ipv4 = %t
+ms_bind_ipv6 = %t
+# small Talos VMs: do not let bluestore autotune into an OOM
+osd_memory_target = 1073741824
+osd_memory_target_autotune = false
+`, fsid, strings.Join(addrs, ","), v4, v6)
 }
 
 // Keyring formats a keyring section. caps is a list of "service", "capspec" pairs.

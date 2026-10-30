@@ -98,3 +98,51 @@ func TestKeyring(t *testing.T) {
 		t.Fatalf("got %q", got)
 	}
 }
+
+func TestZapJob(t *testing.T) {
+	p := params()
+	p.Device, p.DiskSerial = "/dev/disk/by-id/ata-QEMU_HARDDISK_QM00001", "QM00001"
+	c := Zap(p, "j2", "inputs")
+
+	env := strings.Join(c.ContainerEnvironment, "\n")
+	for _, want := range []string{"DISK_SERIAL=QM00001", "DEVICE=" + p.Device, "JOB=j2", "CEPHADM_TALOS_KEYRING=\n"} {
+		if !strings.Contains(env+"\n", want) {
+			t.Errorf("environment misses %q", want)
+		}
+	}
+
+	if !strings.Contains(env, "ceph-volume lvm zap") || c.SecurityConfig.SecurityProfile != "privileged" {
+		t.Error("not the privileged zap script")
+	}
+}
+
+func TestJoiningMonHasTheMonKeyOnly(t *testing.T) {
+	k := MonKeyring("AQBkey==")
+	if strings.Count(k, "[") != 1 || !strings.HasPrefix(k, "[mon.]\n") || !strings.Contains(k, `caps mon = "allow *"`) {
+		t.Errorf("mon keyring %q", k)
+	}
+}
+
+func TestCephConfAndImageRepository(t *testing.T) {
+	conf := CephConf("f1", []string{"10.5.0.3", "fd00::1"})
+	for _, want := range []string{"fsid = f1\n", "mon_host = [v2:10.5.0.3:3300,v1:10.5.0.3:6789],[v2:[fd00::1]:3300,v1:[fd00::1]:6789]\n", "ms_bind_ipv4 = true\n", "ms_bind_ipv6 = true\n"} {
+		if !strings.Contains(conf, want) {
+			t.Errorf("ceph.conf misses %q:\n%s", want, conf)
+		}
+	}
+
+	for ref, want := range map[string]string{
+		"quay.io/ceph/ceph@sha256:" + strings.Repeat("a", 64): "quay.io/ceph/ceph",
+		"10.5.0.1:5000/cephadm-talos-agent:dev":               "10.5.0.1:5000/cephadm-talos-agent",
+		"alpine:3":                                            "docker.io/library/alpine",
+	} {
+		if got, err := ImageRepository(ref); err != nil || got != want {
+			t.Errorf("%s: %q %v", ref, got, err)
+		}
+	}
+
+	a := Agent("ceph-0123abcd-agent-h1", "ceph-0123abcd-records-init-h1", "registry/agent:1", []string{"quay.io/ceph/ceph", "quay.io/ceph/keepalived"}, "ca", "c", "k", "cc", "ck")
+	if !strings.Contains(strings.Join(a.ContainerEnvironment, "\n"), EnvImageRepos+"=quay.io/ceph/ceph quay.io/ceph/keepalived") {
+		t.Error("the agent document misses its image repositories")
+	}
+}

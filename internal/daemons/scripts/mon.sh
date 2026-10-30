@@ -6,17 +6,18 @@ D=/var/lib/ceph/$FSID/mon.$ID
 # gets a new id, so its stale store (which the quorum no longer knows) is rebuilt.
 if [ "$(cat "$D/cephadm-talos-done" 2>/dev/null)" != "$DEPLOY_ID" ]; then
 	keyring /tmp/mon.keyring
-	if [ "${MODE:-join}" = bootstrap ]; then
-		log "creating initial monmap for $ID $ADDRV"
-		monmaptool --create --clobber --fsid "$FSID" --addv "$ID" "$ADDRV" /tmp/monmap
-	else
-		log "fetching monmap from the existing quorum"
-		# the mon keyring we were given holds client.admin as well (see internal/orch)
-		ceph -n client.admin -k /tmp/mon.keyring --connect-timeout 30 mon getmap -o /tmp/monmap
-	fi
 	rm -rf "$D"
 	mkdir -p "$D"
-	ceph-mon --mkfs -i "$ID" --fsid "$FSID" --monmap /tmp/monmap --keyring /tmp/mon.keyring --mon-data "$D"
+	if [ "$MODE" = bootstrap ]; then
+		log "creating initial monmap for $ID $ADDRV"
+		monmaptool --create --clobber --fsid "$FSID" --addv "$ID" "$ADDRV" /tmp/monmap
+		ceph-mon --mkfs -i "$ID" --fsid "$FSID" --monmap /tmp/monmap --keyring /tmp/mon.keyring --mon-data "$D"
+	else
+		# as cephadm does: the store from ceph.conf's mon_host and the mon. key
+		# alone; the new mon probes the quorum and joins it
+		log "creating mon.$ID to join the quorum at mon_host"
+		ceph-mon --mkfs -i "$ID" --fsid "$FSID" --keyring /tmp/mon.keyring --mon-data "$D" --public-addrv "$ADDRV"
+	fi
 	echo "$DEPLOY_ID" > "$D/cephadm-talos-done"
 	rm -f /tmp/mon.keyring /tmp/monmap
 fi

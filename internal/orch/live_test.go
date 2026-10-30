@@ -36,8 +36,13 @@ func TestLiveJobs(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
+	serial, link, err := o.diskIdentity(ctx, h.Addr, os.Getenv("CEPHADM_TALOS_LIVE_DEVICE"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	start := time.Now()
-	if err := o.zap(ctx, h, os.Getenv("CEPHADM_TALOS_LIVE_DEVICE")); err != nil {
+	if err := o.zap(ctx, h, link, serial); err != nil {
 		t.Fatalf("zap: %v", err)
 	}
 

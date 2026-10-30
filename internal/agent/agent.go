@@ -23,6 +23,7 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/constants"
 	"github.com/siderolabs/talos/pkg/machinery/role"
 
+	"github.com/nberlee/cephadm-talos/internal/daemons"
 	"github.com/nberlee/cephadm-talos/internal/pki"
 	"github.com/nberlee/cephadm-talos/internal/records"
 	"github.com/nberlee/cephadm-talos/internal/talos"
@@ -350,17 +351,6 @@ func TLSConfig(caPEM, certPEM, keyPEM []byte) (*tls.Config, error) {
 	}, nil
 }
 
-// Env names of the agent's TLS material (base64 encoded PEM), set in its document.
-const (
-	EnvCA   = "CEPHADM_TALOS_AGENT_CA"
-	EnvCert = "CEPHADM_TALOS_AGENT_CERT"
-	EnvKey  = "CEPHADM_TALOS_AGENT_KEY"
-	// EnvClientCert and EnvClientKey are the agent's client certificate, for the
-	// mgr module's confirmation endpoint and bridge (plan 03)
-	EnvClientCert = "CEPHADM_TALOS_AGENT_CLIENT_CERT"
-	EnvClientKey  = "CEPHADM_TALOS_AGENT_CLIENT_KEY"
-)
-
 func envPEM(name string) ([]byte, error) {
 	v := os.Getenv(name)
 	if v == "" {
@@ -374,7 +364,7 @@ func envPEM(name string) ([]byte, error) {
 func Main(ctx context.Context) error {
 	var pems [3][]byte
 
-	for i, name := range []string{EnvCA, EnvCert, EnvKey} {
+	for i, name := range []string{daemons.EnvCA, daemons.EnvCert, daemons.EnvKey} {
 		b, err := envPEM(name)
 		if err != nil {
 			return err

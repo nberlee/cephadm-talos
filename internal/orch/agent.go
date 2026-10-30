@@ -182,8 +182,27 @@ func (o *Orch) agentDocs(h state.Host) []any {
 	return []any{
 		spec.RecordsVolume(),
 		daemons.RecordsInit(init, o.St.Agent.Image),
-		daemons.Agent(o.agentDocName(h), init, o.St.Agent.Image, o.St.Agent.CACert, h.AgentCert, h.AgentKey, h.AgentClientCert, h.AgentClientKey),
+		daemons.Agent(o.agentDocName(h), init, o.St.Agent.Image, o.imageRepos(), o.St.Agent.CACert, h.AgentCert, h.AgentKey, h.AgentClientCert, h.AgentClientKey),
 	}
+}
+
+// imageRepos are the repositories of the cluster's images, which the agents'
+// admission policy allows (plan 03, item 13).
+func (o *Orch) imageRepos() []string {
+	refs := []string{o.St.Image}
+	if o.St.RGW != nil {
+		refs = append(refs, o.St.RGW.KeepalivedImage)
+	}
+
+	var repos []string
+
+	for _, r := range refs {
+		if repo, err := daemons.ImageRepository(r); err == nil && !slices.Contains(repos, repo) {
+			repos = append(repos, repo)
+		}
+	}
+
+	return repos
 }
 
 // expiresSoon reports whether a certificate is due for renewal.
