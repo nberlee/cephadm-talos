@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"net/url"
 	"time"
 )
 
@@ -55,6 +56,8 @@ type Leaf struct {
 	Years int
 	// Lifetime, if set, replaces Years
 	Lifetime time.Duration
+	// Identity, if set, is carried as a URI SAN (see Identity)
+	Identity *Identity
 }
 
 // Issue signs a leaf certificate with the CA.
@@ -82,6 +85,10 @@ func Issue(caCertPEM, caKeyPEM string, l Leaf) (certPEM, keyPEM string, err erro
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{l.Usage},
 		DNSNames:     l.Names,
+	}
+
+	if l.Identity != nil {
+		tmpl.URIs = []*url.URL{l.Identity.URI()}
 	}
 
 	for _, ip := range l.IPs {

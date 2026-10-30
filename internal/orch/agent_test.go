@@ -105,18 +105,25 @@ func TestRenewAgentCerts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fresh := state.Host{Name: "fresh", Addr: "node"}
+	fresh := state.Host{Name: "fresh", Addr: "10.5.0.2"}
 	if err := o.ensureAgentCert(&fresh); err != nil {
 		t.Fatal(err)
 	}
 
 	// a certificate that is already at its end (0 years)
-	due := state.Host{Name: "due", Addr: "node"}
-	due.AgentCert, due.AgentKey, _ = pki.Issue(o.St.Agent.CACert, o.St.Agent.CAKey, pki.Leaf{CommonName: "agent due", IPs: []string{"node"}, Usage: x509.ExtKeyUsageServerAuth})
+	due := state.Host{Name: "due", Addr: "10.5.0.3"}
+	if err := o.ensureAgentCert(&due); err != nil {
+		t.Fatal(err)
+	}
+
+	due.AgentCert, due.AgentKey, _ = pki.Issue(o.St.Agent.CACert, o.St.Agent.CAKey, pki.Leaf{
+		CommonName: "agent due", IPs: []string{"10.5.0.3"}, Names: []string{"due"}, Usage: x509.ExtKeyUsageServerAuth,
+		Identity: &pki.Identity{FSID: o.St.FSID, Role: pki.RoleAgent, Name: "due"},
+	})
 	o.St.AddHost(fresh)
 	o.St.AddHost(due)
 
-	freshCert, dueCert, mgrCert := fresh.AgentCert, due.AgentCert, o.St.Agent.MgrCert
+	freshCert, dueCert, mgrCert := fresh.AgentCert, due.AgentCert, o.St.Agent.OperatorCert
 
 	if err := o.RenewAgentCerts(context.Background()); err != nil {
 		t.Fatal(err)
@@ -127,9 +134,9 @@ func TestRenewAgentCerts(t *testing.T) {
 		got[h.Name] = h.AgentCert
 	}
 
-	if got["fresh"] != freshCert || got["due"] == dueCert || o.St.Agent.MgrCert != mgrCert {
-		t.Errorf("renewal: fresh changed %t, due changed %t, mgr changed %t",
-			got["fresh"] != freshCert, got["due"] != dueCert, o.St.Agent.MgrCert != mgrCert)
+	if got["fresh"] != freshCert || got["due"] == dueCert || o.St.Agent.OperatorCert != mgrCert {
+		t.Errorf("renewal: fresh changed %t, due changed %t, operator changed %t",
+			got["fresh"] != freshCert, got["due"] != dueCert, o.St.Agent.OperatorCert != mgrCert)
 	}
 
 	if len(o.St.ConfPending) != 0 {
@@ -158,7 +165,7 @@ func TestHostRmRemovesTheAgent(t *testing.T) {
 	}
 
 	// the agent's process lingers for a moment after its document is gone
-	inst := containers.NewContainerInstanceSpec(containers.NamespaceName, o.agentDocName(h)+"-0")
+	inst := containers.NewContainerInstanceStatus(containers.NamespaceName, o.agentDocName(h)+"-0")
 	inst.TypedSpec().ContainerID = o.agentDocName(h)
 
 	if err := f.St.Create(ctx, inst); err != nil {
@@ -196,8 +203,15 @@ func TestRenewalPushIsRetriedAfterAFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	due := state.Host{Name: "due", Addr: "node"}
-	due.AgentCert, due.AgentKey, _ = pki.Issue(o.St.Agent.CACert, o.St.Agent.CAKey, pki.Leaf{CommonName: "agent due", IPs: []string{"node"}, Usage: x509.ExtKeyUsageServerAuth})
+	due := state.Host{Name: "due", Addr: "10.5.0.3"}
+	if err := o.ensureAgentCert(&due); err != nil {
+		t.Fatal(err)
+	}
+
+	due.AgentCert, due.AgentKey, _ = pki.Issue(o.St.Agent.CACert, o.St.Agent.CAKey, pki.Leaf{
+		CommonName: "agent due", IPs: []string{"10.5.0.3"}, Names: []string{"due"}, Usage: x509.ExtKeyUsageServerAuth,
+		Identity: &pki.Identity{FSID: o.St.FSID, Role: pki.RoleAgent, Name: "due"},
+	})
 	o.St.AddHost(due)
 
 	f.FailAfterApply = status.Error(codes.Unavailable, "connection lost")
@@ -264,5 +278,60 @@ func TestRemoveClusterRemovesAgentsWithoutStatus(t *testing.T) {
 
 	if strings.Contains(cfg, o.agentDocName(h)) {
 		t.Errorf("agent document left behind")
+	}
+}
+
+func TestCertIdentities(t *testing.T) {
+	f := talostest.New(t, images())
+	o := fakeOrch(t, f)
+
+	if err := o.setupAgent(context.Background(), "node", "registry/agent:dev", false); err != nil {
+		t.Fatal(err)
+	}
+
+	h := state.Host{Name: "h1", Addr: "10.5.0.2"}
+	if err := o.ensureAgentCert(&h); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := o.ensureMgrCerts(&h, true); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, c := range []struct {
+		pem   string
+		role  pki.Role
+		name  string
+		usage x509.ExtKeyUsage
+	}{
+		{h.AgentCert, pki.RoleAgent, "h1", x509.ExtKeyUsageServerAuth},
+		{h.AgentClientCert, pki.RoleAgent, "h1", x509.ExtKeyUsageClientAuth},
+		{h.MgrServerCert, pki.RoleMgr, "h1", x509.ExtKeyUsageServerAuth},
+		{h.MgrClientCert, pki.RoleMgr, "h1", x509.ExtKeyUsageClientAuth},
+		{o.St.Agent.OperatorCert, pki.RoleOperator, "admin", x509.ExtKeyUsageClientAuth},
+	} {
+		cert, err := pki.Parse(c.pem)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		id, err := pki.CertIdentity(cert)
+		if err != nil || id != (pki.Identity{FSID: o.St.FSID, Role: c.role, Name: c.name}) {
+			t.Errorf("%s %s: identity %+v %v", c.role, c.name, id, err)
+		}
+
+		if len(cert.ExtKeyUsage) != 1 || cert.ExtKeyUsage[0] != c.usage {
+			t.Errorf("%s %s: usage %v", c.role, c.name, cert.ExtKeyUsage)
+		}
+	}
+
+	// unchanged certificates are kept; dropping the mgr drops its certificates
+	server := h.AgentCert
+	if err := o.ensureAgentCert(&h); err != nil || h.AgentCert != server {
+		t.Errorf("valid agent certificate reissued (%v)", err)
+	}
+
+	if err := o.ensureMgrCerts(&h, false); err != nil || h.MgrServerCert != "" || h.MgrClientKey != "" {
+		t.Errorf("mgr certificates kept without a mgr (%v)", err)
 	}
 }

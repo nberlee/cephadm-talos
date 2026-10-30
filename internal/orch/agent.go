@@ -25,8 +25,8 @@ func (o *Orch) agentDocName(h state.Host) string {
 	return o.St.DocName(state.Daemon{Type: "agent", ID: h.Name})
 }
 
-// setupAgent creates the agent CA and the mgr's client certificate, and pins
-// the agent image to the digest Talos pulls on node.
+// setupAgent creates the agent CA and the operator's client certificate, and
+// pins the agent image to the digest Talos pulls on node.
 func (o *Orch) setupAgent(ctx context.Context, node, image string, refresh bool) error {
 	a := &state.Agent{Image: image}
 
@@ -49,51 +49,120 @@ func (o *Orch) setupAgent(ctx context.Context, node, image string, refresh bool)
 
 	o.St.Agent = a
 
-	return o.issueMgrCert()
+	return o.issueOperatorCert()
 }
 
-// issueMgrCert (re)issues the mgr's client certificate for the agents.
-func (o *Orch) issueMgrCert() error {
+// identity is a role's identity in this cluster (plan 03, item 3).
+func (o *Orch) identity(role pki.Role, name string) pki.Identity {
+	return pki.Identity{FSID: o.St.FSID, Role: role, Name: name}
+}
+
+// issue signs a certificate for one identity and usage with the agent CA.
+func (o *Orch) issue(id pki.Identity, usage x509.ExtKeyUsage, ips, names []string) (string, string, error) {
 	a := o.St.Agent
 
-	c, k, err := pki.Issue(a.CACert, a.CAKey, pki.Leaf{CommonName: "mgr", Usage: x509.ExtKeyUsageClientAuth, Years: agentCertYears})
+	return pki.Issue(a.CACert, a.CAKey, pki.Leaf{
+		CommonName: string(id.Role) + " " + id.Name, IPs: ips, Names: names,
+		Usage: usage, Years: agentCertYears, Identity: &id,
+	})
+}
+
+// issueOperatorCert (re)issues the CLI's client certificate.
+func (o *Orch) issueOperatorCert() error {
+	c, k, err := o.issue(o.identity(pki.RoleOperator, "admin"), x509.ExtKeyUsageClientAuth, nil, nil)
 	if err != nil {
 		return err
 	}
 
-	a.MgrCert, a.MgrKey = c, k
+	o.St.Agent.OperatorCert, o.St.Agent.OperatorKey = c, k
 
 	return nil
 }
 
-// ensureAgentCert gives a host a server certificate for its address and name,
-// or a new one if those changed.
+// certValid reports whether a certificate carries the identity and, for a
+// server certificate, exactly these addresses and names.
+func certValid(certPEM string, id pki.Identity, server bool, ips, names []string) bool {
+	c, err := pki.Parse(certPEM)
+	if err != nil {
+		return false
+	}
+
+	if _, err := pki.Require(c, id); err != nil {
+		return false
+	}
+
+	return !server || certCovers(certPEM, ips, names)
+}
+
+// ensureAgentCert gives a host its agent's server certificate (for its address
+// and name) and client certificate, or new ones if they no longer match.
 func (o *Orch) ensureAgentCert(h *state.Host) error {
 	if o.St.Agent == nil {
 		return nil
 	}
 
-	if h.AgentCert != "" && certCovers(h.AgentCert, []string{h.Addr}, []string{h.Name}) {
+	id := o.identity(pki.RoleAgent, h.Name)
+	ips, names := []string{h.Addr}, []string{h.Name}
+
+	if !certValid(h.AgentCert, id, true, ips, names) {
+		if err := o.issueAgentServerCert(h); err != nil {
+			return err
+		}
+	}
+
+	if !certValid(h.AgentClientCert, id, false, nil, nil) {
+		return o.issueAgentClientCert(h)
+	}
+
+	return nil
+}
+
+func (o *Orch) issueAgentServerCert(h *state.Host) (err error) {
+	h.AgentCert, h.AgentKey, err = o.issue(o.identity(pki.RoleAgent, h.Name), x509.ExtKeyUsageServerAuth, []string{h.Addr}, []string{h.Name})
+
+	return err
+}
+
+func (o *Orch) issueAgentClientCert(h *state.Host) (err error) {
+	h.AgentClientCert, h.AgentClientKey, err = o.issue(o.identity(pki.RoleAgent, h.Name), x509.ExtKeyUsageClientAuth, nil, nil)
+
+	return err
+}
+
+// ensureMgrCerts gives a host its mgr's server and client certificates, or new
+// ones if they no longer match; without a mgr they are dropped.
+func (o *Orch) ensureMgrCerts(h *state.Host, withMgr bool) error {
+	if o.St.Agent == nil || !withMgr {
+		h.MgrServerCert, h.MgrServerKey, h.MgrClientCert, h.MgrClientKey = "", "", "", ""
+
 		return nil
 	}
 
-	return o.issueAgentCert(h)
-}
+	id := o.identity(pki.RoleMgr, h.Name)
 
-func (o *Orch) issueAgentCert(h *state.Host) error {
-	a := o.St.Agent
-
-	c, k, err := pki.Issue(a.CACert, a.CAKey, pki.Leaf{
-		CommonName: "agent " + h.Name, IPs: []string{h.Addr}, Names: []string{h.Name},
-		Usage: x509.ExtKeyUsageServerAuth, Years: agentCertYears,
-	})
-	if err != nil {
-		return err
+	if !certValid(h.MgrServerCert, id, true, []string{h.Addr}, []string{h.Name}) {
+		if err := o.issueMgrServerCert(h); err != nil {
+			return err
+		}
 	}
 
-	h.AgentCert, h.AgentKey = c, k
+	if !certValid(h.MgrClientCert, id, false, nil, nil) {
+		return o.issueMgrClientCert(h)
+	}
 
 	return nil
+}
+
+func (o *Orch) issueMgrServerCert(h *state.Host) (err error) {
+	h.MgrServerCert, h.MgrServerKey, err = o.issue(o.identity(pki.RoleMgr, h.Name), x509.ExtKeyUsageServerAuth, []string{h.Addr}, []string{h.Name})
+
+	return err
+}
+
+func (o *Orch) issueMgrClientCert(h *state.Host) (err error) {
+	h.MgrClientCert, h.MgrClientKey, err = o.issue(o.identity(pki.RoleMgr, h.Name), x509.ExtKeyUsageClientAuth, nil, nil)
+
+	return err
 }
 
 // agentDocs is the agent of a host, if the cluster has agents.
@@ -102,7 +171,7 @@ func (o *Orch) agentDocs(h state.Host) []any {
 		return nil
 	}
 
-	return []any{daemons.Agent(o.agentDocName(h), o.St.Agent.Image, o.St.Agent.CACert, h.AgentCert, h.AgentKey)}
+	return []any{daemons.Agent(o.agentDocName(h), o.St.Agent.Image, o.St.Agent.CACert, h.AgentCert, h.AgentKey, h.AgentClientCert, h.AgentClientKey)}
 }
 
 // expiresSoon reports whether a certificate is due for renewal.
@@ -112,7 +181,7 @@ func expiresSoon(certPEM string, now time.Time) bool {
 	return err != nil || t.Sub(now) <= agentRenewal
 }
 
-// RenewAgentCerts reissues agent and mgr certificates with 30 days or less
+// RenewAgentCerts reissues agent, mgr and operator certificates with 30 days or less
 // left and pushes them like ceph.conf, so a failed push is retried by the next
 // command. Until plan 03, this only happens when the CLI runs.
 func (o *Orch) RenewAgentCerts(ctx context.Context) error {
@@ -126,23 +195,50 @@ func (o *Orch) RenewAgentCerts(ctx context.Context) error {
 
 	for i := range o.St.Hosts {
 		h := &o.St.Hosts[i]
-		if h.AgentCert == "" || !expiresSoon(h.AgentCert, now) {
-			continue
-		}
+		before := *h
 
-		if err := o.issueAgentCert(h); err != nil {
+		// certificates a host lacks or that no longer match it (identity, address,
+		// name, a mgr placed or removed) are issued anew
+		if err := o.ensureAgentCert(h); err != nil {
 			return err
 		}
 
-		renewed = append(renewed, h.Name)
+		if err := o.ensureMgrCerts(h, o.hasMgr(*h)); err != nil {
+			return err
+		}
+
+		if *h != before {
+			renewed = append(renewed, "missing or changed "+h.Name)
+		}
+
+		for _, c := range []struct {
+			cert  string
+			issue func(*state.Host) error
+			what  string
+		}{
+			{h.AgentCert, o.issueAgentServerCert, "agent server"},
+			{h.AgentClientCert, o.issueAgentClientCert, "agent client"},
+			{h.MgrServerCert, o.issueMgrServerCert, "mgr server"},
+			{h.MgrClientCert, o.issueMgrClientCert, "mgr client"},
+		} {
+			if c.cert == "" || !expiresSoon(c.cert, now) {
+				continue
+			}
+
+			if err := c.issue(h); err != nil {
+				return err
+			}
+
+			renewed = append(renewed, c.what+" "+h.Name)
+		}
 	}
 
-	if expiresSoon(o.St.Agent.MgrCert, now) {
-		if err := o.issueMgrCert(); err != nil {
+	if expiresSoon(o.St.Agent.OperatorCert, now) {
+		if err := o.issueOperatorCert(); err != nil {
 			return err
 		}
 
-		renewed = append(renewed, "mgr")
+		renewed = append(renewed, "operator")
 	}
 
 	if len(renewed) == 0 {

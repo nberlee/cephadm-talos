@@ -51,7 +51,7 @@ func seed(t *testing.T, f *talostest.Node) {
 	img.TypedSpec().Digest = "sha256:pulled"
 	must(t, f.St.Create(ctx, img))
 
-	inst := containers.NewContainerInstanceSpec(containers.NamespaceName, "ceph-gone-3")
+	inst := containers.NewContainerInstanceStatus(containers.NamespaceName, "ceph-gone-3")
 	inst.TypedSpec().ContainerID = "ceph-gone"
 	must(t, f.St.Create(ctx, inst))
 }
@@ -172,16 +172,29 @@ func TestMutualTLS(t *testing.T) {
 	caCert, caKey, err := pki.NewCA("agent CA", 10)
 	must(t, err)
 
-	srvCert, srvKey, err := pki.Issue(caCert, caKey, pki.Leaf{CommonName: "agent", IPs: []string{"127.0.0.1"}, Usage: x509.ExtKeyUsageServerAuth, Years: 3})
+	id := func(fsid string, role pki.Role, name string) *pki.Identity {
+		return &pki.Identity{FSID: fsid, Role: role, Name: name}
+	}
+
+	srvCert, srvKey, err := pki.Issue(caCert, caKey, pki.Leaf{CommonName: "agent", IPs: []string{"127.0.0.1"}, Usage: x509.ExtKeyUsageServerAuth, Years: 3, Identity: id("f1", pki.RoleAgent, "h1")})
 	must(t, err)
 
-	mgrCert, mgrKey, err := pki.Issue(caCert, caKey, pki.Leaf{CommonName: "mgr", Usage: x509.ExtKeyUsageClientAuth, Years: 3})
+	mgrCert, mgrKey, err := pki.Issue(caCert, caKey, pki.Leaf{CommonName: "mgr", Usage: x509.ExtKeyUsageClientAuth, Years: 3, Identity: id("f1", pki.RoleMgr, "h2")})
+	must(t, err)
+
+	foreignMgrCert, foreignMgrKey, err := pki.Issue(caCert, caKey, pki.Leaf{CommonName: "mgr", Usage: x509.ExtKeyUsageClientAuth, Years: 3, Identity: id("f2", pki.RoleMgr, "h2")})
+	must(t, err)
+
+	agentClientCert, agentClientKey, err := pki.Issue(caCert, caKey, pki.Leaf{CommonName: "agent", Usage: x509.ExtKeyUsageClientAuth, Years: 3, Identity: id("f1", pki.RoleAgent, "h3")})
+	must(t, err)
+
+	plainCert, plainKey, err := pki.Issue(caCert, caKey, pki.Leaf{CommonName: "mgr", Usage: x509.ExtKeyUsageClientAuth, Years: 3})
 	must(t, err)
 
 	otherCA, otherKey, err := pki.NewCA("other CA", 10)
 	must(t, err)
 
-	strangerCert, strangerKey, err := pki.Issue(otherCA, otherKey, pki.Leaf{CommonName: "mgr", Usage: x509.ExtKeyUsageClientAuth, Years: 3})
+	strangerCert, strangerKey, err := pki.Issue(otherCA, otherKey, pki.Leaf{CommonName: "mgr", Usage: x509.ExtKeyUsageClientAuth, Years: 3, Identity: id("f1", pki.RoleMgr, "h2")})
 	must(t, err)
 
 	cfg, err := TLSConfig([]byte(caCert), []byte(srvCert), []byte(srvKey))
@@ -222,9 +235,12 @@ func TestMutualTLS(t *testing.T) {
 	}
 
 	for name, pair := range map[string][2]string{
-		"no certificate":            {"", ""},
-		"certificate of another CA": {strangerCert, strangerKey},
-		"agent server certificate":  {srvCert, srvKey},
+		"no certificate":               {"", ""},
+		"certificate of another CA":    {strangerCert, strangerKey},
+		"agent server certificate":     {srvCert, srvKey},
+		"mgr of another cluster":       {foreignMgrCert, foreignMgrKey},
+		"agent client certificate":     {agentClientCert, agentClientKey},
+		"certificate without identity": {plainCert, plainKey},
 	} {
 		if err := get(pair[0], pair[1]); err == nil {
 			t.Errorf("%s accepted", name)
@@ -304,5 +320,22 @@ func TestShutdownJoinsARunningRefresh(t *testing.T) {
 
 	if !finished.Load() {
 		t.Fatal("Wait returned while the refresh was still running")
+	}
+}
+
+func TestTLSConfigNeedsAnAgentIdentity(t *testing.T) {
+	caCert, caKey, err := pki.NewCA("agent CA", 10)
+	must(t, err)
+
+	for name, ident := range map[string]*pki.Identity{
+		"no identity":      nil,
+		"a mgr's identity": {FSID: "f1", Role: pki.RoleMgr, Name: "h1"},
+	} {
+		c, k, err := pki.Issue(caCert, caKey, pki.Leaf{CommonName: "agent", IPs: []string{"127.0.0.1"}, Usage: x509.ExtKeyUsageServerAuth, Years: 3, Identity: ident})
+		must(t, err)
+
+		if _, err := TLSConfig([]byte(caCert), []byte(c), []byte(k)); err == nil {
+			t.Errorf("%s: accepted as the agent's certificate", name)
+		}
 	}
 }

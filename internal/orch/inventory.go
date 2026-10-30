@@ -22,10 +22,12 @@ const InventorySchema = 1
 
 // Files the talos mgr module reads (EtcFileConfig names, below /etc).
 const (
-	inventoryFile = "ceph/talos/inventory.json"
-	agentCAFile   = "ceph/talos/agent-ca.crt"
-	mgrCertFile   = "ceph/talos/mgr.crt"
-	mgrKeyFile    = "ceph/talos/mgr.key"
+	inventoryFile     = "ceph/talos/inventory.json"
+	agentCAFile       = "ceph/talos/agent-ca.crt"
+	mgrCertFile       = "ceph/talos/mgr-client.crt"
+	mgrKeyFile        = "ceph/talos/mgr-client.key"
+	mgrServerCertFile = "ceph/talos/mgr-server.crt"
+	mgrServerKeyFile  = "ceph/talos/mgr-server.key"
 	// the module is installed as "cephadm": Ceph accepts only cephadm, rook and
 	// test_orchestrator as orchestrator backend (orchestrator/module.py)
 	mgrModuleDir = "ceph/mgr/cephadm"
@@ -110,9 +112,9 @@ func (o *Orch) earliestCertExpiry() (time.Time, bool) {
 
 	var first time.Time
 
-	certs := []string{o.St.Agent.MgrCert}
+	certs := []string{o.St.Agent.OperatorCert}
 	for _, h := range o.St.Hosts {
-		certs = append(certs, h.AgentCert)
+		certs = append(certs, h.AgentCert, h.AgentClientCert, h.MgrServerCert, h.MgrClientCert)
 	}
 
 	for _, c := range certs {
@@ -139,7 +141,11 @@ func (o *Orch) publishedContent() string {
 	}
 
 	if a := o.St.Agent; a != nil {
-		h.Write([]byte(a.CACert + a.MgrCert + a.MgrKey))
+		h.Write([]byte(a.CACert))
+
+		for _, host := range o.St.Hosts {
+			h.Write([]byte(host.Name + "\x00" + host.MgrServerCert + host.MgrServerKey + host.MgrClientCert + host.MgrClientKey + "\x00"))
+		}
 	}
 
 	return hex.EncodeToString(h.Sum(nil))
@@ -289,7 +295,7 @@ func (o *Orch) inventoryDoc() any {
 }
 
 // mgrFileDocs are the module and its TLS files on a mgr host, or their removal elsewhere.
-func (o *Orch) mgrFileDocs(withMgr bool) []any {
+func (o *Orch) mgrFileDocs(h state.Host, withMgr bool) []any {
 	files := mgrmodule.Files()
 
 	var docs []any
@@ -302,13 +308,15 @@ func (o *Orch) mgrFileDocs(withMgr bool) []any {
 		}
 	}
 
-	if a := o.St.Agent; a != nil && withMgr {
+	if a := o.St.Agent; a != nil && withMgr && h.MgrClientCert != "" {
 		docs = append(docs,
 			spec.EtcFile(agentCAFile, 0o644, a.CACert),
-			spec.EtcFile(mgrCertFile, 0o644, a.MgrCert),
-			spec.EtcFile(mgrKeyFile, 0o600, a.MgrKey))
+			spec.EtcFile(mgrCertFile, 0o644, h.MgrClientCert),
+			spec.EtcFile(mgrKeyFile, 0o600, h.MgrClientKey),
+			spec.EtcFile(mgrServerCertFile, 0o644, h.MgrServerCert),
+			spec.EtcFile(mgrServerKeyFile, 0o600, h.MgrServerKey))
 	} else {
-		for _, f := range []string{agentCAFile, mgrCertFile, mgrKeyFile} {
+		for _, f := range []string{agentCAFile, mgrCertFile, mgrKeyFile, mgrServerCertFile, mgrServerKeyFile} {
 			docs = append(docs, spec.Delete("EtcFileConfig", f))
 		}
 	}
@@ -318,7 +326,7 @@ func (o *Orch) mgrFileDocs(withMgr bool) []any {
 
 // talosFileDeletes removes everything the talos mgr module reads from a host.
 func (o *Orch) talosFileDeletes() []any {
-	return append([]any{spec.Delete("EtcFileConfig", inventoryFile)}, o.mgrFileDocs(false)...)
+	return append([]any{spec.Delete("EtcFileConfig", inventoryFile)}, o.mgrFileDocs(state.Host{}, false)...)
 }
 
 // hasMgr reports whether a mgr is placed on the host.

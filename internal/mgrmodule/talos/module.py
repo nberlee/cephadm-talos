@@ -108,8 +108,37 @@ def load_inventory(path: Optional[str] = None) -> Dict[str, Any]:
     return inv
 
 
-def fetch_record(addr: str, tls: ssl.SSLContext, refresh: bool = False) -> Dict[str, Any]:
-    """Fetch and validate one agent's status record within an overall deadline; raises on any problem."""
+IDENTITY_SCHEME = 'cephadm-talos://'
+
+
+def cert_identity(peercert: Optional[Dict[str, Any]]) -> Tuple[str, str, str]:
+    """The (fsid, role, name) of a verified peer certificate's identity URI SAN (plan 03, item 3)."""
+    found = []
+    for kind, value in (peercert or {}).get('subjectAltName', ()):
+        if kind != 'URI' or not value.startswith(IDENTITY_SCHEME):
+            continue
+        parts = value[len(IDENTITY_SCHEME):].split('/')
+        if len(parts) != 3 or not all(parts) or any(c in value for c in '?#@'):
+            raise ValueError('malformed identity %r' % value)
+        found.append((parts[0], parts[1], parts[2]))
+    if len(found) != 1:
+        raise ValueError('certificate carries %d cephadm-talos identities, want 1' % len(found))
+    return found[0]
+
+
+def require_identity(peercert: Optional[Dict[str, Any]], fsid: str, role: str, name: Optional[str] = None) -> str:
+    """Check a peer's identity; returns its name. Endpoints check this, never the common name."""
+    got = cert_identity(peercert)
+    if got[0] != fsid or got[1] != role or (name is not None and got[2] != name):
+        raise ValueError('peer is %s/%s/%s, want %s/%s/%s' % (got + (fsid, role, name or '*')))
+    return got[2]
+
+
+def fetch_record(addr: str, tls: ssl.SSLContext, refresh: bool = False,
+                 expect: Optional[Tuple[str, str]] = None) -> Dict[str, Any]:
+    """Fetch and validate one agent's status record within an overall deadline; raises on any problem.
+
+    expect is the (fsid, host) the agent's certificate must be issued to."""
     total = REFRESH_TIMEOUT if refresh else REQUEST_TIMEOUT
     conn = http.client.HTTPSConnection(addr, AGENT_PORT, context=tls, timeout=total)
     expired = threading.Event()
@@ -136,6 +165,8 @@ def fetch_record(addr: str, tls: ssl.SSLContext, refresh: bool = False) -> Dict[
         sock[0] = conn.sock
         if expired.is_set():  # the deadline passed while connecting
             cut()
+        if expect is not None:
+            require_identity(conn.sock.getpeercert(), expect[0], 'agent', expect[1])
         conn.request('GET', '/status?refresh=1' if refresh else '/status')
         resp = conn.getresponse()
         body = resp.read(MAX_RECORD + 1)
@@ -295,7 +326,7 @@ class Poller:
 def tls_context(directory: str = TALOS_DIR) -> ssl.SSLContext:
     ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=os.path.join(directory, 'agent-ca.crt'))
     ctx.minimum_version = ssl.TLSVersion.TLSv1_3
-    ctx.load_cert_chain(os.path.join(directory, 'mgr.crt'), os.path.join(directory, 'mgr.key'))
+    ctx.load_cert_chain(os.path.join(directory, 'mgr-client.crt'), os.path.join(directory, 'mgr-client.key'))
     return ctx
 
 
@@ -307,7 +338,11 @@ class Module(orchestrator.Orchestrator, MgrModule):
         self._poller = Poller(self._fetch)
 
     def _fetch(self, addr: str, refresh: bool) -> Dict[str, Any]:
-        return fetch_record(addr, tls_context(), refresh=refresh)
+        inv = load_inventory()
+        names = [h['name'] for h in inv['hosts'] if h['addr'] == addr]
+        if len(names) != 1:
+            raise ValueError('address %s is not one inventory host' % addr)
+        return fetch_record(addr, tls_context(), refresh=refresh, expect=(inv['fsid'], names[0]))
 
     def serve(self) -> None:
         while not self._poller.stop.is_set():

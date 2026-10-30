@@ -44,9 +44,18 @@ type Host struct {
 	// nodes need not share one talosconfig
 	Talosconfig string `json:"talosconfig,omitempty"`
 	Context     string `json:"context,omitempty"`
-	// AgentCert and AgentKey are the agent's server certificate (agent CA)
-	AgentCert string `json:"agent_cert,omitempty"`
-	AgentKey  string `json:"agent_key,omitempty"`
+	// AgentCert and AgentKey are the agent's server certificate, AgentClientCert
+	// and AgentClientKey its client certificate (agent CA, identity agent/<host>)
+	AgentCert       string `json:"agent_cert,omitempty"`
+	AgentKey        string `json:"agent_key,omitempty"`
+	AgentClientCert string `json:"agent_client_cert,omitempty"`
+	AgentClientKey  string `json:"agent_client_key,omitempty"`
+	// MgrServerCert, MgrClientCert and their keys are the certificates of the
+	// mgr on this host (agent CA, identity mgr/<host>), set while it has one
+	MgrServerCert string `json:"mgr_server_cert,omitempty"`
+	MgrServerKey  string `json:"mgr_server_key,omitempty"`
+	MgrClientCert string `json:"mgr_client_cert,omitempty"`
+	MgrClientKey  string `json:"mgr_client_key,omitempty"`
 }
 
 // Published is the revision of what the talos mgr module reads from the nodes
@@ -61,13 +70,13 @@ type Published struct {
 	MgrRestart []string `json:"mgr_restart,omitempty"`
 }
 
-// Agent holds the agent CA, the mgr's client certificate and the agent image.
+// Agent holds the agent CA, the operator's client certificate and the agent image.
 type Agent struct {
-	Image   string `json:"image"` // digest reference
-	CACert  string `json:"ca_cert"`
-	CAKey   string `json:"ca_key"`
-	MgrCert string `json:"mgr_cert"`
-	MgrKey  string `json:"mgr_key"`
+	Image        string `json:"image"` // digest reference
+	CACert       string `json:"ca_cert"`
+	CAKey        string `json:"ca_key"`
+	OperatorCert string `json:"operator_cert"`
+	OperatorKey  string `json:"operator_key"`
 }
 
 // RGW holds the object gateway settings shared by all rgw and vip daemons.

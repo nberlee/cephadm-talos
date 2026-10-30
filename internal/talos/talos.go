@@ -365,16 +365,17 @@ func (c *Client) ImageStatuses(ctx context.Context, node string) (map[string]con
 	return res, nil
 }
 
-// instanceGenerations returns the generations of all ContainerInstanceSpecs of a container.
+// instanceGenerations returns the generations of all instances of a container
+// (ContainerInstanceStatus: the spec is sensitive, as it carries the environment).
 func (c *Client) instanceGenerations(ctx context.Context, node, name string) ([]uint64, error) {
-	cl, nctx, err := c.node(ctx, node, "get containerinstancespec")
+	cl, nctx, err := c.node(ctx, node, "get containerinstancestatus")
 	if err != nil {
 		return nil, err
 	}
 
-	list, err := safe.StateListAll[*containers.ContainerInstanceSpec](nctx, cl.COSI)
+	list, err := safe.StateListAll[*containers.ContainerInstanceStatus](nctx, cl.COSI)
 	if err != nil {
-		return nil, wrap("list containerinstancespec on "+node, err)
+		return nil, wrap("list containerinstancestatus on "+node, err)
 	}
 
 	var gens []uint64
@@ -388,16 +389,16 @@ func (c *Client) instanceGenerations(ctx context.Context, node, name string) ([]
 	return gens, nil
 }
 
-// InstanceContainers returns the containers that still have a ContainerInstanceSpec.
+// InstanceContainers returns the containers that still have an instance.
 func (c *Client) InstanceContainers(ctx context.Context, node string) ([]string, error) {
-	cl, nctx, err := c.node(ctx, node, "get containerinstancespec")
+	cl, nctx, err := c.node(ctx, node, "get containerinstancestatus")
 	if err != nil {
 		return nil, err
 	}
 
-	list, err := safe.StateListAll[*containers.ContainerInstanceSpec](nctx, cl.COSI)
+	list, err := safe.StateListAll[*containers.ContainerInstanceStatus](nctx, cl.COSI)
 	if err != nil {
-		return nil, wrap("list containerinstancespec on "+node, err)
+		return nil, wrap("list containerinstancestatus on "+node, err)
 	}
 
 	var out []string
@@ -411,7 +412,7 @@ func (c *Client) InstanceContainers(ctx context.Context, node string) ([]string,
 	return out, nil
 }
 
-// HasInstances reports whether any ContainerInstanceSpec of a container is left.
+// HasInstances reports whether any instance of a container is left.
 // Instances keep a finalizer until their process is gone, unlike ContainerStatus
 // which disappears as soon as the ContainerConfig is deleted.
 func (c *Client) HasInstances(ctx context.Context, node, name string) (bool, error) {
@@ -420,7 +421,7 @@ func (c *Client) HasInstances(ctx context.Context, node, name string) (bool, err
 	return len(gens) > 0, err
 }
 
-// InstanceGeneration returns the highest ContainerInstanceSpec generation of a
+// InstanceGeneration returns the highest instance generation of a
 // container; Talos creates a new generation whenever it replaces the instance.
 func (c *Client) InstanceGeneration(ctx context.Context, node, name string) (uint64, error) {
 	gens, err := c.instanceGenerations(ctx, node, name)
@@ -453,7 +454,7 @@ func Permanent(err error) error {
 var (
 	StatusTypes   = []resource.Type{containers.ContainerStatusType}
 	ImageTypes    = []resource.Type{containers.ContainerStatusType, containers.ContainerImageStatusType}
-	InstanceTypes = []resource.Type{containers.ContainerStatusType, containers.ContainerInstanceSpecType}
+	InstanceTypes = []resource.Type{containers.ContainerStatusType, containers.ContainerInstanceStatusType}
 )
 
 // WaitFor calls check once, then again whenever a resource of one of the types
@@ -609,11 +610,11 @@ func (c *Client) Restart(ctx context.Context, node, name string) error {
 		return err
 	}
 
-	// containerd knows the container by its instance (ContainerInstanceSpec
+	// containerd knows the container by its instance (ContainerInstanceStatus
 	// ID, e.g. <name>-3), not by the ContainerConfig name
-	list, err := safe.StateListAll[*containers.ContainerInstanceSpec](nctx, cl.COSI)
+	list, err := safe.StateListAll[*containers.ContainerInstanceStatus](nctx, cl.COSI)
 	if err != nil {
-		return wrap("list containerinstancespec on "+node, err)
+		return wrap("list containerinstancestatus on "+node, err)
 	}
 
 	var (

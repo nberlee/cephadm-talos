@@ -199,7 +199,7 @@ func (o *Orch) hostDocs(h state.Host) []any {
 	docs := append([]any{spec.CephVolume(), spec.CephConf(o.CephConf())}, o.agentDocs(h)...)
 	docs = append(docs, o.inventoryDoc())
 
-	return append(docs, o.mgrFileDocs(o.hasMgr(h))...)
+	return append(docs, o.mgrFileDocs(h, o.hasMgr(h))...)
 }
 
 // pushConf rewrites ceph.conf on every host (after the mon set changed).
@@ -312,7 +312,8 @@ func (o *Orch) addHost(ctx context.Context, addr string, apply bool) (state.Host
 	if old, ok := o.St.Host(name); ok {
 		h.Maintenance, h.NoOut = old.Maintenance, old.NoOut
 		h.Talosconfig, h.Context = old.Talosconfig, old.Context
-		h.AgentCert, h.AgentKey = old.AgentCert, old.AgentKey
+		h.AgentCert, h.AgentKey, h.AgentClientCert, h.AgentClientKey = old.AgentCert, old.AgentKey, old.AgentClientCert, old.AgentClientKey
+		h.MgrServerCert, h.MgrServerKey, h.MgrClientCert, h.MgrClientKey = old.MgrServerCert, old.MgrServerKey, old.MgrClientCert, old.MgrClientKey
 	}
 
 	if err := o.ensureAgentCert(&h); err != nil {
@@ -409,6 +410,11 @@ func (o *Orch) Bootstrap(ctx context.Context, addr, image, agentImage string, re
 
 	// the host was added before the agent CA existed
 	if err := o.ensureAgentCert(&h); err != nil {
+		return err
+	}
+
+	// bootstrap places the first mgr on this host
+	if err := o.ensureMgrCerts(&h, true); err != nil {
 		return err
 	}
 
@@ -672,8 +678,15 @@ func (o *Orch) deployMgr(ctx context.Context, h state.Host) error {
 		Keyring: daemons.Keyring(entity, k),
 	}, mgrmodule.Names()...)
 
+	// the mgr's own server and client certificates for the agent channel
+	if err := o.ensureMgrCerts(&h, true); err != nil {
+		return err
+	}
+
+	o.St.AddHost(h)
+
 	// the mgr starts only once the talos module's files are on the host
-	if err := o.apply(ctx, h.Addr, append(o.mgrFileDocs(true), doc)...); err != nil {
+	if err := o.apply(ctx, h.Addr, append(o.mgrFileDocs(h, true), doc)...); err != nil {
 		return err
 	}
 

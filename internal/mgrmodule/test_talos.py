@@ -358,3 +358,25 @@ class PollerShutdown(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class IdentityTest(unittest.TestCase):
+    def cert(self, *uris):
+        return {'subjectAltName': [('DNS', 'h1')] + [('URI', u) for u in uris]}
+
+    def test_identity(self):
+        c = self.cert('cephadm-talos://f1/agent/h1', 'spiffe://x/y')
+        self.assertEqual(m.cert_identity(c), ('f1', 'agent', 'h1'))
+        self.assertEqual(m.require_identity(c, 'f1', 'agent', 'h1'), 'h1')
+        self.assertEqual(m.require_identity(c, 'f1', 'agent'), 'h1')
+
+    def test_refused(self):
+        c = self.cert('cephadm-talos://f1/agent/h1')
+        for fsid, role, name in (('f2', 'agent', 'h1'), ('f1', 'mgr', 'h1'), ('f1', 'agent', 'h2')):
+            with self.assertRaises(ValueError):
+                m.require_identity(c, fsid, role, name)
+        for bad in (None, {}, self.cert(), self.cert('cephadm-talos://f1/agent/h1', 'cephadm-talos://f1/agent/h2'),
+                    self.cert('cephadm-talos://f1/agent'), self.cert('cephadm-talos://f1/agent/h1/x'),
+                    self.cert('cephadm-talos:///agent/h1'), self.cert('cephadm-talos://f1/agent/h1?x=1')):
+            with self.assertRaises(ValueError):
+                m.cert_identity(bad)

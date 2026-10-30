@@ -21,6 +21,7 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/constants"
 	"github.com/siderolabs/talos/pkg/machinery/role"
 
+	"github.com/nberlee/cephadm-talos/internal/pki"
 	"github.com/nberlee/cephadm-talos/internal/talos"
 )
 
@@ -45,7 +46,7 @@ type Container struct {
 	State       string `json:"state,omitempty"` // Talos state; empty if there is no ContainerStatus
 	ImageDigest string `json:"image_digest,omitempty"`
 	Restarts    uint64 `json:"restarts"`
-	Instances   bool   `json:"instances"` // a ContainerInstanceSpec (process) is left
+	Instances   bool   `json:"instances"` // an instance (process) is left
 }
 
 // Record is the status the agent serves.
@@ -290,11 +291,31 @@ func TLSConfig(caPEM, certPEM, keyPEM []byte) (*tls.Config, error) {
 		return nil, errors.New("agent CA: no certificate found")
 	}
 
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return nil, err
+	}
+
+	// the agent's own identity names its cluster; only that cluster's mgrs may call it
+	own, err := pki.CertIdentity(leaf)
+	if err != nil || own.Role != pki.RoleAgent {
+		return nil, fmt.Errorf("agent certificate is not an agent's: %v %v", own, err)
+	}
+
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		ClientAuth:   tls.RequireAndVerifyClientCert,
 		ClientCAs:    pool,
 		MinVersion:   tls.VersionTLS13,
+		VerifyConnection: func(cs tls.ConnectionState) error {
+			if len(cs.PeerCertificates) == 0 {
+				return errors.New("no client certificate")
+			}
+
+			_, err := pki.Require(cs.PeerCertificates[0], pki.Identity{FSID: own.FSID, Role: pki.RoleMgr})
+
+			return err
+		},
 	}, nil
 }
 
@@ -303,6 +324,10 @@ const (
 	EnvCA   = "CEPHADM_TALOS_AGENT_CA"
 	EnvCert = "CEPHADM_TALOS_AGENT_CERT"
 	EnvKey  = "CEPHADM_TALOS_AGENT_KEY"
+	// EnvClientCert and EnvClientKey are the agent's client certificate, for the
+	// mgr module's confirmation endpoint and bridge (plan 03)
+	EnvClientCert = "CEPHADM_TALOS_AGENT_CLIENT_CERT"
+	EnvClientKey  = "CEPHADM_TALOS_AGENT_CLIENT_KEY"
 )
 
 func envPEM(name string) ([]byte, error) {

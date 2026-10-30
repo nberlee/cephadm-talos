@@ -184,7 +184,7 @@ const AgentUID = 50
 
 // Agent renders the node agent: read-only Talos access over the machined
 // socket, its status served on the host network (internal/agent).
-func Agent(name, image, caPEM, certPEM, keyPEM string) *spec.ContainerConfig {
+func Agent(name, image, caPEM, certPEM, keyPEM, clientCertPEM, clientKeyPEM string) *spec.ContainerConfig {
 	b64 := func(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
 
 	c := spec.Container(name, image)
@@ -192,6 +192,8 @@ func Agent(name, image, caPEM, certPEM, keyPEM string) *spec.ContainerConfig {
 		agent.EnvCA + "=" + b64(caPEM),
 		agent.EnvCert + "=" + b64(certPEM),
 		agent.EnvKey + "=" + b64(keyPEM),
+		agent.EnvClientCert + "=" + b64(clientCertPEM),
+		agent.EnvClientKey + "=" + b64(clientKeyPEM),
 	}
 	c.RunAsConfig = spec.RunAs(AgentUID, AgentUID)
 	c.SecurityConfig = spec.Restricted()

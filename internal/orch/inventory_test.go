@@ -37,6 +37,14 @@ func inventoryOrch(t *testing.T) *Orch {
 	o.St.AddDaemon(state.Daemon{Type: state.TypeOSD, ID: "h2-sda", Host: "h2", LocalOnly: true})
 	o.St.AddDaemon(state.Daemon{Type: state.TypeVIP, ID: "h2", Host: "h2"})
 
+	// as deployMgr does: the mgr host gets the mgr's server and client certificates
+	h1, _ := o.St.Host("h1")
+	if err := o.ensureMgrCerts(&h1, true); err != nil {
+		t.Fatal(err)
+	}
+
+	o.St.AddHost(h1)
+
 	return o
 }
 
@@ -68,7 +76,8 @@ func TestInventory(t *testing.T) {
 	}
 
 	b, _ := json.Marshal(inv)
-	for _, secret := range []string{o.St.Agent.CAKey, o.St.Agent.MgrKey} {
+	h1, _ := o.St.Host("h1")
+	for _, secret := range []string{o.St.Agent.CAKey, o.St.Agent.OperatorKey, h1.MgrServerKey, h1.MgrClientKey} {
 		if strings.Contains(string(b), strings.TrimSpace(secret)[30:60]) {
 			t.Errorf("a key leaked into the inventory")
 		}
@@ -88,7 +97,7 @@ func TestMgrFilesOnlyOnMgrHosts(t *testing.T) {
 			}
 
 			s := string(b)
-			for _, f := range append([]string{agentCAFile, mgrCertFile, mgrKeyFile, inventoryFile}, mgrmodule.Names()...) {
+			for _, f := range append([]string{agentCAFile, mgrCertFile, mgrKeyFile, mgrServerCertFile, mgrServerKeyFile, inventoryFile}, mgrmodule.Names()...) {
 				if strings.Contains(s, "name: "+f) || strings.Contains(s, "name: "+mgrModuleDir+"/"+f) {
 					out[f] = map[bool]string{true: "delete", false: "write"}[strings.Contains(s, "$patch: delete")]
 				}
@@ -103,7 +112,7 @@ func TestMgrFilesOnlyOnMgrHosts(t *testing.T) {
 
 	on, off := names(o.hostDocs(h1)), names(o.hostDocs(h2))
 
-	for _, f := range append([]string{agentCAFile, mgrCertFile, mgrKeyFile}, mgrmodule.Names()...) {
+	for _, f := range append([]string{agentCAFile, mgrCertFile, mgrKeyFile, mgrServerCertFile, mgrServerKeyFile}, mgrmodule.Names()...) {
 		if on[f] != "write" || off[f] != "delete" {
 			t.Errorf("%s: mgr host %q, other host %q", f, on[f], off[f])
 		}
@@ -194,7 +203,7 @@ func TestModuleChangeRestartsTheMgrs(t *testing.T) {
 	// containerd knows the mgr by its instance
 	mgrDoc := o.St.DocName(state.Daemon{Type: state.TypeMgr, ID: "h1"})
 	for gen := range uint64(3) {
-		inst := containers.NewContainerInstanceSpec(containers.NamespaceName, fmt.Sprintf("%s-%d", mgrDoc, gen))
+		inst := containers.NewContainerInstanceStatus(containers.NamespaceName, fmt.Sprintf("%s-%d", mgrDoc, gen))
 		inst.TypedSpec().ContainerID, inst.TypedSpec().Generation = mgrDoc, gen
 
 		if err := f.St.Create(ctx, inst); err != nil {
@@ -274,7 +283,15 @@ func TestRenewalBoundaryAndEarliestExpiry(t *testing.T) {
 	}
 
 	issue := func(name string, lifetime time.Duration, usage x509.ExtKeyUsage) (string, string) {
-		c, k, err := pki.Issue(o.St.Agent.CACert, o.St.Agent.CAKey, pki.Leaf{CommonName: name, IPs: []string{"10.5.0.2"}, Usage: usage, Lifetime: lifetime})
+		role, id := pki.RoleAgent, name
+		if usage == x509.ExtKeyUsageClientAuth {
+			role, id = pki.RoleOperator, "admin"
+		}
+
+		c, k, err := pki.Issue(o.St.Agent.CACert, o.St.Agent.CAKey, pki.Leaf{
+			CommonName: name, IPs: []string{"10.5.0.2"}, Names: []string{name}, Usage: usage, Lifetime: lifetime,
+			Identity: &pki.Identity{FSID: o.St.FSID, Role: role, Name: id},
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -283,21 +300,21 @@ func TestRenewalBoundaryAndEarliestExpiry(t *testing.T) {
 	}
 
 	day := 24 * time.Hour
-	keep := state.Host{Name: "keep", Addr: "node"}
+	keep := state.Host{Name: "keep", Addr: "10.5.0.2"}
 	keep.AgentCert, keep.AgentKey = issue("keep", 31*day, x509.ExtKeyUsageServerAuth)
-	due := state.Host{Name: "due", Addr: "node"}
+	due := state.Host{Name: "due", Addr: "10.5.0.2"}
 	due.AgentCert, due.AgentKey = issue("due", 29*day, x509.ExtKeyUsageServerAuth)
 	o.St.AddHost(keep)
 	o.St.AddHost(due)
-	o.St.Agent.MgrCert, o.St.Agent.MgrKey = issue("mgr", 20*day, x509.ExtKeyUsageClientAuth)
+	o.St.Agent.OperatorCert, o.St.Agent.OperatorKey = issue("mgr", 20*day, x509.ExtKeyUsageClientAuth)
 
-	// the earliest expiry is the mgr's, 20 days out
+	// the earliest expiry is the operator's, 20 days out
 	inv := o.inventory()
 	if inv.CertExpiry == nil || inv.CertExpiry.Sub(time.Now()) > 21*day || inv.CertExpiry.Sub(time.Now()) < 19*day {
-		t.Fatalf("earliest expiry %v, want the mgr's in 20 days", inv.CertExpiry)
+		t.Fatalf("earliest expiry %v, want the operator's in 20 days", inv.CertExpiry)
 	}
 
-	keepCert, dueCert, mgrCert := keep.AgentCert, due.AgentCert, o.St.Agent.MgrCert
+	keepCert, dueCert, mgrCert := keep.AgentCert, due.AgentCert, o.St.Agent.OperatorCert
 
 	if err := o.RenewAgentCerts(ctx); err != nil {
 		t.Fatal(err)
@@ -308,9 +325,9 @@ func TestRenewalBoundaryAndEarliestExpiry(t *testing.T) {
 		got[h.Name] = h.AgentCert
 	}
 
-	if got["keep"] != keepCert || got["due"] == dueCert || o.St.Agent.MgrCert == mgrCert {
-		t.Errorf("31 days kept %t, 29 days renewed %t, mgr renewed %t",
-			got["keep"] == keepCert, got["due"] != dueCert, o.St.Agent.MgrCert != mgrCert)
+	if got["keep"] != keepCert || got["due"] == dueCert || o.St.Agent.OperatorCert == mgrCert {
+		t.Errorf("31 days kept %t, 29 days renewed %t, operator renewed %t",
+			got["keep"] == keepCert, got["due"] != dueCert, o.St.Agent.OperatorCert != mgrCert)
 	}
 
 	// after renewal the earliest expiry is the untouched 31 day certificate
