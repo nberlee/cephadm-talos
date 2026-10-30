@@ -15,6 +15,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/role"
 
 	"github.com/nberlee/cephadm-talos/internal/pki"
+	"github.com/nberlee/cephadm-talos/internal/records"
 	"github.com/nberlee/cephadm-talos/internal/talos"
 )
 
@@ -56,6 +58,8 @@ type Record struct {
 	TalosVersion string               `json:"talos_version"`
 	ObservedAt   time.Time            `json:"observed_at"` // completion of the last successful refresh
 	Containers   map[string]Container `json:"containers"`
+	// Records is "ok" or why the agent's records cannot be used
+	Records string `json:"records,omitempty"`
 }
 
 // Agent keeps the last complete observation of its node.
@@ -76,6 +80,8 @@ type Agent struct {
 
 	// Channel is the agent's side of the agent channel (plan 03); nil serves status only
 	Channel *Channel
+	// Records is the agent's durable records (plan 03); nil in tests that do not need them
+	Records *records.Store
 
 	logPrint func(format string, args ...any)
 	// refresh replaces observe in tests
@@ -196,6 +202,14 @@ func (a *Agent) observe(ctx context.Context) error {
 	}
 
 	rec := &Record{Schema: Schema, Hostname: hostname, TalosVersion: version, Containers: map[string]Container{}}
+
+	// a missing, unwritable or damaged records directory blocks every change (plan 03, item 6)
+	if a.Records != nil {
+		rec.Records = "ok"
+		if err := a.Records.Check(); err != nil {
+			rec.Records = err.Error()
+		}
+	}
 
 	for name, s := range statuses {
 		c := rec.Containers[name]
@@ -385,7 +399,7 @@ func Main(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	a := &Agent{Talos: tc, Life: ctx, Channel: ch}
+	a := &Agent{Talos: tc, Life: ctx, Channel: ch, Records: &records.Store{Dir: filepath.Join(records.Mount, records.RecordsDir)}}
 
 	var wg sync.WaitGroup
 

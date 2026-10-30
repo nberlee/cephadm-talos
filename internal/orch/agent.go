@@ -9,6 +9,7 @@ import (
 
 	"github.com/nberlee/cephadm-talos/internal/daemons"
 	"github.com/nberlee/cephadm-talos/internal/pki"
+	"github.com/nberlee/cephadm-talos/internal/spec"
 	"github.com/nberlee/cephadm-talos/internal/state"
 )
 
@@ -165,13 +166,24 @@ func (o *Orch) issueMgrClientCert(h *state.Host) (err error) {
 	return err
 }
 
-// agentDocs is the agent of a host, if the cluster has agents.
+// recordsInitDocName is the ContainerConfig name of a host's records-init.
+func (o *Orch) recordsInitDocName(h state.Host) string {
+	return o.St.DocName(state.Daemon{Type: "records-init", ID: h.Name})
+}
+
+// agentDocs are the agent of a host and its records-init, if the cluster has agents.
 func (o *Orch) agentDocs(h state.Host) []any {
 	if o.St.Agent == nil || h.AgentCert == "" {
 		return nil
 	}
 
-	return []any{daemons.Agent(o.agentDocName(h), o.St.Agent.Image, o.St.Agent.CACert, h.AgentCert, h.AgentKey, h.AgentClientCert, h.AgentClientKey)}
+	init := o.recordsInitDocName(h)
+
+	return []any{
+		spec.RecordsVolume(),
+		daemons.RecordsInit(init, o.St.Agent.Image),
+		daemons.Agent(o.agentDocName(h), init, o.St.Agent.Image, o.St.Agent.CACert, h.AgentCert, h.AgentKey, h.AgentClientCert, h.AgentClientKey),
+	}
 }
 
 // expiresSoon reports whether a certificate is due for renewal.
@@ -267,11 +279,16 @@ func (o *Orch) removeAgent(ctx context.Context, h state.Host) error {
 		return nil
 	}
 
-	name := o.agentDocName(h)
+	// the agent first: it depends on records-init
+	for _, name := range []string{o.agentDocName(h), o.recordsInitDocName(h)} {
+		if err := o.remove(ctx, h.Addr, name); err != nil {
+			return err
+		}
 
-	if err := o.remove(ctx, h.Addr, name); err != nil {
-		return err
+		if err := o.waitGone(ctx, h.Addr, name, 5*time.Minute); err != nil {
+			return err
+		}
 	}
 
-	return o.waitGone(ctx, h.Addr, name, 5*time.Minute)
+	return nil
 }

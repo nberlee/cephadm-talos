@@ -15,6 +15,7 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/config/types/container"
 
 	"github.com/nberlee/cephadm-talos/internal/agent"
+	"github.com/nberlee/cephadm-talos/internal/records"
 	"github.com/nberlee/cephadm-talos/internal/spec"
 )
 
@@ -184,7 +185,7 @@ const AgentUID = 50
 
 // Agent renders the node agent: read-only Talos access over the machined
 // socket, its status served on the host network (internal/agent).
-func Agent(name, image, caPEM, certPEM, keyPEM, clientCertPEM, clientKeyPEM string) *spec.ContainerConfig {
+func Agent(name, recordsInit, image, caPEM, certPEM, keyPEM, clientCertPEM, clientKeyPEM string) *spec.ContainerConfig {
 	b64 := func(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
 
 	c := spec.Container(name, image)
@@ -199,6 +200,24 @@ func Agent(name, image, caPEM, certPEM, keyPEM, clientCertPEM, clientKeyPEM stri
 	c.SecurityConfig = spec.Restricted()
 	c.SecurityConfig.SecurityMachinedAccess = true
 	c.NetworkConfig = spec.HostNetwork()
+	// its records, prepared on every boot by records-init (plan 03, item 6)
+	c.MountsConfig = []spec.Mount{spec.UserVolume(spec.RecordsVolumeName, records.Mount)}
+	c.DependsOnConfig = &container.ContainerDependsOn{ContainersConfig: []container.ContainerDependency{spec.Succeeded(recordsInit)}}
+
+	return c
+}
+
+// RecordsInit renders the container that prepares the agent's records
+// directories on every boot: the agent binary as root, with only the
+// capabilities chown and chmod need (plan 03 spike: CHOWN alone fails at chmod
+// once the directory belongs to the agent).
+func RecordsInit(name, image string) *spec.ContainerConfig {
+	c := spec.Container(name, image)
+	c.ContainerEntrypoint = []string{"/cephadm-talos", "records-init"}
+	c.RunAsConfig = spec.RunAs(0, 0)
+	c.SecurityConfig = spec.Restricted("CHOWN", "FOWNER")
+	c.MountsConfig = []spec.Mount{spec.UserVolume(spec.RecordsVolumeName, records.Mount)}
+	c.RestartConfig = spec.RestartOnFailure(3)
 
 	return c
 }

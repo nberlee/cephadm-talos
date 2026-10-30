@@ -15,7 +15,9 @@ import (
 	"time"
 
 	"github.com/nberlee/cephadm-talos/internal/agent"
+	"github.com/nberlee/cephadm-talos/internal/daemons"
 	"github.com/nberlee/cephadm-talos/internal/orch"
+	"github.com/nberlee/cephadm-talos/internal/records"
 	"github.com/nberlee/cephadm-talos/internal/state"
 	"github.com/nberlee/cephadm-talos/internal/talos"
 )
@@ -87,6 +89,11 @@ func run() error {
 	// the agent runs in a container on every Ceph node and needs no cluster state
 	if args[0] == "agent" {
 		return agent.Main(ctx)
+	}
+
+	// prepares the agent's records on every boot, as root with CHOWN and FOWNER (plan 03, item 6)
+	if args[0] == "records-init" {
+		return records.Init(records.Mount, daemons.AgentUID, daemons.AgentUID)
 	}
 
 	// stored in the cluster state at bootstrap: must not depend on the working directory

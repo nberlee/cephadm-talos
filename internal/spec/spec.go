@@ -85,6 +85,35 @@ func CephVolume() *block.UserVolumeConfigV1Alpha1 {
 	return v
 }
 
+// RecordsVolumeName is the per-node user volume of the agent's records and the
+// job claims and results; outside the cluster data that rm-cluster --zap deletes.
+const RecordsVolumeName = "cephadm-talos"
+
+// RecordsVolume returns the directory user volume of the agent's records.
+func RecordsVolume() *block.UserVolumeConfigV1Alpha1 {
+	v := block.NewUserVolumeConfigV1Alpha1()
+	v.MetaName = RecordsVolumeName
+	t := blockres.VolumeTypeDirectory
+	v.VolumeType = &t
+
+	return v
+}
+
+// RestartOnFailure restarts a failed container at most maxRetries times.
+func RestartOnFailure(maxRetries int) *container.ContainerRestart {
+	return &container.ContainerRestart{RestartPolicy: config.ContainerRestartPolicyOnFailure, RestartMaxRetries: &maxRetries}
+}
+
+// RestartNever runs a container once per boot.
+func RestartNever() *container.ContainerRestart {
+	return &container.ContainerRestart{RestartPolicy: config.ContainerRestartPolicyNever}
+}
+
+// Succeeded is a dependency on a container that has exited with code 0.
+func Succeeded(name string) container.ContainerDependency {
+	return container.ContainerDependency{DependencyName: name, DependencyCondition: config.ContainerDependencyConditionSucceeded}
+}
+
 // EtcFile writes a file below /etc on the node.
 func EtcFile(name string, mode uint32, contents string) *runtime.EtcFileConfigV1Alpha1 {
 	f := runtime.NewEtcFileConfigV1Alpha1(name)
