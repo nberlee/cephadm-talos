@@ -359,3 +359,19 @@ func TestFollowLogsDryRunHasNoNodeAccess(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestExecNotStarted(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want bool
+	}{
+		{status.Error(codes.FailedPrecondition, `container "x" is not running`), true},
+		{status.Error(codes.Unknown, `failed to exec in container "x": container x-1 init process is not running: failed precondition`), true},
+		{status.Error(codes.Unavailable, "connection reset"), false},
+		{status.Error(codes.Unknown, "stream terminated"), false},
+	} {
+		if got := execNotStarted(tc.err); got != tc.want {
+			t.Errorf("%v: %v, want %v", tc.err, got, tc.want)
+		}
+	}
+}

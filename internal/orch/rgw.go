@@ -80,18 +80,12 @@ func (o *Orch) DeployRGW(ctx context.Context, hostName string, opts RGWOptions) 
 
 	entity := "client.rgw." + h.Name
 
-	k, err := o.key(entity)
+	k, err := o.newKey(entity)
 	if err != nil {
 		return err
 	}
 
-	adm, err := o.adminHost()
-	if err != nil {
-		return err
-	}
-
-	kr := daemons.Keyring(entity, k, "mon", "allow rw", "osd", "allow rwx", "mgr", "allow rw")
-	if _, err := o.Job(ctx, adm.Addr, fmt.Sprintf("echo %s | base64 -d | ceph auth import -i -", base64Std(kr)), 5*time.Minute); err != nil {
+	if err := o.importKey(ctx, daemons.Keyring(entity, k, "mon", "allow rw", "osd", "allow rwx", "mgr", "allow rw")); err != nil {
 		return err
 	}
 

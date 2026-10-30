@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/siderolabs/talos/pkg/machinery/resources/containers"
+	"gopkg.in/yaml.v3"
 
 	"github.com/nberlee/cephadm-talos/internal/daemons"
 	"github.com/nberlee/cephadm-talos/internal/mgrmodule"
@@ -108,28 +109,48 @@ func (o *Orch) execAdmin(ctx context.Context, node string, argv []string, input 
 		return 0, "", err
 	}
 
-	target, err := o.execTarget(ctx, node)
+	// nothing ran without a target: the caller may try another node
+	targets, err := o.execTargets(ctx, node)
 	if err != nil {
-		return 0, "", err
+		return 0, "", fmt.Errorf("%w: %w", talos.ErrExecNotStarted, err)
 	}
 
 	script := `IFS= read -r key || exit 70; export CEPH_ARGS="-n client.admin --key $key"; unset key; exec "$@"`
-	stdin := io.MultiReader(strings.NewReader(k+"\n"), bytes.NewReader(input))
 
-	rc, err := o.Talos.Exec(ctx, node, target, append([]string{"bash", "-c", script, "cephadm-talos-exec"}, argv...), stdin, stdout, stderr)
+	// a container that stops while the exec is set up (a restarting mgr) runs
+	// nothing: the next one runs the command
+	for _, target := range targets {
+		stdin := io.MultiReader(strings.NewReader(k+"\n"), bytes.NewReader(input))
 
-	return rc, target, err
+		rc, err := o.Talos.Exec(ctx, node, target, append([]string{"bash", "-c", script, "cephadm-talos-exec"}, argv...), stdin, stdout, stderr)
+		if errors.Is(err, talos.ErrExecNotStarted) && target != targets[len(targets)-1] {
+			continue
+		}
+
+		return rc, target, err
+	}
+
+	return 0, "", fmt.Errorf("no running Ceph container on %s to run the command in", node)
 }
 
-// execTarget picks the running Ceph container on node that admin commands run
-// in: a mgr, else a mon, an rgw or an OSD (all have the ceph CLI and ceph.conf).
-func (o *Orch) execTarget(ctx context.Context, node string) (string, error) {
+// statusProbeTimeout bounds the container status query of an admin exec.
+const statusProbeTimeout = 15 * time.Second
+
+// execTargets are the running Ceph containers on node in the order admin
+// commands try them: mgrs, mons, rgws, OSDs.
+func (o *Orch) execTargets(ctx context.Context, node string) ([]string, error) {
+	// a node that does not answer leaves time for the next one
+	ctx, cancel := context.WithTimeout(ctx, statusProbeTimeout)
+	defer cancel()
+
 	st, err := o.Talos.ContainerStatuses(ctx, node)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	prefix := fmt.Sprintf("ceph-%s-", o.St.Short())
+
+	var targets []string
 
 	for _, typ := range []string{state.TypeMgr, state.TypeMon, state.TypeRGW, state.TypeOSD} {
 		var names []string
@@ -140,14 +161,15 @@ func (o *Orch) execTarget(ctx context.Context, node string) (string, error) {
 			}
 		}
 
-		if len(names) > 0 {
-			sort.Strings(names)
-
-			return names[0], nil
-		}
+		sort.Strings(names)
+		targets = append(targets, names...)
 	}
 
-	return "", fmt.Errorf("no running Ceph container on %s to run the command in", node)
+	if len(targets) == 0 {
+		return nil, fmt.Errorf("no running Ceph container on %s to run the command in", node)
+	}
+
+	return targets, nil
 }
 
 // syncBuffer collects stdout and stderr, which Talos writes concurrently.
@@ -668,7 +690,13 @@ func (o *Orch) Remove(ctx context.Context, name string, force, zap bool) error {
 func (o *Orch) RemoveCluster(ctx context.Context, zap bool) error {
 	prefix := "ceph-" + o.St.Short() + "-"
 
-	for _, h := range o.St.Hosts {
+	// zap first refuses, before anything is removed
+	if zap && !o.opened {
+		return errors.New("--zap needs the cluster's state, which names the OSD devices, and it cannot be read; remove the cluster without --zap and wipe the disks with talosctl")
+	}
+
+	// members and contacts: a node enrolled without a successful publication too
+	for _, h := range o.St.AllHosts() {
 		names := map[string]bool{}
 
 		for _, d := range o.St.Daemons {
@@ -698,6 +726,17 @@ func (o *Orch) RemoveCluster(ctx context.Context, zap bool) error {
 			if strings.HasPrefix(name, prefix) {
 				names[name] = true
 			}
+		}
+
+		// the node's own documents: the cluster's state may be unreadable, and a
+		// container without a status yet is in no list above
+		configured, err := o.configuredContainers(ctx, h.Addr, prefix)
+		if err != nil {
+			return err
+		}
+
+		for _, name := range configured {
+			names[name] = true
 		}
 
 		docs := append([]any{spec.Delete("EtcFileConfig", "ceph/ceph.conf")}, o.talosFileDeletes()...)
@@ -732,7 +771,7 @@ func (o *Orch) RemoveCluster(ctx context.Context, zap bool) error {
 			}
 		}
 
-		for _, h := range o.St.Hosts {
+		for _, h := range o.St.AllHosts() {
 			o.printf("deleting /var/mnt/ceph/%s on %s\n", o.St.FSID, h.Name)
 
 			id := randHex(3)
@@ -1060,4 +1099,33 @@ func (o *Orch) Hosts(w io.Writer) error {
 	}
 
 	return tw.Flush()
+}
+
+// configuredContainers lists the ContainerConfig documents with prefix in a
+// node's machine config.
+func (o *Orch) configuredContainers(ctx context.Context, node, prefix string) ([]string, error) {
+	// only reads: a dry run lists them too
+	defer o.reading()()
+
+	cfg, err := o.Talos.MachineConfig(ctx, node)
+	if err != nil {
+		return nil, err
+	}
+
+	var names []string
+
+	dec := yaml.NewDecoder(strings.NewReader(cfg))
+
+	for {
+		var m map[string]any
+		if err := dec.Decode(&m); errors.Is(err, io.EOF) {
+			return names, nil
+		} else if err != nil {
+			return nil, fmt.Errorf("%s: machine config: %w", node, err)
+		}
+
+		if name, ok := m["name"].(string); ok && m["kind"] == "ContainerConfig" && strings.HasPrefix(name, prefix) {
+			names = append(names, name)
+		}
+	}
 }

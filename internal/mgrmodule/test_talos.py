@@ -178,6 +178,33 @@ class Inventory(unittest.TestCase):
         with self.assertRaises(m.InventoryError):
             m.inventory_from_store(broken)
 
+    def test_malformed_manifests(self):
+        good = store_entries(inventory())
+        key = next(k for k in good if '/manifest/' in k)
+        manifest = json.loads(good[key])
+        chunk = manifest['records']['inventory']['chunks'][0]
+        bad = ['[]', '"x"', 'null']
+        for change in (
+                lambda mf: mf.update(seq=True),
+                lambda mf: mf.update(seq='1'),
+                lambda mf: mf.update(records=[]),
+                lambda mf: mf.update(records={'inventory': []}),
+                lambda mf: mf['records']['inventory'].update(chunks='abc'),
+                lambda mf: mf['records']['inventory'].update(chunks=[]),
+                lambda mf: mf['records']['inventory'].update(chunks=[1]),
+                lambda mf: mf['records']['inventory'].update(sha256=None),
+                lambda mf: mf['records']['inventory'].update(size='12'),
+                lambda mf: mf['records']['inventory'].update(chunks=[chunk + 'x'])):
+            mf = json.loads(good[key])
+            change(mf)
+            bad.append(json.dumps(mf))
+        for text in bad:
+            with self.subTest(manifest=text):
+                with self.assertRaises(m.InventoryError):
+                    m.inventory_from_store(dict(good, **{key: text}))
+        with self.assertRaises(m.InventoryError):
+            m.inventory_from_store(dict(good, **{chunk[len('mgr/cephadm/'):]: None}))
+
     def test_available_details(self):
         entries = store_entries(inventory(cert_expiry='2029-10-28T00:00:00Z'))
         mod = object.__new__(m.Module)

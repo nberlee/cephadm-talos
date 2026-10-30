@@ -6,6 +6,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -46,6 +48,8 @@ type Orch struct {
 
 	// st is the cluster's state in the store, once a mon answers (plan 03, item 4)
 	st *store.Store
+	// opened: the cluster's state was read from its mons
+	opened bool
 	// StoreBackend replaces config-key through exec (tests)
 	StoreBackend store.Backend
 	// AuthGet replaces `auth get` through exec (tests)
@@ -59,6 +63,9 @@ const Incarnation = "cli"
 // Open reads the cluster's state from the store through the first node that
 // answers, after state.Load read the workstation's part.
 func (o *Orch) Open(ctx context.Context) error {
+	// reading the state changes nothing: a dry run reads the real state too
+	defer o.reading()()
+
 	var errs []error
 
 	for _, h := range o.St.Hosts {
@@ -81,10 +88,28 @@ func (o *Orch) Open(ctx context.Context) error {
 			}
 		}
 
-		return o.St.ApplyRecords(recs)
+		if err := o.St.ApplyRecords(recs); err != nil {
+			return err
+		}
+
+		o.opened = true
+
+		return nil
 	}
 
 	return fmt.Errorf("no node with a running Ceph daemon and a mon answers; the cluster state is in its mons: %w", errors.Join(errs...))
+}
+
+// reading lets a dry run read the cluster (state, mon auth) for the duration of
+// a call that only reads; it returns the function that restores dry-run mode.
+func (o *Orch) reading() func() {
+	if !o.Talos.DryRun {
+		return func() {}
+	}
+
+	o.Talos.DryRun = false
+
+	return func() { o.Talos.DryRun = true }
 }
 
 // openStore opens the store through a Ceph container on node.
@@ -124,21 +149,55 @@ func randHex(n int) string {
 }
 
 // key returns the secret of an entity, generating it on first use.
-// key returns an entity's cephx secret: mon auth is authoritative (plan 03,
-// item 4), read with `auth get` once a mon answers; a new entity, or any before
-// the first mon exists (bootstrap), gets a new secret, which its caller imports.
+// key returns client.admin's secret, which the workstation keeps (local.json),
+// or an existing entity's secret from mon auth.
 func (o *Orch) key(entity string) (string, error) {
+	if entity == "client.admin" {
+		if k, ok := o.St.Keys[entity]; ok {
+			return k, nil
+		}
+
+		return o.newKey(entity) // bootstrap creates it
+	}
+
+	return o.existingKey(entity)
+}
+
+// existingKey returns the secret of an entity mon auth must already know (plan
+// 03, item 4): rendering an existing daemon never invents a key.
+func (o *Orch) existingKey(entity string) (string, error) {
 	if k, ok := o.St.Keys[entity]; ok {
 		return k, nil
 	}
 
-	if o.st != nil && !o.Talos.DryRun {
-		get := o.authGet
-		if o.AuthGet != nil {
-			get = o.AuthGet
-		}
+	if o.st == nil {
+		return "", fmt.Errorf("the key of %s is in mon auth, which is not reachable", entity)
+	}
 
-		k, found, err := get(entity)
+	k, found, err := o.lookupKey(entity)
+	if err != nil {
+		return "", err
+	}
+
+	if !found {
+		return "", fmt.Errorf("%s is not in mon auth", entity)
+	}
+
+	o.St.Keys[entity] = k
+
+	return k, nil
+}
+
+// newKey returns the secret for an entity being created: the one mon auth
+// already has (a retried deploy), or a new one, which the caller registers
+// (importKey, or the mon keyring at bootstrap).
+func (o *Orch) newKey(entity string) (string, error) {
+	if k, ok := o.St.Keys[entity]; ok {
+		return k, nil
+	}
+
+	if o.st != nil {
+		k, found, err := o.lookupKey(entity)
 		if err != nil {
 			return "", err
 		}
@@ -158,6 +217,45 @@ func (o *Orch) key(entity string) (string, error) {
 	o.St.Keys[entity] = k
 
 	return k, nil
+}
+
+func (o *Orch) lookupKey(entity string) (string, bool, error) {
+	if o.AuthGet != nil {
+		return o.AuthGet(entity)
+	}
+
+	defer o.reading()()
+
+	return o.authGet(entity)
+}
+
+// importKey registers a keyring with mon auth; the keyring goes over stdin,
+// never on a command line, which Talos audits.
+func (o *Orch) importKey(ctx context.Context, keyring string) error {
+	if o.Talos.DryRun {
+		return nil
+	}
+
+	adm, err := o.adminHost()
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, configKeyTimeout)
+	defer cancel()
+
+	var errb bytes.Buffer
+
+	rc, _, err := o.execAdmin(ctx, adm.Addr, []string{"ceph", "auth", "import", "-i", "-"}, []byte(keyring), &errb, &errb)
+	if err != nil {
+		return err
+	}
+
+	if rc != 0 {
+		return fmt.Errorf("auth import: rc %d: %s", rc, strings.TrimSpace(errb.String()))
+	}
+
+	return nil
 }
 
 // authGet reads an entity's secret from mon auth.
@@ -481,9 +579,27 @@ func (o *Orch) save() error {
 		return err
 	}
 
-	// the mgr module's inventory (plan 02's schema), now a record of the state
+	// the mgr module's inventory (plan 02's schema), now a record of the state:
+	// its revision and time change only with its content
 	inv := o.inventory()
-	inv.Revision, inv.UpdatedAt = o.St.Published.Revision, time.Now().UTC()
+	inv.Revision, inv.UpdatedAt = 0, time.Time{}
+
+	b, err := json.Marshal(inv)
+	if err != nil {
+		return err
+	}
+
+	sum := sha256.Sum256(b)
+	if r := &o.St.Inventory; r.Hash != hex.EncodeToString(sum[:]) {
+		r.Revision, r.Hash, r.UpdatedAt = r.Revision+1, hex.EncodeToString(sum[:]), time.Now().UTC()
+
+		// the cluster record carries the new revision too
+		if recs, err = o.St.Records(); err != nil {
+			return err
+		}
+	}
+
+	inv.Revision, inv.UpdatedAt = o.St.Inventory.Revision, o.St.Inventory.UpdatedAt
 
 	if recs["inventory"], err = json.Marshal(inv); err != nil {
 		return err
@@ -583,17 +699,17 @@ func (o *Orch) Bootstrap(ctx context.Context, addr, image, agentImage string, re
 	o.St.AddDaemon(mon)
 	o.St.AddDaemon(mgr)
 
-	monKey, err := o.key("mon.")
+	monKey, err := o.newKey("mon.")
 	if err != nil {
 		return err
 	}
 
-	mgrKey, err := o.key("mgr." + h.Name)
+	mgrKey, err := o.newKey("mgr." + h.Name)
 	if err != nil {
 		return err
 	}
 
-	osdKey, err := o.key("client.bootstrap-osd")
+	osdKey, err := o.newKey("client.bootstrap-osd")
 	if err != nil {
 		return err
 	}
@@ -824,19 +940,13 @@ func (o *Orch) deployMgr(ctx context.Context, h state.Host) error {
 
 	entity := "mgr." + h.Name
 
-	k, err := o.key(entity)
-	if err != nil {
-		return err
-	}
-
-	adm, err := o.adminHost()
+	k, err := o.newKey(entity)
 	if err != nil {
 		return err
 	}
 
 	// register the key: there is no mon keyring to put it in after bootstrap
-	kr := daemons.Keyring(entity, k, "mon", "profile mgr", "osd", "allow *", "mds", "allow *")
-	if _, err := o.Job(ctx, adm.Addr, fmt.Sprintf("echo %s | base64 -d | ceph auth import -i -", base64Std(kr)), 5*time.Minute); err != nil {
+	if err := o.importKey(ctx, daemons.Keyring(entity, k, "mon", "profile mgr", "osd", "allow *", "mds", "allow *")); err != nil {
 		return err
 	}
 

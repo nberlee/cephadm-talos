@@ -243,7 +243,7 @@ func (o *Orch) restartMgrs(ctx context.Context) error {
 
 	o.St.Published.MgrRestart = left
 
-	if err := o.St.Save(); err != nil {
+	if err := o.save(); err != nil {
 		return err
 	}
 
@@ -265,7 +265,7 @@ func (o *Orch) Publish(ctx context.Context) error {
 			}
 		}
 
-		if err := o.St.Save(); err != nil {
+		if err := o.save(); err != nil {
 			return err
 		}
 

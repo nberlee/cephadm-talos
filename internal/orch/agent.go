@@ -266,7 +266,7 @@ func (o *Orch) RenewAgentCerts(ctx context.Context) error {
 		}
 	}
 
-	if err := o.St.Save(); err != nil {
+	if err := o.save(); err != nil {
 		return err
 	}
 

@@ -286,6 +286,56 @@ func TestRemoveClusterRemovesAgentsWithoutStatus(t *testing.T) {
 	}
 }
 
+func TestRemoveClusterWithoutItsState(t *testing.T) {
+	f := talostest.New(t, images())
+	o := fakeOrch(t, f)
+	ctx := context.Background()
+
+	if err := o.setupAgent(ctx, "node", "registry/agent:dev", false); err != nil {
+		t.Fatal(err)
+	}
+
+	h := state.Host{Name: "h1", Addr: "node"}
+	if err := o.ensureAgentCert(&h); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := o.apply(ctx, "node", o.hostDocs(h)...); err != nil {
+		t.Fatal(err)
+	}
+
+	// what a workstation knows when no mon answers: the host, not the cluster
+	gone := &Orch{Talos: o.Talos, St: state.New(o.St.FSID), Out: io.Discard}
+	gone.St.AddHost(state.Host{Name: "h1", Addr: "node"})
+
+	if err := gone.RemoveCluster(ctx, true); err == nil {
+		t.Fatal("zap without the OSD devices")
+	}
+
+	cfg, err := o.Talos.MachineConfig(ctx, "node")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(cfg, o.agentDocName(h)) {
+		t.Fatal("a refused zap removed documents")
+	}
+
+	if err := gone.RemoveCluster(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg, err = o.Talos.MachineConfig(ctx, "node"); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, name := range []string{o.agentDocName(h), o.recordsInitDocName(h)} {
+		if strings.Contains(cfg, name) {
+			t.Errorf("%s left behind", name)
+		}
+	}
+}
+
 func TestCertIdentities(t *testing.T) {
 	f := talostest.New(t, images())
 	o := fakeOrch(t, f)

@@ -142,11 +142,20 @@ func run() error {
 		tc.Hosts[h.Addr] = talos.Conn{Talosconfig: h.Talosconfig, Context: h.Context}
 	}
 
-	// the cluster's state is in its mons (plan 03, item 4)
-	if !*dryRun {
-		if err := o.Open(ctx); err != nil {
+	// the cluster's state is in its mons (plan 03, item 4); a dry run reads it too.
+	// rm-cluster also works when no mon answers: it removes what the nodes
+	// known to this workstation configure
+	if err := o.Open(ctx); err != nil {
+		if cmd != "rm-cluster" {
 			return err
 		}
+
+		fmt.Fprintln(os.Stderr, "warning:", err)
+		fmt.Fprintln(os.Stderr, "warning: removing what the hosts in this workstation's state configure")
+	}
+
+	if cmd == "rm-cluster" {
+		return rmCluster(ctx, o, args)
 	}
 
 	// agent certificates are renewed on every command, also read-only ones,
@@ -163,17 +172,15 @@ func run() error {
 
 	// the talos mgr module's inventory follows every change: published now if
 	// an earlier command could not, and again when this command is done
-	if cmd != "rm-cluster" {
-		if err := o.Publish(ctx); err != nil {
+	if err := o.Publish(ctx); err != nil {
+		fmt.Fprintln(os.Stderr, "warning:", err)
+	}
+
+	defer func() {
+		if err := o.Publish(context.WithoutCancel(ctx)); err != nil {
 			fmt.Fprintln(os.Stderr, "warning:", err)
 		}
-
-		defer func() {
-			if err := o.Publish(context.WithoutCancel(ctx)); err != nil {
-				fmt.Fprintln(os.Stderr, "warning:", err)
-			}
-		}()
-	}
+	}()
 
 	switch cmd {
 	case "ps", "ls", "conf", "logs":
@@ -331,17 +338,6 @@ func run() error {
 		}
 
 		os.Exit(rc)
-	case "rm-cluster":
-		fs := flag.NewFlagSet("rm-cluster", flag.ExitOnError)
-		zap := fs.Bool("zap", false, "also zap OSD devices and delete /var/mnt/ceph/<fsid> on every host")
-		yes := fs.Bool("yes-i-really-mean-it", false, "confirm")
-		_ = fs.Parse(args)
-
-		if !*yes {
-			return fmt.Errorf("this destroys cluster %s; pass --yes-i-really-mean-it", st.FSID)
-		}
-
-		return o.RemoveCluster(ctx, *zap)
 	case "conf":
 		fmt.Print(o.CephConf())
 
@@ -349,4 +345,17 @@ func run() error {
 	}
 
 	return fmt.Errorf("unknown command %q, see cephadm-talos -h (%s)", cmd, strings.Join([]string{"bootstrap", "host", "deploy", "ps", "logs", "rm", "upgrade", "shell"}, ", "))
+}
+
+func rmCluster(ctx context.Context, o *orch.Orch, args []string) error {
+	fs := flag.NewFlagSet("rm-cluster", flag.ExitOnError)
+	zap := fs.Bool("zap", false, "also zap OSD devices and delete /var/mnt/ceph/<fsid> on every host")
+	yes := fs.Bool("yes-i-really-mean-it", false, "confirm")
+	_ = fs.Parse(args)
+
+	if !*yes {
+		return fmt.Errorf("this destroys cluster %s; pass --yes-i-really-mean-it", o.St.FSID)
+	}
+
+	return o.RemoveCluster(ctx, *zap)
 }

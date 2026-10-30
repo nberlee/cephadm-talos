@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/nberlee/cephadm-talos/internal/store"
+	"github.com/nberlee/cephadm-talos/internal/talos"
 )
 
 // configKeyTimeout bounds one config-key exec.
@@ -59,7 +61,7 @@ func (c *configKeys) load(ctx context.Context) error {
 
 	var out, errb bytes.Buffer
 
-	rc, _, err := c.o.execAdmin(ctx, c.node, []string{"python3", "-c", readScript, c.prefix}, nil, &out, &errb)
+	rc, err := c.exec(ctx, []string{"python3", "-c", readScript, c.prefix}, nil, &out, &errb)
 	if err != nil {
 		return err
 	}
@@ -96,6 +98,40 @@ func (c *configKeys) fresh(ctx context.Context) error {
 }
 
 func (c *configKeys) EntryLimit() int { return c.limit }
+
+// exec runs a command for the store on its node, or on another host with a
+// running Ceph container once this one has none (its last daemon removed).
+func (c *configKeys) exec(ctx context.Context, argv []string, input []byte, stdout, stderr *bytes.Buffer) (int, error) {
+	nodes := []string{c.node}
+
+	for _, h := range c.o.St.Hosts {
+		if h.Addr != c.node {
+			nodes = append(nodes, h.Addr)
+		}
+	}
+
+	var lastErr error
+
+	for _, n := range nodes {
+		stdout.Reset()
+		stderr.Reset()
+
+		rc, _, err := c.o.execAdmin(ctx, n, argv, input, stdout, stderr)
+		if errors.Is(err, talos.ErrExecNotStarted) {
+			lastErr = err
+
+			continue // nothing ran on this host
+		}
+
+		if err == nil {
+			c.node = n
+		}
+
+		return rc, err
+	}
+
+	return 0, fmt.Errorf("no host with a running Ceph container for the cluster state: %w", lastErr)
+}
 
 func (c *configKeys) inside(key string) error {
 	if !strings.HasPrefix(key, c.prefix) {
@@ -187,7 +223,7 @@ func (c *configKeys) mutate(ctx context.Context, ops []map[string]string) error 
 
 	var errb bytes.Buffer
 
-	rc, _, err := c.o.execAdmin(ctx, c.node, []string{"python3", "-c", mutateScript}, in.Bytes(), &errb, &errb)
+	rc, err := c.exec(ctx, []string{"python3", "-c", mutateScript}, in.Bytes(), &errb, &errb)
 	if err != nil || rc != 0 {
 		// some of the writes may have happened: the next read starts from a fresh snapshot
 		c.snap = nil

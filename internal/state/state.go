@@ -155,6 +155,12 @@ type State struct {
 	// RGWPending lists hosts whose rgw/vip documents (certificate, peers) could
 	// not be updated yet; retried like ConfPending
 	RGWPending []string `json:"rgw_pending,omitempty"`
+	// Inventory is the revision of the mgr module's inventory record: bumped,
+	// with its time, only when its content changes
+	Inventory InventoryRevision `json:"-"`
+	// Contacts are nodes the workstation knows but the published state does not
+	// (enrolled, but the publication failed): kept for cleanup, not members
+	Contacts []Host `json:"-"`
 
 	path string
 }
@@ -265,7 +271,7 @@ func (s *State) Save() error {
 
 	l := Local{Schema: SchemaVersion, FSID: s.FSID, Talosconfig: s.Talosconfig, Context: s.Context, AdminKey: s.Keys["client.admin"]}
 
-	for _, h := range s.Hosts {
+	for _, h := range s.AllHosts() {
 		l.Hosts = append(l.Hosts, LocalHost{Name: h.Name, Addr: h.Addr, Talosconfig: h.Talosconfig, Context: h.Context})
 	}
 
@@ -289,6 +295,13 @@ func (s *State) Save() error {
 	return os.WriteFile(filepath.Join(Root(), "current"), []byte(s.FSID+"\n"), 0o600)
 }
 
+// InventoryRevision identifies a content of the mgr module's inventory.
+type InventoryRevision struct {
+	Revision  int       `json:"revision"`
+	Hash      string    `json:"hash"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
 // cluster is the cluster-wide record: everything but hosts and daemons.
 type cluster struct {
 	Schema      int       `json:"schema"`
@@ -301,6 +314,8 @@ type cluster struct {
 	Published   Published `json:"published"`
 	ConfPending []string  `json:"conf_pending,omitempty"`
 	RGWPending  []string  `json:"rgw_pending,omitempty"`
+
+	Inventory InventoryRevision `json:"inventory"`
 }
 
 // Records returns the cluster's part of the state as store records: what the
@@ -309,7 +324,7 @@ type cluster struct {
 func (s *State) Records() (map[string][]byte, error) {
 	c := cluster{
 		Schema: SchemaVersion, FSID: s.FSID, Image: s.Image, CephVersion: s.CephVersion, Arch: s.Arch,
-		RGW: s.RGW, Published: s.Published, ConfPending: s.ConfPending, RGWPending: s.RGWPending,
+		RGW: s.RGW, Published: s.Published, ConfPending: s.ConfPending, RGWPending: s.RGWPending, Inventory: s.Inventory,
 	}
 
 	if s.Agent != nil {
@@ -363,15 +378,30 @@ func (s *State) ApplyRecords(recs map[string][]byte) error {
 	}
 
 	local := map[string]Host{}
-	for _, h := range s.Hosts {
+	for _, h := range s.AllHosts() {
 		local[h.Name] = h
 	}
 
+	members := map[string]bool{}
+
 	for i := range hosts {
+		members[hosts[i].Name] = true
+
 		if l, ok := local[hosts[i].Name]; ok {
 			hosts[i].Talosconfig, hosts[i].Context = l.Talosconfig, l.Context
 		}
 	}
+
+	// nodes known here but not in the published state stay reachable for cleanup
+	var contacts []Host
+
+	for _, h := range s.AllHosts() {
+		if !members[h.Name] {
+			contacts = append(contacts, Host{Name: h.Name, Addr: h.Addr, Talosconfig: h.Talosconfig, Context: h.Context})
+		}
+	}
+
+	s.Contacts = contacts
 
 	var operator *Agent
 	if s.Agent != nil {
@@ -380,6 +410,7 @@ func (s *State) ApplyRecords(recs map[string][]byte) error {
 
 	s.Image, s.CephVersion, s.Arch, s.RGW, s.Published = c.Image, c.CephVersion, c.Arch, c.RGW, c.Published
 	s.ConfPending, s.RGWPending, s.Hosts, s.Daemons = c.ConfPending, c.RGWPending, hosts, daemons
+	s.Inventory = c.Inventory
 	s.Agent = c.Agent
 
 	if s.Agent != nil && operator != nil {
@@ -419,6 +450,21 @@ func (s *State) AddHost(h Host) {
 // RemoveHost drops a host from the inventory.
 func (s *State) RemoveHost(name string) {
 	s.Hosts = slices.DeleteFunc(s.Hosts, func(h Host) bool { return h.Name == name })
+	s.Contacts = slices.DeleteFunc(s.Contacts, func(h Host) bool { return h.Name == name })
+}
+
+// AllHosts are the members and the contacts: every node this cluster may have
+// touched, for cleanup.
+func (s *State) AllHosts() []Host {
+	out := slices.Clone(s.Hosts)
+
+	for _, c := range s.Contacts {
+		if !slices.ContainsFunc(out, func(h Host) bool { return h.Name == c.Name }) {
+			out = append(out, c)
+		}
+	}
+
+	return out
 }
 
 // DocName is the Talos ContainerConfig name of a daemon.

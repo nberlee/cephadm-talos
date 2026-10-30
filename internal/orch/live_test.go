@@ -19,15 +19,8 @@ import (
 //
 //	CEPHADM_TALOS_LIVE_HOST=<host> CEPHADM_TALOS_LIVE_DEVICE=/dev/sdb go test -tags live -run TestLiveJobs ./internal/orch/
 func TestLiveJobs(t *testing.T) {
-	st, err := state.Load("")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	tc := &talos.Client{Default: talos.Conn{Talosconfig: st.Talosconfig, Context: st.Context}}
-	defer tc.Close() //nolint:errcheck
-
-	o := &Orch{Talos: tc, St: st, Out: os.Stdout}
+	o := liveOrch(t)
+	st := o.St
 
 	h, ok := st.Host(os.Getenv("CEPHADM_TALOS_LIVE_HOST"))
 	if !ok {
@@ -59,15 +52,7 @@ func TestLiveJobs(t *testing.T) {
 //
 //	go test -tags live -run TestLiveStore ./internal/orch/
 func TestLiveStore(t *testing.T) {
-	st, err := state.Load("")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	tc := &talos.Client{Default: talos.Conn{Talosconfig: st.Talosconfig, Context: st.Context}}
-	defer tc.Close() //nolint:errcheck
-
-	o := &Orch{Talos: tc, St: st, Out: os.Stdout}
+	o := liveOrch(t)
 
 	adm, err := o.adminHost()
 	if err != nil {
@@ -122,4 +107,33 @@ func TestLiveStore(t *testing.T) {
 	if err := b2.Remove(ctx, keys); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// liveOrch opens the current cluster as a command does: the workstation's
+// state, then the cluster's state from its mons.
+func liveOrch(t *testing.T) *Orch {
+	t.Helper()
+
+	st, err := state.Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tc := &talos.Client{Default: talos.Conn{Talosconfig: st.Talosconfig, Context: st.Context}, Hosts: map[string]talos.Conn{}}
+	t.Cleanup(func() { tc.Close() }) //nolint:errcheck
+
+	for _, h := range st.Hosts {
+		tc.Hosts[h.Addr] = talos.Conn{Talosconfig: h.Talosconfig, Context: h.Context}
+	}
+
+	o := &Orch{Talos: tc, St: st, Out: os.Stdout}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	if err := o.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	return o
 }

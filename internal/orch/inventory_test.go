@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -388,5 +389,66 @@ func TestPublishInterruptedBeforeThePatch(t *testing.T) {
 	cfg, err := o.Talos.MachineConfig(ctx, "node")
 	if err != nil || !strings.Contains(cfg, "ceph/ceph.conf") {
 		t.Errorf("host documents not on the node after the retry (%v)", err)
+	}
+}
+
+func TestInventoryRevisionFollowsItsContent(t *testing.T) {
+	o := fakeOrch(t, talostest.New(t))
+	o.St.AddHost(state.Host{Name: "h1", Addr: "node"})
+
+	if err := o.save(); err != nil {
+		t.Fatal(err)
+	}
+
+	first := o.St.Inventory
+	if first.Revision != 1 || first.UpdatedAt.IsZero() {
+		t.Fatalf("first save %+v", first)
+	}
+
+	// a change outside the inventory keeps its revision and time
+	o.St.ConfPending = []string{"h1"}
+	if err := o.save(); err != nil {
+		t.Fatal(err)
+	}
+
+	if o.St.Inventory != first {
+		t.Errorf("unchanged inventory moved: %+v, was %+v", o.St.Inventory, first)
+	}
+
+	// the revision survives the next command, and a change bumps it
+	st := reload(t, o)
+	if st.Inventory != first {
+		t.Fatalf("reloaded %+v, want %+v", st.Inventory, first)
+	}
+
+	next := &Orch{Talos: o.Talos, St: st, Out: io.Discard, StoreBackend: o.StoreBackend, AuthGet: noAuth}
+	if err := next.Open(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	next.St.AddHost(state.Host{Name: "h2", Addr: "node"})
+	if err := next.save(); err != nil {
+		t.Fatal(err)
+	}
+
+	if next.St.Inventory.Revision != 2 {
+		t.Errorf("changed inventory %+v", next.St.Inventory)
+	}
+
+	ctx := context.Background()
+
+	m, err := next.st.Latest(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	b, err := next.st.Read(ctx, m, "inventory")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var inv inventory
+	if err := json.Unmarshal(b, &inv); err != nil || inv.Revision != 2 || len(inv.Hosts) != 2 {
+		t.Errorf("published inventory %+v: %v", inv, err)
 	}
 }

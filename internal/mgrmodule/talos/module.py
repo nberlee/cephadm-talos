@@ -96,19 +96,29 @@ def inventory_from_store(entries: Dict[str, str], incarnation: str = INCARNATION
     key = seqs[max(seqs)]
     try:
         m = json.loads(entries[key])
-        if m.get('schema') != STORE_SCHEMA or m.get('incarnation') != incarnation or m.get('seq') != max(seqs):
+        if not isinstance(m, dict):
+            raise ValueError('manifest is not an object')
+        if m.get('schema') != STORE_SCHEMA or m.get('incarnation') != incarnation \
+                or type(m.get('seq')) is not int or m['seq'] != max(seqs):
             raise ValueError('unexpected manifest %r' % {k: m.get(k) for k in ('schema', 'incarnation', 'seq')})
-        e = m['records']['inventory']
+        recs = m.get('records')
+        e = recs.get('inventory') if isinstance(recs, dict) else None
+        if not isinstance(e, dict) or not isinstance(e.get('chunks'), list) or not e['chunks'] \
+                or not _str(e.get('sha256')) or type(e.get('size')) is not int:
+            raise ValueError('invalid inventory entry %r' % e)
         enc = ''
         for c in e['chunks']:
-            if not c.startswith(MODULE_PREFIX + base + 'rec/'):
-                raise ValueError('chunk %s outside the incarnation' % c)
-            enc += entries[c[len(MODULE_PREFIX):]]
+            if not _str(c) or not c.startswith(MODULE_PREFIX + base + 'rec/'):
+                raise ValueError('chunk %r outside the incarnation' % c)
+            part = entries[c[len(MODULE_PREFIX):]]
+            if not isinstance(part, str):
+                raise ValueError('chunk %s is not text' % c)
+            enc += part
         data = base64.b64decode(enc, validate=True)
         if hashlib.sha256(data).hexdigest() != e['sha256'] or len(data) != e['size']:
             raise ValueError('inventory does not match its manifest')
         inv = json.loads(data)
-    except (KeyError, TypeError, ValueError) as e:
+    except (KeyError, TypeError, ValueError, AttributeError) as e:
         raise InventoryError('cannot read the inventory from %s: %s' % (key, e))
     return check_inventory(inv, key)
 

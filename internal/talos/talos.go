@@ -72,6 +72,10 @@ type Client struct {
 // ErrNotFound is returned when a resource does not exist on the node.
 var ErrNotFound = errors.New("not found")
 
+// ErrExecNotStarted is returned when Talos did not start an exec'd command:
+// the container is not running, or stopped while the command was set up.
+var ErrExecNotStarted = errors.New("command not started")
+
 // Effective returns the connection settings used for a node.
 func (c *Client) Effective(node string) Conn {
 	pick := func(vals ...string) string {
@@ -626,10 +630,22 @@ func (c *Client) Exec(ctx context.Context, node, container string, args []string
 	res, err := cl.ContainerExec(nctx, &machine.DebugContainerExecRequestSpec{Container: container, Args: args},
 		client.ContainerStreamOptions{Stdin: stdin, Stdout: stdout, Stderr: stderr})
 	if err != nil {
+		if execNotStarted(err) {
+			return 0, fmt.Errorf("exec in %s: %w: %w", container, ErrExecNotStarted, err)
+		}
+
 		return 0, wrap("exec in "+container, err)
 	}
 
 	return res.ExitCode, nil
+}
+
+// execNotStarted reports whether a ContainerExec error came before the command
+// started: Talos reports a container that is not (or no longer) running as
+// FailedPrecondition, or, when its init process stops during the setup, as
+// "failed to exec in container" with containerd's reason.
+func execNotStarted(err error) bool {
+	return status.Code(err) == codes.FailedPrecondition || strings.Contains(err.Error(), "failed to exec in container")
 }
 
 // Restart restarts a ContainerConfig container.
