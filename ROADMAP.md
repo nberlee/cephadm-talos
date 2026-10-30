@@ -33,7 +33,7 @@ Out of scope for v1: Omni-managed nodes. Omni applies the full config it compose
 | Restart policy, terminal status, backoff | [#14733](https://github.com/siderolabs/talos/issues/14733#issuecomment-6440031175), [PR #14795](https://github.com/siderolabs/talos/pull/14795) open (draft); durable one-shot rejected; used from plan 03 | Idempotent entrypoints; jobs park after finishing and rerun after a reboot if their document survives; backoff in the entrypoint |
 | Stop timeout and shutdown order | [#14732](https://github.com/siderolabs/talos/issues/14732), [PR #14788](https://github.com/siderolabs/talos/pull/14788) open; used from plan 03 | 10s for every container, all stopped at once |
 | Host PID recorded for `machinedAccess` containers | [PR #14603](https://github.com/siderolabs/talos/pull/14603), open | Workload isolation off on Ceph nodes (`docs/support.md`) |
-| Raw volume handed over as a device | [#14730](https://github.com/siderolabs/talos/issues/14730#issuecomment-6467332527), accepted for Talos 1.16, [PR #14775](https://github.com/siderolabs/talos/pull/14775) open; used by the OSD redesign (milestone 5) | OSDs run privileged with host `/dev` |
+| Raw volume handed over as a device | [#14730](https://github.com/siderolabs/talos/issues/14730#issuecomment-6467332527), [PR #14775](https://github.com/siderolabs/talos/pull/14775) merged 2026-10-30; used by the OSD redesign (milestone 5) | OSDs run privileged with host `/dev` |
 | `RLIMIT_NOFILE` inherited from the host | [#14551](https://github.com/siderolabs/talos/issues/14551), accepted | 1024 open files per container |
 | Shared namespaces, init (draft 07) | held | No SMB service |
 | `memlock` and other rlimits (draft 08) | held | No NVMe-oF gateway |

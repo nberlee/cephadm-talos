@@ -10,16 +10,16 @@ Plan 04 follows with: enrollment by the leader instead of the CLI, daily certifi
 
 ## Talos baseline
 
-This plan builds on four open Talos PRs, tested together on the QEMU cluster (`report-14732-*`, `report-14733-test` and the exec and device reports, 2026-10-28/29):
+This plan builds on four Talos PRs (#14775 merged on 2026-10-30, not yet in a pre-release; the other three open), tested together on the QEMU cluster (`report-14732-*`, `report-14733-test` and the exec and device reports, 2026-10-28/29):
 
 | PR | Feature | Used here for |
 |---|---|---|
 | [#14781](https://github.com/siderolabs/talos/pull/14781) (#14729) | `ContainerExec` into a running `ContainerConfig` container: separate stdout/stderr, exit code, stdin, audit lines, `os:admin` | admin commands without job documents (items 8, 11) |
 | [#14795](https://github.com/siderolabs/talos/pull/14795) (#14733), draft | `restart: {policy, maxRetries, delay, maxDelay}`, `completed`/`failed` states with exit code, `dependsOn.containers` with `condition: succeeded` | jobs that exit, crash-loop backoff, init containers (items 6, 8, 12) |
 | [#14788](https://github.com/siderolabs/talos/pull/14788) (#14732) | `stopTimeout` (default 10s, at most 4m) on every stop path including `talosctl restart`, shutdown in reverse `dependsOn.containers` order | per-daemon grace periods, VIP released before RGW drains (item 12) |
-| [#14775](https://github.com/siderolabs/talos/pull/14775) (#14730) | `devices: [{rawVolume}]`, a `RawVolumeConfig` partition as a block device without `privileged` | not in this plan: the OSD redesign in milestone 5 (see "Workarounds") |
+| [#14775](https://github.com/siderolabs/talos/pull/14775) (#14730), merged 2026-10-30 | `devices: [{rawVolume}]`, a `RawVolumeConfig` partition as a block device without `privileged` | not in this plan: the OSD redesign in milestone 5 (see "Workarounds") |
 
-Development and the QEMU cluster use a combined build of these branches; `pkg/machinery` comes from the same build (open point 1). The supported Talos release becomes the first one that contains every PR this plan uses. The PRs may still change in review; the parts of the design that rely on them are named per item so they can be adjusted.
+Development and the QEMU cluster use a combined build: upstream main with the three open branches merged; `pkg/machinery` comes from the same build (open point 1). The supported Talos release becomes the first one that contains every PR this plan uses. The open PRs may still change in review; the parts of the design that rely on them are named per item so they can be adjusted.
 
 ## Roles and security
 
@@ -197,7 +197,7 @@ Plan 04: enrollment by the leader, daily certificate renewal by the mgr, agent s
 
 ## Decisions (signed off 2026-10-30)
 
-1. Unmerged Talos PRs: implement against the four PR branches, with `pkg/machinery` from a combined branch pushed to the fork and a `replace` in `go.mod` until the PRs are in a Talos pre-release; the supported Talos release becomes the first one with all of them. This departs from the rule "latest Talos pre-release for `pkg/machinery`" until then (CLAUDE.md updated). The combined branch renumbers the new protobuf fields (and upstream renumbers again for whichever PR lands second), so `pkg/machinery` and the node image must always come from the same commit: against a node on a real pre-release, the new fields would be misread, not just missing. The pin moves with every PR update. If #14795 or #14788 is rejected, items 6, 8 and 12 fall back to the PoC's entrypoint workarounds.
+1. Unmerged Talos PRs: implement against the four PR branches, with `pkg/machinery` from a combined branch pushed to the fork and a `replace` in `go.mod` until the PRs are in a Talos pre-release; the supported Talos release becomes the first one with all of them. This departs from the rule "latest Talos pre-release for `pkg/machinery`" until then (CLAUDE.md updated). The combined branch renumbers the new protobuf fields (and upstream renumbers again for whichever PR lands second), so `pkg/machinery` and the node image must always come from the same commit: against a node on a real pre-release, the new fields would be misread, not just missing. The pin moves with every PR update. If #14795 or #14788 is rejected, items 6, 8 and 12 fall back to the PoC's entrypoint workarounds. Since 2026-10-30 #14775 is merged upstream; the combined branch merges upstream main with the other three.
 2. The CLI runs `shell` and `ceph orch` through exec into a mgr container (item 11); the agents' operator API serves suspension and recovery only.
 3. Split: this plan, plan 04 for the items above, the OSD redesign in milestone 5.
 4. The CLI keeps bootstrap, enrollment, recovery without mons and `rm-cluster`; all other commands become `ceph orch`, with the CLI as a thin client.
