@@ -75,4 +75,4 @@ require (
 	k8s.io/utils v0.0.0-20261023123148-ca04ba58ecab // indirect
 )
 
-replace github.com/siderolabs/talos/pkg/machinery => ../talos-combined/pkg/machinery
+replace github.com/siderolabs/talos/pkg/machinery => github.com/nberlee/talos/pkg/machinery v0.0.0-20261030085331-8ee5a247ecc6
