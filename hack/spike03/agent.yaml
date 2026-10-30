@@ -1,0 +1,12 @@
+# Spike (plan 03, step 0): the agent identity (machinedAccess, uid 50, restricted)
+# applying a document and exec'ing in the mon container, with os:reader and os:admin.
+apiVersion: v1alpha1
+kind: ContainerConfig
+name: x-spike-agent
+image: 10.5.0.1:5000/cephadm-talos-agent@sha256:da36eb928394f5970e92997ebfde45f5a61ba6187c7b4c89e50bb4bc6ba272ca
+entrypoint: [/cephadm-talos, spike03-agent]
+runAs: {uid: 50, gid: 50}
+security:
+  profile: restricted
+  machinedAccess: true
+restart: {policy: never}

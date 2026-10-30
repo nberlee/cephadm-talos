@@ -89,6 +89,11 @@ func run() error {
 		return agent.Main(ctx)
 	}
 
+	// plan 03 spike, removed in step 1
+	if args[0] == "spike03-agent" {
+		return spike03Agent(ctx)
+	}
+
 	// stored in the cluster state at bootstrap: must not depend on the working directory
 	if *talosconfig != "" {
 		abs, err := filepath.Abs(*talosconfig)

@@ -579,6 +579,23 @@ func (c *Client) streamLogs(ctx context.Context, node, name string, follow bool,
 	}
 }
 
+// Exec runs a command in a running container (Talos ContainerExec) and returns its
+// exit code. Secrets go through stdin only: Talos audits the arguments.
+func (c *Client) Exec(ctx context.Context, node, container string, args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
+	cl, nctx, err := c.node(ctx, node, "exec "+container)
+	if err != nil {
+		return 0, err
+	}
+
+	res, err := cl.ContainerExec(nctx, &machine.DebugContainerExecRequestSpec{Container: container, Args: args},
+		client.ContainerStreamOptions{Stdin: stdin, Stdout: stdout, Stderr: stderr})
+	if err != nil {
+		return 0, wrap("exec in "+container, err)
+	}
+
+	return res.ExitCode, nil
+}
+
 // Restart restarts a ContainerConfig container.
 func (c *Client) Restart(ctx context.Context, node, name string) error {
 	if c.DryRun {

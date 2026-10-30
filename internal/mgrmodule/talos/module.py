@@ -23,7 +23,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import orchestrator
 from ceph.deployment.hostspec import HostSpec
-from mgr_module import CLICommandBase, MgrModule
+from mgr_module import CLICommandBase, MgrModule, Option
 from orchestrator import DaemonDescription, DaemonDescriptionStatus, handle_orch_error
 
 TalosCLICommand = CLICommandBase.make_registry_subtype("TalosCLICommand")
@@ -301,6 +301,10 @@ def tls_context(directory: str = TALOS_DIR) -> ssl.SSLContext:
 
 class Module(orchestrator.Orchestrator, MgrModule):
     CLICommand = TalosCLICommand
+    MODULE_OPTIONS = [
+        # plan 03 spike, removed in step 1
+        Option('spike03_listener', type='bool', default=False),
+    ]
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -310,6 +314,17 @@ class Module(orchestrator.Orchestrator, MgrModule):
         return fetch_record(addr, tls_context(), refresh=refresh)
 
     def serve(self) -> None:
+        spike = None
+        if self.get_module_option('spike03_listener'):
+            from .spike03 import Spike
+            spike = Spike(self)
+        try:
+            self._serve()
+        finally:
+            if spike:
+                spike.shutdown()
+
+    def _serve(self) -> None:
         while not self._poller.stop.is_set():
             try:
                 self._poller.poll(load_inventory()['hosts'])
