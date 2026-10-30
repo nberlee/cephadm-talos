@@ -35,9 +35,9 @@ func Container(name, image string) *ContainerConfig {
 	return c
 }
 
-// UserVolume mounts a user volume.
+// UserVolume mounts a user volume by name.
 func UserVolume(name, destination string, options ...string) Mount {
-	return Mount{UserVolumeMount: &container.UserVolumeMount{VolumeName: name, MountDestination: destination, MountOpts: options}}
+	return Mount{VolumeMount: &container.VolumeMount{VolumeName: name, MountDestination: destination, MountOpts: options}}
 }
 
 // HostPath bind-mounts a host path.

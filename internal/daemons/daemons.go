@@ -84,7 +84,7 @@ func base(p Params, typ string) *spec.ContainerConfig {
 		NetworksConfig:   []string{"addresses"},
 		TimeConfig:       boolPtr(true),
 		PathsConfig:      []string{"/etc/ceph/ceph.conf"},
-		ContainersConfig: p.DependsOn,
+		ContainersConfig: running(p.DependsOn),
 	}
 
 	return c
@@ -261,4 +261,18 @@ func Keyring(entity, key string, caps ...string) string {
 	}
 
 	return s
+}
+
+// running lists containers that must be running and healthy first.
+func running(names []string) []container.ContainerDependency {
+	if len(names) == 0 {
+		return nil
+	}
+
+	deps := make([]container.ContainerDependency, len(names))
+	for i, n := range names {
+		deps[i] = container.ContainerDependency{DependencyName: n}
+	}
+
+	return deps
 }
