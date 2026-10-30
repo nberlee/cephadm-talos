@@ -14,6 +14,7 @@
 ## Versions
 
 - Until Talos 1.15.0 is released, always use the latest Talos pre-release (alpha or beta) for `pkg/machinery` and the test cluster. Supported: Talos 1.15 or later.
+- Exception (plan 03, signed off 2026-10-30): while our Talos PRs (#14775, #14781, #14788, #14795) are unmerged, `pkg/machinery` and the test cluster come from one combined build of those branches, always the same commit for both. The supported Talos release becomes the first one containing them.
 - Ceph: only the latest release is supported (today v20.2.4).
 - amd64 only for now; arm64 later.
 - No migration or backwards compatibility is needed before the first tagged release.
