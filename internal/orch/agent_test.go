@@ -186,6 +186,10 @@ func TestHostRmRemovesTheAgent(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if strings.Contains(cfg, o.recordsInitDocName(h)) {
+		t.Errorf("records-init document left behind")
+	}
+
 	if strings.Contains(cfg, o.agentDocName(h)) {
 		t.Errorf("agent document left behind")
 	}
@@ -274,6 +278,10 @@ func TestRemoveClusterRemovesAgentsWithoutStatus(t *testing.T) {
 	cfg, err := o.Talos.MachineConfig(ctx, "node")
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	if strings.Contains(cfg, o.recordsInitDocName(h)) {
+		t.Errorf("records-init document left behind")
 	}
 
 	if strings.Contains(cfg, o.agentDocName(h)) {

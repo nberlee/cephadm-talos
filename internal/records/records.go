@@ -23,8 +23,10 @@ const (
 	// RecordsDir holds the agent's records: uid/gid AgentUID, mode 0700.
 	RecordsDir = "records"
 	// JobsDir holds job claims and results: owned by the agent, mode 1777, so
-	// jobs (which may run as root) create their files and only the agent, the
-	// directory's owner, removes them.
+	// jobs (which may run as root) create their files there and the agent, the
+	// directory's owner, can remove them. The sticky bit keeps other non-root
+	// users out; a root job (or one with CAP_FOWNER) can still remove files, so
+	// this is no protection against the jobs themselves.
 	JobsDir = "jobs"
 )
 
