@@ -3,17 +3,30 @@ package store
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // mem is a config-key store in memory that enforces the entry size.
 type mem struct {
-	mu sync.Mutex
-	m  map[string][]byte
+	mu    sync.Mutex
+	m     map[string][]byte
+	limit int
+}
+
+func (b *mem) EntryLimit() int {
+	if b.limit == 0 {
+		return 64 << 10
+	}
+
+	return b.limit
 }
 
 func (b *mem) Get(_ context.Context, k string) ([]byte, error) {
@@ -32,7 +45,7 @@ func (b *mem) Set(_ context.Context, k string, v []byte) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if len(v) > 64<<10 {
+	if len(v) > b.EntryLimit() {
 		return errors.New("entry too large")
 	}
 
@@ -104,7 +117,7 @@ func TestPublishAndRead(t *testing.T) {
 	}
 
 	m2, err := s.Publish(ctx, map[string][]byte{"hosts": []byte(`[2]`)})
-	if err != nil || m2.Seq != m1.Seq+1 {
+	if err != nil || m2.Seq <= m1.Seq {
 		t.Fatalf("second publication %+v %v", m2, err)
 	}
 
@@ -208,5 +221,85 @@ func TestNamesAreChecked(t *testing.T) {
 
 	if _, err := (Store{B: &mem{}, Incarnation: "cli"}).Publish(ctx, map[string][]byte{"a/b": nil}); err == nil {
 		t.Error("bad record name accepted")
+	}
+}
+
+func TestChunksFollowTheConfiguredLimit(t *testing.T) {
+	ctx := context.Background()
+	b := &mem{limit: 8 << 10}
+	s := Store{B: b, Incarnation: "cli"}
+
+	m, err := s.Publish(ctx, map[string][]byte{"big": bytes.Repeat([]byte("y"), 50<<10)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if v, err := s.Read(ctx, m, "big"); err != nil || len(v) != 50<<10 {
+		t.Fatalf("%d bytes %v", len(v), err)
+	}
+
+	if _, err := (Store{B: &mem{limit: 1024}, Incarnation: "cli"}).Publish(ctx, map[string][]byte{"a": nil}); err == nil {
+		t.Error("published below the minimum entry size")
+	}
+}
+
+func TestLeftoverChunksAreNeverOverwritten(t *testing.T) {
+	ctx := context.Background()
+	b := &mem{}
+	s := Store{B: b, Incarnation: "cli"}
+
+	m1, _ := s.Publish(ctx, map[string][]byte{"hosts": []byte("one")})
+
+	// chunks of an attempt whose manifest never got written (or whose
+	// acknowledgement was lost) at the next sequence
+	stray := Prefix + "inc/cli/rec/" + strconv.FormatInt(m1.Seq+1, 10) + "/hosts.0"
+	_ = b.Set(ctx, stray, []byte("c3RyYXk="))
+
+	m2, err := s.Publish(ctx, map[string][]byte{"hosts": []byte("two")})
+	if err != nil || m2.Seq <= m1.Seq+1 {
+		t.Fatalf("publication %d over a leftover at %d: %v", m2.Seq, m1.Seq+1, err)
+	}
+
+	if v, _ := b.Get(ctx, stray); string(v) != "c3RyYXk=" {
+		t.Error("leftover chunk overwritten")
+	}
+
+	if v, err := s.Read(ctx, m2, "hosts"); err != nil || string(v) != "two" {
+		t.Fatalf("%q %v", v, err)
+	}
+}
+
+// A write of an earlier attempt that lands only after a later publication
+// (its outcome was unknown) never becomes the latest.
+func TestALateWriteDoesNotWin(t *testing.T) {
+	ctx := context.Background()
+	b := &mem{}
+	clock := time.Unix(1000, 0)
+	s := Store{B: b, Incarnation: "cli", Now: func() time.Time { return clock }}
+
+	early := clock.UnixNano() // the attempt that timed out before anything was visible
+
+	clock = clock.Add(time.Second)
+
+	m, err := s.Publish(ctx, map[string][]byte{"hosts": []byte("new")})
+	if err != nil || m.Seq <= early {
+		t.Fatalf("publication %d, earlier attempt %d: %v", m.Seq, early, err)
+	}
+
+	// the earlier attempt's manifest and chunk arrive now
+	late := Manifest{Schema: Schema, Incarnation: "cli", Seq: early, Records: map[string]Entry{"hosts": {
+		Chunks: []string{Prefix + "inc/cli/rec/" + strconv.FormatInt(early, 10) + "/hosts.0"}, SHA256: "x", Size: 3,
+	}}}
+	lb, _ := json.Marshal(late)
+	_ = b.Set(ctx, late.Records["hosts"].Chunks[0], []byte("b2xk"))
+	_ = b.Set(ctx, fmt.Sprintf("%sinc/cli/manifest/%020d", Prefix, early), lb)
+
+	got, err := s.Latest(ctx)
+	if err != nil || got.Seq != m.Seq {
+		t.Fatalf("latest %d %v, want %d", got.Seq, err, m.Seq)
+	}
+
+	if v, err := s.Read(ctx, got, "hosts"); err != nil || string(v) != "new" {
+		t.Fatalf("%q %v", v, err)
 	}
 }

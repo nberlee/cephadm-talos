@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Prefix is the config-key namespace of cephadm-talos, inside the module's store.
@@ -34,7 +35,10 @@ const MaxEntry = 60 << 10
 const Schema = 1
 
 // Backend is a config-key store: the CLI reaches it through exec, the leader
-// through the module's bridge.
+// through the module's bridge. Get and List read one consistent snapshot, so a
+// reader of a manifest finds its chunks even while a writer compacts (a backend
+// without snapshots must make its callers retry on a fresh Latest). An
+// incarnation has one writer at a time; its publications are serialized.
 type Backend interface {
 	Get(ctx context.Context, key string) ([]byte, error) // ErrNotFound if missing
 	List(ctx context.Context, prefix string) ([]string, error)
@@ -42,7 +46,13 @@ type Backend interface {
 	SetMany(ctx context.Context, entries []KV) error
 	// Remove deletes keys; missing ones are not an error
 	Remove(ctx context.Context, keys []string) error
+	// EntryLimit is the largest value the store accepts (the mons'
+	// mon_config_key_max_entry_size)
+	EntryLimit() int
 }
+
+// minEntry is the smallest entry limit the store works with.
+const minEntry = 4 << 10
 
 // KV is one config-key entry.
 type KV struct {
@@ -79,6 +89,16 @@ type Entry struct {
 type Store struct {
 	B           Backend
 	Incarnation string
+	// Now is the clock for sequences; nil is time.Now
+	Now func() time.Time
+}
+
+func (s Store) now() time.Time {
+	if s.Now != nil {
+		return s.Now()
+	}
+
+	return time.Now()
 }
 
 func (s Store) base() (string, error) {
@@ -98,12 +118,28 @@ func (s Store) Publish(ctx context.Context, records map[string][]byte) (Manifest
 		return Manifest{}, err
 	}
 
-	prev, err := s.Latest(ctx)
-	if err != nil && !errors.Is(err, ErrNotFound) {
+	// The next sequence is above every manifest and every chunk already there,
+	// and at least the current time in nanoseconds: an earlier attempt whose
+	// write is still under way (its outcome unknown, not visible yet) has a lower
+	// sequence than any later one, so landing late it neither overwrites a later
+	// publication nor becomes the latest manifest. This assumes the writer's
+	// clock does not step back.
+	top, err := s.highest(ctx)
+	if err != nil {
 		return Manifest{}, err
 	}
 
-	m := Manifest{Schema: Schema, Incarnation: s.Incarnation, Seq: prev.Seq + 1, Records: map[string]Entry{}}
+	top = max(top, s.now().UnixNano()-1)
+
+	limit := s.B.EntryLimit()
+	if limit < minEntry {
+		return Manifest{}, fmt.Errorf("store: config-key entries are limited to %d bytes, at least %d are needed", limit, minEntry)
+	}
+
+	// below the limit, with room to spare
+	chunkSize := min(MaxEntry, limit-limit/16)
+
+	m := Manifest{Schema: Schema, Incarnation: s.Incarnation, Seq: top + 1, Records: map[string]Entry{}}
 
 	names := make([]string, 0, len(records))
 	for n := range records {
@@ -127,9 +163,9 @@ func (s Store) Publish(ctx context.Context, records map[string][]byte) (Manifest
 		// cut never splits a character
 		enc := base64.StdEncoding.EncodeToString(data)
 
-		for i := 0; i == 0 || i*MaxEntry < len(enc); i++ {
+		for i := 0; i == 0 || i*chunkSize < len(enc); i++ {
 			key := fmt.Sprintf("%srec/%d/%s.%d", base, m.Seq, n, i)
-			chunks = append(chunks, KV{Key: key, Value: []byte(enc[i*MaxEntry : min((i+1)*MaxEntry, len(enc))])})
+			chunks = append(chunks, KV{Key: key, Value: []byte(enc[i*chunkSize : min((i+1)*chunkSize, len(enc))])})
 			e.Chunks = append(e.Chunks, key)
 		}
 
@@ -145,8 +181,8 @@ func (s Store) Publish(ctx context.Context, records map[string][]byte) (Manifest
 		return Manifest{}, err
 	}
 
-	if len(b) > MaxEntry {
-		return Manifest{}, fmt.Errorf("store: manifest of %d bytes exceeds %d", len(b), MaxEntry)
+	if len(b) > chunkSize {
+		return Manifest{}, fmt.Errorf("store: manifest of %d bytes exceeds %d", len(b), chunkSize)
 	}
 
 	// the manifest last: it publishes the records it names
@@ -154,40 +190,94 @@ func (s Store) Publish(ctx context.Context, records map[string][]byte) (Manifest
 		return Manifest{}, err
 	}
 
-	return m, s.compact(ctx, m.Seq)
+	// a failed compaction leaves older publications behind: the manifest is
+	// published regardless, which the returned manifest says
+	if err := s.compact(ctx); err != nil {
+		return m, fmt.Errorf("store: published %d, compaction failed: %w", m.Seq, err)
+	}
+
+	return m, nil
 }
 
-// compact removes this incarnation's publications older than the last Keep:
-// their manifests first, so no reader finds a manifest without its records.
-func (s Store) compact(ctx context.Context, latest int64) error {
+// highest returns the highest sequence of any manifest or record chunk of the
+// incarnation, 0 if there is none.
+func (s Store) highest(ctx context.Context) (int64, error) {
+	base, err := s.base()
+	if err != nil {
+		return 0, err
+	}
+
+	keys, err := s.B.List(ctx, base)
+	if err != nil {
+		return 0, err
+	}
+
+	var top int64
+
+	for _, k := range keys {
+		if n, ok := seqOf(strings.TrimPrefix(k, base)); ok && n > top {
+			top = n
+		}
+	}
+
+	return top, nil
+}
+
+// seqOf returns the sequence of a key below an incarnation: manifest/<seq> or rec/<seq>/...
+func seqOf(rest string) (int64, bool) {
+	var seq string
+
+	switch {
+	case strings.HasPrefix(rest, "manifest/"):
+		seq = strings.TrimPrefix(rest, "manifest/")
+	case strings.HasPrefix(rest, "rec/"):
+		seq, _, _ = strings.Cut(strings.TrimPrefix(rest, "rec/"), "/")
+	default:
+		return 0, false
+	}
+
+	n, err := strconv.ParseInt(seq, 10, 64)
+
+	return n, err == nil && n >= 0
+}
+
+// compact removes this incarnation's publications older than the last Keep
+// manifests: their manifests first, so no reader finds a manifest without its
+// records, then every chunk below the oldest kept manifest.
+func (s Store) compact(ctx context.Context) error {
 	base, err := s.base()
 	if err != nil {
 		return err
 	}
-
-	var manifests, recs []string
 
 	keys, err := s.B.List(ctx, base)
 	if err != nil {
 		return err
 	}
 
+	var seqs []int64
+
+	for _, k := range keys {
+		rest := strings.TrimPrefix(k, base)
+		if n, ok := seqOf(rest); ok && strings.HasPrefix(rest, "manifest/") {
+			seqs = append(seqs, n)
+		}
+	}
+
+	if len(seqs) <= Keep {
+		return nil
+	}
+
+	sort.Slice(seqs, func(i, j int) bool { return seqs[i] > seqs[j] })
+	oldest := seqs[Keep-1]
+
+	var manifests, recs []string
+
 	for _, k := range keys {
 		rest := strings.TrimPrefix(k, base)
 
-		var seq string
-
-		switch {
-		case strings.HasPrefix(rest, "manifest/"):
-			seq = strings.TrimPrefix(rest, "manifest/")
-		case strings.HasPrefix(rest, "rec/"):
-			seq, _, _ = strings.Cut(strings.TrimPrefix(rest, "rec/"), "/")
-		default:
-			continue
-		}
-
-		n, err := strconv.ParseInt(seq, 10, 64)
-		if err != nil || n > latest-Keep {
+		n, ok := seqOf(rest)
+		if !ok || n >= oldest {
 			continue
 		}
 
