@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -22,11 +23,13 @@ import (
 	"time"
 
 	"github.com/siderolabs/talos/pkg/machinery/constants"
+	"github.com/siderolabs/talos/pkg/machinery/resources/containers"
 	"github.com/siderolabs/talos/pkg/machinery/role"
 
 	"github.com/nberlee/cephadm-talos/internal/daemons"
 	"github.com/nberlee/cephadm-talos/internal/pki"
 	"github.com/nberlee/cephadm-talos/internal/records"
+	"github.com/nberlee/cephadm-talos/internal/spec"
 	"github.com/nberlee/cephadm-talos/internal/talos"
 )
 
@@ -53,7 +56,9 @@ type Container struct {
 	ImageDigest string `json:"image_digest,omitempty"`
 	Restarts    uint64 `json:"restarts"`
 	ExitCode    int32  `json:"exit_code,omitempty"`
-	Instances   bool   `json:"instances"` // an instance (process) is left
+	// Version is the Ceph version the running daemon reports on its admin socket
+	Version   string `json:"version,omitempty"`
+	Instances bool   `json:"instances"` // an instance (process) is left
 }
 
 // Record is the status the agent serves.
@@ -93,10 +98,116 @@ type Agent struct {
 	Node *Node
 	// Granter serves grants, operation lookups and the handoff (plan 03); nil serves none
 	Granter *Granter
+	// Exec runs the agent's admin socket queries; nil runs none
+	Exec Execer
+
+	// versions caches each daemon's reported version per instance
+	versions map[string]versionSeen
 
 	logPrint func(format string, args ...any)
 	// refresh replaces observe in tests
 	refresh func(context.Context) error
+}
+
+// versionSeen is what one instance of a container reported, or how often it
+// was asked without an answer.
+type versionSeen struct {
+	// the instance: Talos resets generation and restarts when a container is
+	// removed and created again, its PID and image tell the new one apart
+	generation, restarts uint64
+	pid                  uint32
+	image                string
+
+	version  string
+	attempts int
+}
+
+// versionAttempts is how often one instance is asked: a daemon that just
+// started may not have its socket yet.
+const versionAttempts = 3
+
+// daemonVersions asks each running daemon for its version, once per instance
+// (Talos audits every exec), at most versionAttempts times without an answer.
+// Only a document that passes the admission policy is asked: its environment
+// is exactly its template's. This is a check, not a boundary: whoever could
+// give a container another environment controls its processes anyway, and the
+// query is a fixed read-only command whose answer is a version string. The
+// bootstrap mon's document is not a grantable one and is not asked: it is
+// replaced by the joining mon's template after bootstrap (plan 03, item 13).
+func (a *Agent) daemonVersions(ctx context.Context, rec *Record, statuses map[string]containers.ContainerStatusSpec) {
+	if a.Exec == nil || a.Node == nil || a.Node.Policy == nil {
+		return
+	}
+
+	cfg, err := a.Talos.MachineConfig(ctx, "")
+	if err != nil {
+		return
+	}
+
+	docs, err := typedDocs([]byte(cfg))
+	if err != nil {
+		return
+	}
+
+	var disks []Disk
+
+	if list, err := a.Talos.Disks(ctx, ""); err == nil {
+		for _, d := range list {
+			disks = append(disks, Disk{Serial: d.TypedSpec().Serial, Symlinks: d.TypedSpec().Symlinks})
+		}
+	}
+
+	var names []string
+
+	for k := range docs {
+		if name, ok := strings.CutPrefix(k, "ContainerConfig/"); ok {
+			names = append(names, name)
+		}
+	}
+
+	seen := map[string]versionSeen{}
+
+	for name, s := range statuses {
+		td, ok := docs["ContainerConfig/"+name]
+		if !ok || s.State != containers.ContainerStateRunning {
+			continue
+		}
+
+		c, ok := td.doc.(*spec.ContainerConfig)
+		if !ok {
+			continue
+		}
+
+		entity := asokEntity(a.Node.FSID, c)
+		if entity == "" {
+			continue
+		}
+
+		v, ok := a.versions[name]
+		if !ok || v.generation != s.Generation || v.restarts != s.RestartCount || v.pid != s.PID || v.image != s.Image {
+			v = versionSeen{generation: s.Generation, restarts: s.RestartCount, pid: s.PID, image: s.Image}
+		}
+
+		// a refresh out of time asks no more: the attempts stay for the next one
+		if v.version == "" && v.attempts < versionAttempts && ctx.Err() == nil &&
+			a.Node.Policy.Check([]Doc{{Kind: "ContainerConfig", Name: name, YAML: td.yaml}}, disks, names) == nil {
+			v.attempts++
+
+			if version, err := daemonVersion(ctx, a.Exec, name, entity); err == nil {
+				v.version = version
+			}
+		}
+
+		seen[name] = v
+
+		if v.version != "" {
+			ct := rec.Containers[name]
+			ct.Version = v.version
+			rec.Containers[name] = ct
+		}
+	}
+
+	a.versions = seen
 }
 
 // Wait returns when no refresh is running anymore; cancel Life first.
@@ -247,6 +358,8 @@ func (a *Agent) observe(ctx context.Context) error {
 		c.Instances = true
 		rec.Containers[name] = c
 	}
+
+	a.daemonVersions(ctx, rec, statuses)
 
 	rec.ObservedAt = a.now()
 
@@ -448,7 +561,12 @@ func Main(ctx context.Context) error {
 	node := &Node{Talos: tc, Records: recs, FSID: self.FSID, Host: self.Name, Policy: &Policy{
 		FSID: self.FSID, Host: self.Name, CACert: string(pems[0]), Repos: repos,
 	}}
-	a := &Agent{Talos: tc, Life: ctx, Channel: ch, Records: recs, Node: node, Granter: NewGranter(node, ch, clientTLS, recs)}
+	a := &Agent{
+		Talos: tc, Life: ctx, Channel: ch, Records: recs, Node: node, Granter: NewGranter(node, ch, clientTLS, recs),
+		Exec: func(ctx context.Context, container string, args []string, stdout, stderr io.Writer) (int, error) {
+			return tc.Exec(ctx, "", container, args, nil, stdout, stderr)
+		},
+	}
 
 	// an apply interrupted by the last stop is decided from the node first
 	if err := a.Granter.Reconcile(ctx); err != nil {

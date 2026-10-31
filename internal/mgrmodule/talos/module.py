@@ -255,7 +255,8 @@ def validate_record(rec: Any) -> Dict[str, Any]:
     for name, c in rec['containers'].items():
         if not isinstance(c, dict) or not isinstance(c.get('state', ''), str) or not isinstance(c.get('image_digest', ''), str) \
                 or not isinstance(c.get('restarts', 0), int) or not isinstance(c.get('instances', False), bool) \
-                or not isinstance(c.get('exit_code', 0), int) or isinstance(c.get('exit_code', 0), bool):
+                or not isinstance(c.get('exit_code', 0), int) or isinstance(c.get('exit_code', 0), bool) \
+                or not isinstance(c.get('version', ''), str):
             raise ValueError('invalid container %r in status record' % name)
     rec['observed_at'] = parse_time(rec['observed_at'])
     return rec
@@ -318,7 +319,8 @@ def build_daemons(inv: Dict[str, Any], observations: Dict[str, Tuple[Optional[Di
             container_id=d['doc_name'],
             container_image_name=d.get('desired_image') or None,
             container_image_digests=[c['image_digest']] if c and c.get('image_digest') else None,
-            version=inv.get('ceph_version') if d['daemon_type'] != 'keepalived' else None,
+            # what the daemon reports on its admin socket, else what the cluster runs
+            version=((c or {}).get('version') or inv.get('ceph_version')) if d['daemon_type'] != 'keepalived' else None,
             status=status,
             status_desc=desc,
             last_refresh=rec['observed_at'] if rec else None,

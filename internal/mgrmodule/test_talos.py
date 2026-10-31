@@ -232,6 +232,17 @@ class ExitStates(unittest.TestCase):
             self.assertEqual((status, got), (want, desc))
 
 
+class ReportedVersion(unittest.TestCase):
+    def test_version_from_the_daemon(self):
+        inv = inventory()
+        d = inv['daemons'][0]
+        rec = m.validate_record(record({d['doc_name']: {'state': 'running', 'version': '20.2.5'}}, NOW.isoformat()))
+        dd = {x.daemon_name: x for x in m.build_daemons(inv, {d['host']: (rec, '')}, NOW)}
+        self.assertEqual(dd['%s.%s' % (d['daemon_type'], d['daemon_id'])].version, '20.2.5')
+        with self.assertRaises(ValueError):
+            m.validate_record(record({d['doc_name']: {'state': 'running', 'version': 20}}, NOW.isoformat()))
+
+
 class BadParts(unittest.TestCase):
     def test_malformed_container_rejects_only_that_host(self):
         with self.assertRaises(ValueError):
