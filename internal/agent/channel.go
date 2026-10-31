@@ -242,7 +242,7 @@ func verifyConfirmation(raw []byte, peer *x509.Certificate, mgr string, req wire
 
 	if conf.Version != wire.Version || conf.FSID != req.FSID || conf.Session != req.Session || conf.Host != req.Host ||
 		conf.Revision != req.Revision || conf.Operation != req.Operation || conf.InputsHash != req.InputsHash ||
-		conf.Challenge != req.Challenge || conf.Mgr != mgr || conf.GID <= 0 {
+		conf.Challenge != req.Challenge || conf.Mgr != mgr || conf.GID <= 0 || conf.Epoch <= 0 {
 		return wire.Confirmation{}, errors.New("confirmation does not match the challenge")
 	}
 

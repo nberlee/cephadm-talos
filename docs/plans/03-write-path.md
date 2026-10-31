@@ -180,7 +180,7 @@ On the combined Talos build `v1.15.0-alpha.2-51-g8ee5a247e` (`cephadm-talos/comb
 1. Identities and the module side: per-role certificates, bridge, confirmation endpoint, heartbeat and incarnation.
 2. The agent's durable records, the job result protocol with `never` jobs, OSD identity and preparation records.
 3. State and keys in the cluster: manifest and chunked records under `mgr/cephadm/`, rendering with `auth get`, the module reading the store.
-4. Agents as writers: revisions, reservations and confirmations, the admission policy, drift, quorum freeze, the journal and takeover.
+4. Agents as writers: revisions, reservations and confirmations, the admission policy, drift, quorum freeze, the journal and takeover. Until step 6 the CLI stays the only writer of the cluster state (incarnation "cli"), which the leader reads: takeover in this step closes the earlier incarnations' sessions and imports their operations, while publishing the state under the leader's incarnation, the module reading its inventory from there and the CLI switching to it come with the first state change the leader makes, in step 6.
 5. Daemon documents (item 12) and the status schema; exec in the agent.
 6. The `ceph orch` commands of item 9, with control-plane safety (item 10).
 7. CLI roles: bootstrap handoff, enrollment, `shell` and `ceph orch` through exec, suspension for recovery and `rm-cluster`.

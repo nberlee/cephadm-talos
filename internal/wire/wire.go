@@ -64,6 +64,7 @@ type Confirmation struct {
 	FSID       string `json:"fsid"`
 	Mgr        string `json:"mgr"`
 	GID        int64  `json:"gid"`
+	Epoch      int64  `json:"epoch"` // the mgrmap epoch the incarnation was captured at: orders incarnations
 	Session    string `json:"session"`
 	Host       string `json:"host"`
 	Revision   int64  `json:"revision"`
@@ -102,6 +103,7 @@ type Grant struct {
 	Mgr       string `json:"mgr"`      // the active mgr the leader runs beside
 	MgrAddr   string `json:"mgr_addr"` // its host's address, for the confirmation
 	GID       int64  `json:"gid"`      // the leader's incarnation: the mgr's gid
+	Epoch     int64  `json:"epoch"`    // and its captured mgrmap epoch, which orders incarnations
 	Revision  int64  `json:"revision"`
 	Operation string `json:"operation"`
 	// Docs replace documents of the same kind and name, or remove them
@@ -173,6 +175,7 @@ type Abandon struct {
 	Mgr       string `json:"mgr"`
 	MgrAddr   string `json:"mgr_addr"`
 	GID       int64  `json:"gid"`
+	Epoch     int64  `json:"epoch"`
 	Revision  int64  `json:"revision"`
 	Operation string `json:"operation"`
 }
@@ -190,6 +193,42 @@ func AbandonInputs(a Abandon) string {
 	sum := sha256.Sum256(b)
 
 	return hex.EncodeToString(sum[:])
+}
+
+// Close is a new leader closing the sessions of earlier incarnations on an
+// agent (plan 03, item 6): confirmed like a grant, it raises the agent's
+// session floor to Epoch, below which no grant, abandon or close is admitted.
+// Incarnations are ordered by their captured mgrmap epoch, not their gid: a
+// standby promoted later may have a smaller gid.
+type Close struct {
+	Version int    `json:"version"`
+	FSID    string `json:"fsid"`
+	Host    string `json:"host"`
+	Mgr     string `json:"mgr"`
+	MgrAddr string `json:"mgr_addr"`
+	GID     int64  `json:"gid"`
+	Epoch   int64  `json:"epoch"`
+}
+
+// CloseInputs is the hash the agent's confirmation of a close carries.
+func CloseInputs(c Close) string {
+	b, _ := json.Marshal(struct {
+		Close bool   `json:"close"`
+		FSID  string `json:"fsid"`
+		Host  string `json:"host"`
+		GID   int64  `json:"gid"`
+		Epoch int64  `json:"epoch"`
+	}{true, c.FSID, c.Host, c.GID, c.Epoch})
+
+	sum := sha256.Sum256(b)
+
+	return hex.EncodeToString(sum[:])
+}
+
+// CloseReply is the agent's session floor after a close.
+type CloseReply struct {
+	Version int   `json:"version"`
+	Floor   int64 `json:"floor"`
 }
 
 // Handoff is the CLI's request that an agent take ownership of its node's

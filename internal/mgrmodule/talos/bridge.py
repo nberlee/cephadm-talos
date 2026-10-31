@@ -472,7 +472,7 @@ class Channel:
         if not self.leadership.still_active():
             return 409, {'error': 'not confirmed as the active mgr'}
         payload = json.dumps({
-            'version': WIRE_VERSION, 'fsid': self.fsid, 'mgr': self.mgr_id, 'gid': cap[0],
+            'version': WIRE_VERSION, 'fsid': self.fsid, 'mgr': self.mgr_id, 'gid': cap[0], 'epoch': cap[1],
             'session': req['session'], 'host': req['host'], 'revision': req['revision'],
             'operation': req['operation'], 'inputs_hash': req['inputs_hash'], 'challenge': req['challenge'],
         }, sort_keys=True, separators=(',', ':')).encode()

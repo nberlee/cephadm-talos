@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -77,6 +78,19 @@ type JournalOp struct {
 	Error string            `json:"error,omitempty"`
 }
 
+// Takeover is a new leader's progress in taking over from earlier
+// incarnations (plan 03, item 6), in its journal under "takeover": the hosts
+// whose sessions it closed, and whether it imported its predecessors'
+// unresolved operations and undecided requests.
+type Takeover struct {
+	Version int `json:"version"`
+	// Epoch is the incarnation's captured mgrmap epoch: a later takeover
+	// imports only from incarnations with a lower one
+	Epoch    int64    `json:"epoch"`
+	Closed   []string `json:"closed"`
+	Imported bool     `json:"imported"`
+}
+
 // JournalPrefix is an incarnation's journal in config-key.
 func JournalPrefix(gid int64) string {
 	return store.Prefix + "inc/" + strconv.FormatInt(gid, 10) + "/journal/"
@@ -95,6 +109,8 @@ type LeaderLoop struct {
 
 	// bridgeAddr is where the module listens: this host's loopback
 	bridgeAddr string
+	// closed are the hosts whose earlier sessions this incarnation closed
+	closed map[string]bool
 	// agentURL returns a host's agent; tests replace it
 	agentURL func(h state.Host) string
 	now      func() time.Time
@@ -131,7 +147,7 @@ func (l *LeaderLoop) Run(ctx context.Context) {
 
 	for {
 		if lead := l.active(); lead != nil {
-			if err := l.Tick(ctx, lead.GID); err != nil {
+			if err := l.Tick(ctx, lead.GID, lead.Epoch); err != nil {
 				l.log("%v", err)
 			}
 		}
@@ -154,11 +170,12 @@ func (l *LeaderLoop) active() *Leader {
 	return lead
 }
 
-// stillLeader reports whether this agent is still the leader of incarnation gid.
-func (l *LeaderLoop) stillLeader(gid int64) bool {
+// stillLeader reports whether this agent is still the leader of the
+// incarnation gid, captured at epoch.
+func (l *LeaderLoop) stillLeader(gid, epoch int64) bool {
 	lead := l.active()
 
-	return lead != nil && lead.GID == gid
+	return lead != nil && lead.GID == gid && lead.Epoch == epoch
 }
 
 // errRetry marks an error the next tick retries: nothing was decided.
@@ -173,8 +190,9 @@ func (l *LeaderLoop) bridge() *Bridge {
 	return &Bridge{TLS: l.ClientTLS, Addr: addr, Mgr: l.Self.Name, FSID: l.Self.FSID}
 }
 
-// Tick carries out the incarnation's pending requests, in id order.
-func (l *LeaderLoop) Tick(ctx context.Context, gid int64) error {
+// Tick takes over from earlier incarnations as far as it can, then carries
+// out the incarnation's pending requests, in id order.
+func (l *LeaderLoop) Tick(ctx context.Context, gid, epoch int64) error {
 	b := l.bridge()
 	prefix := JournalPrefix(gid)
 
@@ -183,31 +201,261 @@ func (l *LeaderLoop) Tick(ctx context.Context, gid int64) error {
 		return err
 	}
 
-	reqs, err := js.List(ctx, prefix+"req/")
+	to, err := l.takeover(ctx, b, js, gid, epoch)
 	if err != nil {
 		return err
 	}
 
-	sort.Strings(reqs)
+	l.closed = map[string]bool{}
+	for _, h := range to.Closed {
+		l.closed[h] = true
+	}
 
-	for _, k := range reqs {
-		if !l.stillLeader(gid) {
+	// every id with a request or an operation: an imported grant is resolved
+	// even without its request
+	keys, err := js.List(ctx, prefix)
+	if err != nil {
+		return err
+	}
+
+	seen := map[string]bool{}
+
+	var ids []string
+
+	for _, k := range keys {
+		kind, id, ok := strings.Cut(strings.TrimPrefix(k, prefix), "/")
+		if ok && (kind == "req" || kind == "op") && !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+
+	sort.Strings(ids)
+
+	for _, id := range ids {
+		if !l.stillLeader(gid, epoch) {
 			return nil // the next leader carries on
 		}
 
-		id := strings.TrimPrefix(k, prefix+"req/")
 		if !operationRe.MatchString(id) {
 			l.log("request %q: not an operation id", id)
 
 			continue
 		}
 
-		if err := l.request(ctx, b, js, gid, id); err != nil {
+		if err := l.request(ctx, b, js, gid, epoch, id); err != nil {
 			l.log("request %s: %v", id, err)
 		}
 	}
 
 	return nil
+}
+
+// takeover closes earlier incarnations' sessions on every host it can reach
+// and imports its predecessors' journals once. A host whose session is not
+// closed yet gets no grant: it is retried on every tick.
+func (l *LeaderLoop) takeover(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64) (Takeover, error) {
+	key := JournalPrefix(gid) + "takeover"
+
+	to, found, err := readJSONKey[Takeover](ctx, js, key)
+	if err != nil {
+		return Takeover{}, err
+	}
+
+	if !found {
+		to = Takeover{Version: journalVersion, Epoch: epoch, Closed: []string{}}
+	}
+
+	st, _, err := l.clusterState(ctx, b)
+	if err != nil {
+		return to, err
+	}
+
+	me, ok := st.Host(l.Self.Name)
+	if !ok {
+		return to, fmt.Errorf("the leader's host %s is not in the cluster state", l.Self.Name)
+	}
+
+	changed := !found
+
+	for _, h := range st.Hosts {
+		if slices.Contains(to.Closed, h.Name) || !l.stillLeader(gid, epoch) {
+			continue
+		}
+
+		c := wire.Close{Version: wire.Version, FSID: l.Self.FSID, Host: h.Name, Mgr: l.Self.Name, MgrAddr: me.Addr, GID: gid, Epoch: epoch}
+
+		var res wire.CloseReply
+		if _, err := l.call(ctx, h, http.MethodPost, "/v1/close", c, &res); err != nil {
+			l.log("closing earlier sessions on %s: %v", h.Name, err)
+
+			continue
+		}
+
+		to.Closed = append(to.Closed, h.Name)
+		changed = true
+	}
+
+	if !to.Imported && l.stillLeader(gid, epoch) {
+		if err := l.importPredecessors(ctx, b, js, gid, epoch); err != nil {
+			return to, err
+		}
+
+		to.Imported, changed = true, true
+	}
+
+	if changed {
+		if err := writeJSONKey(ctx, js, key, to); err != nil {
+			return to, err
+		}
+	}
+
+	return to, nil
+}
+
+// importPredecessors carries the earlier incarnations' unresolved grants
+// (their outcome is then asked from the agent, or the grant abandoned) and
+// undecided requests into this incarnation's journal. Histories are merged
+// by id: the newest incarnation that has an operation for an id decides it,
+// so a request an intermediate incarnation completed is not run again.
+func (l *LeaderLoop) importPredecessors(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64) error {
+	all, err := b.Store(ctx, store.Prefix+"inc/")
+	if err != nil {
+		return err
+	}
+
+	keys, err := all.List(ctx, store.Prefix+"inc/")
+	if err != nil {
+		return err
+	}
+
+	// the predecessors and their epochs: an incarnation that never took over
+	// (no takeover record) never acted, and its requests are older than ours
+	epochs := map[int64]int64{}
+
+	for _, k := range keys {
+		inc, rest, ok := strings.Cut(strings.TrimPrefix(k, store.Prefix+"inc/"), "/journal/")
+		if !ok {
+			continue
+		}
+
+		old, err := strconv.ParseInt(inc, 10, 64)
+		if err != nil || old <= 0 || old == gid {
+			continue // "cli" has no journal
+		}
+
+		if _, ok := epochs[old]; !ok {
+			epochs[old] = 0
+		}
+
+		if rest == "takeover" {
+			to, found, err := readJSONKey[Takeover](ctx, all, k)
+			if err != nil {
+				return err
+			}
+
+			if found {
+				epochs[old] = to.Epoch
+			}
+		}
+	}
+
+	// per id: the newest predecessor (by epoch) with an operation, and with a request
+	type history struct {
+		op, req           int64 // incarnations
+		opEpoch, reqEpoch int64
+	}
+
+	ids := map[string]*history{}
+
+	for _, k := range keys {
+		inc, rest, ok := strings.Cut(strings.TrimPrefix(k, store.Prefix+"inc/"), "/journal/")
+		if !ok {
+			continue
+		}
+
+		old, err := strconv.ParseInt(inc, 10, 64)
+		if err != nil {
+			continue
+		}
+
+		e, known := epochs[old]
+		if !known || e >= epoch {
+			continue // not a predecessor
+		}
+
+		kind, id, _ := strings.Cut(rest, "/")
+		if (kind != "op" && kind != "req") || !operationRe.MatchString(id) {
+			continue
+		}
+
+		h := ids[id]
+		if h == nil {
+			h = &history{opEpoch: -1, reqEpoch: -1}
+			ids[id] = h
+		}
+
+		if kind == "op" && e > h.opEpoch {
+			h.op, h.opEpoch = old, e
+		} else if kind == "req" && e > h.reqEpoch {
+			h.req, h.reqEpoch = old, e
+		}
+	}
+
+	own := JournalPrefix(gid)
+
+	for id, h := range ids {
+		// what this incarnation already has stays
+		if _, err := js.Get(ctx, own+"op/"+id); err == nil {
+			continue
+		} else if !errors.Is(err, store.ErrNotFound) {
+			return err
+		}
+
+		if h.op > 0 {
+			op, found, err := readJSONKey[JournalOp](ctx, all, JournalPrefix(h.op)+"op/"+id)
+			if err != nil || !found {
+				return err
+			}
+
+			if op.State != JournalGranting && op.State != wire.OpUncertain {
+				continue // decided
+			}
+
+			l.log("importing grant %s from incarnation %d", id, h.op)
+
+			if err := writeJSONKey(ctx, js, own+"op/"+id, op); err != nil {
+				return err
+			}
+
+			continue
+		}
+
+		if err := l.copyRequest(ctx, all, js, JournalPrefix(h.req)+"req/"+id, own+"req/"+id); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (l *LeaderLoop) copyRequest(ctx context.Context, from, to store.Backend, src, dst string) error {
+	if _, err := to.Get(ctx, dst); err == nil {
+		return nil // never overwritten
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
+
+	raw, err := from.Get(ctx, src)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil
+	}
+
+	if err != nil {
+		return err
+	}
+
+	return to.SetMany(ctx, []store.KV{{Key: dst, Value: raw}})
 }
 
 func readJSONKey[T any](ctx context.Context, js store.Backend, key string) (T, bool, error) {
@@ -243,7 +491,7 @@ func writeJSONKey(ctx context.Context, js store.Backend, key string, v any) erro
 
 // request carries out one request, or resolves its grant if its outcome was
 // not recorded.
-func (l *LeaderLoop) request(ctx context.Context, b *Bridge, js store.Backend, gid int64, id string) error {
+func (l *LeaderLoop) request(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, id string) error {
 	prefix := JournalPrefix(gid)
 	opKey := prefix + "op/" + id
 
@@ -253,11 +501,13 @@ func (l *LeaderLoop) request(ctx context.Context, b *Bridge, js store.Backend, g
 	}
 
 	if found {
-		if op.State != JournalGranting {
+		// a grant whose outcome is not known yet, or uncertain on the agent,
+		// is asked again until the agent decides it
+		if op.State != JournalGranting && op.State != wire.OpUncertain {
 			return nil // done
 		}
 
-		return l.resolve(ctx, b, js, gid, opKey, op, id)
+		return l.resolve(ctx, b, js, gid, epoch, opKey, op, id)
 	}
 
 	raw, err := js.Get(ctx, prefix+"req/"+id)
@@ -278,7 +528,7 @@ func (l *LeaderLoop) request(ctx context.Context, b *Bridge, js store.Backend, g
 		return writeJSONKey(ctx, js, opKey, JournalOp{Version: journalVersion, Kind: req.Kind, Host: req.Host, State: JournalFailed, Error: "unknown or malformed request"})
 	}
 
-	return l.revision(ctx, b, js, gid, id, req.Host)
+	return l.revision(ctx, b, js, gid, epoch, id, req.Host)
 }
 
 // clusterState reads the cluster state the CLI publishes ("cli"), retrying
@@ -485,7 +735,7 @@ func (l *LeaderLoop) renderHost(ctx context.Context, b *Bridge, st *state.State,
 }
 
 // revision makes a host's documents match the cluster state.
-func (l *LeaderLoop) revision(ctx context.Context, b *Bridge, js store.Backend, gid int64, id, host string) error {
+func (l *LeaderLoop) revision(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, id, host string) error {
 	opKey := JournalPrefix(gid) + "op/" + id
 	op := JournalOp{Version: journalVersion, Kind: KindRevision, Host: host}
 
@@ -505,6 +755,11 @@ func (l *LeaderLoop) revision(ctx context.Context, b *Bridge, js store.Backend, 
 	h, ok := st.Host(host)
 	if !ok || h.Name != host {
 		return fail(fmt.Errorf("no host %s in the cluster state", host))
+	}
+
+	// a host whose earlier sessions are not closed yet waits
+	if !l.closed[host] {
+		return fmt.Errorf("%w: %s's earlier sessions are not closed yet", errRetry, host)
 	}
 
 	// a host in maintenance keeps its daemons in the state with their
@@ -596,7 +851,7 @@ func (l *LeaderLoop) revision(ctx context.Context, b *Bridge, js store.Backend, 
 	op.Revision = max(rep.Revision+1, l.clock().UnixNano())
 	op.State = JournalGranting
 
-	if !l.stillLeader(gid) {
+	if !l.stillLeader(gid, epoch) {
 		return nil // nothing written: the next leader decides
 	}
 
@@ -605,12 +860,12 @@ func (l *LeaderLoop) revision(ctx context.Context, b *Bridge, js store.Backend, 
 		return err
 	}
 
-	if !l.stillLeader(gid) {
+	if !l.stillLeader(gid, epoch) {
 		return nil // the intent stays: the next leader resolves it
 	}
 
 	g := wire.Grant{
-		Version: wire.Version, FSID: l.Self.FSID, Host: h.Name, Mgr: l.Self.Name, MgrAddr: me.Addr, GID: gid,
+		Version: wire.Version, FSID: l.Self.FSID, Host: h.Name, Mgr: l.Self.Name, MgrAddr: me.Addr, GID: gid, Epoch: epoch,
 		Revision: op.Revision, Operation: id, Docs: grant,
 	}
 
@@ -638,7 +893,7 @@ func (l *LeaderLoop) record(ctx context.Context, js store.Backend, opKey string,
 // resolve asks the agent for the outcome of a grant the journal has no outcome
 // for. An agent without a record either never received the grant or refused
 // it without a confirmation; it records the operation as abandoned.
-func (l *LeaderLoop) resolve(ctx context.Context, b *Bridge, js store.Backend, gid int64, opKey string, op JournalOp, id string) error {
+func (l *LeaderLoop) resolve(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, opKey string, op JournalOp, id string) error {
 	st, _, err := l.clusterState(ctx, b)
 	if err != nil {
 		return err
@@ -659,7 +914,7 @@ func (l *LeaderLoop) resolve(ctx context.Context, b *Bridge, js store.Backend, g
 	// can then no longer run; an operation it has a record of keeps it
 	a := wire.Abandon{
 		Version: wire.Version, FSID: l.Self.FSID, Host: h.Name, Mgr: l.Self.Name, MgrAddr: me.Addr,
-		GID: gid, Revision: op.Revision, Operation: id,
+		GID: gid, Epoch: epoch, Revision: op.Revision, Operation: id,
 	}
 
 	var res wire.Operation

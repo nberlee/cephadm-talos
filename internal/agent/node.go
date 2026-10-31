@@ -67,7 +67,17 @@ type applyIntent struct {
 	Revision int64             `json:"revision"`
 	Before   map[string]string `json:"before"` // the ownership it started from
 	Sent     map[string]string `json:"sent"`   // key -> hash of the sent document, "" for a removal
+	// BootID and At say when the apply was sent: on another boot, or after
+	// ApplySettle, an apply that is not visible will not become visible
+	BootID string    `json:"boot_id"`
+	At     time.Time `json:"at"`
 }
+
+// ApplySettle is how long after an apply was sent its absence from the config
+// counts as proof that it did not happen, on the same boot. Talos handles an
+// apply synchronously and finishes it even when the caller is gone (its
+// config update does not follow the caller's context), well within this.
+const ApplySettle = 10 * time.Minute
 
 // NodeStatus is the ownership part of the status record.
 type NodeStatus struct {
@@ -97,6 +107,7 @@ type Node struct {
 		MachineConfig(ctx context.Context, node string) (string, error)
 		Patch(ctx context.Context, node string, patches ...[]byte) error
 		Disks(ctx context.Context, node string) ([]*block.Disk, error)
+		BootID(ctx context.Context, node string) (string, error)
 	}
 	Records *records.Store
 	// Policy admits the documents Apply applies; nil admits nothing
@@ -492,6 +503,85 @@ func (n *Node) Report(ctx context.Context) (wire.NodeReport, error) {
 	return r, nil
 }
 
+// Reconcile decides an apply whose outcome was not recorded (an intent left
+// behind) from the machine config, which Talos persists before it answers:
+// if the node holds exactly what the apply would have left, it happened
+// (completed); if it holds exactly what it held before and the apply can no
+// longer be in progress (another boot, or ApplySettle passed), it did not
+// (refused); anything else stays uncertain and blocks every later apply. It returns ""
+// when there is no such apply, the revision of the one it decided, and the
+// ownership's revision afterwards, all from one look under the node lock.
+func (n *Node) Reconcile(ctx context.Context) (outcome string, rev, owned int64, err error) {
+	if err := n.lock(ctx); err != nil {
+		return "", 0, 0, err
+	}
+	defer n.unlock()
+
+	defer func() {
+		if err == nil {
+			own, _, oerr := n.ownership()
+			owned, err = own.Revision, oerr
+		}
+	}()
+
+	var intent applyIntent
+
+	pending, err := n.readJSON(applyRecord, &intent)
+	if err != nil || !pending {
+		return "", 0, 0, err
+	}
+
+	// settlement first: the config read after it shows any apply that was
+	// still being handled when it was established
+	boot, err := n.Talos.BootID(ctx, "")
+	if err != nil {
+		return "", 0, 0, err
+	}
+
+	settled := boot != intent.BootID || time.Since(intent.At) >= ApplySettle
+
+	cfg, err := n.Talos.MachineConfig(ctx, "")
+	if err != nil {
+		return "", 0, 0, err
+	}
+
+	cur, err := parseDocs(cfg)
+	if err != nil {
+		return "", 0, 0, err
+	}
+
+	next := Ownership{Schema: ownershipSchema, Revision: intent.Revision, Docs: map[string]string{}}
+	for k, h := range intent.Before {
+		next.Docs[k] = h
+	}
+
+	for k, h := range intent.Sent {
+		if h == "" {
+			delete(next.Docs, k)
+		} else {
+			next.Docs[k] = h
+		}
+	}
+
+	switch {
+	case len(n.drift(next, cur)) == 0:
+		if err := n.writeJSON(ownershipRecord, next); err != nil {
+			return "", 0, 0, err
+		}
+
+		return "completed", intent.Revision, 0, n.Records.Remove(applyRecord)
+	case len(n.drift(Ownership{Docs: intent.Before}, cur)) == 0:
+		// not visible proves nothing while the apply may still be handled
+		if !settled {
+			return "uncertain", intent.Revision, 0, nil
+		}
+
+		return "refused", intent.Revision, 0, n.Records.Remove(applyRecord)
+	}
+
+	return "uncertain", intent.Revision, 0, nil
+}
+
 // fenceRecord holds the revision below which nothing is applied anymore.
 const fenceRecord = "fence"
 
@@ -714,7 +804,12 @@ func (n *Node) apply(ctx context.Context, until time.Time, revision int64, docs 
 		return Ownership{}, started, errors.New("the confirmation expired before the apply")
 	}
 
-	if err := n.writeJSON(applyRecord, applyIntent{Schema: ownershipSchema, Revision: revision, Before: own.Docs, Sent: sent}); err != nil {
+	boot, err := n.Talos.BootID(ctx, "")
+	if err != nil {
+		return Ownership{}, started, err
+	}
+
+	if err := n.writeJSON(applyRecord, applyIntent{Schema: ownershipSchema, Revision: revision, Before: own.Docs, Sent: sent, BootID: boot, At: time.Now().UTC()}); err != nil {
 		return Ownership{}, started, err
 	}
 

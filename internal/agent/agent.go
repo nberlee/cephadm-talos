@@ -285,6 +285,7 @@ func (a *Agent) Handler() http.Handler {
 		mux.HandleFunc("POST /v1/handoff", a.Granter.HandleHandoff)
 		mux.HandleFunc("GET /v1/node", a.Granter.HandleNode)
 		mux.HandleFunc("POST /v1/abandon", a.Granter.HandleAbandon)
+		mux.HandleFunc("POST /v1/close", a.Granter.HandleClose)
 	}
 
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
@@ -446,6 +447,11 @@ func Main(ctx context.Context) error {
 		FSID: self.FSID, Host: self.Name, CACert: string(pems[0]), Repos: repos,
 	}}
 	a := &Agent{Talos: tc, Life: ctx, Channel: ch, Records: recs, Node: node, Granter: NewGranter(node, ch, clientTLS, recs)}
+
+	// an apply interrupted by the last stop is decided from the node first
+	if err := a.Granter.Reconcile(ctx); err != nil {
+		log.Printf("reconciling the last operations: %v", err)
+	}
 
 	var wg sync.WaitGroup
 

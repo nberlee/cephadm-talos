@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -118,7 +119,7 @@ func (g *Granter) checkGrant(gr wire.Grant, leader string) error {
 	case gr.Mgr != leader:
 		// the leader is the agent beside the active mgr: same host, same name
 		return errors.New("the grant's mgr is not the sender's host")
-	case pki.ValidName(gr.Mgr) != nil || gr.GID <= 0 || gr.Revision <= 0 || !operationRe.MatchString(gr.Operation):
+	case pki.ValidName(gr.Mgr) != nil || gr.GID <= 0 || gr.Epoch <= 0 || gr.Revision <= 0 || !operationRe.MatchString(gr.Operation):
 		return errors.New("malformed grant")
 	case len(gr.Docs) == 0:
 		return errors.New("a grant without documents")
@@ -210,7 +211,124 @@ func (g *Granter) prune() error {
 	return nil
 }
 
+// sessionRecord holds the session floor: the captured mgrmap epoch of the
+// lowest incarnation whose grants, abandons and closes are still admitted
+// (plan 03, item 6). Epochs order incarnations; gids do not.
+const sessionRecord = "session"
+
+type session struct {
+	Schema int   `json:"schema"`
+	Floor  int64 `json:"floor"`
+}
+
+func (g *Granter) floor() (int64, error) {
+	b, err := g.Records.Read(sessionRecord)
+	if errors.Is(err, records.ErrNotFound) {
+		return 0, nil
+	}
+
+	if err != nil {
+		return 0, err
+	}
+
+	var s session
+	if err := json.Unmarshal(b, &s); err != nil || s.Schema != ownershipSchema || s.Floor < 0 {
+		return 0, fmt.Errorf("record %s: damaged", sessionRecord)
+	}
+
+	return s.Floor, nil
+}
+
+// admitted refuses an incarnation captured below the session floor.
+func (g *Granter) admitted(epoch int64) error {
+	f, err := g.floor()
+	if err != nil {
+		return err
+	}
+
+	if epoch < f {
+		return fmt.Errorf("the incarnation of epoch %d is closed: a successor of epoch %d took over", epoch, f)
+	}
+
+	return nil
+}
+
+// reconcile decides the agent's own unresolved operations where the node
+// shows what happened (plan 03, item 6): an apply left with its intent is
+// decided by Node.Reconcile; an operation started without an intent either
+// completed (the ownership has its revision) or refused before its intent
+// (the ownership is older). The barrier guarantees nothing newer ran since.
+// What the node cannot tell stays unresolved. Called under the grant slot.
+func (g *Granter) reconcile(ctx context.Context) error {
+	outcome, rev, owned, err := g.Node.Reconcile(ctx)
+	if err != nil {
+		return err
+	}
+
+	names, err := g.Records.List("op-")
+	if err != nil {
+		return err
+	}
+
+	for _, n := range names {
+		op, found, err := g.readOp(strings.TrimPrefix(n, "op-"))
+		if err != nil || !found {
+			return err
+		}
+
+		// a reservation left by a stop between reserving and starting never
+		// reached the node: no grant runs while the slot is held
+		if op.State == wire.OpReserved {
+			op.State, op.Error = wire.OpRefused, "reconciled: the grant stopped before it started"
+			if err := g.writeOp(op); err != nil {
+				return err
+			}
+
+			continue
+		}
+
+		if op.State != wire.OpStarted && op.State != wire.OpUncertain {
+			continue
+		}
+
+		switch {
+		case outcome == "uncertain" && op.Revision == rev:
+			continue // the node cannot tell
+		case outcome != "" && op.Revision == rev:
+			op.State, op.Error = outcome, "reconciled from the node's config"
+		default:
+			// an intent still there is someone else's decision
+			if outcome == "uncertain" {
+				continue
+			}
+
+			switch {
+			case owned == op.Revision:
+				op.State, op.Error = wire.OpCompleted, "reconciled from the node's ownership"
+			case owned < op.Revision:
+				op.State, op.Error = wire.OpRefused, "reconciled: the apply did not start"
+			default:
+				continue
+			}
+		}
+
+		if err := g.writeOp(op); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func (g *Granter) grant(ctx context.Context, gr wire.Grant) (wire.Operation, error) {
+	if err := g.admitted(gr.Epoch); err != nil {
+		return wire.Operation{}, err
+	}
+
+	if err := g.reconcile(ctx); err != nil {
+		return wire.Operation{}, err
+	}
+
 	hash := wire.GrantInputs(gr)
 
 	prev, found, err := g.readOp(gr.Operation)
@@ -268,8 +386,8 @@ func (g *Granter) grant(ctx context.Context, gr wire.Grant) (wire.Operation, err
 	}
 
 	// the confirmation says which incarnation is active: it must be the grant's
-	if conf.GID != gr.GID {
-		return unconfirmed(fmt.Errorf("the grant is from incarnation %d, mgr.%s is active as %d", gr.GID, conf.Mgr, conf.GID))
+	if conf.GID != gr.GID || conf.Epoch != gr.Epoch {
+		return unconfirmed(fmt.Errorf("the grant is from incarnation %d (epoch %d), mgr.%s is active as %d (epoch %d)", gr.GID, gr.Epoch, conf.Mgr, conf.GID, conf.Epoch))
 	}
 
 	if !g.now().Before(until) {
@@ -426,6 +544,14 @@ func (g *Granter) Abandon(ctx context.Context, a wire.Abandon) (wire.Operation, 
 }
 
 func (g *Granter) abandon(ctx context.Context, a wire.Abandon) (wire.Operation, error) {
+	if err := g.admitted(a.Epoch); err != nil {
+		return wire.Operation{}, err
+	}
+
+	if err := g.reconcile(ctx); err != nil {
+		return wire.Operation{}, err
+	}
+
 	prev, found, err := g.readOp(a.Operation)
 	if err != nil || found {
 		return prev, err
@@ -445,7 +571,7 @@ func (g *Granter) abandon(ctx context.Context, a wire.Abandon) (wire.Operation, 
 		return wire.Operation{}, err
 	}
 
-	if conf.GID != a.GID || !g.now().Before(until) {
+	if conf.GID != a.GID || conf.Epoch != a.Epoch || !g.now().Before(until) {
 		return wire.Operation{}, errors.New("the abandon is not confirmed for this incarnation")
 	}
 
@@ -462,6 +588,112 @@ func (g *Granter) abandon(ctx context.Context, a wire.Abandon) (wire.Operation, 
 	}
 
 	return op, g.prune()
+}
+
+// Reconcile decides the agent's unresolved operations the node can decide;
+// the agent runs it when it starts.
+func (g *Granter) Reconcile(ctx context.Context) error {
+	select {
+	case g.mu <- struct{}{}:
+		defer func() { <-g.mu }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	return g.reconcile(ctx)
+}
+
+// Close raises the session floor to a new leader's epoch (wire.Close):
+// confirmed like a grant, under the grant slot, so no grant of an earlier
+// incarnation is running when it returns or can start afterwards.
+func (g *Granter) Close(ctx context.Context, c wire.Close) (int64, error) {
+	select {
+	case g.mu <- struct{}{}:
+		defer func() { <-g.mu }()
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+
+	return g.close(ctx, c)
+}
+
+func (g *Granter) close(ctx context.Context, c wire.Close) (int64, error) {
+	f, err := g.floor()
+	if err != nil {
+		return 0, err
+	}
+
+	if c.Epoch < f {
+		return 0, fmt.Errorf("the incarnation of epoch %d is closed: a successor of epoch %d took over", c.Epoch, f)
+	}
+
+	if c.Epoch == f {
+		return f, nil
+	}
+
+	confirm := g.confirm
+	if confirm == nil {
+		confirm = func(ctx context.Context, t ConfirmTarget, revision int64, operation, inputsHash string) (wire.Confirmation, time.Time, error) {
+			return g.Channel.Confirm(ctx, g.ClientTLS, t, revision, operation, inputsHash)
+		}
+	}
+
+	conf, until, err := confirm(ctx, ConfirmTarget{Addr: c.MgrAddr, Mgr: c.Mgr}, 0, "close-"+strconv.FormatInt(c.GID, 10), wire.CloseInputs(c))
+	if err != nil {
+		return 0, err
+	}
+
+	if conf.GID != c.GID || conf.Epoch != c.Epoch || !g.now().Before(until) {
+		return 0, errors.New("the close is not confirmed for this incarnation")
+	}
+
+	b, err := json.Marshal(session{Schema: ownershipSchema, Floor: c.Epoch})
+	if err != nil {
+		return 0, err
+	}
+
+	return c.Epoch, g.Records.Write(sessionRecord, b)
+}
+
+// HandleClose serves POST /v1/close from a new leader.
+func (g *Granter) HandleClose(w http.ResponseWriter, r *http.Request) {
+	leader, err := g.leaderOf(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusForbidden)
+
+		return
+	}
+
+	var c wire.Close
+
+	dec := json.NewDecoder(io.LimitReader(r.Body, 4096))
+	dec.DisallowUnknownFields()
+
+	if err := dec.Decode(&c); err != nil {
+		http.Error(w, "malformed close", http.StatusBadRequest)
+
+		return
+	}
+
+	gr := wire.Grant{Version: c.Version, FSID: c.FSID, Host: c.Host, Mgr: c.Mgr, MgrAddr: c.MgrAddr, GID: c.GID, Epoch: c.Epoch, Revision: 1, Operation: "close", Docs: []wire.GrantDoc{{Kind: "-", Name: "-"}}}
+	if err := g.checkGrant(gr, leader); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), grantTimeout)
+	defer cancel()
+
+	floor, err := g.Close(ctx, c)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(wire.CloseReply{Version: wire.Version, Floor: floor})
 }
 
 // HandleAbandon serves POST /v1/abandon from the leader.
@@ -494,7 +726,7 @@ func (g *Granter) HandleAbandon(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// the same shape rules as a grant, without documents
-	gr := wire.Grant{Version: a.Version, FSID: a.FSID, Host: a.Host, Mgr: a.Mgr, MgrAddr: a.MgrAddr, GID: a.GID, Revision: a.Revision, Operation: a.Operation, Docs: []wire.GrantDoc{{Kind: "-", Name: "-"}}}
+	gr := wire.Grant{Version: a.Version, FSID: a.FSID, Host: a.Host, Mgr: a.Mgr, MgrAddr: a.MgrAddr, GID: a.GID, Epoch: a.Epoch, Revision: a.Revision, Operation: a.Operation, Docs: []wire.GrantDoc{{Kind: "-", Name: "-"}}}
 	if err := g.checkGrant(gr, leader); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 
@@ -535,6 +767,20 @@ func (g *Granter) HandleNode(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), reportTimeout)
 	defer cancel()
+
+	// an apply left undecided is decided first, if no grant is running
+	select {
+	case g.mu <- struct{}{}:
+		err := g.reconcile(ctx)
+		<-g.mu
+
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+
+			return
+		}
+	default:
+	}
 
 	rep, err := g.Node.Report(ctx)
 	if err != nil {

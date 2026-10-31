@@ -163,7 +163,7 @@ func (fm fakeModule) serve(t *testing.T, ca testCA, certPEM, keyPEM string) stri
 		must(t, json.NewDecoder(r.Body).Decode(&req))
 
 		conf := wire.Confirmation{
-			Version: wire.Version, FSID: req.FSID, Mgr: fm.mgr, GID: fm.gid, Session: req.Session, Host: req.Host,
+			Version: wire.Version, FSID: req.FSID, Mgr: fm.mgr, GID: fm.gid, Epoch: 7, Session: req.Session, Host: req.Host,
 			Revision: req.Revision, Operation: req.Operation, InputsHash: req.InputsHash, Challenge: req.Challenge,
 		}
 		if fm.tamper != nil {

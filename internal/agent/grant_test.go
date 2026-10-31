@@ -17,6 +17,7 @@ import (
 	"github.com/nberlee/cephadm-talos/internal/daemons"
 	"github.com/nberlee/cephadm-talos/internal/pki"
 	"github.com/nberlee/cephadm-talos/internal/spec"
+	"github.com/nberlee/cephadm-talos/internal/talos"
 	"github.com/nberlee/cephadm-talos/internal/wire"
 )
 
@@ -26,6 +27,7 @@ type testGranter struct {
 	*Granter
 	patches *countingPatch
 	gid     int64
+	epoch   int64
 	refuse  error
 	expired bool
 	calls   int
@@ -45,13 +47,14 @@ func newTestGranter(t *testing.T) *testGranter {
 	ch, err := NewChannel(pki.Identity{FSID: testFSID, Role: pki.RoleAgent, Name: "h1"})
 	must(t, err)
 
-	tg := &testGranter{Granter: NewGranter(n, ch, nil, n.Records), patches: cp, gid: 42}
+	tg := &testGranter{Granter: NewGranter(n, ch, nil, n.Records), patches: cp, gid: 42, epoch: 5}
 	tg.confirm = func(_ context.Context, target ConfirmTarget, revision int64, operation, hash string) (wire.Confirmation, time.Time, error) {
 		tg.calls++
 
 		// the reservation is durable before a grant's confirmation is asked (an
-		// abandon has none)
-		abandon := hash == wire.AbandonInputs(wire.Abandon{FSID: testFSID, Host: "h1", Revision: revision, Operation: operation})
+		// abandon or a close has none)
+		abandon := hash == wire.AbandonInputs(wire.Abandon{FSID: testFSID, Host: "h1", Revision: revision, Operation: operation}) ||
+			strings.HasPrefix(operation, "close-")
 
 		op, found, err := tg.readOp(operation)
 		if !abandon && (err != nil || !found || op.State != wire.OpReserved || op.InputsHash != hash) {
@@ -67,7 +70,7 @@ func newTestGranter(t *testing.T) *testGranter {
 			until = time.Now().Add(-time.Second)
 		}
 
-		return wire.Confirmation{Mgr: target.Mgr, GID: tg.gid, Revision: revision, Operation: operation, InputsHash: hash}, until, nil
+		return wire.Confirmation{Mgr: target.Mgr, GID: tg.gid, Epoch: tg.epoch, Revision: revision, Operation: operation, InputsHash: hash}, until, nil
 	}
 
 	return tg
@@ -78,7 +81,7 @@ func probeGrant(rev int64, op, id string) wire.Grant {
 	y := string(mustRender(daemons.Probe(name, testImage)))
 
 	return wire.Grant{
-		Version: wire.Version, FSID: testFSID, Host: "h1", Mgr: "h0", MgrAddr: "10.5.0.2", GID: 42,
+		Version: wire.Version, FSID: testFSID, Host: "h1", Mgr: "h0", MgrAddr: "10.5.0.2", GID: 42, Epoch: 5,
 		Revision: rev, Operation: op, Docs: []wire.GrantDoc{{Kind: "ContainerConfig", Name: name, YAML: &y}},
 	}
 }
@@ -166,15 +169,97 @@ func TestGrantRefusedOrUncertain(t *testing.T) {
 		t.Fatalf("failed patch: %+v %v", op, err)
 	}
 
-	// a retry does not apply again, and nothing else is applied
+	// not visible on the node proves nothing while Talos may still handle the
+	// apply: a retry does not run it again, nothing else runs
 	g.Node.Talos = g.patches
 
-	if op, _ = g.Grant(ctx, probeGrant(3, "op-4", "bbbbbb")); op.State != wire.OpUncertain {
-		t.Fatalf("retry of an uncertain grant: %+v", op)
+	if op, _ = g.Grant(ctx, probeGrant(3, "op-4", "bbbbbb")); op.State != wire.OpUncertain || g.patches.n != 0 {
+		t.Fatalf("retry right after the failed patch: %+v, %d patches", op, g.patches.n)
 	}
 
-	if _, err := g.Grant(ctx, probeGrant(4, "op-5", "cccccc")); err == nil || !strings.Contains(err.Error(), "unresolved") || g.patches.n != 0 {
-		t.Fatalf("grant after an uncertain one: %v, %d patches", err, g.patches.n)
+	// once the apply cannot be in progress anymore, its absence decides: refused,
+	// and the same grant may run
+	var intent applyIntent
+
+	if _, err := g.Node.readJSON(applyRecord, &intent); err != nil {
+		t.Fatal(err)
+	}
+
+	intent.At = intent.At.Add(-ApplySettle)
+	must(t, g.Node.writeJSON(applyRecord, intent))
+
+	if op, _ = g.Grant(ctx, probeGrant(3, "op-4", "bbbbbb")); op.State != wire.OpCompleted || g.patches.n != 1 {
+		t.Fatalf("retry after the apply settled: %+v, %d patches", op, g.patches.n)
+	}
+
+	// a patch the node cannot tell about (neither before nor after): it stays
+	// uncertain and blocks
+	g.Node.Talos = otherWriterPatch{g.patches.Client, t}
+
+	if op, _ = g.Grant(ctx, probeGrant(4, "op-5", "cccccc")); op.State != wire.OpUncertain {
+		t.Fatalf("overtaken patch: %+v", op)
+	}
+
+	g.Node.Talos = g.patches
+
+	if _, err := g.Grant(ctx, probeGrant(5, "op-6", "dddddd")); err == nil || !strings.Contains(err.Error(), "unresolved") {
+		t.Fatalf("grant after an undecidable one: %v", err)
+	}
+}
+
+// otherWriterPatch fails after another writer changed ceph.conf: the node
+// shows neither the state before nor the one after the apply.
+type otherWriterPatch struct {
+	*talos.Client
+	t *testing.T
+}
+
+func (o otherWriterPatch) Patch(ctx context.Context, node string, _ ...[]byte) error {
+	if err := o.Client.Patch(ctx, node, yamlOf(o.t, conf("10.5.0.7"))); err != nil {
+		return err
+	}
+
+	return errors.New("connection reset")
+}
+
+func TestReconcileFromTheNode(t *testing.T) {
+	ctx := context.Background()
+
+	// an operation started before a crash, its ownership written: completed
+	g := newTestGranter(t)
+	must(t, g.writeOp(wire.Operation{Version: wire.Version, Operation: "op-a", Revision: 1, InputsHash: "x", GID: 42, State: wire.OpStarted}))
+	must(t, g.Reconcile(ctx))
+
+	if op, _, _ := g.readOp("op-a"); op.State != wire.OpCompleted {
+		t.Fatalf("started at the owned revision: %+v", op)
+	}
+
+	// started, but the ownership is older: it did not get to its intent
+	must(t, g.writeOp(wire.Operation{Version: wire.Version, Operation: "op-b", Revision: 7, InputsHash: "x", GID: 42, State: wire.OpStarted}))
+	must(t, g.Reconcile(ctx))
+
+	if op, _, _ := g.readOp("op-b"); op.State != wire.OpRefused {
+		t.Fatalf("started above the owned revision: %+v", op)
+	}
+
+	// an apply that reached Talos but not its ownership record: completed
+	own, _, err := g.Node.ownership()
+	must(t, err)
+
+	must(t, g.Node.writeJSON(applyRecord, applyIntent{Schema: ownershipSchema, Revision: 9, Before: own.Docs, Sent: map[string]string{}}))
+	must(t, g.writeOp(wire.Operation{Version: wire.Version, Operation: "op-c", Revision: 9, InputsHash: "x", GID: 42, State: wire.OpUncertain}))
+	must(t, g.Reconcile(ctx))
+
+	if op, _, _ := g.readOp("op-c"); op.State != wire.OpCompleted {
+		t.Fatalf("apply with its effect on the node: %+v", op)
+	}
+
+	if own, _, _ := g.Node.ownership(); own.Revision != 9 {
+		t.Fatalf("ownership after reconciling: %d", own.Revision)
+	}
+
+	if st := g.Node.Status(ctx); st.State != "owned" {
+		t.Fatalf("status %+v", st)
 	}
 }
 
@@ -209,11 +294,13 @@ func TestGrantSafetyBounds(t *testing.T) {
 		t.Fatalf("expired during the apply: %+v %v, %d patches", op, err, g.patches.n)
 	}
 
-	// an operation that started before a crash, without an outcome: nothing else runs
+	// an operation that started, the node newer than it: the node cannot tell,
+	// nothing else runs
 	g = newTestGranter(t)
-	must(t, g.writeOp(wire.Operation{Version: wire.Version, Operation: "op-crashed", Revision: 2, InputsHash: "x", GID: 42, State: wire.OpStarted}))
+	must(t, g.writeOp(wire.Operation{Version: wire.Version, Operation: "op-crashed", Revision: 1, InputsHash: "x", GID: 42, State: wire.OpStarted}))
+	must(t, g.Node.writeJSON(ownershipRecord, Ownership{Schema: ownershipSchema, Revision: 5, Docs: map[string]string{}}))
 
-	if _, err := g.Grant(ctx, probeGrant(3, "op-8", "aaaaaa")); err == nil || !strings.Contains(err.Error(), "op-crashed") {
+	if _, err := g.Grant(ctx, probeGrant(6, "op-8", "aaaaaa")); err == nil || !strings.Contains(err.Error(), "op-crashed") {
 		t.Fatalf("grant after a crash: %v", err)
 	}
 
@@ -418,5 +505,88 @@ func TestGrantEndpoints(t *testing.T) {
 
 	if w := serve(request(t, http.MethodPost, "/v1/handoff", h, operator), g.HandleHandoff); w.Code != http.StatusConflict {
 		t.Fatalf("handoff of an owned node: %d %s", w.Code, w.Body)
+	}
+}
+
+func TestCloseRaisesTheSessionFloor(t *testing.T) {
+	g := newTestGranter(t)
+	ctx := context.Background()
+
+	c := wire.Close{Version: wire.Version, FSID: testFSID, Host: "h1", Mgr: "h0", MgrAddr: "10.5.0.2", GID: 50, Epoch: 9}
+
+	// unconfirmed: nothing changes
+	g.refuse = errors.New("not the active mgr")
+	if _, err := g.Close(ctx, c); err == nil {
+		t.Fatal("an unconfirmed close")
+	}
+
+	g.refuse, g.gid, g.epoch = nil, 50, 9
+
+	if f, err := g.Close(ctx, c); err != nil || f != 9 {
+		t.Fatalf("close: %d %v", f, err)
+	}
+
+	// the older incarnation can no longer grant, abandon or lower the floor
+	g.gid, g.epoch = 42, 5
+
+	if _, err := g.Grant(ctx, probeGrant(2, "old", "aaaaaa")); err == nil || !strings.Contains(err.Error(), "closed") || g.patches.n != 0 {
+		t.Fatalf("grant of a closed incarnation: %v", err)
+	}
+
+	if _, found, _ := g.readOp("old"); found {
+		t.Fatal("a closed incarnation left a record")
+	}
+
+	if _, err := g.Close(ctx, wire.Close{Version: wire.Version, FSID: testFSID, Host: "h1", Mgr: "h0", MgrAddr: "10.5.0.2", GID: 42, Epoch: 5}); err == nil {
+		t.Fatal("the floor was lowered")
+	}
+
+	// the floor survives a restart: it is a record
+	g2 := NewGranter(g.Node, g.Channel, nil, g.Records)
+	if f, err := g2.floor(); err != nil || f != 9 {
+		t.Fatalf("floor after a restart: %d %v", f, err)
+	}
+
+	// the new incarnation grants
+	g.gid, g.epoch = 50, 9
+
+	gr := probeGrant(3, "new", "bbbbbb")
+	gr.GID, gr.Epoch = 50, 9
+
+	if op, err := g.Grant(ctx, gr); err != nil || op.State != wire.OpCompleted {
+		t.Fatalf("grant of the new incarnation: %+v %v", op, err)
+	}
+}
+
+func TestReconcileWaitsForAnApplyInProgress(t *testing.T) {
+	g := newTestGranter(t)
+	ctx := context.Background()
+
+	own, _, err := g.Node.ownership()
+	must(t, err)
+
+	boot, err := g.Node.Talos.BootID(ctx, "")
+	must(t, err)
+
+	// an apply sent just now, not visible yet: Talos may still commit it
+	must(t, g.Node.writeJSON(applyRecord, applyIntent{Schema: ownershipSchema, Revision: 9, Before: own.Docs, Sent: map[string]string{"EtcFileConfig/ceph/x": "h"}, BootID: boot, At: time.Now()}))
+
+	if outcome, _, _, err := g.Node.Reconcile(ctx); err != nil || outcome != "uncertain" {
+		t.Fatalf("fresh apply: %s %v", outcome, err)
+	}
+
+	// sent on an earlier boot: it either committed before the reboot or never will
+	must(t, g.Node.writeJSON(applyRecord, applyIntent{Schema: ownershipSchema, Revision: 9, Before: own.Docs, Sent: map[string]string{"EtcFileConfig/ceph/x": "h"}, BootID: "boot-0", At: time.Now()}))
+
+	if outcome, _, _, err := g.Node.Reconcile(ctx); err != nil || outcome != "refused" {
+		t.Fatalf("apply of an earlier boot: %s %v", outcome, err)
+	}
+
+	// a reservation left by a stop before the grant started is refused
+	must(t, g.writeOp(wire.Operation{Version: wire.Version, Operation: "op-r", Revision: 3, InputsHash: "x", GID: 42, State: wire.OpReserved}))
+	must(t, g.Reconcile(ctx))
+
+	if op, _, _ := g.readOp("op-r"); op.State != wire.OpRefused {
+		t.Fatalf("left reservation: %+v", op)
 	}
 }

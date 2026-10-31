@@ -167,7 +167,7 @@ class ConfirmTest(unittest.TestCase):
         self.assertEqual(code, 200)
         payload = base64.b64decode(reply['payload'])
         key.public_key().verify(base64.b64decode(reply['signature']), payload, ec.ECDSA(hashes.SHA256()))
-        self.assertEqual(json.loads(payload), {'version': 1, 'fsid': 'f1', 'mgr': 'h1', 'gid': 42, 'session': 'ab' * 16,
+        self.assertEqual(json.loads(payload), {'version': 1, 'fsid': 'f1', 'mgr': 'h1', 'gid': 42, 'epoch': 5, 'session': 'ab' * 16,
                                                'host': 'h3', 'revision': 7, 'operation': 'op-1', 'inputs_hash': 'cd' * 32,
                                                'challenge': 'ef' * 16})
 

@@ -83,7 +83,7 @@ func newLeaderSetup(t *testing.T) *leaderSetup {
 
 	// the active mgr on h0 heartbeats its agent: the leader of gid 42
 	ch.mu.Lock()
-	ch.leader = &Leader{Mgr: "h0", GID: 42, At: time.Now()}
+	ch.leader = &Leader{Mgr: "h0", GID: 42, Epoch: 5, At: time.Now()}
 	ch.mu.Unlock()
 
 	setup.leader, setup.module, setup.st = l, m, st
@@ -134,7 +134,7 @@ func TestLeaderGrantsAHostRevision(t *testing.T) {
 
 	s.request("r1", `{"version":1,"kind":"revision","host":"h1"}`)
 
-	if err := s.leader.Tick(ctx, 42); err != nil {
+	if err := s.leader.Tick(ctx, 42, 5); err != nil {
 		t.Fatal(err)
 	}
 
@@ -165,7 +165,7 @@ func TestLeaderGrantsAHostRevision(t *testing.T) {
 	// the host has everything now: the next revision changes nothing
 	s.request("r2", `{"version":1,"kind":"revision","host":"h1"}`)
 
-	if err := s.leader.Tick(ctx, 42); err != nil {
+	if err := s.leader.Tick(ctx, 42, 5); err != nil {
 		t.Fatal(err)
 	}
 
@@ -174,7 +174,7 @@ func TestLeaderGrantsAHostRevision(t *testing.T) {
 	}
 
 	// a request done stays done
-	if err := s.leader.Tick(ctx, 42); err != nil || s.op(t, "r1").State != "completed" {
+	if err := s.leader.Tick(ctx, 42, 5); err != nil || s.op(t, "r1").State != "completed" {
 		t.Fatalf("re-run: %v", err)
 	}
 }
@@ -187,7 +187,7 @@ func TestLeaderRefusesBadRequests(t *testing.T) {
 	s.request("r2", `{"version":1,"kind":"shell","host":"h1"}`)
 	s.request("r3", `{"version":1,"kind":"revision","host":"h1","extra":1}`)
 
-	_ = s.leader.Tick(ctx, 42)
+	_ = s.leader.Tick(ctx, 42, 5)
 
 	for _, id := range []string{"r1", "r2", "r3"} {
 		if op := s.op(t, id); op.State != JournalFailed {
@@ -210,7 +210,7 @@ func TestLeaderResolvesALostAnswer(t *testing.T) {
 	s.module.kv[JournalPrefix(42)+"op/r1"] = `{"version":1,"kind":"revision","host":"h1","state":"granting","revision":5}`
 	s.module.mu.Unlock()
 
-	if err := s.leader.Tick(ctx, 42); err != nil {
+	if err := s.leader.Tick(ctx, 42, 5); err != nil {
 		t.Fatal(err)
 	}
 
@@ -238,7 +238,7 @@ func TestLeaderOnlyWhileHeartbeated(t *testing.T) {
 
 	now := time.Now()
 	s.leader.Channel.mu.Lock()
-	s.leader.Channel.leader = &Leader{Mgr: "h0", GID: 42, At: now}
+	s.leader.Channel.leader = &Leader{Mgr: "h0", GID: 42, Epoch: 5, At: now}
 	s.leader.Channel.mu.Unlock()
 
 	if lead := s.leader.active(); lead == nil || lead.GID != 42 {
@@ -252,7 +252,7 @@ func TestLeaderOnlyWhileHeartbeated(t *testing.T) {
 
 	s.leader.now = nil
 	s.leader.Channel.mu.Lock()
-	s.leader.Channel.leader = &Leader{Mgr: "h9", GID: 42, At: now}
+	s.leader.Channel.leader = &Leader{Mgr: "h9", GID: 42, Epoch: 5, At: now}
 	s.leader.Channel.mu.Unlock()
 
 	if s.leader.active() != nil {
@@ -265,13 +265,13 @@ func TestLeaderDoesNotHideDrift(t *testing.T) {
 	ctx := context.Background()
 
 	s.request("r1", `{"version":1,"kind":"revision","host":"h1"}`)
-	must(t, s.leader.Tick(ctx, 42))
+	must(t, s.leader.Tick(ctx, 42, 5))
 
 	// someone changes ceph.conf on the node; the owned hash stays what the leader renders
 	must(t, s.agent.patches.Client.Patch(ctx, "", yamlOf(t, conf("10.5.0.9"))))
 
 	s.request("r2", `{"version":1,"kind":"revision","host":"h1"}`)
-	must(t, s.leader.Tick(ctx, 42))
+	must(t, s.leader.Tick(ctx, 42, 5))
 
 	if op := s.op(t, "r2"); op.State != JournalFailed || !strings.Contains(op.Error, "drift") {
 		t.Fatalf("revision on a drifted node: %+v", op)
@@ -287,7 +287,7 @@ func TestLeaderRetriesWhenTheBridgeDoesNotAnswer(t *testing.T) {
 	s.module.mu.Unlock()
 
 	s.request("r1", `{"version":1,"kind":"revision","host":"h1"}`)
-	_ = s.leader.Tick(ctx, 42)
+	_ = s.leader.Tick(ctx, 42, 5)
 
 	s.module.mu.Lock()
 	_, decided := s.module.kv[JournalPrefix(42)+"op/r1"]
@@ -298,7 +298,7 @@ func TestLeaderRetriesWhenTheBridgeDoesNotAnswer(t *testing.T) {
 		t.Fatalf("a request decided without the mon. key: %+v", s.op(t, "r1"))
 	}
 
-	must(t, s.leader.Tick(ctx, 42))
+	must(t, s.leader.Tick(ctx, 42, 5))
 
 	if op := s.op(t, "r1"); op.State != "completed" {
 		t.Fatalf("after the bridge answers: %+v", op)
@@ -311,11 +311,11 @@ func TestLeaderStopsWhenItIsNoLongerTheLeader(t *testing.T) {
 
 	// another incarnation: nothing is done for gid 42
 	s.leader.Channel.mu.Lock()
-	s.leader.Channel.leader = &Leader{Mgr: "h0", GID: 43, At: time.Now()}
+	s.leader.Channel.leader = &Leader{Mgr: "h0", GID: 43, Epoch: 6, At: time.Now()}
 	s.leader.Channel.mu.Unlock()
 
 	s.request("r1", `{"version":1,"kind":"revision","host":"h1"}`)
-	must(t, s.leader.Tick(ctx, 42))
+	must(t, s.leader.Tick(ctx, 42, 5))
 
 	s.module.mu.Lock()
 	_, decided := s.module.kv[JournalPrefix(42)+"op/r1"]
@@ -327,7 +327,7 @@ func TestLeaderStopsWhenItIsNoLongerTheLeader(t *testing.T) {
 
 	// leadership ends while the host is asked for its report: nothing is granted
 	s.leader.Channel.mu.Lock()
-	s.leader.Channel.leader = &Leader{Mgr: "h0", GID: 42, At: time.Now()}
+	s.leader.Channel.leader = &Leader{Mgr: "h0", GID: 42, Epoch: 5, At: time.Now()}
 	s.leader.Channel.mu.Unlock()
 
 	s.onRequest = func(r *http.Request) {
@@ -338,7 +338,7 @@ func TestLeaderStopsWhenItIsNoLongerTheLeader(t *testing.T) {
 		}
 	}
 
-	must(t, s.leader.Tick(ctx, 42))
+	must(t, s.leader.Tick(ctx, 42, 5))
 
 	if s.agent.patches.n != 0 {
 		t.Fatalf("%d patches after leadership ended", s.agent.patches.n)
@@ -354,7 +354,7 @@ func TestAgentEndpointBounds(t *testing.T) {
 	// abandoning while a grant runs is refused, so a grant in flight cannot be overtaken
 	g.mu <- struct{}{}
 
-	ab := wire.Abandon{Version: wire.Version, FSID: testFSID, Host: "h1", Mgr: "h0", MgrAddr: "10.5.0.2", GID: 42, Revision: 9, Operation: "r9"}
+	ab := wire.Abandon{Version: wire.Version, FSID: testFSID, Host: "h1", Mgr: "h0", MgrAddr: "10.5.0.2", GID: 42, Epoch: 5, Revision: 9, Operation: "r9"}
 
 	w := httptest.NewRecorder()
 	g.HandleAbandon(w, request(t, http.MethodPost, "/v1/abandon", ab, leader))
@@ -406,7 +406,7 @@ func TestAbandonFencesItsRevision(t *testing.T) {
 	g := newTestGranter(t)
 	ctx := context.Background()
 
-	ab := wire.Abandon{Version: wire.Version, FSID: testFSID, Host: "h1", Mgr: "h0", MgrAddr: "10.5.0.2", GID: 42, Revision: 50, Operation: "lost-1"}
+	ab := wire.Abandon{Version: wire.Version, FSID: testFSID, Host: "h1", Mgr: "h0", MgrAddr: "10.5.0.2", GID: 42, Epoch: 5, Revision: 50, Operation: "lost-1"}
 
 	// not confirmed: nothing recorded, nothing fenced
 	g.refuse = errors.New("not the active mgr")
@@ -471,7 +471,7 @@ func TestLeaderLeavesMaintenanceHostsAlone(t *testing.T) {
 	publish(t, s.leader, s.st)
 
 	s.request("r1", `{"version":1,"kind":"revision","host":"h1"}`)
-	must(t, s.leader.Tick(ctx, 42))
+	must(t, s.leader.Tick(ctx, 42, 5))
 
 	if op := s.op(t, "r1"); op.State != JournalFailed || !strings.Contains(op.Error, "maintenance") || s.agent.patches.n != 0 {
 		t.Fatalf("revision of a host in maintenance: %+v", op)
@@ -482,19 +482,19 @@ func TestAbandonFenceRespectsTheConfirmation(t *testing.T) {
 	g := newTestGranter(t)
 	ctx := context.Background()
 
-	// the node is busy until the confirmation has run out
-	must(t, g.Node.lock(ctx))
-
+	// the node is busy from the confirmation until it has run out
 	confirm := g.confirm
 	g.confirm = func(ctx context.Context, target ConfirmTarget, revision int64, operation, hash string) (wire.Confirmation, time.Time, error) {
 		c, _, err := confirm(ctx, target, revision, operation, hash)
+
+		must(t, g.Node.lock(ctx))
 
 		go func() { time.Sleep(150 * time.Millisecond); g.Node.unlock() }()
 
 		return c, time.Now().Add(100 * time.Millisecond), err
 	}
 
-	ab := wire.Abandon{Version: wire.Version, FSID: testFSID, Host: "h1", Mgr: "h0", MgrAddr: "10.5.0.2", GID: 42, Revision: 50, Operation: "lost-2"}
+	ab := wire.Abandon{Version: wire.Version, FSID: testFSID, Host: "h1", Mgr: "h0", MgrAddr: "10.5.0.2", GID: 42, Epoch: 5, Revision: 50, Operation: "lost-2"}
 	if _, err := g.Abandon(ctx, ab); err == nil {
 		t.Fatal("abandon fenced after its confirmation expired")
 	}
@@ -520,12 +520,250 @@ func TestLeaderDoesNotRestartLeavingDaemons(t *testing.T) {
 	publish(t, s.leader, s.st)
 
 	s.request("r1", `{"version":1,"kind":"revision","host":"h1"}`)
-	must(t, s.leader.Tick(ctx, 42))
+	must(t, s.leader.Tick(ctx, 42, 5))
 
 	op := s.op(t, "r1")
 	for k := range op.Docs {
 		if strings.Contains(k, "-mon-") || strings.Contains(k, "-mgr-") || strings.Contains(k, "mgr/cephadm") {
 			t.Errorf("granted %s", k)
 		}
+	}
+}
+
+func TestTakeoverClosesSessionsAndImports(t *testing.T) {
+	s := newLeaderSetup(t)
+	ctx := context.Background()
+
+	// incarnation 41 left a grant without its outcome and a request it never decided
+	s.module.mu.Lock()
+	s.module.kv[JournalPrefix(41)+"req/x"] = `{"version":1,"kind":"revision","host":"h1"}`
+	s.module.kv[JournalPrefix(41)+"op/x"] = `{"version":1,"kind":"revision","host":"h1","state":"granting","revision":7}`
+	s.module.kv[JournalPrefix(41)+"req/y"] = `{"version":1,"kind":"revision","host":"h1"}`
+	s.module.kv[JournalPrefix(41)+"req/z"] = `{"version":1,"kind":"revision","host":"h1"}`
+	s.module.kv[JournalPrefix(41)+"op/z"] = `{"version":1,"kind":"revision","host":"h1","state":"completed","revision":6}`
+	s.module.mu.Unlock()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	// h1's session closed; h0 has no agent here and stays to be closed
+	if f, err := s.agent.floor(); err != nil || f != 5 {
+		t.Fatalf("floor %d %v", f, err)
+	}
+
+	s.module.mu.Lock()
+	raw := s.module.kv[JournalPrefix(42)+"takeover"]
+	_, zImported := s.module.kv[JournalPrefix(42)+"req/z"]
+	s.module.mu.Unlock()
+
+	var to Takeover
+	if json.Unmarshal([]byte(raw), &to) != nil || !to.Imported || len(to.Closed) != 1 || to.Closed[0] != "h1" {
+		t.Fatalf("takeover %s", raw)
+	}
+
+	// the lost grant was abandoned under the new incarnation; the undecided request ran; the decided one stays
+	if op := s.op(t, "x"); op.State != "abandoned" {
+		t.Fatalf("imported grant: %+v", op)
+	}
+
+	if op := s.op(t, "y"); op.State != "completed" {
+		t.Fatalf("imported request: %+v", op)
+	}
+
+	if zImported {
+		t.Fatal("a decided request was imported")
+	}
+
+	// the fence of the abandoned grant holds
+	if f, _ := s.agent.Node.fence(); f != 7 {
+		t.Fatalf("fence %d", f)
+	}
+}
+
+func TestNoGrantBeforeTheSessionIsClosed(t *testing.T) {
+	s := newLeaderSetup(t)
+	ctx := context.Background()
+
+	// the agent cannot confirm the close: its session stays open
+	s.onRequest = func(r *http.Request) {
+		if r.URL.Path == "/v1/close" {
+			s.agent.refuse = errors.New("no confirmation")
+		} else {
+			s.agent.refuse = nil
+		}
+	}
+
+	s.request("r1", `{"version":1,"kind":"revision","host":"h1"}`)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	s.module.mu.Lock()
+	_, decided := s.module.kv[JournalPrefix(42)+"op/r1"]
+	s.module.mu.Unlock()
+
+	if decided || s.agent.patches.n != 0 {
+		t.Fatalf("granted before the session was closed: %v, %d patches", decided, s.agent.patches.n)
+	}
+
+	// once the close goes through, the request runs
+	s.onRequest = nil
+	s.agent.refuse = nil
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if op := s.op(t, "r1"); op.State != "completed" {
+		t.Fatalf("after the close: %+v", op)
+	}
+}
+
+func TestALostJournalWriteIsResolvedNotResent(t *testing.T) {
+	s := newLeaderSetup(t)
+	ctx := context.Background()
+
+	s.request("r1", `{"version":1,"kind":"revision","host":"h1"}`)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	op := s.op(t, "r1")
+	if op.State != "completed" || s.agent.patches.n != 1 {
+		t.Fatalf("grant: %+v, %d patches", op, s.agent.patches.n)
+	}
+
+	// as if the mons went away after the grant and its outcome was never written
+	op.State = JournalGranting
+
+	b, _ := json.Marshal(op)
+
+	s.module.mu.Lock()
+	s.module.kv[JournalPrefix(42)+"op/r1"] = string(b)
+	s.module.mu.Unlock()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if op := s.op(t, "r1"); op.State != "completed" || s.agent.patches.n != 1 {
+		t.Fatalf("resolved: %+v, %d patches", op, s.agent.patches.n)
+	}
+}
+
+func TestImportedGrantWithoutItsRequestIsResolved(t *testing.T) {
+	s := newLeaderSetup(t)
+	ctx := context.Background()
+
+	// an import that copied the operation but not its request
+	s.module.mu.Lock()
+	s.module.kv[JournalPrefix(42)+"op/x"] = `{"version":1,"kind":"revision","host":"h1","state":"granting","revision":7}`
+	s.module.kv[JournalPrefix(42)+"takeover"] = `{"version":1,"closed":[],"imported":true}`
+	s.module.mu.Unlock()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if op := s.op(t, "x"); op.State != "abandoned" {
+		t.Fatalf("imported grant without its request: %+v", op)
+	}
+}
+
+func TestTakeoverMergesHistoriesAcrossIncarnations(t *testing.T) {
+	s := newLeaderSetup(t)
+	ctx := context.Background()
+
+	// 40 left x undecided, 41 imported and completed it, 42 takes over
+	s.module.mu.Lock()
+	s.module.kv[JournalPrefix(40)+"req/x"] = `{"version":1,"kind":"revision","host":"h1"}`
+	s.module.kv[JournalPrefix(41)+"req/x"] = `{"version":1,"kind":"revision","host":"h1"}`
+	s.module.kv[JournalPrefix(41)+"op/x"] = `{"version":1,"kind":"revision","host":"h1","state":"completed","revision":6}`
+	s.module.mu.Unlock()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	s.module.mu.Lock()
+	_, req := s.module.kv[JournalPrefix(42)+"req/x"]
+	_, op := s.module.kv[JournalPrefix(42)+"op/x"]
+	s.module.mu.Unlock()
+
+	if req || op || s.agent.patches.n != 0 {
+		t.Fatalf("a completed request ran again: req %v op %v, %d patches", req, op, s.agent.patches.n)
+	}
+}
+
+// A standby promoted later can have a smaller gid: epochs order incarnations.
+func TestIncarnationsAreOrderedByEpoch(t *testing.T) {
+	g := newTestGranter(t)
+	ctx := context.Background()
+
+	// the old active mgr, gid 90, captured at epoch 5, closed the sessions
+	g.gid, g.epoch = 90, 5
+	if _, err := g.Close(ctx, wire.Close{Version: wire.Version, FSID: testFSID, Host: "h1", Mgr: "h0", MgrAddr: "10.5.0.2", GID: 90, Epoch: 5}); err != nil {
+		t.Fatal(err)
+	}
+
+	// the promoted standby has gid 42, captured at epoch 8: it takes over and grants
+	g.gid, g.epoch = 42, 8
+	if f, err := g.Close(ctx, wire.Close{Version: wire.Version, FSID: testFSID, Host: "h1", Mgr: "h0", MgrAddr: "10.5.0.2", GID: 42, Epoch: 8}); err != nil || f != 8 {
+		t.Fatalf("successor with a smaller gid: %d %v", f, err)
+	}
+
+	gr := probeGrant(2, "next", "aaaaaa")
+	gr.Epoch = 8
+
+	if op, err := g.Grant(ctx, gr); err != nil || op.State != wire.OpCompleted {
+		t.Fatalf("grant of the successor: %+v %v", op, err)
+	}
+
+	// the old one, with its larger gid, is closed
+	g.gid, g.epoch = 90, 5
+
+	old := probeGrant(3, "old", "bbbbbb")
+	old.GID = 90
+
+	if _, err := g.Grant(ctx, old); err == nil {
+		t.Fatal("the closed incarnation granted")
+	}
+}
+
+func TestImportFollowsEpochsNotGIDs(t *testing.T) {
+	s := newLeaderSetup(t)
+	ctx := context.Background()
+
+	// incarnation 90 (epoch 3) is a predecessor of 42 (epoch 5); 30 (epoch 9) is not
+	s.module.mu.Lock()
+	s.module.kv[JournalPrefix(90)+"takeover"] = `{"version":1,"epoch":3,"closed":[],"imported":true}`
+	s.module.kv[JournalPrefix(90)+"req/p"] = `{"version":1,"kind":"revision","host":"h1"}`
+	s.module.kv[JournalPrefix(30)+"takeover"] = `{"version":1,"epoch":9,"closed":[],"imported":true}`
+	s.module.kv[JournalPrefix(30)+"req/q"] = `{"version":1,"kind":"revision","host":"h1"}`
+	s.module.mu.Unlock()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if op := s.op(t, "p"); op.State != "completed" {
+		t.Fatalf("request of the predecessor with a larger gid: %+v", op)
+	}
+
+	s.module.mu.Lock()
+	_, q := s.module.kv[JournalPrefix(42)+"req/q"]
+	s.module.mu.Unlock()
+
+	if q {
+		t.Fatal("imported from a later incarnation")
+	}
+}
+
+func TestUncertainIsAskedAgain(t *testing.T) {
+	s := newLeaderSetup(t)
+	ctx := context.Background()
+
+	s.request("r1", `{"version":1,"kind":"revision","host":"h1"}`)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	// as if the agent had answered uncertain and decided it since
+	op := s.op(t, "r1")
+	op.State = "uncertain"
+
+	b, _ := json.Marshal(op)
+
+	s.module.mu.Lock()
+	s.module.kv[JournalPrefix(42)+"op/r1"] = string(b)
+	s.module.mu.Unlock()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if op := s.op(t, "r1"); op.State != "completed" {
+		t.Fatalf("uncertain not asked again: %+v", op)
 	}
 }
