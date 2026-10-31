@@ -160,6 +160,12 @@ func TestLiveAgentStatus(t *testing.T) {
 		}
 
 		t.Logf("%s: records %s, node %+v, %d containers, observed %s", h.Name, rec.Records, *rec.Node, len(rec.Containers), rec.ObservedAt.Format(time.RFC3339))
+
+		for name, c := range rec.Containers {
+			if c.Version != "" {
+				t.Logf("%s: %s reports Ceph %s", h.Name, name, c.Version)
+			}
+		}
 	}
 }
 
