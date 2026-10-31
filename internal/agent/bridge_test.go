@@ -16,10 +16,21 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nberlee/cephadm-talos/internal/cephx"
 	"github.com/nberlee/cephadm-talos/internal/pki"
 	"github.com/nberlee/cephadm-talos/internal/store"
 	"github.com/nberlee/cephadm-talos/internal/wire"
 )
+
+// fakeKey is the secret the fake module's mon auth has for every entity.
+var fakeKey = func() string {
+	k, err := cephx.NewKey()
+	if err != nil {
+		panic(err)
+	}
+
+	return k
+}()
 
 // fakeBridge is the module's bridge over an in-memory config-key store.
 type fakeBridge struct {
@@ -33,6 +44,8 @@ type fakeBridge struct {
 	refuse string
 	// page is how many keys one listing returns
 	page int
+	// fsid is the cluster in the module's certificate; "" is f1
+	fsid string
 }
 
 func (m *fakeBridge) run(req wire.BridgeRequest) map[string]any {
@@ -80,7 +93,7 @@ func (m *fakeBridge) run(req wire.BridgeRequest) map[string]any {
 			return map[string]any{"outcome": "done", "r": -2, "outs": "failed to find osd.9"}
 		}
 
-		return map[string]any{"outcome": "done", "r": 0, "out": `[{"entity":"` + str("entity") + `","key":"AQBkey=="}]`}
+		return map[string]any{"outcome": "done", "r": 0, "out": `[{"entity":"` + str("entity") + `","key":"` + fakeKey + `"}]`}
 	}
 
 	return nil
@@ -89,7 +102,12 @@ func (m *fakeBridge) run(req wire.BridgeRequest) map[string]any {
 func (m *fakeBridge) serve(t *testing.T, ca testCA, mgr string) (host, port string) {
 	t.Helper()
 
-	cert, key := ca.pair(pki.RoleMgr, mgr, x509.ExtKeyUsageServerAuth, "f1")
+	fsid := m.fsid
+	if fsid == "" {
+		fsid = "f1"
+	}
+
+	cert, key := ca.pair(pki.RoleMgr, mgr, x509.ExtKeyUsageServerAuth, fsid)
 	pair, err := tls.X509KeyPair([]byte(cert), []byte(key))
 	must(t, err)
 
@@ -301,7 +319,7 @@ func TestBridgeOutcomes(t *testing.T) {
 		t.Error("a deadline above the module's maximum")
 	}
 
-	if k, found, err := b.AuthGet(ctx, "osd.1"); err != nil || !found || k != "AQBkey==" {
+	if k, found, err := b.AuthGet(ctx, "osd.1"); err != nil || !found || k != fakeKey {
 		t.Errorf("auth get: %q %v %v", k, found, err)
 	}
 

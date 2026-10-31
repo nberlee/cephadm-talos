@@ -49,9 +49,12 @@ func newTestGranter(t *testing.T) *testGranter {
 	tg.confirm = func(_ context.Context, target ConfirmTarget, revision int64, operation, hash string) (wire.Confirmation, time.Time, error) {
 		tg.calls++
 
-		// the reservation is durable before the confirmation is asked
+		// the reservation is durable before a grant's confirmation is asked (an
+		// abandon has none)
+		abandon := hash == wire.AbandonInputs(wire.Abandon{FSID: testFSID, Host: "h1", Revision: revision, Operation: operation})
+
 		op, found, err := tg.readOp(operation)
-		if err != nil || !found || op.State != wire.OpReserved || op.InputsHash != hash {
+		if !abandon && (err != nil || !found || op.State != wire.OpReserved || op.InputsHash != hash) {
 			t.Errorf("no reservation before the confirmation: %+v %v %v", op, found, err)
 		}
 

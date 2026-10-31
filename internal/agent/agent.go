@@ -283,6 +283,8 @@ func (a *Agent) Handler() http.Handler {
 		mux.HandleFunc("POST /v1/grant", a.Granter.HandleGrant)
 		mux.HandleFunc("GET /v1/operations/{id}", a.Granter.HandleOperation)
 		mux.HandleFunc("POST /v1/handoff", a.Granter.HandleHandoff)
+		mux.HandleFunc("GET /v1/node", a.Granter.HandleNode)
+		mux.HandleFunc("POST /v1/abandon", a.Granter.HandleAbandon)
 	}
 
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
@@ -437,16 +439,21 @@ func Main(ctx context.Context) error {
 	}
 
 	recs := &records.Store{Dir: filepath.Join(records.Mount, records.RecordsDir)}
+	// from the agent's own document, which only the CLI writes; no
+	// repositories admit no image
+	repos := strings.Fields(os.Getenv(daemons.EnvImageRepos))
 	node := &Node{Talos: tc, Records: recs, FSID: self.FSID, Host: self.Name, Policy: &Policy{
-		// from the agent's own document, which only the CLI writes; no
-		// repositories admit no image
-		FSID: self.FSID, Host: self.Name, CACert: string(pems[0]), Repos: strings.Fields(os.Getenv(daemons.EnvImageRepos)),
+		FSID: self.FSID, Host: self.Name, CACert: string(pems[0]), Repos: repos,
 	}}
 	a := &Agent{Talos: tc, Life: ctx, Channel: ch, Records: recs, Node: node, Granter: NewGranter(node, ch, clientTLS, recs)}
 
 	var wg sync.WaitGroup
 
 	wg.Go(func() { a.Run(ctx) })
+
+	// the leader, while this host's mgr is the active one and heartbeats it
+	leader := &LeaderLoop{Self: self, Channel: ch, ClientTLS: clientTLS, Repos: repos, CACert: string(pems[0])}
+	wg.Go(func() { leader.Run(ctx) })
 
 	srv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", Port),

@@ -23,6 +23,7 @@ import (
 	"github.com/nberlee/cephadm-talos/internal/records"
 	"github.com/nberlee/cephadm-talos/internal/state"
 	"github.com/nberlee/cephadm-talos/internal/talos"
+	"github.com/nberlee/cephadm-talos/internal/wire"
 )
 
 // The agent is the only writer of its node's Ceph documents (plan 03, item 7).
@@ -104,10 +105,25 @@ type Node struct {
 	FSID string
 	Host string
 
-	// mu serializes Adopt, Apply and Status: each reads and writes the records
-	// and the config as one step
-	mu sync.Mutex
+	// sem serializes Adopt, Apply, Fence, Status and Report: each reads and
+	// writes the records and the config as one step; waiting for it ends with
+	// the caller's context
+	sem  chan struct{}
+	once sync.Once
 }
+
+func (n *Node) lock(ctx context.Context) error {
+	n.once.Do(func() { n.sem = make(chan struct{}, 1) })
+
+	select {
+	case n.sem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("the node is busy: %w", ctx.Err())
+	}
+}
+
+func (n *Node) unlock() { <-n.sem }
 
 func (n *Node) docName(typ string) string {
 	return (&state.State{FSID: n.FSID}).DocName(state.Daemon{Type: typ, ID: n.Host})
@@ -375,41 +391,51 @@ func (n *Node) ownership() (Ownership, bool, error) {
 
 // Status reports the node's ownership state.
 func (n *Node) Status(ctx context.Context) NodeStatus {
-	n.mu.Lock()
-	defer n.mu.Unlock()
+	if err := n.lock(ctx); err != nil {
+		return NodeStatus{State: "busy", Error: err.Error()}
+	}
+	defer n.unlock()
 
+	st, _, _ := n.statusLocked(ctx)
+
+	return st
+}
+
+// statusLocked derives the status, with the ownership and the config's
+// documents it was derived from (nil when it could not read them).
+func (n *Node) statusLocked(ctx context.Context) (NodeStatus, Ownership, map[string]string) {
 	if err := n.Records.Check(); err != nil {
-		return NodeStatus{State: "error", Error: err.Error()}
+		return NodeStatus{State: "error", Error: err.Error()}, Ownership{}, nil
 	}
 
 	var intent applyIntent
 
 	pending, err := n.readJSON(applyRecord, &intent)
 	if err != nil {
-		return NodeStatus{State: "error", Error: err.Error()}
+		return NodeStatus{State: "error", Error: err.Error()}, Ownership{}, nil
 	}
 
 	own, found, err := n.ownership()
 	if err != nil {
-		return NodeStatus{State: "error", Error: err.Error()}
+		return NodeStatus{State: "error", Error: err.Error()}, Ownership{}, nil
 	}
 
 	if pending {
-		return NodeStatus{State: "uncertain", Revision: intent.Revision, Owned: len(own.Docs)}
+		return NodeStatus{State: "uncertain", Revision: intent.Revision, Owned: len(own.Docs)}, own, nil
 	}
 
 	if !found {
-		return NodeStatus{State: "unowned"}
+		return NodeStatus{State: "unowned"}, own, nil
 	}
 
 	cfg, err := n.Talos.MachineConfig(ctx, "")
 	if err != nil {
-		return NodeStatus{State: "error", Revision: own.Revision, Owned: len(own.Docs), Error: err.Error()}
+		return NodeStatus{State: "error", Revision: own.Revision, Owned: len(own.Docs), Error: err.Error()}, own, nil
 	}
 
 	docs, err := parseDocs(cfg)
 	if err != nil {
-		return NodeStatus{State: "error", Revision: own.Revision, Owned: len(own.Docs), Error: err.Error()}
+		return NodeStatus{State: "error", Revision: own.Revision, Owned: len(own.Docs), Error: err.Error()}, own, nil
 	}
 
 	st := NodeStatus{State: "owned", Revision: own.Revision, Owned: len(own.Docs)}
@@ -422,15 +448,107 @@ func (n *Node) Status(ctx context.Context) NodeStatus {
 		st.State, st.Drift = "drift", d
 	}
 
-	return st
+	return st, own, docs
+}
+
+// Report tells the leader what the node owns, its drift, the cluster's
+// containers it has and its disks (wire.NodeReport).
+func (n *Node) Report(ctx context.Context) (wire.NodeReport, error) {
+	if err := n.lock(ctx); err != nil {
+		return wire.NodeReport{}, err
+	}
+	defer n.unlock()
+
+	// status, ownership and documents from one look at the records and the config
+	st, own, cur := n.statusLocked(ctx)
+
+	r := wire.NodeReport{Version: wire.Version, State: st.State, Revision: st.Revision, Drift: st.Drift, Owned: map[string]string{}, Containers: []string{}, Disks: []wire.Disk{}}
+
+	if st.State == "error" {
+		return r, errors.New(st.Error)
+	}
+
+	for k, h := range own.Docs {
+		r.Owned[k] = h
+	}
+
+	for k := range cur {
+		if name, ok := strings.CutPrefix(k, "ContainerConfig/"); ok && strings.HasPrefix(name, n.prefix()) {
+			r.Containers = append(r.Containers, name)
+		}
+	}
+
+	sort.Strings(r.Containers)
+
+	disks, err := n.Talos.Disks(ctx, "")
+	if err != nil {
+		return r, err
+	}
+
+	for _, d := range disks {
+		r.Disks = append(r.Disks, wire.Disk{Serial: d.TypedSpec().Serial, Symlinks: d.TypedSpec().Symlinks})
+	}
+
+	return r, nil
+}
+
+// fenceRecord holds the revision below which nothing is applied anymore.
+const fenceRecord = "fence"
+
+type fence struct {
+	Schema   int   `json:"schema"`
+	Revision int64 `json:"revision"`
+}
+
+// Fence makes every revision up to rev unappliable: the leader gave up a
+// grant of that revision, which must not run if it arrives late.
+func (n *Node) Fence(ctx context.Context, rev int64) error {
+	return n.FenceBefore(ctx, time.Time{}, rev)
+}
+
+// FenceBefore is Fence that writes nothing unless it is before until (zero:
+// no limit): the abandon's confirmation counts only that long.
+func (n *Node) FenceBefore(ctx context.Context, until time.Time, rev int64) error {
+	if err := n.lock(ctx); err != nil {
+		return err
+	}
+	defer n.unlock()
+
+	f, err := n.fence()
+	if err != nil || f >= rev {
+		return err
+	}
+
+	if !until.IsZero() && !time.Now().Before(until) {
+		return errors.New("the confirmation expired before the fence")
+	}
+
+	return n.writeJSON(fenceRecord, fence{Schema: ownershipSchema, Revision: rev})
+}
+
+func (n *Node) fence() (int64, error) {
+	var f fence
+
+	found, err := n.readJSON(fenceRecord, &f)
+	if err != nil || !found {
+		return 0, err
+	}
+
+	if f.Schema != ownershipSchema || f.Revision < 0 {
+		return 0, fmt.Errorf("record %s: damaged", fenceRecord)
+	}
+
+	return f.Revision, nil
 }
 
 // Adopt takes ownership of the cluster's documents on the node as they are,
 // at the handoff (plan 03, item 11): everything but the CLI's own documents.
 // It refuses if the agent already owns the node.
 func (n *Node) Adopt(ctx context.Context, revision int64) (Ownership, error) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
+	if err := n.lock(ctx); err != nil {
+		return Ownership{}, err
+	}
+	defer n.unlock()
 
 	if err := n.Records.Check(); err != nil {
 		return Ownership{}, err
@@ -479,8 +597,10 @@ func (n *Node) Apply(ctx context.Context, revision int64, docs []Doc) (Ownership
 // until (zero: no limit): a confirmation counts only that long (plan 03,
 // item 5), and the lock, the reads and the admission take time.
 func (n *Node) ApplyBefore(ctx context.Context, until time.Time, revision int64, docs []Doc) (Ownership, error) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
+	if err := n.lock(ctx); err != nil {
+		return Ownership{}, fmt.Errorf("%w: %w", ErrNotApplied, err)
+	}
+	defer n.unlock()
 
 	own, started, err := n.apply(ctx, until, revision, docs)
 	if err != nil && !started {
@@ -518,8 +638,13 @@ func (n *Node) apply(ctx context.Context, until time.Time, revision int64, docs 
 		return Ownership{}, started, errors.New("the node has not been handed over")
 	}
 
-	if revision <= own.Revision {
-		return Ownership{}, started, fmt.Errorf("revision %d is not newer than %d", revision, own.Revision)
+	floor, err := n.fence()
+	if err != nil {
+		return Ownership{}, started, err
+	}
+
+	if revision <= max(own.Revision, floor) {
+		return Ownership{}, started, fmt.Errorf("revision %d is not newer than %d", revision, max(own.Revision, floor))
 	}
 
 	sent := map[string]string{}

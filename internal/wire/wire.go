@@ -145,6 +145,9 @@ const (
 	// OpUncertain: the apply may or may not have happened; nothing more is
 	// applied until it is reconciled
 	OpUncertain = "uncertain"
+	// OpAbandoned: the leader gave the operation up before the agent received
+	// it; a later delivery of the same id is refused
+	OpAbandoned = "abandoned"
 )
 
 // Operation is an agent's record of a grant, its answer to the grant and to a
@@ -157,6 +160,36 @@ type Operation struct {
 	GID        int64  `json:"gid"`
 	State      string `json:"state"`
 	Error      string `json:"error,omitempty"`
+}
+
+// Abandon is the leader giving up a grant whose outcome it does not know and
+// that the agent has no record of. The agent confirms it like a grant, then
+// records the operation as abandoned and fences its revision, so the grant
+// cannot run if it arrives late.
+type Abandon struct {
+	Version   int    `json:"version"`
+	FSID      string `json:"fsid"`
+	Host      string `json:"host"`
+	Mgr       string `json:"mgr"`
+	MgrAddr   string `json:"mgr_addr"`
+	GID       int64  `json:"gid"`
+	Revision  int64  `json:"revision"`
+	Operation string `json:"operation"`
+}
+
+// AbandonInputs is the hash the agent's confirmation of an abandon carries.
+func AbandonInputs(a Abandon) string {
+	b, _ := json.Marshal(struct {
+		Abandon   bool   `json:"abandon"`
+		FSID      string `json:"fsid"`
+		Host      string `json:"host"`
+		Revision  int64  `json:"revision"`
+		Operation string `json:"operation"`
+	}{true, a.FSID, a.Host, a.Revision, a.Operation})
+
+	sum := sha256.Sum256(b)
+
+	return hex.EncodeToString(sum[:])
 }
 
 // Handoff is the CLI's request that an agent take ownership of its node's
@@ -174,4 +207,23 @@ type HandoffReply struct {
 	Version  int   `json:"version"`
 	Revision int64 `json:"revision"`
 	Owned    int   `json:"owned"`
+}
+
+// NodeReport is what an agent tells the leader about its node: what it owns,
+// its drift, the cluster's containers it has and its disks, for the leader to
+// skip documents the node already has and to check a revision before granting.
+type NodeReport struct {
+	Version    int               `json:"version"`
+	State      string            `json:"state"` // the agent's NodeStatus state
+	Revision   int64             `json:"revision"`
+	Owned      map[string]string `json:"owned"` // "<kind>/<name>" -> hash of Talos's encoding
+	Drift      []string          `json:"drift,omitempty"`
+	Containers []string          `json:"containers"`
+	Disks      []Disk            `json:"disks"`
+}
+
+// Disk is one of a node's disks as Talos reports it.
+type Disk struct {
+	Serial   string   `json:"serial"`
+	Symlinks []string `json:"symlinks"`
 }

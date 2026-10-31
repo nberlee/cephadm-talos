@@ -40,7 +40,7 @@ func testNode(t *testing.T) (*Node, *talos.Client) {
 	return &Node{Talos: tc, Records: &records.Store{Dir: t.TempDir()}, FSID: testFSID, Host: "h1", Policy: pol}, tc
 }
 
-func render(t *testing.T, d any) []byte {
+func yamlOf(t *testing.T, d any) []byte {
 	t.Helper()
 
 	b, err := spec.Render(d)
@@ -63,7 +63,7 @@ func TestNodeOwnership(t *testing.T) {
 
 	// the handoff: ceph.conf is the cluster's, the app container is not, the agent's own document stays the CLI's
 	agentDoc := n.docName("agent")
-	must(t, tc.Patch(ctx, "", render(t, container(agentDoc, "registry/agent:1"))))
+	must(t, tc.Patch(ctx, "", yamlOf(t, container(agentDoc, "registry/agent:1"))))
 
 	own, err := n.Adopt(ctx, 1)
 	must(t, err)
@@ -78,8 +78,8 @@ func TestNodeOwnership(t *testing.T) {
 
 	probe := n.prefix() + "probe-aaaaaa"
 	docs := []Doc{
-		{Kind: "ContainerConfig", Name: probe, YAML: render(t, daemons.Probe(probe, testImage))},
-		{Kind: "EtcFileConfig", Name: "ceph/ceph.conf", YAML: render(t, conf("10.5.0.3"))},
+		{Kind: "ContainerConfig", Name: probe, YAML: yamlOf(t, daemons.Probe(probe, testImage))},
+		{Kind: "EtcFileConfig", Name: "ceph/ceph.conf", YAML: yamlOf(t, conf("10.5.0.3"))},
 	}
 
 	if own, err = n.Apply(ctx, 2, docs); err != nil {
@@ -107,7 +107,7 @@ func TestNodeOwnership(t *testing.T) {
 		docs []Doc
 	}{
 		{2, docs},
-		{3, []Doc{{Kind: "ContainerConfig", Name: agentDoc, YAML: render(t, container(agentDoc, "registry/agent:2"))}}},
+		{3, []Doc{{Kind: "ContainerConfig", Name: agentDoc, YAML: yamlOf(t, container(agentDoc, "registry/agent:2"))}}},
 		{3, []Doc{{Kind: "ContainerConfig", Name: "app"}}},
 		{3, []Doc{{Kind: "UserVolumeConfig", Name: "cephadm-talos"}}},
 		{3, []Doc{docs[1], docs[1]}},
@@ -134,10 +134,10 @@ func TestNodeDrift(t *testing.T) {
 	_, err := n.Adopt(ctx, 1)
 	must(t, err)
 
-	conf := []Doc{{Kind: "EtcFileConfig", Name: "ceph/ceph.conf", YAML: render(t, conf("10.5.0.4"))}}
+	conf := []Doc{{Kind: "EtcFileConfig", Name: "ceph/ceph.conf", YAML: yamlOf(t, conf("10.5.0.4"))}}
 
 	// someone else changes an owned document
-	must(t, tc.Patch(ctx, "", render(t, spec.CephConf("[global]\nedited = 1\n"))))
+	must(t, tc.Patch(ctx, "", yamlOf(t, spec.CephConf("[global]\nedited = 1\n"))))
 
 	if st := n.Status(ctx); st.State != "drift" || !slices.Equal(st.Drift, []string{"changed EtcFileConfig/ceph/ceph.conf"}) {
 		t.Fatalf("status %+v", st)
@@ -149,7 +149,7 @@ func TestNodeDrift(t *testing.T) {
 
 	// a cluster document the agent did not write
 	foreign := n.prefix() + "osd-x"
-	must(t, tc.Patch(ctx, "", render(t, container(foreign, "quay.io/ceph/ceph:v20.2.4"))))
+	must(t, tc.Patch(ctx, "", yamlOf(t, container(foreign, "quay.io/ceph/ceph:v20.2.4"))))
 
 	st := n.Status(ctx)
 	if !slices.Contains(st.Drift, "foreign ContainerConfig/"+foreign) {
@@ -166,7 +166,7 @@ func TestNodeUncertainApply(t *testing.T) {
 
 	n.Talos = failingPatch{tc}
 
-	conf := []Doc{{Kind: "EtcFileConfig", Name: "ceph/ceph.conf", YAML: render(t, conf("10.5.0.4"))}}
+	conf := []Doc{{Kind: "EtcFileConfig", Name: "ceph/ceph.conf", YAML: yamlOf(t, conf("10.5.0.4"))}}
 	if _, err := n.Apply(ctx, 2, conf); err == nil {
 		t.Fatal("failed patch reported as applied")
 	}
@@ -205,8 +205,8 @@ func TestNodeChecksTheDocumentsYAML(t *testing.T) {
 	n.Talos = cp
 
 	probe := n.prefix() + "probe-aaaaaa"
-	ok := render(t, daemons.Probe(probe, testImage))
-	app := render(t, container("app", "docker.io/library/alpine:3"))
+	ok := yamlOf(t, daemons.Probe(probe, testImage))
+	app := yamlOf(t, container("app", "docker.io/library/alpine:3"))
 
 	for name, yamlDoc := range map[string][]byte{
 		"a second document":       append(append([]byte{}, ok...), app...),
@@ -246,7 +246,7 @@ func (r racingPatch) Patch(ctx context.Context, node string, patches ...[]byte) 
 		return err
 	}
 
-	return r.Client.Patch(ctx, node, render(r.t, spec.CephConf("[global]\nother = writer\n")))
+	return r.Client.Patch(ctx, node, yamlOf(r.t, spec.CephConf("[global]\nother = writer\n")))
 }
 
 func TestAnotherWriterBetweenPatchAndReadBack(t *testing.T) {
@@ -258,7 +258,7 @@ func TestAnotherWriterBetweenPatchAndReadBack(t *testing.T) {
 
 	n.Talos = racingPatch{Client: tc, t: t}
 
-	conf := []Doc{{Kind: "EtcFileConfig", Name: "ceph/ceph.conf", YAML: render(t, conf("10.5.0.3"))}}
+	conf := []Doc{{Kind: "EtcFileConfig", Name: "ceph/ceph.conf", YAML: yamlOf(t, conf("10.5.0.3"))}}
 	if _, err := n.Apply(ctx, 2, conf); !errors.Is(err, ErrDrift) {
 		t.Fatalf("apply overtaken by another writer: %v", err)
 	}
@@ -279,7 +279,7 @@ func TestUntouchedDocumentsKeepTheirHash(t *testing.T) {
 	must(t, err)
 
 	probe := n.prefix() + "probe-aaaaaa"
-	if _, err := n.Apply(ctx, 2, []Doc{{Kind: "ContainerConfig", Name: probe, YAML: render(t, daemons.Probe(probe, testImage))}}); err != nil {
+	if _, err := n.Apply(ctx, 2, []Doc{{Kind: "ContainerConfig", Name: probe, YAML: yamlOf(t, daemons.Probe(probe, testImage))}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -302,7 +302,7 @@ func TestConcurrentApplies(t *testing.T) {
 	for i := range 3 {
 		wg.Go(func() {
 			name := n.prefix() + "probe-" + strings.Repeat(string(rune('a'+i)), 6)
-			_, errs[i] = n.Apply(ctx, int64(2+i), []Doc{{Kind: "ContainerConfig", Name: name, YAML: render(t, daemons.Probe(name, testImage))}})
+			_, errs[i] = n.Apply(ctx, int64(2+i), []Doc{{Kind: "ContainerConfig", Name: name, YAML: yamlOf(t, daemons.Probe(name, testImage))}})
 		})
 	}
 
@@ -368,12 +368,12 @@ func TestApplyRunsThePolicy(t *testing.T) {
 
 	// an IPv6 zone smuggling options into ceph.conf through carriage returns
 	evil := conf("::1%x\rmon_host = 10.5.0.3\rdebug_ms = 20\r#")
-	if _, err := n.Apply(ctx, 2, []Doc{{Kind: "EtcFileConfig", Name: "ceph/ceph.conf", YAML: render(t, evil)}}); err == nil {
+	if _, err := n.Apply(ctx, 2, []Doc{{Kind: "EtcFileConfig", Name: "ceph/ceph.conf", YAML: yamlOf(t, evil)}}); err == nil {
 		t.Fatal("ceph.conf with a zone admitted")
 	}
 
 	n.Policy = nil
-	if _, err := n.Apply(ctx, 2, []Doc{{Kind: "EtcFileConfig", Name: "ceph/ceph.conf", YAML: render(t, conf("10.5.0.3"))}}); err == nil {
+	if _, err := n.Apply(ctx, 2, []Doc{{Kind: "EtcFileConfig", Name: "ceph/ceph.conf", YAML: yamlOf(t, conf("10.5.0.3"))}}); err == nil {
 		t.Fatal("applied without a policy")
 	}
 
@@ -405,7 +405,7 @@ func TestApplyDeadlineInsidePatch(t *testing.T) {
 
 	before, _ := tc.MachineConfig(ctx, "")
 
-	_, err = n.ApplyBefore(ctx, time.Now().Add(100*time.Millisecond), 2, []Doc{{Kind: "EtcFileConfig", Name: "ceph/ceph.conf", YAML: render(t, conf("10.5.0.3"))}})
+	_, err = n.ApplyBefore(ctx, time.Now().Add(100*time.Millisecond), 2, []Doc{{Kind: "EtcFileConfig", Name: "ceph/ceph.conf", YAML: yamlOf(t, conf("10.5.0.3"))}})
 	if !errors.Is(err, ErrNotApplied) || !errors.Is(err, talos.ErrApplyDeadline) {
 		t.Fatalf("apply past its deadline: %v", err)
 	}

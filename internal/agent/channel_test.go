@@ -37,7 +37,7 @@ func newTestCA(t *testing.T) testCA {
 
 func (ca testCA) pair(role pki.Role, name string, usage x509.ExtKeyUsage, fsid string) (string, string) {
 	c, k, err := pki.Issue(ca.cert, ca.key, pki.Leaf{
-		CommonName: string(role), IPs: []string{"127.0.0.1"}, Usage: usage, Years: 1,
+		CommonName: string(role), IPs: []string{"127.0.0.1"}, Names: []string{name}, Usage: usage, Years: 1,
 		Identity: &pki.Identity{FSID: fsid, Role: role, Name: name},
 	})
 	must(ca.t, err)

@@ -54,7 +54,7 @@ type BridgeResult struct {
 // credentials.
 type Bridge struct {
 	TLS  *tls.Config // the agent's client certificate and the agent CA
-	Addr string      // the mgr host's address: the agent's own host
+	Addr string      // the mgr host's address: the agent's own host, or 127.0.0.1
 	Mgr  string      // the mgr's name, its certificate's identity
 	FSID string
 }
@@ -71,6 +71,9 @@ func NewDispatchID() (string, error) {
 
 func (b *Bridge) client() *http.Client {
 	cfg := b.TLS.Clone()
+	// the mgr's server certificate names its host: the leader dials its own
+	// host's loopback address
+	cfg.ServerName = b.Mgr
 	cfg.VerifyConnection = func(cs tls.ConnectionState) error {
 		if len(cs.PeerCertificates) == 0 {
 			return errors.New("no server certificate")

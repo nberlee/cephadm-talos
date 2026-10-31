@@ -28,6 +28,9 @@ const MaxOperations = 1024
 // maxOperations is MaxOperations; tests lower it.
 var maxOperations = MaxOperations
 
+// reportTimeout bounds one node report; tests lower it.
+var reportTimeout = 20 * time.Second
+
 // grantTimeout bounds handling one grant: the confirmation, the apply and its
 // read-back.
 const grantTimeout = 2 * time.Minute
@@ -50,6 +53,8 @@ type Granter struct {
 	confirm func(ctx context.Context, t ConfirmTarget, revision int64, operation, inputsHash string) (wire.Confirmation, time.Time, error)
 
 	mu chan struct{} // one grant at a time; a buffered channel so a waiter can give up
+	// reports admits one node report at a time
+	reports chan struct{}
 }
 
 func (g *Granter) now() time.Time {
@@ -79,7 +84,7 @@ func (g *Granter) readOp(id string) (wire.Operation, bool, error) {
 
 	// a damaged record is no evidence of anything: it blocks like missing records do
 	switch op.State {
-	case wire.OpReserved, wire.OpRefused, wire.OpStarted, wire.OpCompleted, wire.OpUncertain:
+	case wire.OpReserved, wire.OpRefused, wire.OpStarted, wire.OpCompleted, wire.OpUncertain, wire.OpAbandoned:
 	default:
 		return wire.Operation{}, false, fmt.Errorf("record %s: unknown state", opRecord(id))
 	}
@@ -189,7 +194,7 @@ func (g *Granter) prune() error {
 			return err
 		}
 
-		if found && (op.State == wire.OpCompleted || op.State == wire.OpRefused) {
+		if found && (op.State == wire.OpCompleted || op.State == wire.OpRefused || op.State == wire.OpAbandoned) {
 			done = append(done, op)
 		}
 	}
@@ -214,6 +219,10 @@ func (g *Granter) grant(ctx context.Context, gr wire.Grant) (wire.Operation, err
 	}
 
 	if found {
+		if prev.State == wire.OpAbandoned {
+			return prev, nil // given up by the leader: never runs
+		}
+
 		if prev.InputsHash != hash {
 			return wire.Operation{}, errors.New("the operation id was used with other inputs")
 		}
@@ -402,6 +411,142 @@ func (g *Granter) HandleOperation(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// Abandon gives up an operation the agent has no record of (wire.Abandon):
+// confirmed like a grant, it fences the operation's revision and records the
+// operation as abandoned. An operation the agent has a record of keeps it.
+func (g *Granter) Abandon(ctx context.Context, a wire.Abandon) (wire.Operation, error) {
+	select {
+	case g.mu <- struct{}{}:
+		defer func() { <-g.mu }()
+	case <-ctx.Done():
+		return wire.Operation{}, ctx.Err()
+	}
+
+	return g.abandon(ctx, a)
+}
+
+func (g *Granter) abandon(ctx context.Context, a wire.Abandon) (wire.Operation, error) {
+	prev, found, err := g.readOp(a.Operation)
+	if err != nil || found {
+		return prev, err
+	}
+
+	hash := wire.AbandonInputs(a)
+
+	confirm := g.confirm
+	if confirm == nil {
+		confirm = func(ctx context.Context, t ConfirmTarget, revision int64, operation, inputsHash string) (wire.Confirmation, time.Time, error) {
+			return g.Channel.Confirm(ctx, g.ClientTLS, t, revision, operation, inputsHash)
+		}
+	}
+
+	conf, until, err := confirm(ctx, ConfirmTarget{Addr: a.MgrAddr, Mgr: a.Mgr}, a.Revision, a.Operation, hash)
+	if err != nil {
+		return wire.Operation{}, err
+	}
+
+	if conf.GID != a.GID || !g.now().Before(until) {
+		return wire.Operation{}, errors.New("the abandon is not confirmed for this incarnation")
+	}
+
+	// the fence first: a late grant of this revision can no longer be applied,
+	// also once the record is pruned
+	if err := g.Node.FenceBefore(ctx, until, a.Revision); err != nil {
+		return wire.Operation{}, err
+	}
+
+	op := wire.Operation{Version: wire.Version, Operation: a.Operation, Revision: a.Revision, InputsHash: hash, GID: a.GID, State: wire.OpAbandoned}
+
+	if err := g.writeOp(op); err != nil {
+		return op, err
+	}
+
+	return op, g.prune()
+}
+
+// HandleAbandon serves POST /v1/abandon from the leader.
+func (g *Granter) HandleAbandon(w http.ResponseWriter, r *http.Request) {
+	leader, err := g.leaderOf(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusForbidden)
+
+		return
+	}
+
+	select {
+	case g.mu <- struct{}{}:
+		defer func() { <-g.mu }()
+	default:
+		http.Error(w, "a grant is running", http.StatusTooManyRequests)
+
+		return
+	}
+
+	var a wire.Abandon
+
+	dec := json.NewDecoder(io.LimitReader(r.Body, 4096))
+	dec.DisallowUnknownFields()
+
+	if err := dec.Decode(&a); err != nil {
+		http.Error(w, "malformed abandon", http.StatusBadRequest)
+
+		return
+	}
+
+	// the same shape rules as a grant, without documents
+	gr := wire.Grant{Version: a.Version, FSID: a.FSID, Host: a.Host, Mgr: a.Mgr, MgrAddr: a.MgrAddr, GID: a.GID, Revision: a.Revision, Operation: a.Operation, Docs: []wire.GrantDoc{{Kind: "-", Name: "-"}}}
+	if err := g.checkGrant(gr, leader); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), grantTimeout)
+	defer cancel()
+
+	op, err := g.abandon(ctx, a)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(op)
+}
+
+// HandleNode serves GET /v1/node: the node report, for the leader.
+func (g *Granter) HandleNode(w http.ResponseWriter, r *http.Request) {
+	if _, err := g.leaderOf(r); err != nil {
+		http.Error(w, err.Error(), http.StatusForbidden)
+
+		return
+	}
+
+	// one report at a time, bounded: it holds the node lock while it reads
+	select {
+	case g.reports <- struct{}{}:
+		defer func() { <-g.reports }()
+	default:
+		http.Error(w, "a report is running", http.StatusTooManyRequests)
+
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), reportTimeout)
+	defer cancel()
+
+	rep, err := g.Node.Report(ctx)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(rep)
+}
+
 // HandleHandoff serves POST /v1/handoff from the CLI's operator certificate:
 // the agent takes ownership of its node's cluster documents as they are.
 func (g *Granter) HandleHandoff(w http.ResponseWriter, r *http.Request) {
@@ -442,5 +587,5 @@ func (g *Granter) HandleHandoff(w http.ResponseWriter, r *http.Request) {
 
 // NewGranter returns a Granter; one grant runs at a time.
 func NewGranter(n *Node, ch *Channel, clientTLS *tls.Config, recs *records.Store) *Granter {
-	return &Granter{Node: n, Channel: ch, ClientTLS: clientTLS, Records: recs, mu: make(chan struct{}, 1)}
+	return &Granter{Node: n, Channel: ch, ClientTLS: clientTLS, Records: recs, mu: make(chan struct{}, 1), reports: make(chan struct{}, 1)}
 }
