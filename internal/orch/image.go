@@ -7,8 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nberlee/cephadm-talos/internal/daemons"
-	"github.com/nberlee/cephadm-talos/internal/state"
+	"github.com/nberlee/cephadm-talos/internal/render"
 )
 
 // SupportedCeph is the only Ceph release this build supports (docs/support.md).
@@ -47,7 +46,7 @@ func (o *Orch) resolveImage(ctx context.Context, node, ref string, refresh bool)
 	}
 
 	id := randHex(3)
-	doc := daemons.Probe(o.St.DocName(state.Daemon{Type: "probe", ID: id}), pinned)
+	doc := render.Probe(o.St, id, pinned)
 
 	res, err := o.runJob(ctx, node, doc, id, 5*time.Minute)
 	if err != nil {

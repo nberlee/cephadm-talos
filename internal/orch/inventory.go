@@ -13,6 +13,7 @@ import (
 	"github.com/nberlee/cephadm-talos/internal/daemons"
 	"github.com/nberlee/cephadm-talos/internal/mgrmodule"
 	"github.com/nberlee/cephadm-talos/internal/pki"
+	"github.com/nberlee/cephadm-talos/internal/render"
 	"github.com/nberlee/cephadm-talos/internal/spec"
 	"github.com/nberlee/cephadm-talos/internal/state"
 )
@@ -280,39 +281,27 @@ func (o *Orch) Publish(ctx context.Context) error {
 	return o.restartMgrs(ctx)
 }
 
-// mgrFileDocs are the module and its TLS files on a mgr host, or their removal elsewhere.
-func (o *Orch) mgrFileDocs(h state.Host, withMgr bool) []any {
-	files := mgrmodule.Files()
-
-	var docs []any
-
-	for _, n := range mgrmodule.Names() {
-		if withMgr {
-			docs = append(docs, spec.EtcFile(mgrModuleDir+"/"+n, 0o644, files[n]))
-		} else {
-			docs = append(docs, spec.Delete("EtcFileConfig", mgrModuleDir+"/"+n))
-		}
+// mgrFileDocs are the module and its TLS files on a mgr host, or their
+// removal elsewhere (internal/render).
+func (o *Orch) mgrFileDocs(h state.Host, withMgr bool) ([]any, error) {
+	r, err := render.MgrFiles(o.St, h, withMgr)
+	if err != nil {
+		return nil, err
 	}
 
-	if a := o.St.Agent; a != nil && withMgr && h.MgrClientCert != "" {
-		docs = append(docs,
-			spec.EtcFile(agentCAFile, 0o644, a.CACert),
-			spec.EtcFile(mgrCertFile, 0o644, h.MgrClientCert),
-			spec.EtcFile(mgrKeyFile, 0o600, h.MgrClientKey),
-			spec.EtcFile(mgrServerCertFile, 0o644, h.MgrServerCert),
-			spec.EtcFile(mgrServerKeyFile, 0o600, h.MgrServerKey))
-	} else {
-		for _, f := range []string{agentCAFile, mgrCertFile, mgrKeyFile, mgrServerCertFile, mgrServerKeyFile} {
-			docs = append(docs, spec.Delete("EtcFileConfig", f))
-		}
+	docs := r.Upsert
+	for _, ref := range r.Remove {
+		docs = append(docs, spec.Delete(ref.Kind, ref.Name))
 	}
 
-	return docs
+	return docs, nil
 }
 
 // talosFileDeletes removes everything the talos mgr module reads from a host.
 func (o *Orch) talosFileDeletes() []any {
-	return append([]any{spec.Delete("EtcFileConfig", inventoryFile)}, o.mgrFileDocs(state.Host{}, false)...)
+	docs, _ := o.mgrFileDocs(state.Host{}, false) // removals only: no error
+
+	return append([]any{spec.Delete("EtcFileConfig", inventoryFile)}, docs...)
 }
 
 // hasMgr reports whether a mgr is placed on the host.

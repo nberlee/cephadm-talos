@@ -706,22 +706,6 @@ func (o *Orch) RetryPendingRGW(ctx context.Context) error {
 	return o.applyRGWAndVIP(ctx, "")
 }
 
-// vipParams fills the keepalived settings for a host. Priorities follow the
-// placement order, so the first vip host is the preferred holder.
-func (o *Orch) vipParams(p *daemons.Params, d state.Daemon) {
-	r := o.St.RGW
-	p.Port, p.VIP, p.VRID, p.VRRPPass = r.Port, r.VIP, r.VRID, r.VRRPPass
-	p.Priority = 150
-
-	for i, other := range o.St.DaemonsOf(state.TypeVIP, "") {
-		if other.ID == d.ID {
-			p.Priority = 150 - 10*i
-		} else if oh, ok := o.St.Host(other.Host); ok {
-			p.Peers = append(p.Peers, oh.Addr)
-		}
-	}
-}
-
 // deployHost resolves a host for a deploy, adding an unknown address on the fly.
 func (o *Orch) deployHost(ctx context.Context, hostName string) (state.Host, error) {
 	h, ok := o.St.Host(hostName)

@@ -22,8 +22,8 @@ import (
 
 	"github.com/nberlee/cephadm-talos/internal/cephx"
 	"github.com/nberlee/cephadm-talos/internal/daemons"
-	"github.com/nberlee/cephadm-talos/internal/mgrmodule"
 	"github.com/nberlee/cephadm-talos/internal/pki"
+	"github.com/nberlee/cephadm-talos/internal/render"
 	"github.com/nberlee/cephadm-talos/internal/spec"
 	"github.com/nberlee/cephadm-talos/internal/state"
 	"github.com/nberlee/cephadm-talos/internal/store"
@@ -295,7 +295,7 @@ func (o *Orch) authGet(entity string) (string, bool, error) {
 }
 
 // CephConf renders the minimal ceph.conf shared by all daemons on all hosts.
-func (o *Orch) CephConf() string { return daemons.CephConf(o.St.FSID, o.St.MonAddrs()) }
+func (o *Orch) CephConf() string { return render.CephConf(o.St) }
 
 func monAddrv(ip string) string { return daemons.MonAddrv(ip) }
 
@@ -374,11 +374,16 @@ func (o *Orch) remove(ctx context.Context, node, name string) error {
 }
 
 // hostDocs are the per-host documents every Ceph node needs: the
-// /var/lib/ceph volume, ceph.conf and the node agent.
-func (o *Orch) hostDocs(h state.Host) []any {
-	docs := append([]any{spec.CephVolume(), spec.CephConf(o.CephConf())}, o.agentDocs(h)...)
+// /var/lib/ceph volume, ceph.conf, the node agent and the mgr files.
+func (o *Orch) hostDocs(h state.Host) ([]any, error) {
+	mgr, err := o.mgrFileDocs(h, o.hasMgr(h))
+	if err != nil {
+		return nil, err
+	}
 
-	return append(docs, o.mgrFileDocs(h, o.hasMgr(h))...)
+	docs := append([]any{render.Volume(), spec.CephConf(o.CephConf())}, o.agentDocs(h)...)
+
+	return append(docs, mgr...), nil
 }
 
 // pushConf rewrites ceph.conf on every host (after the mon set changed).
@@ -391,7 +396,12 @@ func (o *Orch) pushConf(ctx context.Context) error {
 	for _, h := range o.St.Hosts {
 		o.printf("updating ceph.conf on %s\n", h.Name)
 
-		if err := o.apply(ctx, h.Addr, o.hostDocs(h)...); err != nil {
+		docs, err := o.hostDocs(h)
+		if err == nil {
+			err = o.apply(ctx, h.Addr, docs...)
+		}
+
+		if err != nil {
 			o.printf("warning: ceph.conf on %s not updated: %v\n", h.Name, err)
 			failed = append(failed, h.Name)
 		}
@@ -510,7 +520,12 @@ func (o *Orch) addHost(ctx context.Context, addr string, apply bool) (state.Host
 		return h, nil
 	}
 
-	if err := o.apply(ctx, addr, o.hostDocs(h)...); err != nil {
+	docs, err := o.hostDocs(h)
+	if err != nil {
+		return h, err
+	}
+
+	if err := o.apply(ctx, addr, docs...); err != nil {
 		return h, err
 	}
 
@@ -691,10 +706,10 @@ func (o *Orch) Bootstrap(ctx context.Context, addr, image, agentImage string, re
 	})
 	// no dependsOn on the mon: Talos rejects configs referencing a removed container,
 	// which would block removing the bootstrap mon later. ceph-mgr retries by itself.
-	mgrDoc := daemons.Mgr(daemons.Params{
-		Name: o.St.DocName(mgr), Image: image, FSID: o.St.FSID, ID: h.Name, Addr: h.Addr,
-		Keyring: daemons.Keyring("mgr."+h.Name, mgrKey),
-	}, mgrmodule.Names()...)
+	mgrDoc, err := render.Daemon(o.St, h, mgr, image, func(string) (string, error) { return mgrKey, nil })
+	if err != nil {
+		return err
+	}
 
 	// the state, the first revision and the pending host are saved before the
 	// node is patched: an interrupted bootstrap leaves a state to clean up from
@@ -705,7 +720,12 @@ func (o *Orch) Bootstrap(ctx context.Context, addr, image, agentImage string, re
 		return err
 	}
 
-	if err := o.apply(ctx, h.Addr, append(o.hostDocs(h), monDoc, mgrDoc)...); err != nil {
+	docs, err := o.hostDocs(h)
+	if err != nil {
+		return err
+	}
+
+	if err := o.apply(ctx, h.Addr, append(docs, monDoc, mgrDoc)...); err != nil {
 		return err
 	}
 
@@ -851,12 +871,11 @@ func (o *Orch) deployMon(ctx context.Context, h state.Host) error {
 		return err
 	}
 
-	doc := daemons.Mon(daemons.Params{
-		Name: o.St.DocName(d), Image: o.St.Image, FSID: o.St.FSID, ID: h.Name, Addr: h.Addr,
-		// the mon. key only (plan 03, item 13): no mon document carries client.admin
-		Keyring: daemons.MonKeyring(monKey),
-		Mode:    "join", Addrv: monAddrv(h.Addr), DeployID: d.DeployID,
-	})
+	// a joining mon with the mon. key only (plan 03, item 13)
+	doc, err := render.Daemon(o.St, h, d, o.St.Image, func(string) (string, error) { return monKey, nil })
+	if err != nil {
+		return err
+	}
 
 	if err := o.apply(ctx, h.Addr, doc); err != nil {
 		return err
@@ -905,10 +924,10 @@ func (o *Orch) deployMgr(ctx context.Context, h state.Host) error {
 		return err
 	}
 
-	doc := daemons.Mgr(daemons.Params{
-		Name: o.St.DocName(d), Image: o.St.Image, FSID: o.St.FSID, ID: h.Name, Addr: h.Addr,
-		Keyring: daemons.Keyring(entity, k),
-	}, mgrmodule.Names()...)
+	doc, err := render.Daemon(o.St, h, d, o.St.Image, func(string) (string, error) { return k, nil })
+	if err != nil {
+		return err
+	}
 
 	// the mgr's own server and client certificates for the agent channel
 	if err := o.ensureMgrCerts(&h, true); err != nil {
@@ -918,7 +937,12 @@ func (o *Orch) deployMgr(ctx context.Context, h state.Host) error {
 	o.St.AddHost(h)
 
 	// the mgr starts only once the talos module's files are on the host
-	if err := o.apply(ctx, h.Addr, append(o.mgrFileDocs(h, true), doc)...); err != nil {
+	mgrFiles, err := o.mgrFileDocs(h, true)
+	if err != nil {
+		return err
+	}
+
+	if err := o.apply(ctx, h.Addr, append(mgrFiles, doc)...); err != nil {
 		return err
 	}
 
@@ -959,7 +983,10 @@ func (o *Orch) deployOSD(ctx context.Context, h state.Host, device string) error
 		return err
 	}
 
-	job := o.osdPrepareDoc(h, d, k)
+	job, err := render.OSDPrepare(o.St, h, d, func(string) (string, error) { return k, nil })
+	if err != nil {
+		return err
+	}
 
 	o.printf("preparing %s:%s (%s)\n", h.Name, device, byID)
 
@@ -983,10 +1010,10 @@ func (o *Orch) deployOSD(ctx context.Context, h state.Host, device string) error
 		return err
 	}
 
-	doc := daemons.OSD(daemons.Params{
-		Name: o.St.DocName(d), Image: o.St.Image, FSID: o.St.FSID, ID: d.ID, Addr: h.Addr,
-		Device: byID, DeployID: d.DeployID, OSDID: id, OSDUUID: uuid,
-	})
+	doc, err := render.Daemon(o.St, h, d, o.St.Image, o.key)
+	if err != nil {
+		return err
+	}
 
 	if err := o.apply(ctx, h.Addr, doc); err != nil {
 		return err
@@ -1014,29 +1041,18 @@ func (o *Orch) deployOSD(ctx context.Context, h state.Host, device string) error
 // osdPrepareInputs binds an OSD's prepare job to its cluster, host, device,
 // disk and deployment.
 func (o *Orch) osdPrepareInputs(h state.Host, d state.Daemon) string {
-	return jobInputs("osd-prepare", o.St.FSID, h.Name, d.OSDDevice(), d.DiskSerial, d.DeployID)
+	return render.OSDPrepareInputs(o.St, h, d)
 }
 
-// osdPrepareDocName is the document of an OSD deployment's prepare job.
-// osdPrepareDoc renders the job that prepares an OSD's disk, with the
-// bootstrap-osd key.
-func (o *Orch) osdPrepareDoc(h state.Host, d state.Daemon, bootstrapKey string) *spec.ContainerConfig {
-	return daemons.OSDPrepare(daemons.Params{
-		Name: o.osdPrepareDocName(d), Image: o.St.Image, FSID: o.St.FSID, ID: "job",
-		Keyring: daemons.Keyring("client.bootstrap-osd", bootstrapKey), Device: d.DevicePath, DiskSerial: d.DiskSerial,
-	}, d.DeployID, o.osdPrepareInputs(h, d))
-}
-
-func (o *Orch) osdPrepareDocName(d state.Daemon) string {
-	return o.St.DocName(state.Daemon{Type: "osd-prepare", ID: d.DeployID})
-}
+func (o *Orch) osdPrepareDocName(d state.Daemon) string { return render.OSDPrepareName(o.St, d) }
 
 // diskIdentity returns the serial Talos reports for a device and its
 // /dev/disk/by-id link that carries that serial. A disk without both cannot be
 // bound to an OSD.
 func (o *Orch) diskIdentity(ctx context.Context, node, device string) (string, string, error) {
 	if o.Talos.DryRun {
-		return "dry-run", device, nil
+		// a stable device as Talos would report it, so the dry run renders what the real one does
+		return "dry-run", "/dev/disk/by-id/dry-run-" + filepath.Base(device), nil
 	}
 
 	disks, err := o.Talos.Disks(ctx, node)

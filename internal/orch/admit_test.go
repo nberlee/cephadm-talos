@@ -1,6 +1,8 @@
 package orch
 
 import (
+	"bytes"
+	"context"
 	"crypto/x509"
 	"encoding/base64"
 	"strings"
@@ -12,8 +14,10 @@ import (
 	"github.com/nberlee/cephadm-talos/internal/cephx"
 	"github.com/nberlee/cephadm-talos/internal/daemons"
 	"github.com/nberlee/cephadm-talos/internal/pki"
+	"github.com/nberlee/cephadm-talos/internal/render"
 	"github.com/nberlee/cephadm-talos/internal/spec"
 	"github.com/nberlee/cephadm-talos/internal/state"
+	"github.com/nberlee/cephadm-talos/internal/talos/talostest"
 )
 
 // policyOrch is inventoryOrch with what every grantable kind needs: digest
@@ -96,7 +100,7 @@ func hostRevision(t *testing.T, o *Orch) ([]agent.Doc, []string) {
 
 	osd, _ := o.St.Find("osd.3")
 	jobs := []*spec.ContainerConfig{
-		o.osdPrepareDoc(h, osd, o.St.Keys["client.bootstrap-osd"]),
+		prepareDoc(t, o, h, osd, o.St.Keys["client.bootstrap-osd"]),
 		o.zapDoc(h, "a1b2c3", osd.DevicePath, osd.DiskSerial),
 	}
 
@@ -106,7 +110,7 @@ func hostRevision(t *testing.T, o *Orch) ([]agent.Doc, []string) {
 
 	docs = append(docs, docOf(t, spec.CephConf(o.CephConf())), docOf(t, spec.CephVolume()))
 
-	for _, f := range o.mgrFileDocs(h, true) {
+	for _, f := range mustDocs(t)(o.mgrFileDocs(h, true)) {
 		docs = append(docs, docOf(t, f))
 	}
 
@@ -248,7 +252,7 @@ func TestAgentsRefuseWhatTheTemplatesDoNot(t *testing.T) {
 			envSet(c, "CMD", "rm -rf /var/lib/ceph")
 			return c
 		},
-		"a prepare without its key": func() any { return o.osdPrepareDoc(h, osd, "") },
+		"a prepare without its key": func() any { return prepareDoc(t, o, h, osd, "") },
 		"an unknown kind": func() any {
 			c := render("mgr")
 			c.MetaName = "ceph-" + o.St.Short() + "-shell-h1"
@@ -352,5 +356,53 @@ func TestPolicyKindByIDNotPrefix(t *testing.T) {
 	pol := &agent.Policy{FSID: o.St.FSID, Host: "prepare", Repos: o.imageRepos(), CACert: o.St.Agent.CACert}
 	if err := pol.Check([]agent.Doc{docOf(t, c)}, testDisks, nil); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func prepareDoc(t *testing.T, o *Orch, h state.Host, d state.Daemon, key string) *spec.ContainerConfig {
+	t.Helper()
+
+	c, err := render.OSDPrepare(o.St, h, d, func(string) (string, error) { return key, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return c
+}
+
+// mustDocs unwraps a list of documents, failing the test on an error.
+func mustDocs(t *testing.T) func([]any, error) []any {
+	return func(docs []any, err error) []any {
+		t.Helper()
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		return docs
+	}
+}
+
+// A dry-run OSD deploy renders what the real one does, with a stable device.
+func TestDryRunOSDDeployRenders(t *testing.T) {
+	o := fakeOrch(t, talostest.New(t))
+	o.St.Image = "quay.io/ceph/ceph@sha256:" + strings.Repeat("ab", 32)
+	o.St.Keys["client.bootstrap-osd"], _ = cephx.NewKey()
+	o.St.AddHost(state.Host{Name: "h1", Addr: "node"})
+	o.St.AddDaemon(state.Daemon{Type: state.TypeMon, ID: "h1", Host: "h1"})
+
+	var out bytes.Buffer
+
+	o.Talos.DryRun, o.Talos.Out = true, &out
+
+	h, _ := o.St.Host("h1")
+	if err := o.deployOSD(context.Background(), h, "/dev/vdb"); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, want := range []string{"osd-prepare-", "DEVICE=/dev/disk/by-id/dry-run-vdb", "name: ceph-" + o.St.Short() + "-osd-h1-vdb"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("the dry run misses %q", want)
+		}
 	}
 }

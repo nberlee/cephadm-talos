@@ -39,7 +39,7 @@ func TestAgentDocument(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	docs := o.hostDocs(h)
+	docs := mustDocs(t)(o.hostDocs(h))
 
 	var a *spec.ContainerConfig
 
@@ -160,7 +160,7 @@ func TestHostRmRemovesTheAgent(t *testing.T) {
 	o.St.AddHost(h)
 
 	ctx := context.Background()
-	if err := o.apply(ctx, "node", o.hostDocs(h)...); err != nil {
+	if err := o.apply(ctx, "node", mustDocs(t)(o.hostDocs(h))...); err != nil {
 		t.Fatal(err)
 	}
 
@@ -260,7 +260,7 @@ func TestRemoveClusterRemovesAgentsWithoutStatus(t *testing.T) {
 	o.St.AddHost(h)
 
 	// the fake node has no controllers: the agent document exists, its status never appears
-	if err := o.apply(ctx, "node", o.hostDocs(h)...); err != nil {
+	if err := o.apply(ctx, "node", mustDocs(t)(o.hostDocs(h))...); err != nil {
 		t.Fatal(err)
 	}
 
@@ -300,7 +300,7 @@ func TestRemoveClusterWithoutItsState(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := o.apply(ctx, "node", o.hostDocs(h)...); err != nil {
+	if err := o.apply(ctx, "node", mustDocs(t)(o.hostDocs(h))...); err != nil {
 		t.Fatal(err)
 	}
 

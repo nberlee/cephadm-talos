@@ -111,7 +111,7 @@ func TestMgrFilesOnlyOnMgrHosts(t *testing.T) {
 	h1, _ := o.St.Host("h1")
 	h2, _ := o.St.Host("h2")
 
-	on, off := names(o.hostDocs(h1)), names(o.hostDocs(h2))
+	on, off := names(mustDocs(t)(o.hostDocs(h1))), names(mustDocs(t)(o.hostDocs(h2)))
 
 	for _, f := range append([]string{agentCAFile, mgrCertFile, mgrKeyFile, mgrServerCertFile, mgrServerKeyFile}, mgrmodule.Names()...) {
 		if on[f] != "write" || off[f] != "delete" {
@@ -209,6 +209,11 @@ func TestModuleChangeRestartsTheMgrs(t *testing.T) {
 
 	h := state.Host{Name: "h1", Addr: "node"}
 	if err := o.ensureAgentCert(&h); err != nil {
+		t.Fatal(err)
+	}
+
+	// as deployMgr does: the mgr's certificates before the mgr
+	if err := o.ensureMgrCerts(&h, true); err != nil {
 		t.Fatal(err)
 	}
 

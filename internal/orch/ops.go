@@ -3,9 +3,7 @@ package orch
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -21,8 +19,8 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/nberlee/cephadm-talos/internal/daemons"
-	"github.com/nberlee/cephadm-talos/internal/mgrmodule"
 	"github.com/nberlee/cephadm-talos/internal/records"
+	"github.com/nberlee/cephadm-talos/internal/render"
 	"github.com/nberlee/cephadm-talos/internal/spec"
 	"github.com/nberlee/cephadm-talos/internal/state"
 	"github.com/nberlee/cephadm-talos/internal/talos"
@@ -347,11 +345,7 @@ func jobEnv(doc *spec.ContainerConfig, key string) string {
 }
 
 // jobInputs identifies what a job does, so the same id with other inputs is refused.
-func jobInputs(parts ...string) string {
-	h := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
-
-	return hex.EncodeToString(h[:])
-}
+func jobInputs(parts ...string) string { return render.JobInputs(parts...) }
 
 // Shell runs a ceph command (or any shell command) as an admin job and prints the output.
 func (o *Orch) Shell(ctx context.Context, host string, cmd []string, timeout time.Duration) (int, error) {
@@ -819,10 +813,7 @@ func (o *Orch) zap(ctx context.Context, h state.Host, device, serial string) err
 
 // zapDoc renders the job that zaps a device, bound to its serial.
 func (o *Orch) zapDoc(h state.Host, id, device, serial string) *spec.ContainerConfig {
-	return daemons.Zap(daemons.Params{
-		Name: o.St.DocName(state.Daemon{Type: "job", ID: id}), Image: o.St.Image, FSID: o.St.FSID, ID: "job",
-		Device: device, DiskSerial: serial,
-	}, id, jobInputs("zap", h.Name, device, serial))
+	return render.Zap(o.St, h, id, device, serial)
 }
 
 // osdIfExists runs a command for an OSD only if that very OSD (id and uuid)
@@ -1029,59 +1020,9 @@ func (o *Orch) Redeploy(ctx context.Context, name string) error {
 	return nil
 }
 
-// redeployDoc re-renders the document of an existing daemon. Its data dir is
-// already initialised, so the mon mode and keyrings only matter for a fresh start.
+// redeployDoc re-renders the document of an existing daemon (internal/render).
 func (o *Orch) redeployDoc(d state.Daemon, h state.Host, image string) (*spec.ContainerConfig, error) {
-	p := daemons.Params{Name: o.St.DocName(d), Image: image, FSID: o.St.FSID, ID: d.ID, Addr: h.Addr, Device: d.OSDDevice(), DeployID: d.DeployID, OSDUUID: d.OSDUUID}
-	if d.OSDID != nil {
-		p.OSDID = *d.OSDID
-	}
-
-	switch d.Type {
-	case state.TypeMon:
-		monKey, err := o.key("mon.")
-		if err != nil {
-			return nil, err
-		}
-
-		p.Keyring = daemons.MonKeyring(monKey)
-		p.Mode = "join"
-		p.Addrv = monAddrv(h.Addr)
-		p.DeployID = d.DeployID
-
-		return daemons.Mon(p), nil
-	case state.TypeMgr:
-		k, err := o.key("mgr." + d.ID)
-		if err != nil {
-			return nil, err
-		}
-
-		p.Keyring = daemons.Keyring("mgr."+d.ID, k)
-
-		return daemons.Mgr(p, mgrmodule.Names()...), nil
-	case state.TypeOSD:
-		// no key: activation takes the OSD's own key from the label
-		p.Device = d.OSDDevice()
-
-		return daemons.OSD(p), nil
-	case state.TypeRGW:
-		k, err := o.key("client.rgw." + d.ID)
-		if err != nil {
-			return nil, err
-		}
-
-		p.Keyring = daemons.Keyring("client.rgw."+d.ID, k)
-		p.Port, p.TLSPEM = o.St.RGW.Port, o.St.RGW.Cert+o.St.RGW.Key
-
-		return daemons.RGW(p), nil
-	case state.TypeVIP:
-		o.vipParams(&p, d)
-
-		// keepalived has its own image and does not follow `upgrade`
-		return daemons.VIP(p, o.St.RGW.KeepalivedImage), nil
-	}
-
-	return nil, fmt.Errorf("unknown daemon type %q", d.Type)
+	return render.Daemon(o.St, h, d, image, o.key)
 }
 
 // Hosts prints the host inventory.
