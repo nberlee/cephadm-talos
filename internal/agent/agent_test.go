@@ -200,7 +200,9 @@ func TestMutualTLS(t *testing.T) {
 	cfg, err := TLSConfig([]byte(caCert), []byte(srvCert), []byte(srvKey))
 	must(t, err)
 
-	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) }))
+	// the agent's own handler: its TLS admits the cluster's roles, /status serves the mgr only
+	a := &Agent{rec: &Record{Schema: Schema, Containers: map[string]Container{}}}
+	srv := httptest.NewUnstartedServer(a.Handler())
 	srv.TLS = cfg
 	srv.StartTLS()
 	t.Cleanup(srv.Close)
@@ -220,12 +222,16 @@ func TestMutualTLS(t *testing.T) {
 
 		cl := &http.Client{Transport: &http.Transport{TLSClientConfig: tc}, Timeout: 5 * time.Second}
 
-		resp, err := cl.Get(srv.URL)
+		resp, err := cl.Get(srv.URL + "/status")
 		if err != nil {
 			return err
 		}
 
 		defer resp.Body.Close() //nolint:errcheck
+
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("status %d", resp.StatusCode)
+		}
 
 		return nil
 	}

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/siderolabs/talos/pkg/machinery/client"
 	"github.com/siderolabs/talos/pkg/machinery/config/types/runtime"
@@ -378,5 +379,43 @@ func TestApplyRunsThePolicy(t *testing.T) {
 
 	if cp.n != 0 {
 		t.Fatalf("%d patches reached Talos", cp.n)
+	}
+}
+
+// delayedPatch stalls inside Patch, as a slow config read there would.
+type delayedPatch struct {
+	*talos.Client
+	d time.Duration
+}
+
+func (p delayedPatch) Patch(ctx context.Context, node string, patches ...[]byte) error {
+	time.Sleep(p.d)
+
+	return p.Client.Patch(ctx, node, patches...)
+}
+
+func TestApplyDeadlineInsidePatch(t *testing.T) {
+	n, tc := testNode(t)
+	ctx := context.Background()
+
+	_, err := n.Adopt(ctx, 1)
+	must(t, err)
+
+	n.Talos = delayedPatch{tc, 150 * time.Millisecond}
+
+	before, _ := tc.MachineConfig(ctx, "")
+
+	_, err = n.ApplyBefore(ctx, time.Now().Add(100*time.Millisecond), 2, []Doc{{Kind: "EtcFileConfig", Name: "ceph/ceph.conf", YAML: render(t, conf("10.5.0.3"))}})
+	if !errors.Is(err, ErrNotApplied) || !errors.Is(err, talos.ErrApplyDeadline) {
+		t.Fatalf("apply past its deadline: %v", err)
+	}
+
+	if after, _ := tc.MachineConfig(ctx, ""); after != before {
+		t.Fatal("the config changed")
+	}
+
+	// nothing was sent: no uncertain outcome
+	if st := n.Status(ctx); st.State != "owned" || st.Revision != 1 {
+		t.Fatalf("status %+v", st)
 	}
 }

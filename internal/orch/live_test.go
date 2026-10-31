@@ -159,7 +159,7 @@ func TestLiveAgentStatus(t *testing.T) {
 			continue
 		}
 
-		t.Logf("%s: records %s, node %+v, %d containers", h.Name, rec.Records, *rec.Node, len(rec.Containers))
+		t.Logf("%s: records %s, node %+v, %d containers, observed %s", h.Name, rec.Records, *rec.Node, len(rec.Containers), rec.ObservedAt.Format(time.RFC3339))
 	}
 }
 

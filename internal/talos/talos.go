@@ -72,6 +72,18 @@ type Client struct {
 // ErrNotFound is returned when a resource does not exist on the node.
 var ErrNotFound = errors.New("not found")
 
+// ErrApplyDeadline is returned by Patch when the deadline set with
+// WithApplyBefore passed before the config was sent: nothing was applied.
+var ErrApplyDeadline = errors.New("apply deadline passed before the config was sent")
+
+type applyBeforeKey struct{}
+
+// WithApplyBefore makes Patch send the config only before until: a change the
+// agent may make only while a confirmation counts (plan 03, item 5).
+func WithApplyBefore(ctx context.Context, until time.Time) context.Context {
+	return context.WithValue(ctx, applyBeforeKey{}, until)
+}
+
 // ErrExecNotStarted is returned when Talos did not start an exec'd command:
 // the container is not running, or stopped while the command was set up.
 var ErrExecNotStarted = errors.New("command not started")
@@ -242,6 +254,11 @@ func (c *Client) Patch(ctx context.Context, node string, patches ...[]byte) erro
 	data, err := out.Bytes()
 	if err != nil {
 		return err
+	}
+
+	// the last moment before anything reaches the node
+	if until, ok := ctx.Value(applyBeforeKey{}).(time.Time); ok && !time.Now().Before(until) {
+		return ErrApplyDeadline
 	}
 
 	resp, err := cl.ApplyConfiguration(nctx, &machine.ApplyConfigurationRequest{

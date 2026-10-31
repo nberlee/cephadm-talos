@@ -89,6 +89,8 @@ type Agent struct {
 	Records *records.Store
 	// Node applies the node's Ceph documents (plan 03); nil in tests that do not need it
 	Node *Node
+	// Granter serves grants, operation lookups and the handoff (plan 03); nil serves none
+	Granter *Granter
 
 	logPrint func(format string, args ...any)
 	// refresh replaces observe in tests
@@ -277,7 +279,22 @@ func (a *Agent) Handler() http.Handler {
 		mux.HandleFunc("POST /v1/heartbeat", a.Channel.HandleHeartbeat)
 	}
 
+	if a.Granter != nil {
+		mux.HandleFunc("POST /v1/grant", a.Granter.HandleGrant)
+		mux.HandleFunc("GET /v1/operations/{id}", a.Granter.HandleOperation)
+		mux.HandleFunc("POST /v1/handoff", a.Granter.HandleHandoff)
+	}
+
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
+		// the status is the mgr module's
+		if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+			if id, err := pki.CertIdentity(r.TLS.PeerCertificates[0]); err != nil || id.Role != pki.RoleMgr {
+				http.Error(w, "the status is served to the mgr only", http.StatusForbidden)
+
+				return
+			}
+		}
+
 		if r.URL.Query().Get("refresh") == "1" {
 			if err := a.Refresh(r.Context(), true); err != nil {
 				return // the client went away
@@ -329,7 +346,8 @@ func TLSConfig(caPEM, certPEM, keyPEM []byte) (*tls.Config, error) {
 		return nil, err
 	}
 
-	// the agent's own identity names its cluster; only that cluster's mgrs may call it
+	// the agent's own identity names its cluster; only that cluster's mgrs,
+	// agents (the leader) and operator may call it, each handler checks the role
 	own, err := pki.CertIdentity(leaf)
 	if err != nil || own.Role != pki.RoleAgent {
 		return nil, fmt.Errorf("agent certificate is not an agent's: %v %v", own, err)
@@ -345,9 +363,19 @@ func TLSConfig(caPEM, certPEM, keyPEM []byte) (*tls.Config, error) {
 				return errors.New("no client certificate")
 			}
 
-			_, err := pki.Require(cs.PeerCertificates[0], pki.Identity{FSID: own.FSID, Role: pki.RoleMgr})
+			id, err := pki.CertIdentity(cs.PeerCertificates[0])
+			if err != nil {
+				return err
+			}
 
-			return err
+			switch {
+			case id.FSID != own.FSID:
+				return errors.New("a client of another cluster")
+			case id.Role != pki.RoleMgr && id.Role != pki.RoleAgent && id.Role != pki.RoleOperator:
+				return fmt.Errorf("role %s may not call an agent", id.Role)
+			}
+
+			return nil
 		},
 	}, nil
 }
@@ -363,9 +391,9 @@ func envPEM(name string) ([]byte, error) {
 
 // Main runs the agent in its container until ctx is done.
 func Main(ctx context.Context) error {
-	var pems [3][]byte
+	var pems [5][]byte
 
-	for i, name := range []string{daemons.EnvCA, daemons.EnvCert, daemons.EnvKey} {
+	for i, name := range []string{daemons.EnvCA, daemons.EnvCert, daemons.EnvKey, daemons.EnvClientCert, daemons.EnvClientKey} {
 		b, err := envPEM(name)
 		if err != nil {
 			return err
@@ -402,15 +430,19 @@ func Main(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	recs := &records.Store{Dir: filepath.Join(records.Mount, records.RecordsDir)}
-	a := &Agent{
-		Talos: tc, Life: ctx, Channel: ch, Records: recs,
-		Node: &Node{Talos: tc, Records: recs, FSID: self.FSID, Host: self.Name, Policy: &Policy{
-			// from the agent's own document, which only the CLI writes; no
-			// repositories admit no image
-			FSID: self.FSID, Host: self.Name, CACert: string(pems[0]), Repos: strings.Fields(os.Getenv(daemons.EnvImageRepos)),
-		}},
+	// the client side, for the module's confirmations
+	clientTLS, err := ClientTLSConfig(pems[0], pems[3], pems[4])
+	if err != nil {
+		return err
 	}
+
+	recs := &records.Store{Dir: filepath.Join(records.Mount, records.RecordsDir)}
+	node := &Node{Talos: tc, Records: recs, FSID: self.FSID, Host: self.Name, Policy: &Policy{
+		// from the agent's own document, which only the CLI writes; no
+		// repositories admit no image
+		FSID: self.FSID, Host: self.Name, CACert: string(pems[0]), Repos: strings.Fields(os.Getenv(daemons.EnvImageRepos)),
+	}}
+	a := &Agent{Talos: tc, Life: ctx, Channel: ch, Records: recs, Node: node, Granter: NewGranter(node, ch, clientTLS, recs)}
 
 	var wg sync.WaitGroup
 

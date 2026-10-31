@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/siderolabs/talos/pkg/machinery/config/config"
 	"github.com/siderolabs/talos/pkg/machinery/config/configloader"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/nberlee/cephadm-talos/internal/records"
 	"github.com/nberlee/cephadm-talos/internal/state"
+	"github.com/nberlee/cephadm-talos/internal/talos"
 )
 
 // The agent is the only writer of its node's Ceph documents (plan 03, item 7).
@@ -80,6 +82,9 @@ type NodeStatus struct {
 
 // maxDrift is how many drift entries the status lists.
 const maxDrift = 32
+
+// ErrNotApplied means Apply refused before anything reached Talos.
+var ErrNotApplied = errors.New("not applied")
 
 // ErrDrift means the node's documents are not the ones the agent recorded.
 var ErrDrift = errors.New("drift")
@@ -467,11 +472,31 @@ func (n *Node) Adopt(ctx context.Context, revision int64) (Ownership, error) {
 // the cluster's or are the CLI's. The intent is recorded before the apply and
 // the new ownership, from the config read back, after it.
 func (n *Node) Apply(ctx context.Context, revision int64, docs []Doc) (Ownership, error) {
+	return n.ApplyBefore(ctx, time.Time{}, revision, docs)
+}
+
+// ApplyBefore is Apply that changes nothing unless the patch starts before
+// until (zero: no limit): a confirmation counts only that long (plan 03,
+// item 5), and the lock, the reads and the admission take time.
+func (n *Node) ApplyBefore(ctx context.Context, until time.Time, revision int64, docs []Doc) (Ownership, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
+	own, started, err := n.apply(ctx, until, revision, docs)
+	if err != nil && !started {
+		// refused before the intent was recorded: nothing reached Talos
+		return Ownership{}, fmt.Errorf("%w: %w", ErrNotApplied, err)
+	}
+
+	return own, err
+}
+
+// apply is Apply under the lock; started reports whether the intent was
+// recorded, after which an error leaves the outcome uncertain.
+func (n *Node) apply(ctx context.Context, until time.Time, revision int64, docs []Doc) (own Ownership, started bool, err error) {
+
 	if err := n.Records.Check(); err != nil {
-		return Ownership{}, err
+		return Ownership{}, started, err
 	}
 
 	var intent applyIntent
@@ -481,20 +506,20 @@ func (n *Node) Apply(ctx context.Context, revision int64, docs []Doc) (Ownership
 			err = fmt.Errorf("the apply of revision %d has an uncertain outcome", intent.Revision)
 		}
 
-		return Ownership{}, err
+		return Ownership{}, started, err
 	}
 
 	own, found, err := n.ownership()
 	if err != nil {
-		return Ownership{}, err
+		return Ownership{}, started, err
 	}
 
 	if !found {
-		return Ownership{}, errors.New("the node has not been handed over")
+		return Ownership{}, started, errors.New("the node has not been handed over")
 	}
 
 	if revision <= own.Revision {
-		return Ownership{}, fmt.Errorf("revision %d is not newer than %d", revision, own.Revision)
+		return Ownership{}, started, fmt.Errorf("revision %d is not newer than %d", revision, own.Revision)
 	}
 
 	sent := map[string]string{}
@@ -506,11 +531,11 @@ func (n *Node) Apply(ctx context.Context, revision int64, docs []Doc) (Ownership
 		k := d.Key()
 
 		if !n.cluster(d.Kind, d.Name) || n.handoff(k) {
-			return Ownership{}, fmt.Errorf("%s is not a document the agent applies", k)
+			return Ownership{}, started, fmt.Errorf("%s is not a document the agent applies", k)
 		}
 
 		if _, dup := sent[k]; dup {
-			return Ownership{}, fmt.Errorf("%s twice in revision %d", k, revision)
+			return Ownership{}, started, fmt.Errorf("%s twice in revision %d", k, revision)
 		}
 
 		sent[k] = ""
@@ -519,7 +544,7 @@ func (n *Node) Apply(ctx context.Context, revision int64, docs []Doc) (Ownership
 		// of the same name, the delete makes the new one replace the old
 		del, err := yaml.Marshal(map[string]string{"apiVersion": "v1alpha1", "kind": d.Kind, "name": d.Name, "$patch": "delete"})
 		if err != nil {
-			return Ownership{}, err
+			return Ownership{}, started, err
 		}
 
 		dels.WriteString("---\n")
@@ -528,7 +553,7 @@ func (n *Node) Apply(ctx context.Context, revision int64, docs []Doc) (Ownership
 		if d.YAML != nil {
 			td, err := checkDoc(d)
 			if err != nil {
-				return Ownership{}, fmt.Errorf("%s: %w", k, err)
+				return Ownership{}, started, fmt.Errorf("%s: %w", k, err)
 			}
 
 			// what is sent is Talos's own encoding of the checked document
@@ -542,43 +567,62 @@ func (n *Node) Apply(ctx context.Context, revision int64, docs []Doc) (Ownership
 
 	cfg, err := n.Talos.MachineConfig(ctx, "")
 	if err != nil {
-		return Ownership{}, err
+		return Ownership{}, started, err
 	}
 
 	cur, err := parseDocs(cfg)
 	if err != nil {
-		return Ownership{}, err
+		return Ownership{}, started, err
 	}
 
 	if d := n.drift(own, cur); len(d) > 0 {
-		return Ownership{}, fmt.Errorf("%w: %s", ErrDrift, strings.Join(d, ", "))
+		return Ownership{}, started, fmt.Errorf("%w: %s", ErrDrift, strings.Join(d, ", "))
 	}
 
 	// every document must pass the admission policy (plan 03, item 13)
 	if err := n.admit(ctx, docs, typed, cur, sent); err != nil {
-		return Ownership{}, err
+		return Ownership{}, started, err
+	}
+
+	// the mutation boundary: the confirmation must still count
+	if !until.IsZero() && !time.Now().Before(until) {
+		return Ownership{}, started, errors.New("the confirmation expired before the apply")
 	}
 
 	if err := n.writeJSON(applyRecord, applyIntent{Schema: ownershipSchema, Revision: revision, Before: own.Docs, Sent: sent}); err != nil {
-		return Ownership{}, err
+		return Ownership{}, started, err
 	}
+
+	started = true
 
 	patches := [][]byte{dels.Bytes()}
 	if adds.Len() > 0 {
 		patches = append(patches, adds.Bytes())
 	}
 
-	if err := n.Talos.Patch(ctx, "", patches...); err != nil {
+	pctx := ctx
+	if !until.IsZero() {
+		pctx = talos.WithApplyBefore(ctx, until)
+	}
+
+	if err := n.Talos.Patch(pctx, "", patches...); errors.Is(err, talos.ErrApplyDeadline) {
+		// nothing was sent: the intent goes, the outcome is certain
+		if rerr := n.Records.Remove(applyRecord); rerr != nil {
+			return Ownership{}, started, rerr
+		}
+
+		return Ownership{}, false, err
+	} else if err != nil {
 		// the intent stays: whether Talos took the config is not known
-		return Ownership{}, fmt.Errorf("apply revision %d: %w", revision, err)
+		return Ownership{}, started, fmt.Errorf("apply revision %d: %w", revision, err)
 	}
 
 	if cfg, err = n.Talos.MachineConfig(ctx, ""); err != nil {
-		return Ownership{}, err
+		return Ownership{}, started, err
 	}
 
 	if cur, err = parseDocs(cfg); err != nil {
-		return Ownership{}, err
+		return Ownership{}, started, err
 	}
 
 	next := Ownership{Schema: ownershipSchema, Revision: revision, Docs: map[string]string{}}
@@ -597,12 +641,12 @@ func (n *Node) Apply(ctx context.Context, revision int64, docs []Doc) (Ownership
 	// the node must now hold exactly what was sent and kept: anything else is
 	// another writer between the patch and this read, and the intent stays
 	if d := n.drift(next, cur); len(d) > 0 {
-		return Ownership{}, fmt.Errorf("apply revision %d: %w afterwards: %s", revision, ErrDrift, strings.Join(d, ", "))
+		return Ownership{}, started, fmt.Errorf("apply revision %d: %w afterwards: %s", revision, ErrDrift, strings.Join(d, ", "))
 	}
 
 	if err := n.writeJSON(ownershipRecord, next); err != nil {
-		return Ownership{}, err
+		return Ownership{}, started, err
 	}
 
-	return next, n.Records.Remove(applyRecord)
+	return next, started, n.Records.Remove(applyRecord)
 }
