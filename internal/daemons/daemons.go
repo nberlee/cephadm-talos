@@ -50,6 +50,17 @@ type Params struct {
 	DependsOn  []string
 }
 
+// Daemons restart after RestartDelay, backing off to RestartMaxDelay (plan 03,
+// item 12).
+const (
+	RestartDelay    = 5 * time.Second
+	RestartMaxDelay = 2 * time.Minute
+)
+
+// RGWStopTimeout lets radosgw drain: rgw_exit_timeout_secs (120s by default)
+// plus 10s. With rgw_graceful_stop it finishes requests in flight first.
+const RGWStopTimeout = 130 * time.Second
+
 // rawScript returns an embedded script without common.sh, for a job's command.
 func rawScript(name string) string {
 	b, err := scripts.ReadFile("scripts/" + name + ".sh")
@@ -96,6 +107,8 @@ func base(p Params, typ string) *spec.ContainerConfig {
 		spec.Tmpfs("/var/log/ceph"),
 	}
 	c.NetworkConfig = spec.HostNetwork()
+	// a crash loop (an OSD started before the mons have quorum) backs off in Talos
+	c.RestartConfig = spec.RestartBackoff(RestartDelay, RestartMaxDelay)
 	c.DependsOnConfig = &container.ContainerDependsOn{
 		NetworksConfig:   []string{"addresses"},
 		TimeConfig:       boolPtr(true),
@@ -164,11 +177,14 @@ func RGW(p Params) *spec.ContainerConfig {
 		"TLS_PEM="+base64.StdEncoding.EncodeToString([]byte(p.TLSPEM)))
 	// no capabilities except binding a port below 1024 (443)
 	c.SecurityConfig = spec.Restricted("NET_BIND_SERVICE")
+	c.ContainerStopTimeout = RGWStopTimeout
 
 	return c
 }
 
-// VIP renders a keepalived container holding the RGW virtual IP.
+// VIP renders a keepalived container holding the RGW virtual IP. Its
+// dependency on its host's RGW (p.DependsOn) makes Talos stop it first on a
+// reboot, shutdown or upgrade, so the VIP moves before the RGW drains.
 //
 // It needs NET_ADMIN to add the address and NET_RAW for VRRP and gratuitous ARP.
 // Talos's own VIP can't be used: it elects the holder through etcd.

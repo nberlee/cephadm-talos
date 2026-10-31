@@ -7,6 +7,7 @@ package spec
 import (
 	"bytes"
 	"fmt"
+	"time"
 
 	"github.com/siderolabs/talos/pkg/machinery/config/config"
 	"github.com/siderolabs/talos/pkg/machinery/config/encoder"
@@ -102,6 +103,12 @@ func RecordsVolume() *block.UserVolumeConfigV1Alpha1 {
 // RestartOnFailure restarts a failed container at most maxRetries times.
 func RestartOnFailure(maxRetries int) *container.ContainerRestart {
 	return &container.ContainerRestart{RestartPolicy: config.ContainerRestartPolicyOnFailure, RestartMaxRetries: &maxRetries}
+}
+
+// RestartBackoff restarts a container whenever it exits, after delay, doubling
+// up to maxDelay while it keeps failing.
+func RestartBackoff(delay, maxDelay time.Duration) *container.ContainerRestart {
+	return &container.ContainerRestart{RestartPolicy: config.ContainerRestartPolicyAlways, RestartDelay: &delay, RestartMaxDelay: &maxDelay}
 }
 
 // RestartNever runs a container once per boot.

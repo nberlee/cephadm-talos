@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/nberlee/cephadm-talos/internal/daemons"
 	"github.com/nberlee/cephadm-talos/internal/state"
 )
 
@@ -195,5 +196,44 @@ func TestPrepareInputsUseTheStableDevice(t *testing.T) {
 
 	if env(t, c.ContainerEnvironment, "DEVICE") != osd.DevicePath || env(t, c.ContainerEnvironment, "JOB_INPUTS") != OSDPrepareInputs(s, h1, osd) || env(t, c.ContainerEnvironment, "JOB") != osd.DeployID {
 		t.Error("the prepare job does not render its own inputs")
+	}
+}
+
+func TestDaemonDocuments(t *testing.T) {
+	s := testState()
+	s.AddDaemon(state.Daemon{Type: state.TypeRGW, ID: "h1", Host: "h1"})
+	h1, _ := s.Host("h1")
+
+	vip, _ := s.Find("vip.h1")
+
+	c, err := Daemon(s, h1, vip, image, keys)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// keepalived stops before its host's RGW
+	rgwDoc := s.DocName(state.Daemon{Type: state.TypeRGW, ID: "h1"})
+	if deps := c.DependsOnConfig.ContainersConfig; len(deps) != 1 || deps[0].DependencyName != rgwDoc {
+		t.Fatalf("vip dependencies %+v", deps)
+	}
+
+	// daemons back off in Talos; the RGW drains
+	rgw, _ := s.Find("rgw.h1")
+
+	r, err := Daemon(s, h1, rgw, image, keys)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if r.RestartConfig == nil || *r.RestartConfig.RestartDelay != daemons.RestartDelay || *r.RestartConfig.RestartMaxDelay != daemons.RestartMaxDelay || r.ContainerStopTimeout != daemons.RGWStopTimeout {
+		t.Fatalf("rgw restart %+v, stop timeout %s", r.RestartConfig, r.ContainerStopTimeout)
+	}
+
+	// an RGW on its way out is no dependency
+	rgw.LocalOnly = true
+	s.AddDaemon(rgw)
+
+	if c, _ = Daemon(s, h1, vip, image, keys); len(c.DependsOnConfig.ContainersConfig) != 0 {
+		t.Fatalf("dependency on a leaving rgw: %+v", c.DependsOnConfig.ContainersConfig)
 	}
 }

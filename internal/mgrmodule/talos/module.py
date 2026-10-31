@@ -35,7 +35,7 @@ TalosCLICommand = CLICommandBase.make_registry_subtype("TalosCLICommand")
 
 TALOS_DIR = '/etc/ceph/talos'
 INVENTORY_SCHEMA = 1
-RECORD_SCHEMA = 1
+RECORD_SCHEMA = 2
 AGENT_PORT = 4721
 MAX_RECORD = 32 << 10
 POLL_INTERVAL = 30.0
@@ -254,7 +254,8 @@ def validate_record(rec: Any) -> Dict[str, Any]:
         raise ValueError('incomplete status record')
     for name, c in rec['containers'].items():
         if not isinstance(c, dict) or not isinstance(c.get('state', ''), str) or not isinstance(c.get('image_digest', ''), str) \
-                or not isinstance(c.get('restarts', 0), int) or not isinstance(c.get('instances', False), bool):
+                or not isinstance(c.get('restarts', 0), int) or not isinstance(c.get('instances', False), bool) \
+                or not isinstance(c.get('exit_code', 0), int) or isinstance(c.get('exit_code', 0), bool):
             raise ValueError('invalid container %r in status record' % name)
     rec['observed_at'] = parse_time(rec['observed_at'])
     return rec
@@ -269,6 +270,9 @@ STATES = {
     'exited': DaemonDescriptionStatus.error,
     'backoff': DaemonDescriptionStatus.error,
     'stopping': DaemonDescriptionStatus.stopped,
+    # restart policies other than always (plan 03, item 12)
+    'completed': DaemonDescriptionStatus.stopped,
+    'failed': DaemonDescriptionStatus.error,
 }
 
 
@@ -290,7 +294,10 @@ def daemon_status(daemon: Dict[str, Any], host: Dict[str, Any], obs: Tuple[Optio
     if not c.get('state'):
         return DaemonDescriptionStatus.stopped, 'stopping', c
     status = STATES.get(c['state'], DaemonDescriptionStatus.unknown)
-    return status, c['state'], c
+    desc = c['state']
+    if desc in ('completed', 'failed', 'exited', 'backoff') and c.get('exit_code'):
+        desc = '%s (exit %d)' % (desc, c['exit_code'])
+    return status, desc, c
 
 
 def build_daemons(inv: Dict[str, Any], observations: Dict[str, Tuple[Optional[Dict[str, Any]], str]],

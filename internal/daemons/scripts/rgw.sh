@@ -5,4 +5,5 @@ keyring "$D/keyring"
 log "starting rgw.$ID on https port $PORT"
 exec radosgw -f -n "client.rgw.$ID" --keyring "$D/keyring" \
 	--rgw-frontends "beast ssl_port=$PORT ssl_certificate=/tmp/rgw.pem" \
+	--rgw_graceful_stop=true \
 	--default-log-to-file=false --default-log-to-stderr=true

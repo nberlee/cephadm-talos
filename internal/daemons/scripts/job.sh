@@ -3,7 +3,6 @@
 # the jobs directory of the cephadm-talos volume. Talos runs it again after a
 # reboot: a job that finds its result reports it and does nothing; one that
 # finds only its started record reports "uncertain" and does not run again.
-trap - EXIT
 J="$JOBS/$FSID.$JOB"
 
 # put FILE: write stdin to FILE atomically (temporary file, fsync, rename, fsync dir)

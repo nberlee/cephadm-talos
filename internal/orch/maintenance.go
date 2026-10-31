@@ -3,6 +3,7 @@ package orch
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -94,6 +95,10 @@ func (o *Orch) MaintenanceEnter(ctx context.Context, name string, force bool) er
 
 	// all documents are deleted and waited for, not only those with a status left:
 	// a status vanishes with its document before the process has exited
+
+	// keepalived first: it depends on its host's RGW, which Talos does not let
+	// go before it, and the VIP should move before the RGW stops anyway
+	sort.SliceStable(daemons, func(i, j int) bool { return daemons[i].Type == state.TypeVIP && daemons[j].Type != state.TypeVIP })
 
 	for _, d := range daemons {
 		o.printf("stopping %s\n", displayName(d))

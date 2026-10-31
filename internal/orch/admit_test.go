@@ -406,3 +406,84 @@ func TestDryRunOSDDeployRenders(t *testing.T) {
 		}
 	}
 }
+
+// Removing an RGW updates its host's keepalived in the same apply: Talos
+// refuses a config that names a missing container.
+func TestRemovingAnRGWDropsTheVIPDependency(t *testing.T) {
+	f := talostest.New(t, images())
+	o := fakeOrch(t, f)
+	ctx := context.Background()
+
+	pol := policyOrch(t)
+	o.St.Image, o.St.RGW, o.St.Keys = pol.St.Image, pol.St.RGW, pol.St.Keys
+	o.St.AddHost(state.Host{Name: "h1", Addr: "node"})
+
+	rgw := state.Daemon{Type: state.TypeRGW, ID: "h1", Host: "h1"}
+	vip := state.Daemon{Type: state.TypeVIP, ID: "h1", Host: "h1"}
+	o.St.AddDaemon(rgw)
+	o.St.AddDaemon(vip)
+
+	h, _ := o.St.Host("h1")
+
+	r, err := o.redeployDoc(rgw, h, o.St.Image)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	v, err := o.redeployDoc(vip, h, o.St.Image)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := o.apply(ctx, "node", r, v); err != nil {
+		t.Fatal(err)
+	}
+
+	// the RGW alone cannot go
+	if err := o.remove(ctx, "node", o.St.DocName(rgw)); err == nil {
+		t.Fatal("Talos took a config naming a missing container")
+	}
+
+	if err := o.removeDoc(ctx, h, rgw); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := o.Talos.MachineConfig(ctx, "node")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if strings.Contains(cfg, "name: "+o.St.DocName(rgw)+"\n") || !strings.Contains(cfg, "name: "+o.St.DocName(vip)) {
+		t.Fatalf("after removing the rgw:\n%s", cfg)
+	}
+}
+
+// A host in maintenance has neither document: removing its RGW starts no keepalived.
+func TestRemovingAnRGWInMaintenanceKeepsTheVIPStopped(t *testing.T) {
+	f := talostest.New(t, images())
+	o := fakeOrch(t, f)
+	ctx := context.Background()
+
+	pol := policyOrch(t)
+	o.St.Image, o.St.RGW, o.St.Keys = pol.St.Image, pol.St.RGW, pol.St.Keys
+	o.St.AddHost(state.Host{Name: "h1", Addr: "node", Maintenance: true})
+
+	rgw := state.Daemon{Type: state.TypeRGW, ID: "h1", Host: "h1"}
+	vip := state.Daemon{Type: state.TypeVIP, ID: "h1", Host: "h1"}
+	o.St.AddDaemon(rgw)
+	o.St.AddDaemon(vip)
+
+	h, _ := o.St.Host("h1")
+	if err := o.removeDoc(ctx, h, rgw); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := o.Talos.MachineConfig(ctx, "node")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if strings.Contains(cfg, o.St.DocName(vip)) {
+		t.Fatalf("keepalived started on a host in maintenance:\n%s", cfg)
+	}
+}

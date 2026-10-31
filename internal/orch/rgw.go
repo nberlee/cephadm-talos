@@ -450,6 +450,22 @@ func (o *Orch) rollRGWHost(ctx context.Context, h state.Host, image string, opts
 			}
 		} else {
 			o.printf("warning: no other vip host with a serving rgw; S3 through the VIP is interrupted while rgw on %s restarts\n", h.Name)
+
+			// keepalived depends on the rgw, which Talos does not let go first:
+			// for a forced replacement it stops too and comes back after
+			if forceRGW {
+				for _, doc := range vipDocs {
+					if err := o.remove(ctx, h.Addr, doc.MetaName); err != nil {
+						return false, err
+					}
+
+					if err := o.waitGone(ctx, h.Addr, doc.MetaName, 2*time.Minute); err != nil {
+						return true, err
+					}
+				}
+
+				drain = true
+			}
 		}
 	}
 

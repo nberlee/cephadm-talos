@@ -146,6 +146,13 @@ func Daemon(s *state.State, h state.Host, d state.Daemon, image string, key Key)
 
 		vipParams(s, &p, d)
 
+		// stopped before its host's RGW, so the VIP moves first (plan 03, item 12)
+		for _, r := range s.DaemonsOf(state.TypeRGW, h.Name) {
+			if !r.LocalOnly && !r.Purged {
+				p.DependsOn = append(p.DependsOn, s.DocName(r))
+			}
+		}
+
 		// keepalived has its own image and does not follow upgrades
 		return daemons.VIP(p, s.RGW.KeepalivedImage), nil
 	}

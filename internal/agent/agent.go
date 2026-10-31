@@ -33,8 +33,9 @@ import (
 // Port is the agent's HTTPS port (cephadm's agent port).
 const Port = 4721
 
-// Schema is the version of the status record.
-const Schema = 1
+// Schema is the version of the status record: 2 adds the exit code of a
+// container that exited (completed, failed, exited, backoff).
+const Schema = 2
 
 // MaxRecord is the largest status record the agent serves.
 const MaxRecord = 32 << 10
@@ -51,6 +52,7 @@ type Container struct {
 	State       string `json:"state,omitempty"` // Talos state; empty if there is no ContainerStatus
 	ImageDigest string `json:"image_digest,omitempty"`
 	Restarts    uint64 `json:"restarts"`
+	ExitCode    int32  `json:"exit_code,omitempty"`
 	Instances   bool   `json:"instances"` // an instance (process) is left
 }
 
@@ -227,7 +229,7 @@ func (a *Agent) observe(ctx context.Context) error {
 
 	for name, s := range statuses {
 		c := rec.Containers[name]
-		c.State, c.ImageDigest, c.Restarts = s.State.String(), s.Image, s.RestartCount
+		c.State, c.ImageDigest, c.Restarts, c.ExitCode = s.State.String(), s.Image, s.RestartCount, s.ExitCode
 		rec.Containers[name] = c
 	}
 

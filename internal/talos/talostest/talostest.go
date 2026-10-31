@@ -178,6 +178,20 @@ func (f *Node) ApplyConfiguration(_ context.Context, req *machine.ApplyConfigura
 		return nil, err
 	}
 
+	// as machined validates: a dependency must name a configured container
+	names := map[string]bool{}
+	for _, c := range p.ContainerConfigs() {
+		names[c.Name()] = true
+	}
+
+	for _, c := range p.ContainerConfigs() {
+		for _, dep := range c.DependsOn().Containers() {
+			if !names[dep.Name()] {
+				return nil, status.Errorf(codes.InvalidArgument, "container %q depends on container %q, which is not configured", c.Name(), dep.Name())
+			}
+		}
+	}
+
 	f.Mu.Lock()
 	f.Applied = append(f.Applied, req.Data)
 	f.Mu.Unlock()

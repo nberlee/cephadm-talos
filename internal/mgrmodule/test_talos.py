@@ -70,7 +70,7 @@ def inventory(**extra):
 
 
 def record(containers, observed=NOW):
-    return {'schema': 1, 'hostname': 'h', 'talos_version': 'v1.15.0', 'observed_at': observed, 'containers': containers}
+    return {'schema': 2, 'hostname': 'h', 'talos_version': 'v1.15.0', 'observed_at': observed, 'containers': containers}
 
 
 class StatusMapping(unittest.TestCase):
@@ -222,20 +222,34 @@ class Inventory(unittest.TestCase):
         self.assertEqual(details['agent_cert_expiry'], '2029-10-28T00:00:00Z')
 
 
+class ExitStates(unittest.TestCase):
+    def test_completed_and_failed(self):
+        d = {'doc_name': 'ceph-f-job-x', 'host': 'h1'}
+        for state, code, want, desc in (('completed', 0, m.DaemonDescriptionStatus.stopped, 'completed'),
+                                        ('failed', 3, m.DaemonDescriptionStatus.error, 'failed (exit 3)')):
+            rec = m.validate_record(record({'ceph-f-job-x': {'state': state, 'exit_code': code}}, NOW.isoformat()))
+            status, got, _ = m.daemon_status(d, {}, (rec, ''), NOW)
+            self.assertEqual((status, got), (want, desc))
+
+
 class BadParts(unittest.TestCase):
     def test_malformed_container_rejects_only_that_host(self):
         with self.assertRaises(ValueError):
-            m.validate_record({'schema': 1, 'observed_at': '2026-10-28T12:00:00Z', 'containers': {'x': []}})
+            m.validate_record({'schema': 2, 'observed_at': '2026-10-28T12:00:00Z', 'containers': {'x': []}})
         with self.assertRaises(ValueError):
-            m.validate_record({'schema': 1, 'observed_at': '2026-10-28T12:00:00Z', 'containers': {'x': {'restarts': 'two'}}})
+            m.validate_record({'schema': 2, 'observed_at': '2026-10-28T12:00:00Z', 'containers': {'x': {'restarts': 'two'}}})
+        with self.assertRaises(ValueError):
+            m.validate_record({'schema': 2, 'observed_at': '2026-10-28T12:00:00Z', 'containers': {'x': {'exit_code': '3'}}})
+        with self.assertRaises(ValueError):
+            m.validate_record({'schema': 1, 'observed_at': '2026-10-28T12:00:00Z', 'containers': {}})
 
         calls = []
 
         def fetch(addr, refresh):
             calls.append(addr)
             if addr == '10.5.0.3':
-                return m.validate_record({'schema': 1, 'observed_at': '2026-10-28T12:00:00Z', 'containers': {'x': []}})
-            return m.validate_record({'schema': 1, 'observed_at': NOW.isoformat(), 'containers': {'ceph-f-mon-h1': {'state': 'running'}}})
+                return m.validate_record({'schema': 2, 'observed_at': '2026-10-28T12:00:00Z', 'containers': {'x': []}})
+            return m.validate_record({'schema': 2, 'observed_at': NOW.isoformat(), 'containers': {'ceph-f-mon-h1': {'state': 'running'}}})
 
         p = m.Poller(fetch)
         self.addCleanup(p.shutdown)
@@ -287,7 +301,7 @@ class OversizedRecord(unittest.TestCase):
         def fetch(addr, refresh):
             if addr == '10.5.0.3':  # the oversized agent
                 return m.fetch_record('127.0.0.1', client)
-            return m.validate_record({'schema': 1, 'observed_at': NOW.isoformat(), 'containers': {'ceph-f-mon-h1': {'state': 'running'}}})
+            return m.validate_record({'schema': 2, 'observed_at': NOW.isoformat(), 'containers': {'ceph-f-mon-h1': {'state': 'running'}}})
 
         p = m.Poller(fetch)
         self.addCleanup(p.shutdown)
@@ -310,7 +324,7 @@ class OverlappingPolls(unittest.TestCase):
             if not refresh:
                 slow.wait(1)
             order.append(('end', refresh))
-            return m.validate_record({'schema': 1, 'observed_at': NOW.isoformat(), 'containers': {'r' if refresh else 'b': {}}})
+            return m.validate_record({'schema': 2, 'observed_at': NOW.isoformat(), 'containers': {'r' if refresh else 'b': {}}})
 
         p = m.Poller(fetch)
         self.addCleanup(p.shutdown)
@@ -377,7 +391,7 @@ class Deadline(unittest.TestCase):
 
 class Records(unittest.TestCase):
     def test_validate(self):
-        rec = m.validate_record({'schema': 1, 'observed_at': '2026-10-28T12:00:00.123456789Z', 'containers': {}})
+        rec = m.validate_record({'schema': 2, 'observed_at': '2026-10-28T12:00:00.123456789Z', 'containers': {}})
         self.assertEqual(rec['observed_at'].microsecond, 123456)
         for bad in ({'schema': 2, 'observed_at': 'x', 'containers': {}}, {'schema': 1, 'containers': {}}, []):
             with self.assertRaises(ValueError):

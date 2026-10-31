@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -603,7 +604,7 @@ func (o *Orch) Remove(ctx context.Context, name string, force, zap bool) error {
 
 	o.printf("stopping %s on %s\n", displayName(d), h.Name)
 
-	if err := o.remove(ctx, h.Addr, o.St.DocName(d)); err != nil {
+	if err := o.removeDoc(ctx, h, d); err != nil {
 		return err
 	}
 
@@ -675,6 +676,43 @@ func (o *Orch) Remove(ctx context.Context, name string, force, zap bool) error {
 	}
 
 	return nil
+}
+
+// removeDoc deletes a daemon's document. An RGW's host keepalived depends on
+// it, and Talos refuses a config that names a missing container: that
+// keepalived is rendered without the dependency in the same apply.
+func (o *Orch) removeDoc(ctx context.Context, h state.Host, d state.Daemon) error {
+	var vips []any
+
+	if d.Type == state.TypeRGW {
+		// only a keepalived the node has: one stopped for maintenance stays stopped
+		configured, err := o.configuredContainers(ctx, h.Addr, "ceph-"+o.St.Short()+"-")
+		if err != nil {
+			return err
+		}
+
+		without := *o.St
+		without.Daemons = slices.DeleteFunc(slices.Clone(o.St.Daemons), func(x state.Daemon) bool { return x.Type == d.Type && x.ID == d.ID })
+
+		for _, v := range without.DaemonsOf(state.TypeVIP, h.Name) {
+			if v.LocalOnly || v.Purged || !slices.Contains(configured, o.St.DocName(v)) {
+				continue
+			}
+
+			doc, err := render.Daemon(&without, h, v, o.St.Image, o.key)
+			if err != nil {
+				return err
+			}
+
+			vips = append(vips, doc)
+		}
+	}
+
+	if len(vips) == 0 {
+		return o.remove(ctx, h.Addr, o.St.DocName(d))
+	}
+
+	return o.apply(ctx, h.Addr, append(vips, spec.Delete("ContainerConfig", o.St.DocName(d)))...)
 }
 
 // RemoveCluster removes every document of this cluster from every host, like
