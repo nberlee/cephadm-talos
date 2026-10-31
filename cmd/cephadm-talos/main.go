@@ -48,6 +48,7 @@ Commands:
   rm [--force] [--zap] <daemon>            remove a daemon (osd: out, safe-to-destroy, purge)
   upgrade --image IMG [--refresh]          rolling image upgrade: mons, mgrs, osds
   shell [--host H] -- <cmd...>             run a command with the admin keyring on a node
+  handoff                                  hand the nodes to their agents and the state to the leader
   rm-cluster [--zap] --yes-i-really-mean-it  remove the whole cluster from all hosts
   conf                                     print the generated ceph.conf
   agent                                    run the node agent (inside its container)
@@ -158,6 +159,22 @@ func run() error {
 		return rmCluster(ctx, o, args)
 	}
 
+	// once a leader owns the cluster state the CLI reads it and changes
+	// nothing itself (plan 03, step 6): changes go through `ceph orch`
+	if o.Managed() {
+		switch cmd {
+		case "ps", "ls", "conf", "logs", "shell", "handoff":
+		case "host":
+			if len(args) == 0 || args[0] != "ls" {
+				return orch.ErrManaged
+			}
+		default:
+			return orch.ErrManaged
+		}
+
+		return runCommand(ctx, o, cmd, args)
+	}
+
 	// agent certificates are renewed on every command, also read-only ones,
 	// and host documents that did not reach every host (ceph.conf, renewed
 	// certificates) are retried: until plan 03 the CLI is the only place
@@ -190,6 +207,11 @@ func run() error {
 		}
 	}
 
+	return runCommand(ctx, o, cmd, args)
+}
+
+// runCommand runs one command on the opened cluster.
+func runCommand(ctx context.Context, o *orch.Orch, cmd string, args []string) error {
 	switch cmd {
 	case "host":
 		if len(args) == 0 {
@@ -338,6 +360,8 @@ func run() error {
 		}
 
 		os.Exit(rc)
+	case "handoff":
+		return o.Handoff(ctx)
 	case "conf":
 		fmt.Print(o.CephConf())
 

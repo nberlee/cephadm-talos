@@ -78,6 +78,7 @@ func newLeaderSetup(t *testing.T) *leaderSetup {
 	st.AddHost(state.Host{Name: "h0", Addr: "10.5.0.2"})
 	st.AddHost(state.Host{Name: "h1", Addr: "10.5.0.3"})
 	st.AddDaemon(state.Daemon{Type: state.TypeMon, ID: "h1", Host: "h1", DeployID: "0123456789abcdef"})
+	st.Sealed = true // handed over
 
 	publish(t, l, st)
 
@@ -765,5 +766,93 @@ func TestUncertainIsAskedAgain(t *testing.T) {
 
 	if op := s.op(t, "r1"); op.State != "completed" {
 		t.Fatalf("uncertain not asked again: %+v", op)
+	}
+}
+
+func TestTheLeaderPublishesItsBaseline(t *testing.T) {
+	s := newLeaderSetup(t)
+	ctx := context.Background()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	s.module.mu.Lock()
+	raw := s.module.kv[JournalPrefix(42)+"takeover"]
+	s.module.mu.Unlock()
+
+	var to Takeover
+	if json.Unmarshal([]byte(raw), &to) != nil || !to.Published || to.From != "cli" || to.FromSeq == 0 {
+		t.Fatalf("takeover %s", raw)
+	}
+
+	// the same records, under the incarnation
+	b := s.leader.bridge()
+
+	own, _, err := s.leader.readRecords(ctx, b, "42")
+	must(t, err)
+
+	cli, _, err := s.leader.readRecords(ctx, b, "cli")
+	must(t, err)
+
+	for name, rec := range cli {
+		if string(own[name]) != string(rec) {
+			t.Errorf("record %s differs", name)
+		}
+	}
+
+	// from now on the leader reads its own: a later CLI publication is not its state
+	h, _ := s.st.Host("h1")
+	h.Maintenance = true
+	s.st.AddHost(h)
+	publish(t, s.leader, s.st)
+
+	s.request("r1", `{"version":1,"kind":"revision","host":"h1"}`)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if op := s.op(t, "r1"); op.State != "completed" {
+		t.Fatalf("revision from the leader's own state: %+v", op)
+	}
+
+	// a successor takes its baseline from this incarnation, not from "cli"
+	s.leader.Channel.mu.Lock()
+	s.leader.Channel.leader = &Leader{Mgr: "h0", GID: 30, Epoch: 9, At: time.Now()}
+	s.leader.Channel.mu.Unlock()
+
+	must(t, s.leader.Tick(ctx, 30, 9))
+
+	s.module.mu.Lock()
+	raw = s.module.kv[JournalPrefix(30)+"takeover"]
+	s.module.mu.Unlock()
+
+	if json.Unmarshal([]byte(raw), &to) != nil || to.From != "42" {
+		t.Fatalf("successor's takeover %s", raw)
+	}
+}
+
+func TestTheLeaderWaitsForTheHandoff(t *testing.T) {
+	s := newLeaderSetup(t)
+	ctx := context.Background()
+
+	s.st.Sealed = false
+	publish(t, s.leader, s.st)
+
+	s.request("r1", `{"version":1,"kind":"revision","host":"h1"}`)
+
+	if err := s.leader.Tick(ctx, 42, 5); !errors.Is(err, errRetry) {
+		t.Fatalf("tick before the handoff: %v", err)
+	}
+
+	s.module.mu.Lock()
+	_, published := s.module.kv[store.Prefix+"inc/42/manifest/"]
+	n := 0
+
+	for k := range s.module.kv {
+		if strings.HasPrefix(k, store.Prefix+"inc/42/") {
+			n++
+		}
+	}
+	s.module.mu.Unlock()
+
+	if published || n != 1 || s.agent.patches.n != 0 {
+		t.Fatalf("the leader acted before the handoff: %d keys of its own, %d patches", n, s.agent.patches.n)
 	}
 }

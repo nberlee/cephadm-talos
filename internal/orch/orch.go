@@ -49,11 +49,27 @@ type Orch struct {
 	st *store.Store
 	// opened: the cluster's state was read from its mons
 	opened bool
+	// incarnation is the one the state was read from: "cli", or a leader's
+	incarnation string
+	// sealed, handingOver: the state read was handed over, or being handed over
+	sealed, handingOver bool
+	// handoff lets the handoff itself save while the state is being handed over
+	handoff bool
 	// StoreBackend replaces config-key through exec (tests)
 	StoreBackend store.Backend
 	// AuthGet replaces `auth get` through exec (tests)
 	AuthGet func(entity string) (key string, found bool, err error)
 }
+
+// Managed reports whether the leader owns the cluster state (plan 03, step
+// 6): once the CLI sealed its state with a handoff, and once a leader
+// published its own. The CLI then only reads and changes nothing on the nodes.
+func (o *Orch) Managed() bool {
+	return o.incarnation != "" && o.incarnation != Incarnation || o.sealed || o.handingOver
+}
+
+// ErrManaged is returned for a change the leader makes now.
+var ErrManaged = errors.New("the cluster is managed by its leader: change it with `cephadm-talos shell -- ceph orch ...`")
 
 // Incarnation is the store namespace the CLI publishes in until the leader
 // takes over (plan 03, step 4).
@@ -68,6 +84,16 @@ func (o *Orch) Open(ctx context.Context) error {
 	var errs []error
 
 	for _, h := range o.St.Hosts {
+		// the current state: the CLI's, or a leader's once one took over
+		inc, err := o.chooseIncarnation(ctx, h.Addr)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", h.Name, err))
+
+			continue
+		}
+
+		o.incarnation = inc
+
 		if err := o.openStore(ctx, h.Addr); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", h.Name, err))
 
@@ -91,7 +117,7 @@ func (o *Orch) Open(ctx context.Context) error {
 			return err
 		}
 
-		o.opened = true
+		o.opened, o.sealed, o.handingOver = true, o.St.Sealed, o.St.HandingOver
 
 		return nil
 	}
@@ -111,20 +137,28 @@ func (o *Orch) reading() func() {
 	return func() { o.Talos.DryRun = true }
 }
 
+func (o *Orch) storeIncarnation() string {
+	if o.incarnation == "" {
+		return Incarnation
+	}
+
+	return o.incarnation
+}
+
 // openStore opens the store through a Ceph container on node.
 func (o *Orch) openStore(ctx context.Context, node string) error {
 	if o.StoreBackend != nil {
-		o.st = &store.Store{B: o.StoreBackend, Incarnation: Incarnation}
+		o.st = &store.Store{B: o.StoreBackend, Incarnation: o.storeIncarnation()}
 
 		return nil
 	}
 
-	ck, err := o.configKeys(ctx, node, store.Prefix+"inc/"+Incarnation+"/")
+	ck, err := o.configKeys(ctx, node, store.Prefix+"inc/"+o.storeIncarnation()+"/")
 	if err != nil {
 		return err
 	}
 
-	o.st = &store.Store{B: ck, Incarnation: Incarnation}
+	o.st = &store.Store{B: ck, Incarnation: o.storeIncarnation()}
 
 	return nil
 }
@@ -539,6 +573,10 @@ func (o *Orch) addHost(ctx context.Context, addr string, apply bool) (state.Host
 func (o *Orch) save() error {
 	if o.Talos.DryRun {
 		return nil
+	}
+
+	if o.Managed() && !o.handoff {
+		return ErrManaged
 	}
 
 	if err := o.St.Save(); err != nil {

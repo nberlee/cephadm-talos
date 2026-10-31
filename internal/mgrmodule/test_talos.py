@@ -222,6 +222,25 @@ class Inventory(unittest.TestCase):
         self.assertEqual(details['agent_cert_expiry'], '2029-10-28T00:00:00Z')
 
 
+class ChooseIncarnation(unittest.TestCase):
+    def test_choice(self):
+        cli = store_entries(inventory(revision=1))
+        self.assertEqual(m.choose_incarnation(cli, None), 'cli')
+        # a leader that published: the highest epoch wins over the CLI and over gids
+        e = dict(cli)
+        e.update(store_entries(inventory(revision=2), incarnation='90'))
+        e['talos/inc/90/journal/takeover'] = json.dumps({'version': 1, 'epoch': 3})
+        e.update(store_entries(inventory(revision=3), incarnation='42'))
+        e['talos/inc/42/journal/takeover'] = json.dumps({'version': 1, 'epoch': 8})
+        self.assertEqual(m.choose_incarnation(e, None), '42')
+        self.assertEqual(m.inventory_from_store(e, m.choose_incarnation(e, None))['revision'], 3)
+        # this mgr's own, once published
+        self.assertEqual(m.choose_incarnation(e, 90), '90')
+        # a journal without a publication is no state
+        e['talos/inc/77/journal/takeover'] = json.dumps({'version': 1, 'epoch': 20})
+        self.assertEqual(m.choose_incarnation(e, 77), '42')
+
+
 class ExitStates(unittest.TestCase):
     def test_completed_and_failed(self):
         d = {'doc_name': 'ceph-f-job-x', 'host': 'h1'}

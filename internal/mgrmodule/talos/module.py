@@ -75,9 +75,34 @@ def _str(v: Any) -> bool:
 # talos/inc/<incarnation>/manifest/<seq> names base64 chunks of each record.
 STORE_PREFIX = 'talos/inc/'
 STORE_SCHEMA = 1
-# the CLI publishes until the leader takes over (plan 03, step 4)
+# the CLI publishes until the leader takes over (plan 03, step 6)
 INCARNATION = 'cli'
 MODULE_PREFIX = 'mgr/cephadm/'
+
+
+def choose_incarnation(entries: Dict[str, str], own: Optional[int]) -> str:
+    """The incarnation whose cluster state is current, as the CLI and the leader
+    choose it: this mgr's own once it published, else the published one with
+    the highest epoch in its takeover record, else the CLI's."""
+    published = set()
+    for k in entries:
+        if k.startswith(STORE_PREFIX):
+            inc, _, rest = k[len(STORE_PREFIX):].partition('/')
+            if rest.startswith('manifest/'):
+                published.add(inc)
+    if own is not None and str(own) in published:
+        return str(own)
+    best, best_epoch = INCARNATION, -1
+    for inc in published:
+        if not inc.isdigit():
+            continue
+        try:
+            epoch = json.loads(entries.get(STORE_PREFIX + inc + '/journal/takeover', '')).get('epoch')
+        except (ValueError, AttributeError):
+            continue
+        if isinstance(epoch, int) and not isinstance(epoch, bool) and epoch > best_epoch:
+            best, best_epoch = inc, epoch
+    return best
 
 
 def inventory_from_store(entries: Dict[str, str], incarnation: str = INCARNATION) -> Dict[str, Any]:
@@ -416,7 +441,8 @@ class Module(orchestrator.Orchestrator, MgrModule):
         return fetch_record(addr, tls_context(), refresh=refresh, expect=(inv['fsid'], names[0]))
 
     def _inventory(self) -> Dict[str, Any]:
-        return inventory_from_store(self.get_store_prefix(STORE_PREFIX))
+        entries = self.get_store_prefix(STORE_PREFIX)
+        return inventory_from_store(entries, choose_incarnation(entries, getattr(self, '_gid', None)))
 
     def _send_mon(self, result: Any, cmd: str) -> None:
         self.send_command(result, 'mon', '', cmd, '')
@@ -444,6 +470,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
                         channel = c  # only a started channel; a failed start is retried
                     if leadership.capture():
                         gid, epoch = leadership.captured() or (0, 0)
+                        self._gid = gid  # this incarnation's state, once its leader published it
                         nonce = self._heartbeat(inv, gid, epoch, nonce)
                 except InventoryError as e:
                     self.log.warning('%s', e)

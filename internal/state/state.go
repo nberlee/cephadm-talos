@@ -155,6 +155,11 @@ type State struct {
 	// RGWPending lists hosts whose rgw/vip documents (certificate, peers) could
 	// not be updated yet; retried like ConfPending
 	RGWPending []string `json:"rgw_pending,omitempty"`
+	// HandingOver: a handoff started, nodes are being handed to their agents;
+	// Sealed: the CLI handed the cluster over to the leader (plan 03, item 11).
+	// In both the CLI changes nothing but the handoff itself
+	HandingOver bool `json:"-"`
+	Sealed      bool `json:"-"`
 	// Inventory is the revision of the mgr module's inventory record: bumped,
 	// with its time, only when its content changes
 	Inventory InventoryRevision `json:"-"`
@@ -316,6 +321,10 @@ type cluster struct {
 	RGWPending  []string  `json:"rgw_pending,omitempty"`
 
 	Inventory InventoryRevision `json:"inventory"`
+
+	// HandingOver: a handoff started; Sealed: it finished, the CLI writes no more
+	HandingOver bool `json:"handing_over,omitempty"`
+	Sealed      bool `json:"sealed,omitempty"`
 }
 
 // Records returns the cluster's part of the state as store records: what the
@@ -325,6 +334,7 @@ func (s *State) Records() (map[string][]byte, error) {
 	c := cluster{
 		Schema: SchemaVersion, FSID: s.FSID, Image: s.Image, CephVersion: s.CephVersion, Arch: s.Arch,
 		RGW: s.RGW, Published: s.Published, ConfPending: s.ConfPending, RGWPending: s.RGWPending, Inventory: s.Inventory,
+		HandingOver: s.HandingOver, Sealed: s.Sealed,
 	}
 
 	if s.Agent != nil {
@@ -410,7 +420,7 @@ func (s *State) ApplyRecords(recs map[string][]byte) error {
 
 	s.Image, s.CephVersion, s.Arch, s.RGW, s.Published = c.Image, c.CephVersion, c.Arch, c.RGW, c.Published
 	s.ConfPending, s.RGWPending, s.Hosts, s.Daemons = c.ConfPending, c.RGWPending, hosts, daemons
-	s.Inventory = c.Inventory
+	s.Inventory, s.HandingOver, s.Sealed = c.Inventory, c.HandingOver, c.Sealed
 	s.Agent = c.Agent
 
 	if s.Agent != nil && operator != nil {

@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -159,4 +161,107 @@ func (c *execKeys) Mutate(ctx context.Context, ops []store.Op) error {
 	}
 
 	return nil
+}
+
+// incarnationsScript prints which incarnations published a cluster state, the
+// epochs in their takeover records and the active mgr's gid, from one
+// librados session: config-key ls lists keys only.
+const incarnationsScript = `
+import json, sys, rados
+r = rados.Rados(conffile='/etc/ceph/ceph.conf')
+r.conf_parse_env()
+r.connect()
+try:
+    prefix = sys.argv[1]
+    ret, out, outs = r.mon_command(json.dumps({'prefix': 'config-key ls', 'format': 'json'}), b'')
+    if ret != 0:
+        sys.exit('config-key ls: %s (%d)' % (outs, ret))
+    published, epochs = set(), {}
+    for k in json.loads(out):
+        if not k.startswith(prefix):
+            continue
+        inc, _, rest = k[len(prefix):].partition('/')
+        if rest.startswith('manifest/'):
+            published.add(inc)
+        elif rest == 'journal/takeover':
+            ret, val, outs = r.mon_command(json.dumps({'prefix': 'config-key get', 'key': k}), b'')
+            if ret == 0:
+                try:
+                    epochs[inc] = json.loads(val).get('epoch')
+                except (ValueError, AttributeError):
+                    pass
+    ret, out, outs = r.mon_command(json.dumps({'prefix': 'mgr dump', 'format': 'json'}), b'')
+    if ret != 0:
+        sys.exit('mgr dump: %s (%d)' % (outs, ret))
+    json.dump({'published': sorted(published), 'epochs': epochs, 'active_gid': json.loads(out).get('active_gid')}, sys.stdout)
+finally:
+    r.shutdown()
+`
+
+// chooseIncarnation picks the incarnation whose cluster state is current, as
+// the leader and the module choose it (module.py choose_incarnation): the
+// active mgr's once it published, else the published one with the highest
+// takeover epoch, else the CLI's.
+func (o *Orch) chooseIncarnation(ctx context.Context, node string) (string, error) {
+	if o.StoreBackend != nil {
+		return Incarnation, nil // tests: the CLI's
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, configKeyTimeout)
+	defer cancel()
+
+	var out, errb bytes.Buffer
+
+	ek := &execKeys{o: o, node: node}
+
+	rc, err := ek.exec(ctx, []string{"python3", "-c", incarnationsScript, store.Prefix + "inc/"}, nil, &out, &errb)
+	if err != nil {
+		return "", err
+	}
+
+	if rc != 0 {
+		return "", fmt.Errorf("listing the cluster state's incarnations: rc %d: %s", rc, strings.TrimSpace(errb.String()))
+	}
+
+	var res struct {
+		Published []string       `json:"published"`
+		Epochs    map[string]any `json:"epochs"`
+		ActiveGID json.Number    `json:"active_gid"`
+	}
+
+	dec := json.NewDecoder(&out)
+	dec.UseNumber()
+
+	if err := dec.Decode(&res); err != nil {
+		return "", fmt.Errorf("listing the cluster state's incarnations: %w", err)
+	}
+
+	return pickIncarnation(res.Published, res.Epochs, res.ActiveGID.String()), nil
+}
+
+// pickIncarnation is the choice of chooseIncarnation.
+func pickIncarnation(published []string, epochs map[string]any, active string) string {
+	if slices.Contains(published, active) {
+		return active
+	}
+
+	best, bestEpoch := Incarnation, int64(-1)
+
+	for _, inc := range published {
+		if _, err := strconv.ParseInt(inc, 10, 64); err != nil {
+			continue
+		}
+
+		n, ok := epochs[inc].(json.Number)
+		if !ok {
+			continue
+		}
+
+		e, err := n.Int64()
+		if err == nil && e > bestEpoch {
+			best, bestEpoch = inc, e
+		}
+	}
+
+	return best
 }

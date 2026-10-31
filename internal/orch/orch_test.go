@@ -1,11 +1,16 @@
 package orch
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
 	"strings"
 	"testing"
 
 	"github.com/nberlee/cephadm-talos/internal/spec"
 	"github.com/nberlee/cephadm-talos/internal/state"
+	"github.com/nberlee/cephadm-talos/internal/talos/talostest"
 )
 
 func TestVersionAtLeast(t *testing.T) {
@@ -107,5 +112,102 @@ func TestLastVIPStart(t *testing.T) {
 
 	if m, ok := lastVIPStart(logs + "(rgw) Entering MASTER STATE\n"); m != "2-7" || !ok {
 		t.Fatalf("got %q %v", m, ok)
+	}
+}
+
+func TestPickIncarnation(t *testing.T) {
+	num := func(n string) json.Number { return json.Number(n) }
+
+	for _, c := range []struct {
+		published []string
+		epochs    map[string]any
+		active    string
+		want      string
+	}{
+		{nil, nil, "42", "cli"},
+		{[]string{"cli"}, nil, "42", "cli"},
+		// the active mgr's own, once published
+		{[]string{"cli", "42", "90"}, map[string]any{"42": num("8"), "90": num("3")}, "90", "90"},
+		// else the highest epoch, not the highest gid
+		{[]string{"cli", "42", "90"}, map[string]any{"42": num("8"), "90": num("3")}, "7", "42"},
+		// a journal without a takeover epoch does not count
+		{[]string{"cli", "42"}, map[string]any{}, "7", "cli"},
+	} {
+		if got := pickIncarnation(c.published, c.epochs, c.active); got != c.want {
+			t.Errorf("%v %v active %s: %s, want %s", c.published, c.epochs, c.active, got, c.want)
+		}
+	}
+}
+
+func TestTheCLIWritesNothingUnderALeader(t *testing.T) {
+	o := fakeOrch(t, talostest.New(t))
+	o.incarnation = "42"
+
+	if !o.Managed() || !errors.Is(o.save(), ErrManaged) {
+		t.Fatal("the CLI saved state under a leader")
+	}
+}
+
+func TestHandoffSealsTheState(t *testing.T) {
+	o := fakeOrch(t, talostest.New(t, images()))
+	ctx := context.Background()
+
+	if err := o.setupAgent(ctx, "node", "registry/agent:dev", false); err != nil {
+		t.Fatal(err)
+	}
+
+	// documents still owed to a node stop it
+	o.St.ConfPending = []string{"h1"}
+	if err := o.Handoff(ctx); err == nil {
+		t.Fatal("handoff with pending documents")
+	}
+
+	o.St.ConfPending = nil
+
+	if err := o.Handoff(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// the next command reads a sealed state: it changes nothing
+	st := reload(t, o)
+	st.Hosts = []state.Host{{Name: "contact"}} // Open needs a node to go through
+
+	next := &Orch{Talos: o.Talos, St: st, Out: io.Discard, StoreBackend: o.StoreBackend, AuthGet: noAuth}
+	if err := next.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if !next.St.Sealed || !next.Managed() || !errors.Is(next.save(), ErrManaged) {
+		t.Fatalf("sealed %v managed %v", next.St.Sealed, next.Managed())
+	}
+
+	if err := next.Handoff(ctx); err == nil {
+		t.Fatal("handed over twice")
+	}
+}
+
+// A handoff that stops half-way blocks the CLI's changes until it is run again.
+func TestAHalfHandoffBlocksTheCLI(t *testing.T) {
+	o := fakeOrch(t, talostest.New(t, images()))
+	ctx := context.Background()
+
+	if err := o.setupAgent(ctx, "node", "registry/agent:dev", false); err != nil {
+		t.Fatal(err)
+	}
+
+	// an agent that does not answer: the handoff stops after recording itself
+	h := state.Host{Name: "h1", Addr: "127.0.0.1:1"}
+	if err := o.ensureAgentCert(&h); err != nil {
+		t.Fatal(err)
+	}
+
+	o.St.AddHost(h)
+
+	if err := o.Handoff(ctx); err == nil {
+		t.Fatal("handoff with an agent that does not answer")
+	}
+
+	if !o.St.HandingOver || o.St.Sealed || !o.Managed() || !errors.Is(o.save(), ErrManaged) {
+		t.Fatalf("after a half handoff: handing over %v sealed %v", o.St.HandingOver, o.St.Sealed)
 	}
 }

@@ -89,6 +89,11 @@ type Takeover struct {
 	Epoch    int64    `json:"epoch"`
 	Closed   []string `json:"closed"`
 	Imported bool     `json:"imported"`
+	// Published: the cluster state is under this incarnation, copied from
+	// From's publication FromSeq; from then on this incarnation writes it
+	Published bool   `json:"published"`
+	From      string `json:"from,omitempty"`
+	FromSeq   int64  `json:"from_seq,omitempty"`
 }
 
 // JournalPrefix is an incarnation's journal in config-key.
@@ -111,6 +116,9 @@ type LeaderLoop struct {
 	bridgeAddr string
 	// closed are the hosts whose earlier sessions this incarnation closed
 	closed map[string]bool
+	// stateInc is the incarnation the cluster state is read from: the
+	// leader's own once it published its baseline
+	stateInc string
 	// agentURL returns a host's agent; tests replace it
 	agentURL func(h state.Host) string
 	now      func() time.Time
@@ -211,6 +219,11 @@ func (l *LeaderLoop) Tick(ctx context.Context, gid, epoch int64) error {
 		l.closed[h] = true
 	}
 
+	// requests are carried out on this incarnation's own state only
+	if !to.Published {
+		return nil
+	}
+
 	// every id with a request or an operation: an imported grant is resolved
 	// even without its request
 	keys, err := js.List(ctx, prefix)
@@ -266,6 +279,26 @@ func (l *LeaderLoop) takeover(ctx context.Context, b *Bridge, js store.Backend, 
 		to = Takeover{Version: journalVersion, Epoch: epoch, Closed: []string{}}
 	}
 
+	own := strconv.FormatInt(gid, 10)
+
+	// a publication of this incarnation is its state, whatever the record says
+	if !to.Published {
+		if _, err := l.latest(ctx, b, own); err == nil {
+			to.Published = true
+		} else if !errors.Is(err, store.ErrNotFound) {
+			return to, err
+		}
+	}
+
+	src := own
+	if !to.Published {
+		if src, err = l.stateSource(ctx, b, epoch); err != nil {
+			return to, err
+		}
+	}
+
+	l.stateInc = src
+
 	st, _, err := l.clusterState(ctx, b)
 	if err != nil {
 		return to, err
@@ -302,6 +335,35 @@ func (l *LeaderLoop) takeover(ctx context.Context, b *Bridge, js store.Backend, 
 		}
 
 		to.Imported, changed = true, true
+	}
+
+	// the baseline: the state as its source last published it, now this
+	// incarnation's to write (plan 03, item 4)
+	if !to.Published && to.Imported && l.stillLeader(gid, epoch) {
+		// the takeover record, with this incarnation's epoch, is there before
+		// its first manifest: whoever finds the manifest can order it
+		if err := writeJSONKey(ctx, js, key, to); err != nil {
+			return to, err
+		}
+
+		recs, seq, err := l.readRecords(ctx, b, src)
+		if err != nil {
+			return to, err
+		}
+
+		bs, err := b.Store(ctx, store.Prefix+"inc/"+own+"/")
+		if err != nil {
+			return to, err
+		}
+
+		if _, err := (store.Store{B: bs, Incarnation: own}).Publish(ctx, recs); err != nil {
+			return to, err
+		}
+
+		l.log("published the cluster state of %s (publication %d) as incarnation %s", src, seq, own)
+
+		to.Published, to.From, to.FromSeq, changed = true, src, seq, true
+		l.stateInc = own
 	}
 
 	if changed {
@@ -531,18 +593,92 @@ func (l *LeaderLoop) request(ctx context.Context, b *Bridge, js store.Backend, g
 	return l.revision(ctx, b, js, gid, epoch, id, req.Host)
 }
 
-// clusterState reads the cluster state the CLI publishes ("cli"), retrying
-// from a fresh manifest: the CLI may compact while the leader reads.
-func (l *LeaderLoop) clusterState(ctx context.Context, b *Bridge) (*state.State, int64, error) {
+// stateSource is where a new incarnation takes its baseline from: the
+// predecessor with the highest epoch below its own that published a state,
+// else the CLI's ("cli").
+func (l *LeaderLoop) stateSource(ctx context.Context, b *Bridge, epoch int64) (string, error) {
+	all, err := b.Store(ctx, store.Prefix+"inc/")
+	if err != nil {
+		return "", err
+	}
+
+	keys, err := all.List(ctx, store.Prefix+"inc/")
+	if err != nil {
+		return "", err
+	}
+
+	published := map[string]bool{}
+
+	for _, k := range keys {
+		inc, rest, ok := strings.Cut(strings.TrimPrefix(k, store.Prefix+"inc/"), "/")
+		if ok && strings.HasPrefix(rest, "manifest/") {
+			published[inc] = true
+		}
+	}
+
+	best, bestEpoch := "cli", int64(-1)
+
+	for inc := range published {
+		if _, err := strconv.ParseInt(inc, 10, 64); err != nil {
+			continue
+		}
+
+		to, found, err := readJSONKey[Takeover](ctx, all, store.Prefix+"inc/"+inc+"/journal/takeover")
+		if err != nil {
+			return "", err
+		}
+
+		if found && to.Epoch < epoch && to.Epoch > bestEpoch {
+			best, bestEpoch = inc, to.Epoch
+		}
+	}
+
+	if best == "cli" {
+		if !published["cli"] {
+			return "", fmt.Errorf("%w: no cluster state has been published", errRetry)
+		}
+
+		// the CLI's state is the leader's only once the CLI handed it over:
+		// sealed, it is frozen and the CLI writes no more (plan 03, item 11)
+		recs, _, err := l.readRecords(ctx, b, "cli")
+		if err != nil {
+			return "", err
+		}
+
+		var c struct {
+			Sealed bool `json:"sealed"`
+		}
+
+		if err := json.Unmarshal(recs["cluster"], &c); err != nil || !c.Sealed {
+			return "", fmt.Errorf("%w: the CLI has not handed the cluster over yet", errRetry)
+		}
+	}
+
+	return best, nil
+}
+
+// latest returns an incarnation's latest manifest.
+func (l *LeaderLoop) latest(ctx context.Context, b *Bridge, inc string) (store.Manifest, error) {
+	bs, err := b.Store(ctx, store.Prefix+"inc/"+inc+"/")
+	if err != nil {
+		return store.Manifest{}, err
+	}
+
+	return store.Store{B: bs, Incarnation: inc}.Latest(ctx)
+}
+
+// readRecords reads an incarnation's latest publication, retrying from a
+// fresh manifest: "cli" may still compact while the leader reads it.
+func (l *LeaderLoop) readRecords(ctx context.Context, b *Bridge, inc string) (map[string][]byte, int64, error) {
 	var lastErr error
 
 	for range 3 {
-		bs, err := b.Store(ctx, store.Prefix+"inc/cli/")
+		bs, err := b.Store(ctx, store.Prefix+"inc/"+inc+"/")
 		if err != nil {
 			return nil, 0, err
 		}
 
-		s := store.Store{B: bs, Incarnation: "cli"}
+		s := store.Store{B: bs, Incarnation: inc}
 
 		m, err := s.Latest(ctx)
 		if err != nil {
@@ -565,15 +701,31 @@ func (l *LeaderLoop) clusterState(ctx context.Context, b *Bridge) (*state.State,
 			continue
 		}
 
-		st := state.New(l.Self.FSID)
-		if err := st.ApplyRecords(recs); err != nil {
-			return nil, 0, err
-		}
-
-		return st, m.Seq, nil
+		return recs, m.Seq, nil
 	}
 
-	return nil, 0, fmt.Errorf("reading the cluster state: %w", lastErr)
+	return nil, 0, fmt.Errorf("reading the cluster state of %s: %w", inc, lastErr)
+}
+
+// clusterState reads the cluster state: the leader's own once it published
+// its baseline, its source before.
+func (l *LeaderLoop) clusterState(ctx context.Context, b *Bridge) (*state.State, int64, error) {
+	inc := l.stateInc
+	if inc == "" {
+		return nil, 0, errors.New("no cluster state chosen yet")
+	}
+
+	recs, seq, err := l.readRecords(ctx, b, inc)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	st := state.New(l.Self.FSID)
+	if err := st.ApplyRecords(recs); err != nil {
+		return nil, 0, err
+	}
+
+	return st, seq, nil
 }
 
 // agentClient talks to a host's agent and requires its certificate.
