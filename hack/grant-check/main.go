@@ -1,7 +1,7 @@
 // grant-check exercises grants on a running cluster from the workstation
 // (plan 03, step 4): it hands a node to its agent with the operator
 // certificate, then acts as the leader with the mgr host's agent certificate:
-// it reads the active mgr's gid through the bridge and grants the node an
+// it reads the active mgr's gid with `ceph mgr dump` through exec and grants the node an
 // image probe and then its removal, each confirmed by the module. It reads
 // the CLI state, so it is a test tool only. The node stays handed over.
 //
@@ -67,7 +67,13 @@ func run(mgrHost, target string) error {
 	tc := &talos.Client{Default: talos.Conn{Talosconfig: st.Talosconfig, Context: st.Context}}
 	defer tc.Close() //nolint:errcheck
 
-	if err := (&orch.Orch{Talos: tc, St: st, Out: os.Stderr}).Open(context.Background()); err != nil {
+	o := &orch.Orch{Talos: tc, St: st, Out: os.Stderr}
+	if err := o.Open(context.Background()); err != nil {
+		return err
+	}
+
+	// the agents' keys are secrets: this tool acts as the operator and the leader
+	if err := o.LoadSecrets(context.Background()); err != nil {
 		return err
 	}
 
@@ -108,16 +114,9 @@ func run(mgrHost, target string) error {
 		return err
 	}
 
-	cfg, err := agent.ClientTLSConfig([]byte(st.Agent.CACert), []byte(mgr.AgentClientCert), []byte(mgr.AgentClientKey))
-	if err != nil {
-		return err
-	}
-
-	b := &agent.Bridge{TLS: cfg, Addr: mgr.Addr, Mgr: mgr.Name, FSID: st.FSID}
-
-	id, _ := agent.NewDispatchID()
-
-	res, err := b.Call(context.Background(), id, "mgr dump", nil, 5*time.Second)
+	// the bridge serves only the agent on the mgr's host, on loopback: the gid
+	// comes from the mons through exec
+	res, err := o.Job(context.Background(), mgr.Addr, "ceph mgr dump --format json", time.Minute)
 	if err != nil {
 		return err
 	}
@@ -127,7 +126,7 @@ func run(mgrHost, target string) error {
 		ActiveName string `json:"active_name"`
 	}
 
-	if err := json.Unmarshal([]byte(res.Out), &dump); err != nil || dump.ActiveName != mgr.Name {
+	if err := json.Unmarshal([]byte(res.Output), &dump); err != nil || dump.ActiveName != mgr.Name {
 		return fmt.Errorf("mgr dump: active %q: %v", dump.ActiveName, err)
 	}
 

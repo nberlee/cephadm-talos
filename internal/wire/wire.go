@@ -16,8 +16,11 @@ const Version = 1
 const (
 	// AgentPort serves the agent's status and the module's heartbeats.
 	AgentPort = 4721
-	// ModulePort serves confirmations and the bridge, in the active mgr.
+	// ModulePort serves confirmations, in the active mgr, on all interfaces.
 	ModulePort = 4722
+	// BridgePort serves the bridge to the local agent, in the active mgr, on
+	// loopback only.
+	BridgePort = 4723
 )
 
 // Heartbeat is what the module in the active mgr sends its local agent every 5

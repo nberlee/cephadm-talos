@@ -36,10 +36,10 @@ func newLeaderSetup(t *testing.T) *leaderSetup {
 	m := &fakeBridge{kv: map[string]string{}, outcomes: map[string]map[string]any{}, page: 1000, fsid: testFSID}
 	host, port := m.serve(t, ca, "h0")
 
-	old := dialPort
-	dialPort = func() string { return port }
+	oldDial, oldBridge := dialPort, bridgePort
+	dialPort, bridgePort = func() string { return port }, func() string { return port }
 
-	t.Cleanup(func() { dialPort = old })
+	t.Cleanup(func() { dialPort, bridgePort = oldDial, oldBridge })
 
 	cc, ck := ca.pair(pki.RoleAgent, "h0", x509.ExtKeyUsageClientAuth, testFSID)
 	clientTLS, err := ClientTLSConfig([]byte(ca.cert), []byte(cc), []byte(ck))
@@ -80,7 +80,7 @@ func newLeaderSetup(t *testing.T) *leaderSetup {
 	st.AddDaemon(state.Daemon{Type: state.TypeMon, ID: "h1", Host: "h1", DeployID: "0123456789abcdef"})
 	st.Sealed = true // handed over
 
-	publish(t, l, st)
+	publish(t, l, m, st)
 
 	// the active mgr on h0 heartbeats its agent: the leader of gid 42
 	ch.mu.Lock()
@@ -89,13 +89,31 @@ func newLeaderSetup(t *testing.T) *leaderSetup {
 
 	setup.leader, setup.module, setup.st = l, m, st
 
+	// from here the module's incarnation writes only below its own namespace
+	m.mu.Lock()
+	m.own = "42"
+	m.mu.Unlock()
+
 	return setup
 }
 
-func publish(t *testing.T, l *LeaderLoop, st *state.State) {
+// publish publishes st as the CLI does, under "cli", which the module's own
+// incarnation may not write.
+func publish(t *testing.T, l *LeaderLoop, m *fakeBridge, st *state.State) {
 	t.Helper()
 
 	ctx := context.Background()
+
+	m.mu.Lock()
+	own := m.own
+	m.own = ""
+	m.mu.Unlock()
+
+	defer func() {
+		m.mu.Lock()
+		m.own = own
+		m.mu.Unlock()
+	}()
 
 	bs, err := l.bridge().Store(ctx, store.Prefix+"inc/cli/")
 	must(t, err)
@@ -193,7 +211,7 @@ func TestLeaderRendersMgrKeysFromTheSecrets(t *testing.T) {
 	s.st.Agent = &state.Agent{CACert: ca.cert}
 	s.agent.Node.Policy.CACert, s.leader.CACert = ca.cert, ca.cert // the agents trust the same CA
 	s.st.AddDaemon(state.Daemon{Type: state.TypeMgr, ID: "h1", Host: "h1"})
-	publish(t, s.leader, s.st)
+	publish(t, s.leader, s.module, s.st)
 
 	s.module.mu.Lock()
 	for k, v := range s.module.kv {
@@ -522,7 +540,7 @@ func TestLeaderLeavesMaintenanceHostsAlone(t *testing.T) {
 	h, _ := s.st.Host("h1")
 	h.Maintenance = true
 	s.st.AddHost(h)
-	publish(t, s.leader, s.st)
+	publish(t, s.leader, s.module, s.st)
 
 	s.request("r1", `{"version":1,"kind":"revision","host":"h1"}`)
 	must(t, s.leader.Tick(ctx, 42, 5))
@@ -571,7 +589,7 @@ func TestLeaderDoesNotRestartLeavingDaemons(t *testing.T) {
 	mon.LocalOnly = true
 	s.st.AddDaemon(mon)
 	s.st.AddDaemon(state.Daemon{Type: state.TypeMgr, ID: "h1", Host: "h1", Purged: true})
-	publish(t, s.leader, s.st)
+	publish(t, s.leader, s.module, s.st)
 
 	s.request("r1", `{"version":1,"kind":"revision","host":"h1"}`)
 	must(t, s.leader.Tick(ctx, 42, 5))
@@ -856,7 +874,7 @@ func TestTheLeaderPublishesItsBaseline(t *testing.T) {
 	h, _ := s.st.Host("h1")
 	h.Maintenance = true
 	s.st.AddHost(h)
-	publish(t, s.leader, s.st)
+	publish(t, s.leader, s.module, s.st)
 
 	s.request("r1", `{"version":1,"kind":"revision","host":"h1"}`)
 	must(t, s.leader.Tick(ctx, 42, 5))
@@ -869,6 +887,10 @@ func TestTheLeaderPublishesItsBaseline(t *testing.T) {
 	s.leader.Channel.mu.Lock()
 	s.leader.Channel.leader = &Leader{Mgr: "h0", GID: 30, Epoch: 9, At: time.Now()}
 	s.leader.Channel.mu.Unlock()
+
+	s.module.mu.Lock()
+	s.module.own = "30" // the successor's module writes below its own incarnation
+	s.module.mu.Unlock()
 
 	must(t, s.leader.Tick(ctx, 30, 9))
 
@@ -886,7 +908,7 @@ func TestTheLeaderWaitsForTheHandoff(t *testing.T) {
 	ctx := context.Background()
 
 	s.st.Sealed = false
-	publish(t, s.leader, s.st)
+	publish(t, s.leader, s.module, s.st)
 
 	s.request("r1", `{"version":1,"kind":"revision","host":"h1"}`)
 

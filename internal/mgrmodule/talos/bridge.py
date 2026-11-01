@@ -34,7 +34,10 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
 WIRE_VERSION = 1
-BRIDGE_PORT = 4722
+# confirmations, for every agent; the bridge, for the local agent only, on loopback
+CONFIRM_PORT = 4722
+BRIDGE_PORT = 4723
+BRIDGE_ADDR = '127.0.0.1'
 MAX_BODY = 64 << 10
 MGR_DUMP_DEADLINE = 5.0
 HEARTBEAT_INTERVAL = 5.0
@@ -309,8 +312,8 @@ class Leadership:
         self.gid: Optional[int] = None
         self.epoch: Optional[int] = None
 
-    def fresh_map(self) -> Optional[Dict[str, Any]]:
-        job = self.commands.submit({'prefix': 'mgr dump', 'format': 'json'})
+    def fresh_map(self, commands: Optional[Commands] = None) -> Optional[Dict[str, Any]]:
+        job = (commands or self.commands).submit({'prefix': 'mgr dump', 'format': 'json'})
         if job is None or not job.ev.wait(MGR_DUMP_DEADLINE) or job.r != 0:
             return None
         return json.loads(job.outb)
@@ -334,12 +337,14 @@ class Leadership:
         with self.lock:
             return None if self.gid is None else (self.gid, self.epoch or 0)
 
-    def still_active(self) -> bool:
-        """A fresh check from the mons that the captured gid is the active one."""
+    def still_active(self, commands: Optional[Commands] = None) -> bool:
+        """A fresh check from the mons that the captured gid is the active one,
+        on commands (default: the leadership's own) so bridge writes do not
+        compete with confirmations and the heartbeat."""
         cap = self.captured()
         if cap is None:
             return False
-        m = self.fresh_map()
+        m = self.fresh_map(commands)
         return m is not None and m.get('active_gid') == cap[0] and m.get('active_name') == self.mgr_id
 
 
@@ -479,6 +484,7 @@ class Channel:
         self.lock = threading.Lock()
         self.records: Dict[str, Record] = {}
         self.server: Optional[Server] = None
+        self.bridge_server: Optional[Server] = None
 
     # --- confirmation -------------------------------------------------------
 
@@ -514,8 +520,16 @@ class Channel:
             m = SECRET_RE.match(args['name'])
             if m and m.group(1) is not None and m.group(1) not in self.mgr_hosts():
                 return 400, {'error': 'secret not allowed'}
-        if self.leadership.captured() is None:
+        cap = self.leadership.captured()
+        if cap is None:
             return 503, {'error': 'no captured incarnation'}
+        # writes go to this incarnation's own namespace only; reads are cluster-wide
+        if call in ('config-key set', 'config-key rm') and not cmd['key'].startswith('%sinc/%d/' % (STORE_PREFIX_FULL, cap[0])):
+            return 400, {'error': 'writes only below this incarnation'}
+        # a change is made only while the mons still show this incarnation active
+        # (checked before, not atomically with, the change)
+        if call not in READ_ONLY and not self.leadership.still_active(self.commands):
+            return 409, {'error': 'not confirmed as the active mgr'}
         rec = Record()
         with self.lock:
             self._expire()
@@ -575,7 +589,9 @@ class Channel:
 
     # --- server -------------------------------------------------------------
 
-    def handler(self) -> Any:
+    def handler(self, local: bool = False) -> Any:
+        """The handler of the public listener (confirmations), or with local
+        that of the loopback listener (the bridge)."""
         channel = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -617,14 +633,14 @@ class Channel:
                     self.reply(400, {'error': str(e)})
                     return
                 try:
-                    if self.path == '/v1/confirm':
+                    if self.path == '/v1/confirm' and not local:
                         try:
                             req = check_confirm_request(req, channel.fsid, name)
                         except ValueError as e:
                             self.reply(400, {'error': str(e)})
                             return
                         self.reply(*channel.confirm(req))
-                    elif self.path == '/v1/bridge':
+                    elif self.path == '/v1/bridge' and local:
                         if name != channel.mgr_id:  # only the local agent, the leader
                             self.reply(403, {'error': 'the bridge serves the local agent only'})
                             return
@@ -645,7 +661,7 @@ class Channel:
                     self.reply(403, {'error': str(e)})
                     return
                 m = re.match(r'\A/v1/bridge/([0-9a-f]{16,128})\Z', self.path)
-                if m is None or name != channel.mgr_id:
+                if m is None or not local or name != channel.mgr_id:
                     self.reply(404, {'error': 'not found'})
                     return
                 self.reply(*channel.outcome(m.group(1)))
@@ -653,23 +669,31 @@ class Channel:
         return Handler
 
     def closing(self) -> bool:
-        return self.server is None or self.server.closed.is_set()
+        return any(srv is None or srv.closed.is_set() for srv in (self.server, self.bridge_server))
 
-    def start(self, port: int = BRIDGE_PORT) -> None:
+    def start(self, port: int = CONFIRM_PORT, bridge_port: int = BRIDGE_PORT) -> None:
+        """Serve confirmations on all interfaces and the bridge on loopback,
+        both with the same TLS context and client certificate checks."""
         if self.ctx is None:
             raise ValueError('no TLS context')
         srv = Server(('', port), self.handler(), self.ctx)
-        self.server = srv
-        threading.Thread(target=srv.serve_forever, kwargs={'poll_interval': 0.5}, name='talos-channel', daemon=True).start()
+        try:
+            local = Server((BRIDGE_ADDR, bridge_port), self.handler(local=True), self.ctx)
+        except Exception:
+            srv.server_close()
+            raise
+        self.server, self.bridge_server = srv, local
+        for s, name in ((srv, 'talos-channel'), (local, 'talos-bridge')):
+            threading.Thread(target=s.serve_forever, kwargs={'poll_interval': 0.5}, name=name, daemon=True).start()
 
     def stop(self) -> None:
         """Close admission and every open connection, stop accepting."""
-        srv = self.server
-        if srv is None:
-            return
-        srv.close_all()
-        srv.shutdown()
-        srv.server_close()
+        for srv in (self.server, self.bridge_server):
+            if srv is None:
+                continue
+            srv.close_all()
+            srv.shutdown()
+            srv.server_close()
 
 
 def server_context(ca_file: str, cert_file: str, key_file: str) -> ssl.SSLContext:

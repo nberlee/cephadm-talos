@@ -46,6 +46,8 @@ type fakeBridge struct {
 	page int
 	// fsid is the cluster in the module's certificate; "" is f1
 	fsid string
+	// own is the module's incarnation: writes only below it; "" allows all
+	own string
 }
 
 func (m *fakeBridge) run(req wire.BridgeRequest) map[string]any {
@@ -145,6 +147,12 @@ func (m *fakeBridge) serve(t *testing.T, ca testCA, mgr string) (host, port stri
 			return
 		}
 
+		if key, _ := req.Args["key"].(string); m.own != "" && (req.Call == "config-key set" || req.Call == "config-key rm") && !strings.HasPrefix(key, store.Prefix+"inc/"+m.own+"/") {
+			w.WriteHeader(http.StatusBadRequest)
+
+			return
+		}
+
 		if req.Call == m.refuse {
 			w.WriteHeader(http.StatusBadRequest)
 
@@ -182,10 +190,10 @@ func testBridge(t *testing.T, mgr string) (*Bridge, *fakeBridge) {
 	m := &fakeBridge{kv: map[string]string{}, outcomes: map[string]map[string]any{}, page: 1000}
 	host, port := m.serve(t, ca, mgr)
 
-	old := dialPort
-	dialPort = func() string { return port }
+	oldDial, oldBridge := dialPort, bridgePort
+	dialPort, bridgePort = func() string { return port }, func() string { return port }
 
-	t.Cleanup(func() { dialPort = old })
+	t.Cleanup(func() { dialPort, bridgePort = oldDial, oldBridge })
 
 	cliCert, cliKey := ca.pair(pki.RoleAgent, "h1", x509.ExtKeyUsageClientAuth, "f1")
 	cfg, err := ClientTLSConfig([]byte(ca.cert), []byte(cliCert), []byte(cliKey))

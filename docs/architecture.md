@@ -1,6 +1,6 @@
 # How cephadm-talos works: components, channels and security
 
-This document describes what is built today (branch `plan-03-write-path`, plan 03 up to step 6a, and from 6b the secrets kept apart) so that its security can be judged. Where something is planned but not built, it says so. The plan is [plans/03-write-path.md](plans/03-write-path.md); fixes for the gaps listed at the end are on the [roadmap](../ROADMAP.md) (milestone 4).
+This document describes what is built today (branch `plan-03-write-path`, plan 03 up to step 6a, and from 6b the secrets kept apart and the bridge on loopback with its write checks) so that its security can be judged. Where something is planned but not built, it says so. The plan is [plans/03-write-path.md](plans/03-write-path.md); fixes for the gaps listed at the end are on the [roadmap](../ROADMAP.md) (milestone 4).
 
 ## Components
 
@@ -8,7 +8,7 @@ This document describes what is built today (branch `plan-03-write-path`, plan 0
 |---|---|---|---|
 | CLI (`cephadm-talos`) | the operator's workstation | a talosconfig per node (`os:admin`), the `client.admin` key, the operator certificate and key, the fsid | everything on every node through the Talos API, and anything in Ceph through `shell`. Before the handoff it writes the cluster state; after it, its own orchestration commands refuse to change anything, but `shell` (arbitrary commands with `client.admin`) and `rm-cluster` still work: the handoff changes who writes the state, not the operator's authority |
 | Agent | one container per Ceph node: `restricted`, uid/gid 50, host network, `machinedAccess` (the local Talos socket), no Ceph binaries, no Ceph key, no talosconfig | its server and client certificate and key, the agent CA certificate, its records on the `cephadm-talos` volume | everything on its own node through the local socket. It reaches no other node's Talos API |
-| Leader | code in the agent on the active mgr's host, only while that mgr's module heartbeats it | the cluster state it reads, which holds no private keys, and while rendering the secrets it reads one at a time through the bridge (see "Secrets") | send revisions (grants) to every agent; read and write config-key below `mgr/cephadm/talos/`, read daemon keys and some secrets through the bridge |
+| Leader | code in the agent on the active mgr's host, only while that mgr's module heartbeats it | the cluster state it reads, which holds no private keys, and while rendering the secrets it reads one at a time through the bridge (see "Secrets") | send revisions (grants) to every agent; through the bridge read config-key below `mgr/cephadm/talos/`, write it below its own incarnation while the mons show that incarnation active, read daemon keys and some secrets |
 | mgr module (installed as `cephadm`) | Python in the active `ceph-mgr` | the mgr's CephX key, the mgr's TLS certificates and keys | Ceph commands with the mgr's caps; confirms that it is the active mgr; serves the bridge; polls every agent's status |
 | Talos (machined) | every node | the node's machine config, including every keyring and TLS key of its containers | runs the containers the machine config describes |
 | Daemons and jobs | containers on each node | see "Where daemon keys live" | talk to the mons |
@@ -19,7 +19,7 @@ This document describes what is built today (branch `plan-03-write-path`, plan 0
 |---|---|---|
 | CLI to Talos API, port 50000 | gRPC over TLS | the Talos CA and the talosconfig (`os:admin`) |
 | Agent to its own Talos | gRPC over a Unix socket (no TLS) | machined identifies the calling process; `machinedAccess` containers may request any role, and the agent requests `os:admin`, so its role request does not limit a compromised agent |
-| Agents, module, CLI among each other: ports 4721 (agent) and 4722 (module) | HTTPS, TLS 1.3, both on the host network on all interfaces | client and server certificates of the agent CA, checked by role, fsid and name in the URI SAN (never the common name) |
+| Agents, module, CLI among each other: ports 4721 (agent) and 4722 (module confirmations) on all interfaces, 4723 (the bridge) on the mgr host's loopback only | HTTPS, TLS 1.3, all on the host network | client and server certificates of the agent CA, checked by role, fsid and name in the URI SAN (never the common name) |
 | Module, daemons and the CLI's exec'd commands to the mons | Ceph messenger | CephX. The generated `ceph.conf` does not require the encrypted messenger mode |
 | S3 clients to RGW (through the VIP or directly) | HTTPS | a certificate of the separate RGW CA the CLI generated (2 years), or the user's own |
 | keepalived between VIP hosts | unicast VRRP | a shared password (`PASS` authentication, 8 characters); its health check of the local RGW uses HTTPS without verifying the certificate (`curl -k`) |
@@ -69,7 +69,7 @@ Who can read machine config secrets: `MachineConfig` is a sensitive Talos resour
 flowchart LR
   CLI["CLI (workstation)"]
   subgraph nodeA["mgr host"]
-    MGR["mgr module :4722"]
+    MGR["mgr module :4722, bridge 127.0.0.1:4723"]
     LA["agent + leader :4721"]
     TA["Talos (machined)"]
   end
@@ -84,7 +84,7 @@ flowchart LR
   CLI -- "handoff (operator cert)" --> AB
   MGR -- "status polls (mgr cert)" --> AB
   MGR -- "status, heartbeat (mgr cert)" --> LA
-  LA -- "bridge (cert of this host's agent)" --> MGR
+  LA -- "bridge on loopback (cert of this host's agent)" --> MGR
   AB -- "confirm (agent cert)" --> MGR
   LA -- "node report, grant, abandon, close (agent cert)" --> AB
   LA -- "local socket, os:admin" --> TA
@@ -114,12 +114,14 @@ The agent:
 | `GET /status` | any mgr of the cluster | the agent's status record: the node's containers with states, exit codes and versions, its records' health, its ownership and drift |
 | `POST /v1/heartbeat` | the mgr on the agent's own host only | every 5 seconds: the module's captured incarnation (gid and epoch). The agent is the leader while the last heartbeat names its own host and is at most 15 seconds old. The module sends heartbeats with the incarnation it captured once; it does not check every 5 seconds that it is still active |
 
-### Agents to the module (port 4722, agent client certificate)
+### Agents to the module (ports 4722 and 4723, agent client certificate)
+
+The module serves two listeners with the same server certificate and the same client certificate checks: port 4722 on all interfaces serves only confirmations, port 4723 on `127.0.0.1` serves only the bridge.
 
 | Call | Who may call | What |
 |---|---|---|
 | `POST /v1/confirm` | any agent of the cluster, for its own host | the module answers only after a fresh `mgr dump` from the mons shows it is the active mgr, and signs the answer (ECDSA P-256 over the exact payload) with its mgr server key: fsid, mgr, gid, epoch, the agent's session, host, revision, operation id, inputs hash and the agent's challenge. It counts 10 seconds from the challenge. The module does not know whether the operation exists; it confirms leadership, not content |
-| `POST /v1/bridge`, `GET /v1/bridge/<id>` | a client certificate `agent/<the mgr's host>`, from anywhere on the network (the leader itself dials loopback). The bridge checks that the module captured an incarnation once, not that it is still active | allowlisted mon commands with fixed argument shapes and a dispatch id: `status`, `health`, `mgr dump`; config-key list, get, set and rm anywhere below `mgr/cephadm/talos/` (all incarnations and `cli`, not only the module's own); the config-key entry limit; `secret get` (see "Secrets"); `auth get` for `mon.`, any `mgr.<id>`, `osd.<n>`, `client.rgw.<id>` and `client.bootstrap-osd` (never `client.admin`); `auth get-or-create` for `mgr.<id>` and `client.rgw.<id>` with caps fixed in the module. A deadline bounds the wait for the answer, not the command: a call that times out answers "unknown" and may still complete; outcomes are kept in memory for a while by dispatch id and are lost when the mgr restarts |
+| `POST /v1/bridge`, `GET /v1/bridge/<id>` (port 4723, loopback) | a client certificate `agent/<the mgr's host>`, from the mgr's host only: loopback takes away reach from other hosts, and the certificate gates the processes on the host, where every container on the host network (mon, OSD, RGW, keepalived) can reach loopback. The module must have captured an incarnation; before every call that changes something (config-key set and rm, `auth get-or-create`) it checks with a fresh `mgr dump` that this incarnation is still the active one, and refuses with 409 if not or if the mons do not answer. The check comes before the change, not atomically with it: an incarnation that becomes stale in between still lands that one call | allowlisted mon commands with fixed argument shapes and a dispatch id: `status`, `health`, `mgr dump`; config-key list and get anywhere below `mgr/cephadm/talos/` (all incarnations and `cli`), set and rm only below the module's own incarnation `mgr/cephadm/talos/inc/<gid>/`; the config-key entry limit; `secret get` (see "Secrets"); `auth get` for `mon.`, any `mgr.<id>`, `osd.<n>`, `client.rgw.<id>` and `client.bootstrap-osd` (never `client.admin`); `auth get-or-create` for `mgr.<id>` and `client.rgw.<id>` with caps fixed in the module. A deadline bounds the wait for the answer, not the command: a call that times out answers "unknown" and may still complete; outcomes are kept in memory for a while by dispatch id and are lost when the mgr restarts |
 
 The bridge refuses `client.admin`, but the keys it does release are broad: `mon.` (`mon allow *`) and mgr keys (`mon profile mgr`, which may change mon auth). Whoever gets them can use them against the mons directly, outside the bridge's allowlist.
 
@@ -143,7 +145,7 @@ The agent serves one grant, abandon or close at a time. A repeated grant with th
 
 The cluster state (hosts, daemons, image, RGW settings, the agent and mgr certificates, the agent CA certificate, the RGW CA and serving certificates, the module's inventory; no private keys, see "Secrets") is kept in config-key below `mgr/cephadm/talos/inc/<incarnation>/` as records plus a manifest. An incarnation is one leadership: a mgr process while it is active, identified by its gid and ordered by the mgrmap epoch at which the mons first confirmed it active (a standby promoted later can have a smaller gid). The CLI writes under `cli` until the handoff.
 
-One writer at a time, by convention of the code (the bridge does not enforce it, and the operator's `shell` can write anything):
+One writer at a time: the bridge lets each leader write only below its own incarnation, while the mons show it active; the CLI writes `cli` through exec, by convention of the code, and the operator's `shell` can write anything:
 
 1. Before the handoff only the CLI writes, under `cli`.
 2. `cephadm-talos handoff` records that it started (from then on the CLI changes nothing but the handoff), hands every node to its agent, and publishes its state one last time, sealed.
@@ -213,7 +215,7 @@ The agent's records (ownership, operations, session floor, fence) are files of m
 - **A compromised agent is root on its node.** It can apply any config on its node, start privileged containers, read every keyring and TLS key in the node's documents, wipe disks and reboot. On its own it has no credential for other nodes' Talos APIs. For a change, other agents require a confirmation signed by the mgr identity of the sender's host with matching gid and epoch, plus admission and fencing; they cannot establish themselves that this mgr is active (see the next points). It can read other agents' node reports and operation records without a confirmation.
 - **On a Talos control-plane node, a compromised agent reaches every node of that Talos cluster.** `os:admin` on the local socket allows `GenerateClientConfiguration`, which signs a talosconfig with the node's Talos CA. Use worker nodes, or nodes whose Talos CA is not shared, where that boundary matters.
 - **A compromised mgr host, active or standby, can confirm.** A confirmation proves that the module holding `mgr/<host>`'s key says it is active; the agent cannot check the mgr map itself. Root on a host with a mgr has both that host's mgr and agent certificates, so it can run a confirming endpoint, become a leader for the agents and raise their session floor with an invented epoch. It also has that mgr's CephX key.
-- **The leader and the active mgr hold the cluster.** The leader can grant every agent anything the admission policy admits (including removals and zaps), and through the bridge read and write config-key below `mgr/cephadm/talos/`, read daemon keys including `mon.` and the mgr keys, and read the RGW serving key, the VRRP password and the mgr TLS keys of any host it publishes a mgr on. A compromised leader therefore has the mgr's Ceph access and can impersonate any host's mgr, but it cannot issue certificates or obtain an agent's key through the bridge. The active mgr itself, with its caps, reads every secret, the agent CA key included. This is comparable to cephadm's mgr, which holds SSH root to every host.
+- **The leader and the active mgr hold the cluster.** The leader can grant every agent anything the admission policy admits (including removals and zaps), and through the bridge read config-key below `mgr/cephadm/talos/` and write below its own incarnation, read daemon keys including `mon.` and the mgr keys, and read the RGW serving key, the VRRP password and the mgr TLS keys of any host it publishes a mgr on. A compromised leader therefore has the mgr's Ceph access and can impersonate any host's mgr, but it cannot issue certificates or obtain an agent's key through the bridge. The active mgr itself, with its caps, reads every secret, the agent CA key included. This is comparable to cephadm's mgr, which holds SSH root to every host.
 - **Confirmations, fences and session floors protect correctness**: they stop a stale leader, not a malicious one with valid certificates.
 - **The CLI's workstation holds full control**: `os:admin` on every node and `client.admin`, before and after the handoff, like a cephadm admin host.
 - **`os:admin` on a node reads that node's secrets** in the machine config: daemon keyrings, the agent's TLS keys and, on a mgr host, the mgr's TLS keys.
@@ -223,7 +225,7 @@ The agent's records (ownership, operations, session floor, fence) are files of m
 Each is on the [roadmap](../ROADMAP.md), milestone 4, with where it is fixed, unless it says it is accepted.
 
 - **Secrets readable by the mgr**: the secrets are out of the published state, but the mgr's caps and `client.admin` read every config-key entry, the agent CA key included. A compromised mgr can issue certificates.
-- **The bridge** listens on all interfaces, does not recheck that its incarnation is active, may write anywhere below `mgr/cephadm/talos/`, and releases `mon.` and mgr keys on request; it releases a host's mgr TLS keys when the inventory, which the leader publishes itself, places a mgr there, not only for an operation the module accepted.
+- **The bridge** releases `mon.` and mgr keys on request, without checking that its incarnation is still active (only changes are checked), and a host's mgr TLS keys when the inventory, which the leader publishes itself, places a mgr there, not only for an operation the module accepted. Its leadership check before a change is not atomic with the change.
 - **The bootstrap mon's document keeps `client.admin`** and the first keys until it is redeployed; the handoff does not replace it yet.
 - **Confirmations are not bound to the active incarnation**: a mgr host's certificates are enough to confirm.
 - **Admission** admits any digest of an allowed repository, does not match mgr keys to certificates or check RGW certificates, and admits a zap of any disk of the node.

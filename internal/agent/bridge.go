@@ -88,7 +88,7 @@ func (b *Bridge) client() *http.Client {
 }
 
 func (b *Bridge) url(path string) string {
-	return "https://" + net.JoinHostPort(b.Addr, dialPort()) + path
+	return "https://" + net.JoinHostPort(b.Addr, bridgePort()) + path
 }
 
 // Call runs one allowlisted call under dispatch, a fresh id the caller may

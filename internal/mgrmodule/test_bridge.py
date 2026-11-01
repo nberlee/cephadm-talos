@@ -29,7 +29,7 @@ class Log:
 
 class Mons:
     """A fake send_command. Answers mgr dump from `maps` (the last repeats; None:
-    no answer yet), anything else at once, or keeps every result pending when late."""
+    no answer yet), anything else at once, or keeps those results pending when late."""
 
     def __init__(self, maps=None):
         self.maps = list(maps or [])
@@ -41,7 +41,7 @@ class Mons:
     def send(self, res, cmd):
         prefix = json.loads(cmd)['prefix']
         self.sent.append((threading.current_thread().name, prefix))
-        if self.late:
+        if self.late and prefix != 'mgr dump':
             self.pending.append(res)
             return
         if prefix == 'mgr dump':
@@ -189,7 +189,7 @@ class BridgeTest(unittest.TestCase):
         self.addCleanup(lcmds.stop)
         lead = b.Leadership('h1', mgrmap(42, 'h1'), lcmds)
         self.assertTrue(lead.capture())
-        mons = Mons()
+        mons = Mons([mgrmap(42, 'h1')])  # the bridge's own fresh check before a change
         cmds = mons.commands(n, 'bridge')
         self.addCleanup(cmds.stop)
         return b.Channel('f1', 'h1', lead, cmds, None, b'', m.require_identity, Log(), lambda: {'h1'}), mons
@@ -342,7 +342,7 @@ class BridgeTest(unittest.TestCase):
 
     def test_a_dispatch_id_runs_once(self):
         ch, mons = self.channel()
-        rm = {'call': 'config-key rm', 'args': {'key': 'mgr/cephadm/talos/x'}}
+        rm = {'call': 'config-key rm', 'args': {'key': 'mgr/cephadm/talos/inc/42/x'}}
         self.assertEqual(self.call(ch, dispatch_id='aa' * 8, **rm)[1]['outcome'], 'done')
         self.assertEqual(self.call(ch, dispatch_id='aa' * 8, **rm)[0], 409)  # also after an immediate completion
         self.assertEqual(ch.outcome('aa' * 8)[1]['outcome'], 'done')
@@ -355,7 +355,7 @@ class BridgeTest(unittest.TestCase):
         for t in ts:
             t.join()
         self.assertEqual(sorted(codes), [200, 409, 409, 409, 409])
-        self.assertTrue(wait_until(lambda: len(mons.sent) == 2), mons.sent)
+        self.assertTrue(wait_until(lambda: len([p for _, p in mons.sent if p != 'mgr dump']) == 2), mons.sent)
 
     def test_deadline_unknown_then_outcome(self):
         ch, mons = self.channel()
@@ -388,7 +388,7 @@ class BridgeTest(unittest.TestCase):
 
     def test_kept_outcomes_are_bounded(self):
         ch, mons = self.channel()
-        rm = {'call': 'config-key rm', 'args': {'key': 'mgr/cephadm/talos/x'}}
+        rm = {'call': 'config-key rm', 'args': {'key': 'mgr/cephadm/talos/inc/42/x'}}
         for i in range(b.MAX_RECORDS):
             self.assertEqual(self.call(ch, dispatch_id='%016x' % i, **rm)[0], 200)
         # answered outcomes make room, oldest first
@@ -403,9 +403,34 @@ class BridgeTest(unittest.TestCase):
             ch.records['%016x' % (2000 + i)] = b.Record()
         self.assertEqual(self.call(ch, dispatch_id='%016x' % 998, deadline=0.01, **rm)[0], 429)
 
+    def test_changes_only_while_active_and_below_the_own_incarnation(self):
+        ch, mons = self.channel()
+        own, other = 'mgr/cephadm/talos/inc/42/rec/1/x', 'mgr/cephadm/talos/inc/41/rec/1/x'
+        for i, (call, args) in enumerate((('config-key set', {'key': other, 'value': 'v'}), ('config-key rm', {'key': other}),
+                                          ('config-key set', {'key': 'mgr/cephadm/talos/inc/cli/manifest/1', 'value': 'v'}),
+                                          ('config-key rm', {'key': 'mgr/cephadm/talos/inc/420/x'}))):
+            self.assertEqual(self.call(ch, call=call, args=args, dispatch_id='%016x' % (600 + i))[0], 400, (call, args))
+        self.assertEqual(self.call(ch, call='config-key get', args={'key': other}, dispatch_id='%016x' % 610)[0], 200)  # reads stay cluster-wide
+        self.assertEqual(self.call(ch, call='config-key set', args={'key': own, 'value': 'v'}, dispatch_id='%016x' % 611)[1]['outcome'], 'done')
+        # another mgr became active: no change goes out, reads still do
+        mons.maps = [mgrmap(43, 'h2')]
+        before = [p for _, p in mons.sent if p != 'mgr dump']
+        for i, (call, args) in enumerate((('config-key set', {'key': own, 'value': 'v'}), ('config-key rm', {'key': own}),
+                                          ('auth get-or-create', {'entity': 'mgr.h1'}))):
+            self.assertEqual(self.call(ch, call=call, args=args, dispatch_id='%016x' % (620 + i))[0], 409, call)
+        self.assertEqual([p for _, p in mons.sent if p != 'mgr dump'], before)
+        self.assertEqual(self.call(ch, call='health', args={}, dispatch_id='%016x' % 630)[0], 200)
+        # no answer from the mons: refused, not sent
+        mons.maps = [None]
+        old = b.MGR_DUMP_DEADLINE
+        b.MGR_DUMP_DEADLINE = 0.05
+        self.addCleanup(setattr, b, 'MGR_DUMP_DEADLINE', old)
+        self.assertEqual(self.call(ch, call='config-key rm', args={'key': own}, dispatch_id='%016x' % 631)[0], 409)
+
     def test_large_output_is_not_kept_in_full(self):
         ch, mons = self.channel()
-        mons.send = lambda res, cmd: res.complete(0, 'x' * (b.MAX_OUTPUT + 1), '')
+        send = mons.send
+        mons.send = lambda res, cmd: send(res, cmd) if json.loads(cmd)['prefix'] == 'mgr dump' else res.complete(0, 'x' * (b.MAX_OUTPUT + 1), '')
         cmds = b.Commands(mons.send, lambda: b.Job({}), 1, 'big')
         self.addCleanup(cmds.stop)
         ch.commands = cmds
@@ -456,6 +481,14 @@ def pki():
     return files
 
 
+def free_port():
+    s = socket.socket()
+    s.bind(('127.0.0.1', 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
 class ServerTest(unittest.TestCase):
     def setUp(self):
         self.files = pki()
@@ -463,27 +496,39 @@ class ServerTest(unittest.TestCase):
         lcmds = lmons.commands(2)
         self.addCleanup(lcmds.stop)
         lead = b.Leadership('h1', mgrmap(42, 'h1'), lcmds)
+        self.assertTrue(lead.capture())
         ctx = b.server_context(self.files['ca.crt'], self.files['srv.crt'], self.files['srv.key'])
-        mons = Mons()
+        mons = Mons([mgrmap(42, 'h1')])
         cmds = mons.commands(2)
         self.addCleanup(cmds.stop)
         self.ch = b.Channel('f1', 'h1', lead, cmds, ctx, b.read(self.files['srv.key']), m.require_identity, Log(), lambda: {'h1'})
-        s = socket.socket()
-        s.bind(('127.0.0.1', 0))
-        self.port = s.getsockname()[1]
-        s.close()
-        self.ch.start(self.port)
+        self.port, self.bridge_port = free_port(), free_port()
+        self.ch.start(self.port, self.bridge_port)
         self.addCleanup(self.ch.stop)
 
-    def get(self, path):
+    def request(self, method, path, port=None, body=None):
         ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=self.files['ca.crt'])
         ctx.load_cert_chain(self.files['cli.crt'], self.files['cli.key'])
-        conn = http.client.HTTPSConnection('127.0.0.1', self.port, context=ctx, timeout=5)
+        conn = http.client.HTTPSConnection('127.0.0.1', port or self.port, context=ctx, timeout=5)
         try:
-            conn.request('GET', path)
+            conn.request(method, path, body=body, headers={'Content-Type': 'application/json'} if body else {})
             return conn.getresponse().status
         finally:
             conn.close()
+
+    def get(self, path, port=None):
+        return self.request('GET', path, port)
+
+    def test_the_bridge_is_on_loopback_only(self):
+        self.assertEqual(self.ch.bridge_server.server_address[0], '127.0.0.1')
+        self.assertEqual(self.ch.server.server_address[0], '0.0.0.0')
+        call = json.dumps({'version': 1, 'call': 'health', 'args': {}, 'deadline': 5, 'dispatch_id': 'ab' * 8})
+        # the public port answers confirmations only, the loopback port the bridge only
+        self.assertEqual(self.request('POST', '/v1/bridge', body=call), 404)
+        self.assertEqual(self.get('/v1/bridge/' + 'ab' * 8), 404)
+        self.assertEqual(self.request('POST', '/v1/bridge', self.bridge_port, call), 200)
+        self.assertEqual(self.get('/v1/bridge/' + 'cd' * 8, self.bridge_port), 404)  # unknown id, but served
+        self.assertEqual(self.request('POST', '/v1/confirm', self.bridge_port, json.dumps(challenge(host='h1'))), 404)
 
     def test_a_silent_connection_does_not_block_others(self):
         silent = socket.create_connection(('127.0.0.1', self.port))
@@ -501,8 +546,9 @@ class ServerTest(unittest.TestCase):
         self.assertLess(time.monotonic() - start, 3)
         silent.settimeout(3)
         self.assertEqual(silent.recv(1), b'')  # closed by the server
-        with self.assertRaises(OSError):
-            self.get('/v1/bridge/' + 'ab' * 8)
+        for port in (self.port, self.bridge_port):
+            with self.assertRaises(OSError):
+                self.get('/v1/bridge/' + 'ab' * 8, port)
 
 
 class ServerCloseTest(unittest.TestCase):

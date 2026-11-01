@@ -263,8 +263,8 @@ func TestConfirm(t *testing.T) {
 }
 
 func TestDialPortIsTheModulePort(t *testing.T) {
-	if dialPort() != strconv.Itoa(wire.ModulePort) {
-		t.Errorf("dial port %s", dialPort())
+	if dialPort() != strconv.Itoa(wire.ModulePort) || bridgePort() != strconv.Itoa(wire.BridgePort) {
+		t.Errorf("dial port %s, bridge port %s", dialPort(), bridgePort())
 	}
 }
 

@@ -28,8 +28,12 @@ import (
 // ConfirmValidity is how long a confirmation counts, from sending the challenge.
 const ConfirmValidity = 10 * time.Second
 
-// dialPort is the module's port; tests point it elsewhere.
-var dialPort = func() string { return strconv.Itoa(wire.ModulePort) }
+// dialPort is the module's confirmation port and bridgePort its bridge port
+// on loopback; tests point them elsewhere.
+var (
+	dialPort   = func() string { return strconv.Itoa(wire.ModulePort) }
+	bridgePort = func() string { return strconv.Itoa(wire.BridgePort) }
+)
 
 // Leader is the incarnation that last heartbeated this agent (plan 03, item 1).
 type Leader struct {
