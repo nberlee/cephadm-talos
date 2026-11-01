@@ -225,8 +225,14 @@ func TestLivePolicyAdmitsTheCluster(t *testing.T) {
 
 		pol := &agent.Policy{FSID: o.St.FSID, Host: h.Name, Repos: o.imageRepos(), CACert: o.St.Agent.CACert}
 
+		// the operator's last approval, as the agents have it (none before the handoff)
+		appr, _, err := o.lastApproval()
+		if err != nil {
+			t.Fatal(err)
+		}
+
 		for _, d := range docs {
-			err := pol.Check([]agent.Doc{d}, ds, names)
+			err := pol.Check([]agent.Doc{d}, ds, names, appr)
 
 			bootstrap := strings.Contains(string(d.YAML), "MODE=bootstrap")
 
