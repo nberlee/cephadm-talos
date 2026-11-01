@@ -1,6 +1,6 @@
 # Roadmap
 
-The proof of concept showed that Ceph runs on Talos `ContainerConfig` without Kubernetes. The goal now is a production cephadm clone: the `ceph orch` interface and the dashboard's orchestrator pages on Talos nodes, for pinned Ceph releases, with a capability matrix that marks each command, spec field and service as implemented, deferred or unsupported. Decisions:
+The proof of concept showed that Ceph runs on Talos `ContainerConfig` without Kubernetes. The goal now is a production cephadm clone: the `ceph orch` interface and the dashboard's orchestrator pages on Talos nodes, for pinned Ceph releases, with a capability matrix that marks each command, spec field and service as implemented, deferred or unsupported. The end goal is everything cephadm supports: every entry of the [capability matrix](docs/capabilities.md) implemented, or unsupported only for a stated reason such as a missing Talos feature. Decisions:
 
 - Go owns the orchestration logic. A thin Python mgr module `talos` implements `orchestrator.Orchestrator` and forwards to it.
 - Talos is reached only through `github.com/siderolabs/talos/pkg/machinery`, never `talosctl`.
@@ -99,7 +99,9 @@ Plan 03, the write path:
 - OSD provisioning records device, OSD uuid, allocated id and key before any irreversible step. Recovery reuses them, or runs a guarded `purge-new` after proving no initialized OSD exists. This addresses the stuck OSD after a reboot between `ceph osd new` and mkfs; crashes after each step are tested.
 - Upgrade: cephadm order, `ok-to-stop` with retries, `noout`, wait for active+clean, staggered filters.
 - Certificates: cluster CA, renewal, rotation without dropping the VIP.
-- Services, each tied to its Talos blocker: MDS, RGW multisite, NFS, ingress beyond the active/passive VIP, crash, ceph-exporter and the monitoring stack (as in @hkraal's setup) have no known Talos blocker; SMB needs draft 07; NVMe-oF needs draft 08; iSCSI is to be validated.
+- CephFS: `mds` services (`ceph fs volume create`, `ceph orch apply mds`, standby and standby-replay daemons), cephadm's MDS handling during upgrades, `cephfs-mirror`, and NFS (NFS-Ganesha through the `nfs` mgr module, exports, its ingress). No known Talos blocker.
+- Monitoring: the cephadm monitoring stack (as in @hkraal's setup): `prometheus`, `alertmanager`, `grafana`, `node-exporter`, `ceph-exporter`, `loki` and `promtail`, with service discovery through the mgr, the dashboard's Grafana and alert integration, TLS and authentication as cephadm sets them up, and their data on Talos volumes. `node-exporter` reads host metrics (host network, `/proc`, `/sys` and the root filesystem read-only), which is to be validated on Talos.
+- Other services, each tied to its Talos blocker: RGW multisite, ingress beyond the active/passive VIP, `crash`, `rbd-mirror`, `mgmt-gateway`, `oauth2-proxy`, `snmp-gateway`, the Jaeger tracing services, `elasticsearch` and custom `container` services have no known Talos blocker; SMB needs draft 07; NVMe-oF needs draft 08; iSCSI is to be validated; `node-proxy` is to be validated (it talks to the BMC over Redfish).
 - Host tuning through `SysctlConfig` and `KernelModuleConfig`.
 - Tests: full cluster power cycle (cross-node start order is a crash loop today), Talos upgrade of every node, disk renumbering and replacement.
 
