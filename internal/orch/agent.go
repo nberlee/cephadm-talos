@@ -202,7 +202,9 @@ func (o *Orch) agentDocs(h state.Host) []any {
 // imageRepos are the repositories of the cluster's images, which the agents'
 // admission policy allows (plan 03, item 13).
 func (o *Orch) imageRepos() []string {
-	refs := []string{o.St.Image}
+	// keepalived's always: an ingress may come after the handoff (plan 03, step
+	// 6e), and the operator's approval admits its digests one by one
+	refs := []string{o.St.Image, DefaultKeepalivedImage}
 	if o.St.RGW != nil {
 		refs = append(refs, o.St.RGW.KeepalivedImage)
 	}
