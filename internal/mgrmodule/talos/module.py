@@ -137,8 +137,11 @@ def rgw_cert_pair(pem: str) -> Tuple[str, str]:
     pub = serialization.PublicFormat.SubjectPublicKeyInfo
     if cert.public_key().public_bytes(serialization.Encoding.PEM, pub) != key.public_key().public_bytes(serialization.Encoding.PEM, pub):
         raise OrchestratorError('rgw_frontend_ssl_certificate: the key is not the certificate\'s')
+    # the Ceph image's cryptography may predate the *_utc attributes (naive UTC then)
+    before = getattr(cert, 'not_valid_before_utc', None) or cert.not_valid_before.replace(tzinfo=datetime.timezone.utc)
+    after = getattr(cert, 'not_valid_after_utc', None) or cert.not_valid_after.replace(tzinfo=datetime.timezone.utc)
     now = datetime.datetime.now(datetime.timezone.utc)
-    if not cert.not_valid_before_utc <= now <= cert.not_valid_after_utc:
+    if not before <= now <= after:
         raise OrchestratorError('rgw_frontend_ssl_certificate: the certificate is not valid now')
     joined = '\n'.join(chain) + '\n'
     if len(joined) > 16384:

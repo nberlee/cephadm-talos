@@ -69,6 +69,11 @@ type JobResult struct {
 // node, through Talos exec (plan 03, item 11), and returns its output (stdout
 // and stderr together).
 func (o *Orch) Job(ctx context.Context, node, cmd string, timeout time.Duration) (JobResult, error) {
+	return o.jobInput(ctx, node, cmd, nil, timeout)
+}
+
+// jobInput is Job with input for the command's stdin.
+func (o *Orch) jobInput(ctx context.Context, node, cmd string, input []byte, timeout time.Duration) (JobResult, error) {
 	if o.Talos.DryRun {
 		o.printf("# exec on %s: %s\n", node, cmd)
 
@@ -80,7 +85,7 @@ func (o *Orch) Job(ctx context.Context, node, cmd string, timeout time.Duration)
 
 	var out syncBuffer
 
-	rc, target, err := o.execAdmin(jctx, node, []string{"bash", "-c", cmd}, nil, &out, &out)
+	rc, target, err := o.execAdmin(jctx, node, []string{"bash", "-c", cmd}, input, &out, &out)
 	if err != nil {
 		if jctx.Err() != nil && ctx.Err() == nil {
 			return JobResult{}, fmt.Errorf("timed out running %q in %s", cmd, target)
@@ -350,6 +355,12 @@ func jobInputs(parts ...string) string { return render.JobInputs(parts...) }
 
 // Shell runs a ceph command (or any shell command) as an admin job and prints the output.
 func (o *Orch) Shell(ctx context.Context, host string, cmd []string, timeout time.Duration) (int, error) {
+	return o.ShellInput(ctx, host, cmd, nil, timeout)
+}
+
+// ShellInput is Shell with input for the command's stdin, after the admin key
+// on the exec's stdin (a spec with a private key never goes on a command line).
+func (o *Orch) ShellInput(ctx context.Context, host string, cmd []string, input []byte, timeout time.Duration) (int, error) {
 	var h state.Host
 
 	if host != "" {
@@ -365,7 +376,7 @@ func (o *Orch) Shell(ctx context.Context, host string, cmd []string, timeout tim
 		}
 	}
 
-	res, err := o.Job(ctx, h.Addr, shellJoin(cmd), timeout)
+	res, err := o.jobInput(ctx, h.Addr, shellJoin(cmd), input, timeout)
 	fmt.Fprint(o.Out, res.Output)
 
 	// a failing command is reported through its exit code; a leftover job never is

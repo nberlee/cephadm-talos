@@ -22,8 +22,20 @@ stub = types.ModuleType('ceph_module')
 for n in ('BaseMgrModule', 'BaseMgrStandbyModule', 'BasePyOSDMap', 'BasePyOSDMapIncremental', 'BasePyCRUSH'):
     setattr(stub, n, type(n, (), {}))
 sys.modules['ceph_module'] = stub
+
+
+class _Library(types.ModuleType):
+    """A stand-in for a Ceph library binding: any name is a class (Python
+    before 3.14 evaluates the annotations that use them)."""
+
+    def __getattr__(self, name: str) -> type:
+        if name.startswith('__'):
+            raise AttributeError(name)
+        return type(name, (Exception,), {})
+
+
 for n in ('cephfs', 'rados', 'rbd'):
-    sys.modules[n] = types.ModuleType(n)
+    sys.modules[n] = _Library(n)
 
 from orchestrator import DaemonDescriptionStatus as S  # noqa: E402
 

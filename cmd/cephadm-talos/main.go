@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -47,7 +48,7 @@ Commands:
   redeploy <daemon>                        re-render and re-apply a daemon document
   rm [--force] [--zap] <daemon>            remove a daemon (osd: out, safe-to-destroy, purge)
   upgrade --image IMG [--refresh]          rolling image upgrade: mons, mgrs, osds
-  shell [--host H] -- <cmd...>             run a command with the admin keyring on a node
+  shell [--host H] [--stdin] -- <cmd...>   run a command with the admin keyring on a node (--stdin: pass stdin on)
   handoff                                  hand the nodes to their agents and the state to the leader
   approve [--image REF] [--prepare H:DISK] [--zap H:DISK] [--drop H:SERIAL:ACTION] [--show]
                                            sign and publish the operator's approval of images and disks
@@ -350,13 +351,29 @@ func runCommand(ctx context.Context, o *orch.Orch, cmd string, args []string) er
 		fs := flag.NewFlagSet("shell", flag.ExitOnError)
 		host := fs.String("host", "", "host to run on (default: first mon host)")
 		timeout := fs.Duration("timeout", 5*time.Minute, "give up after")
+		stdin := fs.Bool("stdin", false, "pass this command's stdin to the command (e.g. ceph ... -i -), never on a command line")
 		_ = fs.Parse(args)
 
 		if fs.NArg() == 0 {
-			return errors.New("shell [--host H] -- <cmd...>")
+			return errors.New("shell [--host H] [--stdin] -- <cmd...>")
 		}
 
-		rc, err := o.Shell(ctx, *host, fs.Args(), *timeout)
+		var input []byte
+
+		if *stdin {
+			b, err := io.ReadAll(io.LimitReader(os.Stdin, 1<<20+1))
+			if err != nil {
+				return err
+			}
+
+			if len(b) > 1<<20 {
+				return errors.New("shell --stdin: more than 1 MiB of input")
+			}
+
+			input = b
+		}
+
+		rc, err := o.ShellInput(ctx, *host, fs.Args(), input, *timeout)
 		if err != nil {
 			return err
 		}
