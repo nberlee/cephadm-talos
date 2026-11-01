@@ -128,10 +128,15 @@ func (m *fakeBridge) run(req wire.BridgeRequest) map[string]any {
 		b, _ := json.Marshal(m.osds)
 
 		return map[string]any{"outcome": "done", "r": 0, "out": string(b)}
-	case "retire", "retire host", "mon rm":
+	case "retire", "retire host", "mon rm", "ok to stop", "noout set", "noout unset", "maintained":
 		m.retired = append(m.retired, req.Call+" "+str("operation"))
 
 		return map[string]any{"outcome": "done", "r": 0, "out": ""}
+	case "mgr fail":
+		// the active mgr respawns: no answer comes back
+		m.retired = append(m.retired, fmt.Sprintf("mgr fail %s %v", str("operation"), req.Args["gid"]))
+
+		return map[string]any{"outcome": "unknown"}
 	case "approval":
 		return map[string]any{"outcome": "done", "r": 0, "out": m.approval}
 	case "status":

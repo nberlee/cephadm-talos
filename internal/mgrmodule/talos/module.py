@@ -491,9 +491,9 @@ class Module(orchestrator.Orchestrator, MgrModule):
         for _, e in led.executable():
             if e['id'].startswith('m-'):
                 continue
-            if daemon is not None and e.get('daemon') is None and e['kind'] != 'remove_host':
+            if daemon is not None and e.get('daemon') is None and e['kind'] not in ledger.HOST_KINDS:
                 continue
-            if daemon is not None and e.get('daemon') != daemon and not (e['kind'] == 'remove_host' and e['host'] == host):
+            if daemon is not None and e.get('daemon') != daemon and not (e['kind'] in ledger.HOST_KINDS and e['host'] == host):
                 continue
             if daemon is None and e['host'] != host:
                 continue
@@ -510,7 +510,12 @@ class Module(orchestrator.Orchestrator, MgrModule):
         except ledger.LedgerError as e:
             raise OrchestratorError('an earlier operation is not settled yet (%s); try again' % e)
 
-    def _accept(self, kind: str, daemon: Optional[str], host: str) -> str:
+    def _not_in_maintenance(self, host: str) -> None:
+        _, fold = self._authority()
+        if host in fold.maintenance:
+            raise OrchestratorError('%s is in maintenance (ceph orch host maintenance exit %s)' % (host, host))
+
+    def _accept(self, kind: str, daemon: Optional[str], host: str, **extra: Any) -> str:
         """Accept an operation: checks, then one ledger entry (ledger.py)."""
         led, fold = self._authority()
         lead = getattr(self, '_leadership', None)
@@ -526,8 +531,10 @@ class Module(orchestrator.Orchestrator, MgrModule):
         busy = self._unfinished(daemon, host)
         if busy:
             raise OrchestratorError('%s has operation %s in progress (orch talos operation %s)' % (daemon or host, busy, busy))
+        if kind != 'exit_maintenance':
+            self._not_in_maintenance(host)
         op_id = 'op-' + os.urandom(8).hex()
-        entry = {'id': op_id, 'kind': kind, 'host': host}
+        entry = {'id': op_id, 'kind': kind, 'host': host, **extra}
         if daemon:
             entry['daemon'] = daemon
         try:
@@ -702,6 +709,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
             busy = self._unfinished(n, fold.daemons[n])
             if busy:
                 raise OrchestratorError('%s has operation %s in progress (orch talos operation %s)' % (n, busy, busy))
+            self._not_in_maintenance(fold.daemons[n])
         return ['Scheduled to remove %s from host %s (operation %s)' % (n, fold.daemons[n], self._accept('remove_daemon', n, fold.daemons[n]))
                 for n in names]
 
@@ -750,11 +758,12 @@ class Module(orchestrator.Orchestrator, MgrModule):
         except ledger.LedgerError as e:
             raise OrchestratorError('an earlier operation is not settled yet (%s); try again' % e)
         for _, e in led.executable():
-            if e['id'].startswith('m-') or e['host'] != host or not (e['kind'] == 'remove_host' or e.get('device') == device):
+            if e['id'].startswith('m-') or e['host'] != host or not (e['kind'] in ledger.HOST_KINDS or e.get('device') == device):
                 continue
             rec = self._journal(e['id'])
             if rec is None or rec.get('state') not in TERMINAL:
                 raise OrchestratorError('%s has operation %s in progress (orch talos operation %s)' % (host, e['id'], e['id']))
+        self._not_in_maintenance(host)
         op_id = 'op-' + os.urandom(8).hex()
         try:
             led.append({'id': op_id, 'kind': 'create_osd', 'host': host, 'device': device})
@@ -783,6 +792,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
             busy = self._unfinished(n, fold.daemons[n])
             if busy:
                 raise OrchestratorError('%s has operation %s in progress (orch talos operation %s)' % (n, busy, busy))
+            self._not_in_maintenance(fold.daemons[n])
         out = []
         for n in names:
             op_id = self._accept_osd_removal(n, fold.daemons[n], fold.uuids[n], zap, force)
@@ -839,6 +849,42 @@ class Module(orchestrator.Orchestrator, MgrModule):
             raise OrchestratorError('%s runs the active mgr' % host)
         op_id = self._accept('remove_host', None, host)
         return 'Scheduled to remove host %s (operation %s)' % (host, op_id)
+
+    @handle_orch_error
+    def enter_host_maintenance(self, hostname: str, force: bool = False, yes_i_really_mean_it: bool = False) -> str:
+        """Stop a host's daemons (their documents removed) and set noout for it."""
+        if yes_i_really_mean_it:
+            raise OrchestratorError('--yes-i-really-mean-it is not supported by this backend')
+        self._settle()
+        _, fold = self._authority()
+        if hostname not in fold.hosts:
+            raise OrchestratorError('%s is not a host of the cluster' % hostname)
+        if hostname in fold.maintenance:
+            raise OrchestratorError('%s is already in maintenance' % hostname)
+        if len(fold.hosts) < 2:
+            raise OrchestratorError('maintenance is not supported on single node clusters')
+        # osd set-group resolves numbers (OSD ids), all and any before CRUSH bucket names
+        if any(n.startswith('osd.') and h == hostname for n, h in fold.daemons.items()) \
+                and (re.match(r'\A(osd\.)?[0-9]+\Z', hostname) or hostname in ('all', 'any')):
+            raise OrchestratorError('host name %s is ambiguous for osd set-group noout' % hostname)
+        if hostname == self.get_mgr_id():
+            standbys = [m for m in (self.get('mgr_map') or {}).get('standbys', []) if m.get('available', True)]
+            if not standbys:
+                raise OrchestratorError('%s runs the active mgr and no standby mgr is available' % hostname)
+        op_id = self._accept('enter_maintenance', None, hostname, force=bool(force))
+        return 'Scheduled to put host %s into maintenance (operation %s)' % (hostname, op_id)
+
+    @handle_orch_error
+    def exit_host_maintenance(self, hostname: str, force: bool = False, offline: bool = False) -> str:
+        """Start a host's daemons again and clear its noout."""
+        if force or offline:
+            raise OrchestratorError('--force and --offline are not supported by this backend')
+        self._settle()
+        _, fold = self._authority()
+        if hostname not in fold.maintenance:
+            raise OrchestratorError('%s is not in maintenance' % hostname)
+        op_id = self._accept('exit_maintenance', None, hostname)
+        return 'Scheduled to take host %s out of maintenance (operation %s)' % (hostname, op_id)
 
     @TalosCLICommand.Read('orch talos operation')
     def _operation(self, id: str) -> HandleCommandResult:

@@ -76,6 +76,8 @@ class Mons:
         self.monmap = []    # quorum_status's monmap names
         self.quorum = []    # quorum_status's quorum_names
         self.mon_rm = []
+        self.not_ok = set()  # prefixes of ok-to-stop checks that refuse
+        self.maint_calls = []
 
     def send(self, res, cmd):
         prefix = json.loads(cmd)['prefix']
@@ -111,6 +113,13 @@ class Mons:
         elif prefix == 'osd metadata':
             i = json.loads(cmd)['id']
             res.complete(0, json.dumps(self.metadata[i]), '') if i in self.metadata else res.complete(-2, '', 'no metadata')
+        elif prefix in ('osd ok-to-stop', 'mon ok-to-stop'):
+            self.maint_calls.append((prefix, json.loads(cmd)['ids']))
+            res.complete(-16, '', 'not ok') if prefix in self.not_ok else res.complete(0, '{}', '')
+        elif prefix in ('osd set-group', 'osd unset-group', 'mgr fail'):
+            c = json.loads(cmd)
+            self.maint_calls.append((prefix, c.get('who')))
+            res.complete(0, '', '')
         elif prefix == 'quorum_status':
             res.complete(0, json.dumps({'monmap': {'mons': [{'name': n} for n in self.monmap]}, 'quorum_names': self.quorum}), '')
         elif prefix == 'mon rm':
@@ -911,6 +920,80 @@ class MonRemovalTest(unittest.TestCase):
         # only for a mon's removal
         other = self.accept('remove_daemon', 'mgr.h1', 'h1')
         self.assertEqual(self.call('mon rm', operation=other)[0], 400)
+
+
+class MaintenanceCallsTest(unittest.TestCase):
+    setUp, call, accept = LedgerCallsTest.setUp, LedgerCallsTest.call, LedgerCallsTest.accept
+
+    def fold(self, *daemons):
+        inv = inventory(*daemons)
+        self.ch.authority = lambda: (self.led, lg.Fold(inv, self.led.executable()))
+
+    def maint(self, kind, host='h1'):
+        op = {'id': 'op-%016x' % (500 + self.n), 'kind': kind, 'host': host}
+        if kind == 'enter_maintenance':
+            op['force'] = False
+        self.n += 1
+        return self.led.append(op)[1]['id']
+
+    def test_checks_noout_and_the_end(self):
+        self.fold('mon.h1@h1', 'mgr.h1@h1', 'osd.3@h1', 'osd.4@h1')
+        enter = self.maint('enter_maintenance')
+        self.mons.not_ok = {'osd ok-to-stop'}
+        self.assertEqual(self.call('ok to stop', operation=enter)[0], 409)
+        self.mons.not_ok = set()
+        self.assertEqual(self.call('ok to stop', operation=enter)[1]['outcome'], 'done')
+        self.assertEqual(self.call('noout set', operation=enter)[1]['outcome'], 'done')
+        self.assertEqual(self.mons.maint_calls, [('osd ok-to-stop', ['3', '4']), ('osd ok-to-stop', ['3', '4']), ('mon ok-to-stop', ['h1']),
+                                                 ('osd set-group', ['h1'])])
+        # an exit's calls are not the enter's, and the reverse
+        self.assertEqual(self.call('noout unset', operation=enter)[0], 400)
+        exit_ = self.maint('exit_maintenance')
+        self.assertEqual(self.call('noout set', operation=exit_)[0], 400)
+        self.assertEqual(self.call('noout unset', operation=exit_)[1]['outcome'], 'done')
+        self.assertIn('h1', self.ch.authority()[1].maintenance)
+        self.assertEqual(self.call('maintained', operation=exit_)[1]['outcome'], 'done')
+        self.assertNotIn('h1', self.ch.authority()[1].maintenance)
+        self.assertEqual(self.call('maintained', operation=exit_)[1]['outcome'], 'done')  # once
+        self.assertEqual(len([e for _, e in self.led.executable() if e['kind'] == 'maintained']), 1)
+
+    def test_noout_only_for_a_host_name_ceph_does_not_read_as_osds(self):
+        inv = inventory('mon.h1@h1')
+        inv['hosts'].append({'name': 'osd.3', 'addr': '10.0.0.3'})
+        self.ch.authority = lambda: (self.led, lg.Fold(inv, self.led.executable()))
+        enter = self.maint('enter_maintenance', 'osd.3')
+        self.assertEqual(self.call('noout set', operation=enter)[0], 400)
+        self.assertEqual(self.mons.maint_calls, [])
+
+    def test_an_unanswered_noout_change_holds_the_next(self):
+        self.fold('mon.h1@h1', 'osd.3@h1')
+        enter = self.maint('enter_maintenance')
+        self.mons.late = True
+        self.assertEqual(self.call('noout set', operation=enter)[0], 503)
+        exit_ = self.maint('exit_maintenance')
+        for call in ('noout unset', 'maintained'):
+            self.assertEqual(self.call(call, operation=exit_)[0], 409, call)
+        self.mons.late = False
+        for res in self.mons.pending:
+            res.complete(0, '', '')
+        self.assertTrue(wait_until(lambda: not self.ch._pending('host/h1')))
+        self.assertEqual(self.call('noout unset', operation=exit_)[1]['outcome'], 'done')
+
+    def test_mgr_fail_by_gid_with_a_standby(self):
+        self.fold('mon.h1@h1', 'mgr.h1@h1', 'mgr.h2@h2')
+        enter = self.maint('enter_maintenance')
+        # no standby: refused, even for the active mgr's own host
+        self.assertEqual(self.call('mgr fail', operation=enter, gid=42)[0], 409)
+        self.mons.maps = [dict(mgrmap(42, 'h1'), standbys=[{'gid': 50, 'name': 'h2', 'available': True}])]
+        # a gid that is no longer the active one: done without a command
+        self.assertEqual(self.call('mgr fail', operation=enter, gid=41)[1]['outcome'], 'done')
+        self.assertEqual(self.mons.maint_calls, [])
+        self.assertEqual(self.call('mgr fail', operation=enter, gid=42)[1]['outcome'], 'done')
+        self.assertEqual(self.mons.maint_calls, [('mgr fail', '42')])
+        # not for a host that does not run the active mgr
+        other = self.maint('enter_maintenance', 'h2')
+        self.assertEqual(self.call('mgr fail', operation=other, gid=42)[0], 400)
+        self.assertEqual(self.call('mgr fail', operation=enter, gid='42')[0], 400)
 
 
 class RemovalTest(LedgerCallsTest):

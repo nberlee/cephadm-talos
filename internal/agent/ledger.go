@@ -38,6 +38,8 @@ const (
 	KindRedeploy     = "redeploy"
 	KindAddDaemon    = "add_daemon"
 	KindRemoveDaemon = "remove_daemon"
+	KindEnterMaint   = "enter_maintenance"
+	KindExitMaint    = "exit_maintenance"
 	KindRemoveHost   = "remove_host"
 	KindCreateOSD    = "create_osd"
 	KindRemoveOSD    = "remove_osd"
@@ -71,6 +73,8 @@ func terminal(s string) bool {
 
 // ledgerOps runs the module's accepted operations after the checkpoint.
 func (l *LeaderLoop) ledgerOps(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64) error {
+	// every host until the ledger was read: a maintenance may be in progress
+	l.holding = holdAll
 	st, _, err := l.clusterState(ctx, b)
 	if err != nil {
 		return err
@@ -91,6 +95,11 @@ func (l *LeaderLoop) ledgerOps(ctx context.Context, b *Bridge, js store.Backend,
 
 			done, err := l.ledgerOp(ctx, b, js, gid, epoch, e)
 			if err != nil || !done {
+				l.holding = ""
+				if e.Op.Kind == KindEnterMaint || e.Op.Kind == KindExitMaint {
+					l.holding = e.Op.Host
+				}
+
 				return err // in progress or retried: nothing after it runs
 			}
 
@@ -102,10 +111,15 @@ func (l *LeaderLoop) ledgerOps(ctx context.Context, b *Bridge, js store.Backend,
 		}
 
 		if !more || len(entries) == 0 {
+			l.holding = ""
+
 			return nil
 		}
 	}
 }
+
+// holdAll holds every host's revision requests (LeaderLoop.holding).
+const holdAll = "*"
 
 // checkpoint publishes the leader's state with key as the last applied ledger
 // operation.
@@ -201,8 +215,9 @@ func (l *LeaderLoop) ledgerOp(ctx context.Context, b *Bridge, js store.Backend, 
 	op := e.Op
 	opKey := JournalPrefix(gid) + "op/" + op.ID
 
-	known := map[string]bool{KindRestart: true, KindRedeploy: true, KindAddDaemon: true, KindRemoveDaemon: true, KindRemoveHost: true, KindCreateOSD: true, KindRemoveOSD: true}
-	noDaemon := op.Kind == KindRemoveHost || op.Kind == KindCreateOSD
+	known := map[string]bool{KindRestart: true, KindRedeploy: true, KindAddDaemon: true, KindRemoveDaemon: true, KindRemoveHost: true, KindCreateOSD: true, KindRemoveOSD: true,
+		KindEnterMaint: true, KindExitMaint: true}
+	noDaemon := op.Kind == KindRemoveHost || op.Kind == KindCreateOSD || op.Kind == KindEnterMaint || op.Kind == KindExitMaint
 	if !ledgerIDRe.MatchString(op.ID) || pki.ValidName(op.Host) != nil || !known[op.Kind] ||
 		noDaemon != (op.Daemon == "") || (op.Daemon != "" && !ledgerDaemonRe.MatchString(op.Daemon)) ||
 		(op.Kind == KindCreateOSD) != strings.HasPrefix(op.Device, "/dev/") {
@@ -215,10 +230,14 @@ func (l *LeaderLoop) ledgerOp(ctx context.Context, b *Bridge, js store.Backend, 
 	}
 
 	switch op.Kind {
-	case KindAddDaemon, KindRemoveDaemon, KindRemoveHost, KindCreateOSD, KindRemoveOSD:
+	case KindAddDaemon, KindRemoveDaemon, KindRemoveHost, KindCreateOSD, KindRemoveOSD, KindEnterMaint, KindExitMaint:
 		var phase func() error
 
 		switch op.Kind {
+		case KindEnterMaint:
+			phase = func() error { return l.enterMaintenance(ctx, b, js, gid, epoch, op) }
+		case KindExitMaint:
+			phase = func() error { return l.exitMaintenance(ctx, b, js, gid, epoch, op) }
 		case KindRemoveOSD:
 			phase = func() error { return l.removeOSD(ctx, b, js, gid, epoch, op) }
 		case KindCreateOSD:
@@ -234,6 +253,10 @@ func (l *LeaderLoop) ledgerOp(ctx context.Context, b *Bridge, js store.Backend, 
 		var onFail func() error
 		if op.Kind == KindCreateOSD {
 			onFail = func() error { return l.cleanCreate(ctx, b, js, gid, epoch, op) }
+		}
+
+		if op.Kind == KindEnterMaint {
+			onFail = func() error { return l.failEnter(ctx, b, js, gid, op) }
 		}
 
 		if err := l.unstick(ctx, js, opKey, opKey, op, onFail, phase()); err != nil {
@@ -1267,3 +1290,320 @@ func (l *LeaderLoop) zapOSD(ctx context.Context, b *Bridge, js store.Backend, gi
 // errZapFailed ends a removal as failed: the OSD is purged and leaves the
 // state, its disk keeps its label (zapping it is the operator's, with the CLI).
 type errZapFailed struct{ error }
+
+// enterMaintenance stops a host's daemons, as cephadm's maintenance enter:
+// Ceph's checks that they can stop (force overrides neither, as in Ceph), the
+// active mgr failed over if it runs there, keepalived off first, noout for its
+// OSDs (recorded in the state first, so the exit clears it), the host marked
+// in maintenance (its daemons stay in the state, not rendered), then every
+// document off and every instance gone. The checks and the active mgr are
+// checked again until the stop grant is sent.
+func (l *LeaderLoop) enterMaintenance(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, op LedgerOp) error {
+	st, _, err := l.clusterState(ctx, b)
+	if err != nil {
+		return err
+	}
+
+	h, ok := st.Host(op.Host)
+	if !ok {
+		return finish(ctx, js, gid, op, JournalFailed, fmt.Errorf("no host %s", op.Host))
+	}
+
+	var docs, vips []string
+
+	osds := false
+
+	for _, d := range st.Daemons {
+		if d.Host != h.Name || d.LocalOnly || d.Purged {
+			continue
+		}
+
+		docs = append(docs, st.DocName(d))
+		osds = osds || d.Type == state.TypeOSD
+
+		if d.Type == state.TypeVIP {
+			vips = append(vips, st.DocName(d))
+		}
+	}
+
+	rs, err := l.journalState(ctx, b, js, gid, op.ID+".rev")
+	if err != nil {
+		return err
+	}
+
+	// right before the stop grant is sent, also on a resumed operation; a
+	// grant already sent is resolved by its step
+	if rs == "" {
+		if err := b.Retire(ctx, "ok to stop", op.ID); err != nil {
+			return err
+		}
+	}
+
+	// also on a resumed operation: leadership may have moved onto this host
+	if !terminal(rs) {
+		active, agid, err := b.ActiveMgrGID(ctx)
+		if err != nil {
+			return err
+		}
+
+		if active == h.Name {
+			// recorded first: the module that answers is the one failed over
+			if err := writeJSONKey(ctx, js, JournalPrefix(gid)+"op/"+op.ID+".fail", JournalOp{Version: journalVersion, Kind: "mgr_fail", Host: h.Name, State: wire.OpStarted, MgrGID: agid}); err != nil {
+				return err
+			}
+
+			// no answer is expected; a refusal (no standby) is retried until the
+			// operation fails, and the successor checks the mgr map again
+			if err := b.MgrFail(ctx, op.ID, agid); err != nil {
+				return fmt.Errorf("%w: failing the active mgr on %s over: %w", errRetry, h.Name, err)
+			}
+
+			return fmt.Errorf("%w: the active mgr on %s is failing over", errRetry, h.Name)
+		}
+	}
+
+	if !h.Maintenance && len(vips) > 0 {
+		keys := make([]string, 0, len(vips))
+		for _, v := range vips {
+			keys = append(keys, "ContainerConfig/"+v)
+		}
+
+		done, ok, err := l.step(ctx, b, js, gid, epoch, op.ID+".vip", h.Name, revisionMode{stop: keys})
+		if err != nil || !done {
+			return err
+		}
+
+		if !ok {
+			return finish(ctx, js, gid, op, JournalFailed, fmt.Errorf("keepalived on %s did not stop", h.Name))
+		}
+
+		// the VIP moves once keepalived has exited, not when its document is gone
+		if err := l.gone(ctx, h, vips); err != nil {
+			return err
+		}
+	}
+
+	if !h.Maintenance && osds && !h.NoOut {
+		if err := l.changeState(ctx, b, gid, func(st *state.State) error {
+			h, ok := st.Host(op.Host)
+			if !ok {
+				return fmt.Errorf("no host %s", op.Host)
+			}
+
+			h.NoOut = true
+			st.AddHost(h)
+
+			return nil
+		}); err != nil {
+			return err
+		}
+
+		h.NoOut = true
+	}
+
+	// before the host is marked: from then on any revision stops its OSDs
+	if h.NoOut {
+		if err := b.Retire(ctx, "noout set", op.ID); err != nil {
+			return err
+		}
+	}
+
+	if !h.Maintenance {
+		if err := l.changeState(ctx, b, gid, func(st *state.State) error {
+			h, ok := st.Host(op.Host)
+			if !ok {
+				return fmt.Errorf("no host %s", op.Host)
+			}
+
+			h.Maintenance = true
+			st.AddHost(h)
+
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+
+	done, ok, err := l.step(ctx, b, js, gid, epoch, op.ID+".rev", h.Name, revisionMode{})
+	if err != nil || !done {
+		return err
+	}
+
+	if !ok {
+		if err := l.failEnter(ctx, b, js, gid, op); err != nil {
+			return err
+		}
+
+		return finish(ctx, js, gid, op, JournalFailed, fmt.Errorf("the revision of %s did not apply", h.Name))
+	}
+
+	if err := l.gone(ctx, h, docs); err != nil {
+		return err
+	}
+
+	return finish(ctx, js, gid, op, wire.OpCompleted, nil)
+}
+
+// failEnter undoes the mark of a maintenance whose stop grant was never sent
+// or never applied (its checks kept refusing, or the node refused it):
+// revisions would stop the host's daemons without the checks. noout stays
+// recorded, so the exit clears it.
+func (l *LeaderLoop) failEnter(ctx context.Context, b *Bridge, js store.Backend, gid int64, op LedgerOp) error {
+	rs, err := l.journalState(ctx, b, js, gid, op.ID+".rev")
+	if err != nil {
+		return err
+	}
+
+	switch rs {
+	case wire.OpCompleted, JournalNoChange, JournalGranting, wire.OpUncertain:
+		return nil // stopped, or maybe: the mark stays
+	}
+
+	return l.changeState(ctx, b, gid, func(st *state.State) error {
+		if h, ok := st.Host(op.Host); ok && h.Maintenance {
+			h.Maintenance = false
+			st.AddHost(h)
+		}
+
+		return nil
+	})
+}
+
+// gone waits until none of a host's documents has an instance left.
+func (l *LeaderLoop) gone(ctx context.Context, h state.Host, docs []string) error {
+	var rep wire.NodeReport
+	if _, err := l.call(ctx, h, http.MethodGet, "/v1/node", nil, &rep); err != nil {
+		return err
+	}
+
+	for _, doc := range docs {
+		if slices.Contains(rep.Instances, doc) {
+			return fmt.Errorf("%w: %s has not stopped yet", errRetry, doc)
+		}
+	}
+
+	return nil
+}
+
+// exitMaintenance starts a host's daemons again: its mon first, in the
+// quorum before the rest is rendered, then its OSDs up in the OSD map, noout
+// cleared, and the module ends the maintenance in the fold.
+func (l *LeaderLoop) exitMaintenance(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, op LedgerOp) error {
+	st, _, err := l.clusterState(ctx, b)
+	if err != nil {
+		return err
+	}
+
+	h, ok := st.Host(op.Host)
+	if !ok {
+		return finish(ctx, js, gid, op, JournalFailed, fmt.Errorf("no host %s", op.Host))
+	}
+
+	if h.Maintenance {
+		if err := l.changeState(ctx, b, gid, func(st *state.State) error {
+			h, ok := st.Host(op.Host)
+			if !ok {
+				return fmt.Errorf("no host %s", op.Host)
+			}
+
+			h.Maintenance = false
+			st.AddHost(h)
+
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+
+	var rest []string
+
+	mon := false
+
+	for _, d := range st.Daemons {
+		if d.Host != h.Name {
+			continue
+		}
+
+		if d.Type == state.TypeMon {
+			mon = true
+		} else {
+			rest = append(rest, "ContainerConfig/"+st.DocName(d))
+		}
+	}
+
+	if mon {
+		done, ok, err := l.step(ctx, b, js, gid, epoch, op.ID+".mon", h.Name, revisionMode{hold: rest})
+		if err != nil || !done {
+			return err
+		}
+
+		if !ok {
+			return finish(ctx, js, gid, op, JournalFailed, fmt.Errorf("the mon of %s did not start", h.Name))
+		}
+
+		q, err := b.Quorum(ctx)
+		if err != nil {
+			return err
+		}
+
+		if !slices.Contains(q, h.Name) {
+			return fmt.Errorf("%w: mon.%s is not in the quorum yet", errRetry, h.Name)
+		}
+	}
+
+	done, ok, err := l.step(ctx, b, js, gid, epoch, op.ID+".rev", h.Name, revisionMode{})
+	if err != nil || !done {
+		return err
+	}
+
+	if !ok {
+		return finish(ctx, js, gid, op, JournalFailed, fmt.Errorf("the revision of %s did not apply", h.Name))
+	}
+
+	osds, err := b.OSDs(ctx)
+	if err != nil {
+		return err
+	}
+
+	for _, d := range st.DaemonsOf(state.TypeOSD, h.Name) {
+		if d.OSDID == nil || d.LocalOnly || d.Purged || d.Leaving {
+			continue
+		}
+
+		up := false
+
+		for _, o := range osds {
+			up = up || o.ID == *d.OSDID && o.UUID == d.OSDUUID && o.Up
+		}
+
+		if !up {
+			return fmt.Errorf("%w: osd.%d is not up yet", errRetry, *d.OSDID)
+		}
+	}
+
+	if h.NoOut {
+		if err := b.Retire(ctx, "noout unset", op.ID); err != nil {
+			return err
+		}
+
+		if err := l.changeState(ctx, b, gid, func(st *state.State) error {
+			h, ok := st.Host(op.Host)
+			if !ok {
+				return fmt.Errorf("no host %s", op.Host)
+			}
+
+			h.NoOut = false
+			st.AddHost(h)
+
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+
+	if err := b.Retire(ctx, "maintained", op.ID); err != nil {
+		return err
+	}
+
+	return finish(ctx, js, gid, op, wire.OpCompleted, nil)
+}

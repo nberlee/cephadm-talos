@@ -312,6 +312,8 @@ def _operation_with(*more: str) -> Callable[[Dict[str, Any]], Dict[str, Any]]:
             raise ValueError('not a disk binding')
         if 'osd' in more and not (type(args['osd']) is int and 0 <= args['osd'] < 1 << 30):
             raise ValueError('not an OSD id')
+        if 'gid' in more and not (type(args['gid']) is int and 0 < args['gid'] < 1 << 63):
+            raise ValueError('not a mgr gid')
         return {}  # answered by the module (Channel.local)
     return build
 
@@ -342,7 +344,8 @@ READ_ONLY = {'status', 'health', 'mgr dump', 'config-key keys', 'config-key get'
 # calls that release a credential: checked against the fold, while active
 CREDENTIALS = {'auth get', 'auth get-or-create', 'secret get'}
 # calls the module answers itself, for operations of its ledger (ledger.py)
-LOCAL = {'mgr cert', 'retire', 'retire host', 'bind disk', 'confirm osd', 'close create', 'osd out', 'drain', 'mon rm'}
+LOCAL = {'mgr cert', 'retire', 'retire host', 'bind disk', 'confirm osd', 'close create', 'osd out', 'drain', 'mon rm',
+         'ok to stop', 'noout set', 'noout unset', 'maintained', 'mgr fail'}
 
 ALLOWLIST: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     'status': _no_args('status'),
@@ -368,6 +371,11 @@ ALLOWLIST: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     'retire': _operation,
     'retire host': _operation,
     'mon rm': _operation,
+    'ok to stop': _operation,
+    'noout set': _operation,
+    'noout unset': _operation,
+    'maintained': _operation,
+    'mgr fail': _operation_with('gid'),
 }
 
 
@@ -793,6 +801,10 @@ class Channel:
                     return self._retire(led, fold, ops, op)
                 if call == 'mon rm':
                     return self._mon_rm(led, fold, ops, op)
+                if call in ('ok to stop', 'noout set', 'noout unset', 'maintained'):
+                    return self._maintenance(call, led, fold, op)
+                if call == 'mgr fail':
+                    return self._mgr_fail(fold, op, (args or {}).get('gid'))
                 if call in ('bind disk', 'confirm osd', 'close create'):
                     return self._creation(call, led, fold, op, args or {})
                 return self._retire_host(led, fold, ops, op)
@@ -894,6 +906,70 @@ class Channel:
         job = self._mon({'prefix': 'mon rm', 'name': mon_id}, name)
         if job is None or job.r not in (0, -2):  # ENOENT: gone already
             return 503, {'error': 'mon rm %s: no answer or refused; ask again' % mon_id}
+        return 200, done
+
+    def _maintenance(self, call: str, led: Any, fold: Any, op: Optional[Dict[str, Any]]) -> Tuple[int, Dict[str, Any]]:
+        """The module's steps of a host's maintenance: Ceph's checks that its
+        daemons can stop (as cephadm's _host_ok_to_stop), noout for its CRUSH
+        bucket, and the end of the maintenance in the fold."""
+        done = {'outcome': 'done', 'r': 0, 'out': '', 'outs': ''}
+        kind = 'exit_maintenance' if call in ('noout unset', 'maintained') else 'enter_maintenance'
+        if op is None or op['kind'] != kind:
+            return 400, {'error': 'no %s operation' % kind}
+        host = op['host']
+        if host not in fold.maintenance:
+            return (200, done) if call == 'maintained' else (400, {'error': '%s is not in maintenance' % host})
+        # an unanswered noout change first: a late one must not undo a later one
+        if call != 'ok to stop' and self._pending('host/' + host):
+            return 409, {'error': 'noout changes for %s are not answered yet; ask again' % host}
+        if call == 'maintained':
+            led.append({'id': 'm-' + secrets.token_hex(8), 'kind': 'maintained', 'of': op['id'], 'host': host})
+            return 200, done
+        on = [n for n, h in fold.daemons.items() if h == host]
+        osds = sorted(n.split('.', 1)[1] for n in on if n.startswith('osd.'))
+        if call == 'ok to stop':
+            checks = ([{'prefix': 'osd ok-to-stop', 'ids': osds, 'max': 16, 'format': 'json'}] if osds else []) + \
+                [{'prefix': 'mon ok-to-stop', 'ids': [n.split('.', 1)[1]]} for n in on if n.startswith('mon.')]
+            for cmd in checks:
+                job = self._mon(cmd)
+                if job is None:
+                    return 503, {'error': '%s: no answer; ask again' % cmd['prefix']}
+                if job.r != 0:
+                    return 409, {'error': '%s: %s' % (cmd['prefix'], job.outs.strip()[:500])}
+            return 200, done
+        # noout set or unset, on the host's CRUSH bucket (only a name Ceph cannot take for ids)
+        if re.match(r'\A(osd\.)?[0-9]+\Z', host) or host in ('all', 'any'):
+            return 400, {'error': 'host name %s is ambiguous for osd set-group' % host}
+        prefix = 'osd set-group' if call == 'noout set' else 'osd unset-group'
+        job = self._mon({'prefix': prefix, 'flags': 'noout', 'who': [host]}, 'host/' + host)
+        if job is None or job.r != 0:
+            return 503, {'error': '%s noout %s: no answer or refused; ask again' % (prefix, host)}
+        return 200, done
+
+    def _mgr_fail(self, fold: Any, op: Optional[Dict[str, Any]], gid: Any) -> Tuple[int, Dict[str, Any]]:
+        """`mgr fail` of the active mgr by its gid, for an operation that must stop
+        it: only while it runs on the operation's host and a standby is available.
+        The active mgr respawns, so the answer may never come; done also when
+        that gid is no longer the active one."""
+        done = {'outcome': 'done', 'r': 0, 'out': '', 'outs': ''}
+        if op is None or op['kind'] != 'enter_maintenance' or op['host'] not in fold.maintenance:
+            return 400, {'error': 'no operation that must stop the active mgr'}
+        job = self._mon({'prefix': 'mgr dump', 'format': 'json'})
+        if job is None or job.r != 0 or job.too_large:
+            return 503, {'error': 'cannot read the mgr map; ask again'}
+        try:
+            mm = json.loads(job.outb)
+            active_gid, active = mm.get('active_gid'), mm.get('active_name')
+            standbys = [s for s in mm.get('standbys', []) if s.get('available', True)]
+        except (ValueError, AttributeError):
+            return 503, {'error': 'cannot read the mgr map; ask again'}
+        if active_gid != gid:
+            return 200, done
+        if active != op['host'] or 'mgr.' + op['host'] not in fold.daemons:
+            return 400, {'error': 'the active mgr is not on %s' % op['host']}
+        if not standbys:
+            return 409, {'error': 'no standby mgr is available'}
+        self._mon({'prefix': 'mgr fail', 'who': str(gid)}, 'mgr.' + op['host'])
         return 200, done
 
     def _creation(self, call: str, led: Any, fold: Any, op: Optional[Dict[str, Any]], args: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:

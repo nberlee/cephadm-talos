@@ -80,6 +80,8 @@ type JournalOp struct {
 	// a job's grant: the job and its result as the agent read it
 	Job    *wire.JobRef    `json:"job,omitempty"`
 	Result *wire.JobResult `json:"result,omitempty"`
+	// MgrGID is the active mgr a `mgr fail` phase asked the module to fail over
+	MgrGID int64 `json:"mgr_gid,omitempty"`
 }
 
 // Takeover is a new leader's progress in taking over from earlier
@@ -127,6 +129,9 @@ type LeaderLoop struct {
 	appr        *approval.Approval
 	// closed are the hosts whose earlier sessions this incarnation closed
 	closed map[string]bool
+	// holding is the host of the ledger operation in progress that orders its
+	// host's documents itself (maintenance): its revision requests wait
+	holding string
 	// stateInc is the incarnation the cluster state is read from: the
 	// leader's own once it published its baseline
 	stateInc string
@@ -611,6 +616,10 @@ func (l *LeaderLoop) request(ctx context.Context, b *Bridge, js store.Backend, g
 		return writeJSONKey(ctx, js, opKey, JournalOp{Version: journalVersion, Kind: req.Kind, Host: req.Host, State: JournalFailed, Error: "unknown or malformed request"})
 	}
 
+	if req.Host == l.holding || l.holding == holdAll {
+		return fmt.Errorf("%w: %s may have a maintenance in progress", errRetry, req.Host)
+	}
+
 	return l.revision(ctx, b, js, gid, epoch, id, req.Host, revisionMode{})
 }
 
@@ -868,7 +877,7 @@ func (l *LeaderLoop) renderHost(ctx context.Context, b *Bridge, st *state.State,
 	withMgr := false
 
 	for _, d := range st.DaemonsOf(state.TypeMgr, h.Name) {
-		withMgr = withMgr || !gone(d)
+		withMgr = withMgr || !gone(d) && !h.Maintenance
 	}
 
 	// a secret only for the document that carries it, through the bridge
@@ -898,8 +907,9 @@ func (l *LeaderLoop) renderHost(ctx context.Context, b *Bridge, st *state.State,
 		}
 
 		// an OSD whose preparation did not finish has no document to grant yet;
-		// its document stays as it is, as does a leaving daemon's
-		if gone(d) || d.Type == state.TypeOSD && (d.OSDID == nil || d.OSDUUID == "") {
+		// its document stays as it is, as does a leaving daemon's; a host in
+		// maintenance has none
+		if gone(d) || h.Maintenance || d.Type == state.TypeOSD && (d.OSDID == nil || d.OSDUUID == "") {
 			continue
 		}
 
@@ -947,6 +957,10 @@ func (l *LeaderLoop) renderHost(ctx context.Context, b *Bridge, st *state.State,
 // every document the node owns (a host on its way out).
 type revisionMode struct {
 	extra []string // keys
+	// stop are documents taken off although the rendering has them; hold
+	// those not granted yet, leaving them as they are on the node
+	stop  []string
+	hold  []string
 	strip bool
 	// add are documents granted besides the rendering (a job); ack
 	// acknowledges a job's result in the same grant
@@ -980,12 +994,6 @@ func (l *LeaderLoop) revision(ctx context.Context, b *Bridge, js store.Backend, 
 	// a host whose earlier sessions are not closed yet waits
 	if !l.closed[host] {
 		return fmt.Errorf("%w: %s's earlier sessions are not closed yet", errRetry, host)
-	}
-
-	// a host in maintenance keeps its daemons in the state with their
-	// documents removed: a revision would start them again
-	if h.Maintenance {
-		return fail(fmt.Errorf("%s is in maintenance", host))
 	}
 
 	me, ok := st.Host(l.Self.Name)
@@ -1026,6 +1034,45 @@ func (l *LeaderLoop) revision(ctx context.Context, b *Bridge, js store.Backend, 
 		}
 
 		r.remove = append(r.remove, mode.extra...)
+
+		// a host in maintenance keeps its daemons in the state with their
+		// documents removed (renderHost renders none); stop takes documents
+		// off before the rest (keepalived before maintenance)
+		stop := map[string]bool{}
+		for _, k := range mode.stop {
+			stop[k] = true
+		}
+
+		if h.Maintenance {
+			for k := range rep.Owned {
+				if strings.HasPrefix(k, "ContainerConfig/") {
+					stop[k] = true
+				}
+			}
+		}
+
+		deferred := map[string]bool{}
+		for _, k := range mode.hold {
+			deferred[k] = true
+		}
+
+		if len(stop)+len(deferred) > 0 {
+			kept := r.docs[:0]
+
+			for _, d := range r.docs {
+				if !stop[d.Key()] && !deferred[d.Key()] {
+					kept = append(kept, d)
+				}
+			}
+
+			r.docs = kept
+
+			for k := range stop {
+				r.remove = append(r.remove, k)
+			}
+
+			sort.Strings(r.remove)
+		}
 
 		for _, d := range mode.add {
 			td, err := checkDoc(d)

@@ -519,15 +519,15 @@ class Acceptance(unittest.TestCase):
 
     def test_restart_and_redeploy_are_accepted_once_at_a_time(self):
         mod, entries = self.module()
-        res = m.Module.daemon_action(mod, 'restart', 'mgr.h3')
+        res = m.Module.daemon_action(mod, 'restart', 'mon.h1')
         self.assertEqual(res.exception_str, '')
         op_id = res.result.split('operation ')[1].rstrip(')')
         [(_, e)] = mod._ledger.executable()
-        self.assertEqual((e['id'], e['kind'], e['daemon'], e['host']), (op_id, 'restart', 'mgr.h3', 'h3'))
+        self.assertEqual((e['id'], e['kind'], e['daemon'], e['host']), (op_id, 'restart', 'mon.h1', 'h1'))
         # another operation on the same daemon waits until the leader finished this one
-        self.assertTrue(m.Module.daemon_action(mod, 'redeploy', 'mgr.h3').exception_str)
+        self.assertTrue(m.Module.daemon_action(mod, 'redeploy', 'mon.h1').exception_str)
         entries['talos/inc/20/journal/op/' + op_id] = json.dumps({'state': 'completed'})
-        self.assertFalse(m.Module.daemon_action(mod, 'redeploy', 'mgr.h3').exception_str)
+        self.assertFalse(m.Module.daemon_action(mod, 'redeploy', 'mon.h1').exception_str)
         out = m.Module._operation(mod, op_id)
         self.assertEqual(out.retval, 0)
         self.assertEqual(json.loads(out.stdout)['journal']['state'], 'completed')
@@ -536,14 +536,14 @@ class Acceptance(unittest.TestCase):
     def test_an_unsettled_append_blocks_acceptance(self):
         mod, entries = self.module()
         mod._ledger.mon.silent = 2
-        self.assertTrue(m.Module.daemon_action(mod, 'restart', 'mgr.h3').exception_str)  # outcome unknown
+        self.assertTrue(m.Module.daemon_action(mod, 'restart', 'mon.h1').exception_str)  # outcome unknown
         # still unknown: no second operation on the same daemon goes in beside it
-        self.assertTrue(m.Module.daemon_action(mod, 'restart', 'mgr.h3').exception_str)
+        self.assertTrue(m.Module.daemon_action(mod, 'restart', 'mon.h1').exception_str)
         self.assertEqual(len(mod._ledger.executable()), 0)
         # settled: the first one counts, and blocks the next on that daemon
         mod._ledger.settle()
         self.assertEqual(len(mod._ledger.executable()), 1)
-        self.assertTrue(m.Module.daemon_action(mod, 'restart', 'mgr.h3').exception_str)
+        self.assertTrue(m.Module.daemon_action(mod, 'restart', 'mon.h1').exception_str)
 
     def test_refused_before_acceptance(self):
         mod, _ = self.module()
@@ -610,6 +610,41 @@ class AddAndRemove(unittest.TestCase):
         res = m.Module.remove_daemons(mod, ['mon.h1'])
         self.assertEqual(res.exception_str, '')
         self.assertEqual(self.ops(mod)[-1], ('remove_daemon', 'mon.h1', 'h1'))
+
+
+class Maintenance(unittest.TestCase):
+    def module(self):
+        mod, entries = AddAndRemove.module(self)
+        mod.get = lambda what: {'standbys': [{'name': 'h1', 'available': True}]} if what == 'mgr_map' else None
+        return mod, entries
+
+    def finish(self, entries, op_id):
+        entries['talos/inc/20/journal/op/' + op_id] = json.dumps({'state': 'completed'})
+
+    def test_enter_and_exit(self):
+        mod, entries = self.module()
+        # h3 is in maintenance in the CLI's state; unknown hosts and Ceph's override are refused
+        for args in (('h3',), ('h9',), ('h1', False, True)):
+            self.assertTrue(m.Module.enter_host_maintenance(mod, *args).exception_str, args)
+        self.assertEqual(m.Module.enter_host_maintenance(mod, 'h1', True).exception_str, '')
+        [(_, enter)] = mod._ledger.executable()
+        self.assertEqual((enter['kind'], enter['host'], enter['force']), ('enter_maintenance', 'h1', True))
+        # nothing else on h1 meanwhile, before or after the enter finished
+        self.assertTrue(m.Module.daemon_action(mod, 'restart', 'mon.h1').exception_str)
+        self.finish(entries, enter['id'])
+        for res in (m.Module.daemon_action(mod, 'restart', 'mon.h1'), m.Module.add_daemon(mod, AddAndRemove.spec(self, 'mgr', 'h1')),
+                    m.Module.remove_osds(mod, ['0']), m.Module.enter_host_maintenance(mod, 'h1')):
+            self.assertTrue(res.exception_str)
+        self.assertTrue(m.Module.exit_host_maintenance(mod, 'h1', True).exception_str)
+        self.assertTrue(m.Module.exit_host_maintenance(mod, 'h2').exception_str)
+        self.assertEqual(m.Module.exit_host_maintenance(mod, 'h1').exception_str, '')
+        self.assertEqual([e['kind'] for _, e in mod._ledger.executable()], ['enter_maintenance', 'exit_maintenance'])
+
+    def test_the_active_mgr_needs_a_standby(self):
+        mod, _ = self.module()
+        mod.get_mgr_id = lambda: 'h2'
+        mod.get = lambda what: {'standbys': []}
+        self.assertIn('standby', m.Module.enter_host_maintenance(mod, 'h2').exception_str)
 
 
 class Conflicts(unittest.TestCase):

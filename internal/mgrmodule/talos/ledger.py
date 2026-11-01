@@ -26,10 +26,12 @@ ENTRY_VERSION = 1
 KEY_RE = re.compile(r'\A(\d{20})-(\d{10})-(takeover|op-[0-9a-f]{16}|m-[0-9a-f]{16})\Z')
 OP_RE = re.compile(r'\Aop-[0-9a-f]{16}\Z')
 # kinds an operation entry may have; ADDS and REMOVES change the fold
-KINDS = ('restart', 'redeploy', 'add_daemon', 'remove_daemon', 'remove_host', 'create_osd', 'remove_osd')
+KINDS = ('restart', 'redeploy', 'add_daemon', 'remove_daemon', 'remove_host', 'create_osd', 'remove_osd', 'enter_maintenance', 'exit_maintenance')
+# kinds that are about a whole host: every other operation on it waits for them
+HOST_KINDS = ('remove_host', 'enter_maintenance', 'exit_maintenance')
 # the module's own entries (ids m-<hex>), which carry out a removal: close a
-# daemon's generation, retire the daemon, retire a host
-MODULE_KINDS = ('close', 'retire', 'retire_host', 'bind', 'confirm', 'close_create', 'drained')
+# daemon's generation, retire the daemon, retire a host; end a host's maintenance
+MODULE_KINDS = ('close', 'retire', 'retire_host', 'bind', 'confirm', 'close_create', 'drained', 'maintained')
 DEVICE_RE = re.compile(r'\A/dev/[A-Za-z0-9][A-Za-z0-9._:/-]{0,200}\Z')
 SERIAL_RE = re.compile(r'\A[A-Za-z0-9._-]{1,64}\Z')
 UUID_RE_OSD = re.compile(r'\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z')
@@ -92,8 +94,12 @@ def check_entry(key: str, raw: str) -> Dict[str, Any]:
         return e
     if kind not in KINDS or (e.get('request') is not None and not (isinstance(e['request'], str) and UUID_RE.match(e['request']))):
         raise LedgerError('operation entry %s' % key)
-    if kind == 'remove_host':
-        if daemon is not None:
+    if kind in ('remove_host', 'exit_maintenance'):
+        if daemon is not None or (kind == 'exit_maintenance' and set(e) - {'version', 'id', 'kind', 'host', 'gid', 'epoch', 'seq', 'request'}):
+            raise LedgerError('operation entry %s' % key)
+        return e
+    if kind == 'enter_maintenance':
+        if daemon is not None or type(e.get('force')) is not bool or set(e) - {'version', 'id', 'kind', 'host', 'force', 'gid', 'epoch', 'seq', 'request'}:
             raise LedgerError('operation entry %s' % key)
         return e
     if kind == 'create_osd':
@@ -163,7 +169,8 @@ class Fold:
     executable entries in order. An add counts from acceptance and opens a
     generation of the daemon (the add's id; "cli" for the CLI's daemons); a
     close entry closes it, a retire entry takes the daemon out, a retire_host
-    entry the host."""
+    entry the host. A host is in maintenance from the acceptance of its enter
+    until the maintained entry of an exit."""
 
     def __init__(self, inventory: Dict[str, Any], entries: List[Tuple[str, Dict[str, Any]]] = ()) -> None:
         self.hosts: Dict[str, str] = {h['name']: h['addr'] for h in inventory['hosts']}
@@ -172,6 +179,7 @@ class Fold:
         self.uuids: Dict[str, str] = {}  # "osd.<id>" -> uuid
         # creations of OSDs: op id -> {'host', 'bind': entry or None, 'confirmed', 'closed'}
         self.creations: Dict[str, Dict[str, Any]] = {}
+        self.maintenance = {h['name'] for h in inventory['hosts'] if h.get('maintenance')}
         for d in inventory['daemons']:
             if d.get('daemon_id'):
                 name = '%s.%s' % (d['daemon_type'], d['daemon_id'])
@@ -190,6 +198,11 @@ class Fold:
                 self.uuids.pop(e['daemon'], None)
             elif kind == 'retire_host' and not any(h == e['host'] for h in self.daemons.values()):
                 self.hosts.pop(e['host'], None)
+                self.maintenance.discard(e['host'])
+            elif kind == 'enter_maintenance' and e['host'] in self.hosts:
+                self.maintenance.add(e['host'])
+            elif kind == 'maintained':
+                self.maintenance.discard(e['host'])
             elif kind == 'create_osd' and e['host'] in self.hosts:
                 self.creations[e['id']] = {'host': e['host'], 'bind': None, 'confirmed': False, 'closed': False}
             elif kind == 'bind' and e['of'] in self.creations and self.creations[e['of']]['bind'] is None:

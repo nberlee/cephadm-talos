@@ -208,3 +208,23 @@ class GenerationTest(unittest.TestCase):
         k, e = entry(5, 9, 'm-%016x' % 9, kind='restart', daemon='mgr.h1', host='h1')
         with self.assertRaises(lg.LedgerError):
             lg.check_entry(k, json.dumps(e))
+
+
+class MaintenanceFoldTest(unittest.TestCase):
+    def test_from_enter_until_maintained(self):
+        inv = dict(GenerationTest.INV, hosts=GenerationTest.INV['hosts'] + [{'name': 'h3', 'addr': '10.0.0.3', 'maintenance': True}])
+        enter = entry(5, 1, 'op-%016x' % 1, kind='enter_maintenance', host='h2', force=False)
+        exit_ = entry(5, 2, 'op-%016x' % 2, kind='exit_maintenance', host='h2')
+        done = entry(5, 3, 'm-%016x' % 3, kind='maintained', of='op-%016x' % 2, host='h2')
+        for k, e in (enter, exit_, done):
+            lg.check_entry(k, json.dumps(e))
+        self.assertEqual(lg.Fold(inv).maintenance, {'h3'})  # the CLI's
+        self.assertEqual(lg.Fold(inv, [enter]).maintenance, {'h2', 'h3'})
+        # the exit's acceptance leaves it in maintenance: its documents are still gone
+        self.assertEqual(lg.Fold(inv, [enter, exit_]).maintenance, {'h2', 'h3'})
+        self.assertEqual(lg.Fold(inv, [enter, exit_, done]).maintenance, {'h3'})
+        for bad in (dict(kind='enter_maintenance', host='h2'), dict(kind='enter_maintenance', host='h2', force=1),
+                    dict(kind='enter_maintenance', host='h2', force=False, daemon='mgr.h2'), dict(kind='exit_maintenance', host='h2', force=False)):
+            k, e = entry(5, 9, 'op-%016x' % 9, **bad)
+            with self.assertRaises(lg.LedgerError, msg=bad):
+                lg.check_entry(k, json.dumps(e))

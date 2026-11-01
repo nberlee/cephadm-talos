@@ -572,20 +572,37 @@ func (b *Bridge) Quorum(ctx context.Context) ([]string, error) {
 
 // ActiveMgr returns the name of the active mgr.
 func (b *Bridge) ActiveMgr(ctx context.Context) (string, error) {
+	name, _, err := b.ActiveMgrGID(ctx)
+
+	return name, err
+}
+
+// ActiveMgrGID returns the active mgr's name and gid.
+func (b *Bridge) ActiveMgrGID(ctx context.Context) (string, int64, error) {
 	out, err := b.do(ctx, "mgr dump", map[string]any{})
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 
 	var m struct {
 		ActiveName string `json:"active_name"`
+		ActiveGID  int64  `json:"active_gid"`
 	}
 
 	if err := json.Unmarshal([]byte(out), &m); err != nil || m.ActiveName == "" {
-		return "", errors.New("bridge: mgr dump: no active mgr")
+		return "", 0, errors.New("bridge: mgr dump: no active mgr")
 	}
 
-	return m.ActiveName, nil
+	return m.ActiveName, m.ActiveGID, nil
+}
+
+// MgrFail asks the module to fail the active mgr over (by its gid) for an
+// operation that must stop it; the active mgr respawns, so the answer may
+// never come.
+func (b *Bridge) MgrFail(ctx context.Context, op string, gid int64) error {
+	_, err := b.do(ctx, "mgr fail", map[string]any{"operation": op, "gid": gid})
+
+	return err
 }
 
 // AuthGetOrCreate returns the secret of a mgr or RGW identity, created with

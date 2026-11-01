@@ -539,7 +539,7 @@ func TestReportWaitsForTheNodeOnlyUntilItsDeadline(t *testing.T) {
 	}
 }
 
-func TestLeaderLeavesMaintenanceHostsAlone(t *testing.T) {
+func TestARevisionOfAMaintenanceHostStartsNothing(t *testing.T) {
 	s := newLeaderSetup(t)
 	ctx := context.Background()
 
@@ -551,8 +551,15 @@ func TestLeaderLeavesMaintenanceHostsAlone(t *testing.T) {
 	s.request("r1", `{"version":1,"kind":"revision","host":"h1"}`)
 	must(t, s.leader.Tick(ctx, 42, 5))
 
-	if op := s.op(t, "r1"); op.State != JournalFailed || !strings.Contains(op.Error, "maintenance") || s.agent.patches.n != 0 {
+	op := s.op(t, "r1")
+	if op.State != "completed" {
 		t.Fatalf("revision of a host in maintenance: %+v", op)
+	}
+
+	for k := range op.Docs {
+		if strings.HasPrefix(k, "ContainerConfig/") {
+			t.Fatalf("a daemon granted on a host in maintenance: %+v", op)
+		}
 	}
 }
 
@@ -1540,5 +1547,325 @@ func TestLeaderRemovesAMonFromTheMonmapFirst(t *testing.T) {
 	// retirement before it reached every host
 	if decided {
 		t.Fatal("completed before ceph.conf reached every host")
+	}
+}
+
+func TestMaintenanceStopsAndStartsAHost(t *testing.T) {
+	s := newLeaderSetup(t)
+	ctx := context.Background()
+	s.withCA(t)
+
+	// h1 runs a mon and the active mgr, deployed
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	add := s.accept(KindAddDaemon, "mgr.h1", "h1", 1)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if op := s.op(t, add.Op.ID); op.State != "completed" {
+		t.Fatalf("add: %+v", op)
+	}
+
+	s.module.mu.Lock()
+	s.module.active, s.module.retired = "h1", nil
+	s.module.mu.Unlock()
+
+	daemonDocs := func() []string {
+		rep, err := s.agent.Node.Report(ctx)
+		must(t, err)
+
+		var out []string
+
+		for k := range rep.Owned {
+			if strings.HasPrefix(k, "ContainerConfig/ceph-"+testFSID[:8]+"-m") {
+				out = append(out, k)
+			}
+		}
+
+		slices.Sort(out)
+
+		return out
+	}
+
+	if len(daemonDocs()) != 2 {
+		t.Fatalf("documents before: %v", daemonDocs())
+	}
+
+	// a revision request for h1 waits while its maintenance is in progress
+	enter := s.accept(KindEnterMaint, "", "h1", 2)
+	s.request("r9", `{"version":1,"kind":"revision","host":"h1"}`)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	s.module.mu.Lock()
+	_, held := s.module.kv[JournalPrefix(42)+"op/r9"]
+	s.module.mu.Unlock()
+
+	if held {
+		t.Fatal("a revision request ran during the maintenance")
+	}
+
+	// checked, then the active mgr failed over by its gid, recorded first; nothing stopped yet
+	s.module.mu.Lock()
+	calls := slices.Clone(s.module.retired)
+	s.module.mu.Unlock()
+
+	if !slices.Equal(calls, []string{"ok to stop " + enter.Op.ID, "mgr fail " + enter.Op.ID + " 42"}) {
+		t.Fatalf("calls %v", calls)
+	}
+
+	if f := s.op(t, enter.Op.ID+".fail"); f.MgrGID != 42 || len(daemonDocs()) != 2 {
+		t.Fatalf("mgr fail record %+v, documents %v", f, daemonDocs())
+	}
+
+	// the successor finds the active mgr elsewhere and goes on
+	s.module.mu.Lock()
+	s.module.active, s.module.retired = "h0", nil
+	s.module.mu.Unlock()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if op := s.op(t, enter.Op.ID); op.State != "completed" || len(daemonDocs()) != 0 {
+		t.Fatalf("enter: %+v, documents %v", op, daemonDocs())
+	}
+
+	st, _, err := s.leader.clusterState(ctx, s.leader.bridge())
+	must(t, err)
+
+	if h, _ := st.Host("h1"); !h.Maintenance || h.NoOut {
+		t.Fatalf("host after enter: %+v", h)
+	}
+
+	if _, ok := st.Find("mgr.h1"); !ok {
+		t.Fatal("the daemons left the state")
+	}
+
+	// the exit starts the mon first and waits for it in the quorum
+	exit := s.accept(KindExitMaint, "", "h1", 3)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if got := daemonDocs(); len(got) != 1 || !strings.Contains(got[0], "-mon-") {
+		t.Fatalf("documents with the mon not in the quorum: %v", got)
+	}
+
+	s.module.mu.Lock()
+	s.module.quorum = []string{"h1"}
+	s.module.mu.Unlock()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if op := s.op(t, exit.Op.ID); op.State != "completed" || len(daemonDocs()) != 2 {
+		t.Fatalf("exit: %+v, documents %v", op, daemonDocs())
+	}
+
+	s.module.mu.Lock()
+	calls = slices.Clone(s.module.retired)
+	s.module.mu.Unlock()
+
+	if !slices.Equal(calls, []string{"ok to stop " + enter.Op.ID, "maintained " + exit.Op.ID}) {
+		t.Fatalf("calls %v", calls)
+	}
+}
+
+func TestMaintenanceOfAnOSDHostSetsNoout(t *testing.T) {
+	s := newLeaderSetup(t)
+	ctx := context.Background()
+
+	disk := block.NewDisk(block.NamespaceName, "sdb")
+	disk.TypedSpec().Serial, disk.TypedSpec().DevPath = "QM00003", "/dev/sdb"
+	disk.TypedSpec().Symlinks = []string{"/dev/disk/by-id/ata-QEMU_HARDDISK_QM00003"}
+	must(t, s.agent.fake.St.Create(ctx, disk))
+
+	id, uuid := 3, "8f2c0a4e-1d3b-4c5a-9e6f-7a8b9c0d1e2f"
+	s.st.AddDaemon(state.Daemon{Type: state.TypeOSD, ID: "h1-sdb", Host: "h1", OSDID: &id, OSDUUID: uuid, DeployID: "0123456789abcdef",
+		DiskSerial: "QM00003", DevicePath: "/dev/disk/by-id/ata-QEMU_HARDDISK_QM00003"})
+	publish(t, s.leader, s.module, s.st)
+
+	s.request("r1", `{"version":1,"kind":"revision","host":"h1"}`)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	s.module.mu.Lock()
+	s.module.active = "h0"
+	s.module.mu.Unlock()
+
+	// forced: Ceph's checks still run (force overrides neither)
+	enter := s.accept(KindEnterMaint, "", "h1", 1)
+	enter.Op.Force = true
+	s.module.mu.Lock()
+	s.module.ledger[len(s.module.ledger)-1] = enter
+	s.module.mu.Unlock()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if op := s.op(t, enter.Op.ID); op.State != "completed" {
+		t.Fatalf("enter: %+v", op)
+	}
+
+	s.module.mu.Lock()
+	s.module.quorum = []string{"h1"}
+	s.module.mu.Unlock()
+
+	exit := s.accept(KindExitMaint, "", "h1", 2)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	// noout stays until the OSD is up again
+	s.module.mu.Lock()
+	_, ended := s.module.kv[JournalPrefix(42)+"op/"+exit.Op.ID]
+	s.module.osds = []OSD{{ID: 3, UUID: uuid, Up: true}}
+	s.module.mu.Unlock()
+
+	if ended {
+		t.Fatal("the exit ended before the OSD was up")
+	}
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	s.module.mu.Lock()
+	calls := slices.Clone(s.module.retired)
+	s.module.mu.Unlock()
+
+	want := []string{"ok to stop " + enter.Op.ID, "noout set " + enter.Op.ID, "noout unset " + exit.Op.ID, "maintained " + exit.Op.ID}
+	if op := s.op(t, exit.Op.ID); op.State != "completed" || !slices.Equal(calls, want) {
+		t.Fatalf("exit: %+v, calls %v", op, calls)
+	}
+
+	st, _, err := s.leader.clusterState(ctx, s.leader.bridge())
+	must(t, err)
+
+	if h, _ := st.Host("h1"); h.Maintenance || h.NoOut {
+		t.Fatalf("host after exit: %+v", h)
+	}
+}
+
+func TestAnExitAfterARefusedEnterStopsNothing(t *testing.T) {
+	s := newLeaderSetup(t)
+	ctx := context.Background()
+	s.withCA(t)
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	add := s.accept(KindAddDaemon, "mgr.h1", "h1", 1)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if op := s.op(t, add.Op.ID); op.State != "completed" {
+		t.Fatalf("add: %+v", op)
+	}
+
+	owned := func() int {
+		rep, err := s.agent.Node.Report(ctx)
+		must(t, err)
+
+		return len(rep.Owned)
+	}
+
+	before := owned()
+
+	// the enter never got past its checks: the exit's mon phase leaves the mgr running
+	exit := s.accept(KindExitMaint, "", "h1", 2)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if owned() != before {
+		t.Fatalf("documents %d, want %d", owned(), before)
+	}
+
+	s.module.mu.Lock()
+	s.module.quorum = []string{"h1"}
+	s.module.mu.Unlock()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if op := s.op(t, exit.Op.ID); op.State != "completed" || owned() != before {
+		t.Fatalf("exit: %+v, documents %d", op, owned())
+	}
+}
+
+func TestRevisionRequestsWaitWithoutTheLedger(t *testing.T) {
+	s := newLeaderSetup(t)
+	ctx := context.Background()
+
+	s.module.mu.Lock()
+	s.module.refuse = "ledger"
+	s.module.mu.Unlock()
+
+	s.request("r1", `{"version":1,"kind":"revision","host":"h1"}`)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	s.module.mu.Lock()
+	_, ran := s.module.kv[JournalPrefix(42)+"op/r1"]
+	s.module.refuse = ""
+	s.module.mu.Unlock()
+
+	if ran {
+		t.Fatal("a revision request ran without knowing whether a maintenance is in progress")
+	}
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if op := s.op(t, "r1"); op.State != "completed" {
+		t.Fatalf("r1: %+v", op)
+	}
+}
+
+func TestAResumedEnterChecksAgainBeforeItStops(t *testing.T) {
+	s := newLeaderSetup(t)
+	ctx := context.Background()
+
+	s.module.mu.Lock()
+	s.module.active = "h0"
+	s.module.mu.Unlock()
+
+	// a predecessor marked h1 and stopped before its stop grant
+	h, _ := s.st.Host("h1")
+	h.Maintenance = true
+	s.st.AddHost(h)
+	publish(t, s.leader, s.module, s.st)
+
+	enter := s.accept(KindEnterMaint, "", "h1", 1)
+	s.module.mu.Lock()
+	s.module.refuse = "ok to stop"
+	s.module.mu.Unlock()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	s.module.mu.Lock()
+	_, granted := s.module.kv[JournalPrefix(42)+"op/"+enter.Op.ID+".rev"]
+	s.module.mu.Unlock()
+
+	if granted {
+		t.Fatal("stopped without Ceph's checks")
+	}
+}
+
+func TestAFailedEnterUnmarksTheHost(t *testing.T) {
+	s := newLeaderSetup(t)
+	ctx := context.Background()
+
+	s.module.mu.Lock()
+	s.module.active = "h0"
+	s.module.mu.Unlock()
+
+	h, _ := s.st.Host("h1")
+	h.Maintenance = true
+	s.st.AddHost(h)
+	publish(t, s.leader, s.module, s.st)
+
+	enter := s.accept(KindEnterMaint, "", "h1", 1)
+	s.module.mu.Lock()
+	s.module.refuse = "ok to stop"
+	s.module.mu.Unlock()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	// refused for longer than stuckAfter: failed, and h1 no longer marked
+	s.leader.failing[enter.Op.ID] = time.Now().Add(-stuckAfter - time.Minute)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if op := s.op(t, enter.Op.ID); op.State != JournalFailed {
+		t.Fatalf("enter: %+v", op)
+	}
+
+	st, _, err := s.leader.clusterState(ctx, s.leader.bridge())
+	must(t, err)
+
+	if h, _ := st.Host("h1"); h.Maintenance {
+		t.Fatal("h1 stays marked: a revision would stop its daemons without the checks")
 	}
 }
