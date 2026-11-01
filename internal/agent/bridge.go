@@ -428,6 +428,12 @@ type LedgerOp struct {
 	// add_daemon of an RGW: its port, and the operator's certificate chain
 	Port int    `json:"port,omitempty"`
 	Cert string `json:"cert,omitempty"`
+	// apply_ingress: the VIP, router id, hosts in order, whether it set a new
+	// password (the secret ingress/<op>/vrrp); its image in Image
+	VIP         string   `json:"vip,omitempty"`
+	VRID        int      `json:"vrid,omitempty"`
+	Hosts       []string `json:"hosts,omitempty"`
+	NewPassword bool     `json:"new_password,omitempty"`
 }
 
 // Ledger returns the executable operations after a ledger key, in the order
@@ -516,6 +522,14 @@ func (b *Bridge) RGWCert(ctx context.Context, op string) (RGWCert, error) {
 // operation's roll: the ones before it are retired and their keys removed.
 func (b *Bridge) RGWCertDone(ctx context.Context, op, keep string) error {
 	_, err := b.do(ctx, "rgw cert done", map[string]any{"operation": op, "keep": keep})
+
+	return err
+}
+
+// RetireKeepalived asks the module to retire a keepalived an ingress apply
+// left out, once its document and instance are gone.
+func (b *Bridge) RetireKeepalived(ctx context.Context, op, daemon string) error {
+	_, err := b.do(ctx, "retire keepalived", map[string]any{"operation": op, "daemon": daemon})
 
 	return err
 }

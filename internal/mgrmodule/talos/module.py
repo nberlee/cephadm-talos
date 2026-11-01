@@ -17,7 +17,9 @@ import http.client
 import json
 import os
 import re
+import secrets
 import ssl
+import string
 import socket
 import threading
 import time
@@ -27,7 +29,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import orchestrator
 from ceph.deployment.hostspec import HostSpec
 from ceph.deployment.service_spec import ServiceSpec
-from mgr_module import CLICommandBase, CommandResult, HandleCommandResult, MgrModule
+from mgr_module import CLICommandBase, CommandResult, HandleCommandResult, MgrModule, Option
 from orchestrator import DaemonDescription, DaemonDescriptionStatus, OrchestratorError, handle_orch_error, UpgradeStatusSpec
 
 from . import bridge, ledger
@@ -476,6 +478,10 @@ def tls_context(directory: str = TALOS_DIR) -> ssl.SSLContext:
 
 class Module(orchestrator.Orchestrator, MgrModule):
     CLICommand = TalosCLICommand
+    MODULE_OPTIONS = [
+        # as in cephadm: the keepalived image of the ingress (a digest the operator approved)
+        Option('container_image_keepalived', type='str', default='', desc='keepalived container image of the ingress, by digest'),
+    ]
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -947,6 +953,12 @@ class Module(orchestrator.Orchestrator, MgrModule):
             raise OrchestratorError('%s is already in maintenance' % hostname)
         if fold.upgrade is not None:
             raise OrchestratorError('an upgrade is in progress (operation %s)' % fold.upgrade['op'])
+        led, _ = self._authority()
+        for _, e in led.executable():
+            if e['kind'] == 'apply_ingress' and hostname in e['hosts'] + ((fold.ingress or {}).get('hosts') or []):
+                rec = self._journal(e['id'])
+                if rec is None or rec.get('state') not in TERMINAL:
+                    raise OrchestratorError('ingress operation %s on %s is in progress' % (e['id'], hostname))
         if len(fold.hosts) < 2:
             raise OrchestratorError('maintenance is not supported on single node clusters')
         # osd set-group resolves numbers (OSD ids), all and any before CRUSH bucket names
@@ -1006,7 +1018,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
             raise OrchestratorError('the newest approval does not decode')
         return [i for i in images if isinstance(i, str)]
 
-    def _accept_cluster(self, kind: str, **fields: Any) -> str:
+    def _accept_cluster(self, kind: str, op_id: Optional[str] = None, **fields: Any) -> str:
         """Accept an operation about the whole cluster (an upgrade's): no host."""
         led, _ = self._authority()
         lead = getattr(self, '_leadership', None)
@@ -1016,7 +1028,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
             led.settle()
         except ledger.LedgerError as e:
             raise OrchestratorError('an earlier operation is not settled yet (%s); try again' % e)
-        op_id = 'op-' + os.urandom(8).hex()
+        op_id = op_id or 'op-' + os.urandom(8).hex()
         try:
             led.append({'id': op_id, 'kind': kind, **fields})
         except ledger.OutcomeUnknown:
@@ -1104,6 +1116,84 @@ class Module(orchestrator.Orchestrator, MgrModule):
         elif u.get('step'):
             spec.message = 'upgrading %s' % u['step']
         return spec
+
+    @handle_orch_error
+    def apply(self, specs: Any, no_overwrite: bool = False, continue_on_error: bool = False) -> List[str]:
+        """The one spec this backend applies: the keepalived-only ingress of the RGWs."""
+        from ceph.deployment.service_spec import IngressSpec
+        # host add goes through Ceph's own routing to add_host (plan 03, step 7)
+        if specs and all(isinstance(s, HostSpec) for s in specs):
+            return orchestrator.raise_if_exception(orchestrator.Orchestrator.apply(self, specs, no_overwrite, continue_on_error))
+        if no_overwrite or continue_on_error or len(specs) != 1 or not isinstance(specs[0], IngressSpec):
+            raise OrchestratorError('apply is supported by this backend for one keepalived-only ingress spec only')
+        return [self._apply_ingress(specs[0])]
+
+    def _apply_ingress(self, spec: Any) -> str:
+        import ipaddress
+        from ceph.deployment.service_spec import IngressSpec
+        p = spec.placement
+        if spec.service_id != 'rgw.default' or spec.backend_service != 'rgw.default' or not spec.keepalive_only:
+            raise OrchestratorError('the ingress is rgw.default with backend_service rgw.default and keepalive_only: true')
+        if p is None or not 0 < len(p.hosts) <= 15 or p.count is not None or p.count_per_host or p.label or p.host_pattern \
+                or any(h.network or h.name for h in p.hosts):
+            raise OrchestratorError('place the ingress on 1 to 15 named hosts')
+        want = IngressSpec(service_id='rgw.default', backend_service='rgw.default', keepalive_only=True, virtual_ip=spec.virtual_ip,
+                           placement=p, first_virtual_router_id=spec.first_virtual_router_id, keepalived_password=spec.keepalived_password)
+        if spec.to_json() != want.to_json() or getattr(spec, 'preview_only', False):
+            raise OrchestratorError('only virtual_ip, placement, first_virtual_router_id and keepalived_password are supported by this backend')
+        try:
+            vip = ipaddress.ip_interface(spec.virtual_ip or '')
+        except ValueError:
+            raise OrchestratorError('virtual_ip: an address with its prefix length')
+        if vip.version != 4 or '/' not in spec.virtual_ip:
+            raise OrchestratorError('virtual_ip: an IPv4 address with its prefix length (keepalived is set up for IPv4 only)')
+        vrid = spec.first_virtual_router_id
+        if type(vrid) is not int or not 0 < vrid < 256:
+            raise OrchestratorError('first_virtual_router_id: 1 to 255')
+        pw = spec.keepalived_password
+        if pw is not None and not re.match(r'\A[A-Za-z0-9]{1,8}\Z', pw):
+            raise OrchestratorError('keepalived_password: 1 to 8 letters and digits')
+        self._settle()
+        _, fold = self._authority()
+        hosts = [h.hostname for h in p.hosts]
+        if len(set(hosts)) != len(hosts):
+            raise OrchestratorError('a host named twice')
+        for h in hosts:
+            if h not in fold.hosts or 'rgw.' + h not in fold.daemons:
+                raise OrchestratorError('%s has no RGW of the cluster' % h)
+            busy = self._unfinished('rgw.' + h, h)
+            if busy:
+                raise OrchestratorError('rgw.%s has operation %s in progress (orch talos operation %s)' % (h, busy, busy))
+            if ipaddress.ip_address(fold.hosts[h]).version != 4:
+                raise OrchestratorError('%s has no IPv4 address' % h)
+        busy = sorted((set(hosts) | set((fold.ingress or {}).get('hosts') or [])) & fold.maintenance)
+        if busy:
+            raise OrchestratorError('hosts in maintenance: %s' % ', '.join(busy))
+        cur = fold.ingress
+        new_password = cur is None
+        if cur is not None:
+            if str(ipaddress.ip_interface(cur['vip'])) != str(vip) or cur.get('vrid') != vrid:
+                raise OrchestratorError('the ingress keeps its VIP %s and router id %s' % (cur['vip'], cur.get('vrid')))
+            placed = {h for n, h in fold.daemons.items() if n.startswith('keepalived.')}
+            if len(set(hosts) | set(cur['hosts']) | placed) > 15:
+                raise OrchestratorError('at most 15 hosts, also old and new together during the change')
+            if pw is not None:
+                r, out, _ = self.mon_command({'prefix': 'config-key get', 'key': bridge.SECRET_PREFIX + fold.vrrp_secret})
+                if r != 0 or out != pw:
+                    raise OrchestratorError('the ingress keeps its keepalived_password')
+        image = self.get_module_option('container_image_keepalived') or fold.cli_rgw.get('keepalived_image') or ''
+        if not ledger.IMAGE_RE.match(image):
+            raise OrchestratorError('set mgr/cephadm/container_image_keepalived to the keepalived image by digest')
+        if image not in self._approved_images():
+            raise OrchestratorError('the operator has not approved %s (cephadm-talos approve --image)' % image)
+        op_id = 'op-' + os.urandom(8).hex()
+        if new_password:
+            secret = pw or ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(8))
+            r, _, outs = self.mon_command({'prefix': 'config-key set', 'key': '%singress/%s/vrrp' % (bridge.SECRET_PREFIX, op_id), 'val': secret})
+            if r != 0:
+                raise OrchestratorError('the VRRP password was not written: %s' % outs)
+        op_id = self._accept_cluster('apply_ingress', op_id=op_id, vip=str(vip), vrid=vrid, hosts=hosts, image=image, new_password=new_password)
+        return 'Scheduled the ingress on %s (operation %s)' % (', '.join(hosts), op_id)
 
     @TalosCLICommand.Read('orch talos operation')
     def _operation(self, id: str) -> HandleCommandResult:

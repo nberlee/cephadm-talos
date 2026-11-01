@@ -27,12 +27,13 @@ KEY_RE = re.compile(r'\A(\d{20})-(\d{10})-(takeover|op-[0-9a-f]{16}|m-[0-9a-f]{1
 OP_RE = re.compile(r'\Aop-[0-9a-f]{16}\Z')
 # kinds an operation entry may have; ADDS and REMOVES change the fold
 KINDS = ('restart', 'redeploy', 'add_daemon', 'remove_daemon', 'remove_host', 'create_osd', 'remove_osd', 'enter_maintenance', 'exit_maintenance', 'powercycle_host',
-         'upgrade_start', 'upgrade_pause', 'upgrade_resume', 'upgrade_stop')
+         'upgrade_start', 'upgrade_pause', 'upgrade_resume', 'upgrade_stop', 'apply_ingress')
 # the upgrade's kinds, operations and module entries: about the cluster, without a host
 UPGRADE_CONTROLS = ('upgrade_pause', 'upgrade_resume', 'upgrade_stop')
 UPGRADE_KINDS = ('upgrade_start',) + UPGRADE_CONTROLS + ('upgrade_done', 'upgrade_refused')
 # entries about the cluster, without a host: the upgrade's and the RGW certificates'
-HOSTLESS = UPGRADE_KINDS + ('rgw_cert', 'rgw_cert_done')
+HOSTLESS = UPGRADE_KINDS + ('rgw_cert', 'rgw_cert_done', 'apply_ingress')
+VIP_RE = re.compile(r'\A(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}/(?:3[0-2]|[12]?\d)\Z')
 IMAGE_RE = re.compile(r'\A[a-z0-9][a-z0-9._/:-]{0,254}@sha256:[0-9a-f]{64}\Z')
 # kinds that are about a whole host: every other operation on it waits for them
 HOST_KINDS = ('remove_host', 'enter_maintenance', 'exit_maintenance', 'powercycle_host')
@@ -112,11 +113,20 @@ def check_entry(key: str, raw: str) -> Dict[str, Any]:
         return e
     if kind not in KINDS or (e.get('request') is not None and not (isinstance(e['request'], str) and UUID_RE.match(e['request']))):
         raise LedgerError('operation entry %s' % key)
-    if (kind in UPGRADE_KINDS) != ('host' not in e):
+    if (kind in HOSTLESS) != ('host' not in e):
         raise LedgerError('operation entry %s' % key)
     if kind == 'upgrade_start':
         if not isinstance(e.get('image'), str) or not IMAGE_RE.match(e['image']) \
                 or set(e) - {'version', 'id', 'kind', 'image', 'gid', 'epoch', 'seq', 'request'}:
+            raise LedgerError('operation entry %s' % key)
+        return e
+    if kind == 'apply_ingress':
+        hosts = e.get('hosts')
+        if not (isinstance(e.get('vip'), str) and VIP_RE.match(e['vip']) and type(e.get('vrid')) is int and 0 < e['vrid'] < 256
+                and isinstance(hosts, list) and 0 < len(hosts) <= 15 and len(set(hosts)) == len(hosts)
+                and all(isinstance(h, str) and HOST_RE.match(h) for h in hosts)
+                and isinstance(e.get('image'), str) and IMAGE_RE.match(e['image']) and type(e.get('new_password')) is bool) \
+                or set(e) - {'version', 'id', 'kind', 'vip', 'vrid', 'hosts', 'image', 'new_password', 'gid', 'epoch', 'seq', 'request'}:
             raise LedgerError('operation entry %s' % key)
         return e
     if kind in UPGRADE_CONTROLS:
@@ -226,6 +236,14 @@ class Fold:
         # the CLI's RGW settings, and the ingress VIP (address without prefix)
         self.cli_rgw: Dict[str, Any] = inventory.get('cli_rgw') or {}
         self.vip: Optional[str] = (self.cli_rgw.get('vip') or '').split('/')[0] or None
+        # the ingress: the CLI's VIP and router id, then the newest apply's; the
+        # secret holding the current VRRP password (the CLI's, or the newest
+        # apply that set one)
+        self.ingress: Optional[Dict[str, Any]] = None
+        if self.cli_rgw.get('vip'):
+            self.ingress = {'vip': self.cli_rgw['vip'], 'vrid': self.cli_rgw.get('vrid'), 'op': None,
+                            'hosts': [d['host'] for d in inventory['daemons'] if d.get('daemon_type') == 'keepalived' and d.get('daemon_id')]}
+        self.vrrp_secret = 'rgw/vrrp'
         if any(d.get('daemon_type') == 'rgw' and d.get('daemon_id') for d in inventory['daemons']):
             self.rgw_certs['cli'] = {'pos': -1, 'retired': False}
         positions: Dict[str, int] = {}
@@ -244,6 +262,8 @@ class Fold:
                     self.rgw_certs['user/' + e['id']] = {'pos': n, 'retired': False}
             elif kind == 'close' and e['daemon'] in self.generations:
                 self.generations[e['daemon']] = (self.generations[e['daemon']][0], False)
+            elif kind == 'retire' and e['daemon'].startswith('keepalived.') and e['host'] in (self.ingress or {}).get('hosts', []):
+                pass  # a newer ingress places it again: it stays
             elif kind == 'retire':
                 self.daemons.pop(e['daemon'], None)
                 self.generations.pop(e['daemon'], None)
@@ -262,6 +282,15 @@ class Fold:
                 for cid, c in self.rgw_certs.items():
                     if cid != e['keep'] and c['pos'] < positions[e['of']]:
                         c['retired'] = True
+            elif kind == 'apply_ingress':
+                self.ingress = {'vip': e['vip'], 'vrid': e['vrid'], 'op': e['id'], 'hosts': list(e['hosts'])}
+                self.vip = e['vip'].split('/')[0]
+                if e['new_password']:
+                    self.vrrp_secret = 'ingress/%s/vrrp' % e['id']
+                # a host left out keeps its keepalived until the module retires it
+                for h in e['hosts']:
+                    if h in self.hosts:
+                        self.daemons['keepalived.' + h], self.generations['keepalived.' + h] = h, (e['id'], True)
             elif kind == 'upgrade_start' and self.upgrade is None:
                 self.upgrade = {'op': e['id'], 'image': e['image'], 'paused': False}
             elif self.upgrade is not None and e.get('upgrade', e.get('of')) == self.upgrade['op'] and kind in UPGRADE_KINDS:
@@ -317,8 +346,8 @@ class Fold:
         if name.endswith('/rgw-server.key'):
             c = self.rgw_certs.get(name[:-len('/rgw-server.key')])
             return self.has('rgw') and c is not None and not c['retired']
-        if name == 'rgw/vrrp':
-            return self.has('keepalived')
+        if name == 'rgw/vrrp' or name.startswith('ingress/'):
+            return self.has('keepalived') and name == self.vrrp_secret
         return False
 
 

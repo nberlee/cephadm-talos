@@ -114,6 +114,18 @@ type RGW struct {
 	// 6e), each RGW naming its own (Daemon.Cert); Cert and Key above are the
 	// CLI's, for an RGW that names none
 	Certs []RGWCert `json:"certs,omitempty"`
+	// VRRPSecret names the secret with the current VRRP password; empty: the
+	// CLI's (rgw/vrrp)
+	VRRPSecret string `json:"vrrp_secret,omitempty"`
+}
+
+// VRRPSecretName is the secret holding the current VRRP password.
+func (r *RGW) VRRPSecretName() string {
+	if r.VRRPSecret != "" {
+		return r.VRRPSecret
+	}
+
+	return SecretVRRP
 }
 
 // RGWCert is an RGW serving certificate: its id, which names its key's secret

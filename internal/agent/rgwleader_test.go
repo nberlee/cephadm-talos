@@ -173,7 +173,7 @@ func TestARollMovesAnRGWToTheOperatorsCertificate(t *testing.T) {
 	must(t, err)
 
 	roll := func() (bool, error) {
-		done, err := s.leader.rollRGW(ctx, s.leader.bridge(), js, 42, 5, op, target)
+		done, err := s.leader.rollRGW(ctx, s.leader.bridge(), js, 42, 5, op, target, "roll")
 		if errors.Is(err, errRetry) {
 			return false, nil
 		}
@@ -263,5 +263,85 @@ func TestLeaderAddsAnRGWWithAGeneratedCertificate(t *testing.T) {
 
 	if !slices.Equal(calls, []string{"rgw cert " + add.Op.ID, "rgw cert done " + add.Op.ID + " " + id}) {
 		t.Fatalf("calls %v", calls)
+	}
+}
+
+func TestAFirstIngressReissuesTheCertificateBeforeKeepalivedStarts(t *testing.T) {
+	s := newLeaderSetup(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	hn := network.NewHostnameStatus(network.NamespaceName, network.HostnameID)
+	hn.TypedSpec().Hostname = "h1"
+	must(t, s.agent.fake.St.Create(ctx, hn))
+
+	addr := network.NewAddressStatus(network.NamespaceName, "eth0/10.5.0.3/24")
+	addr.TypedSpec().Address = netip.MustParsePrefix("10.5.0.3/24")
+	must(t, s.agent.fake.St.Create(ctx, addr))
+
+	// an RGW with the CLI's certificate, not for the VIP yet
+	old, oldKey := splitPEM(servingPEM(t, now.Add(-time.Hour), now.Add(24*time.Hour), "10.5.0.3", "h1"))
+	s.st.RGW = &state.RGW{Port: 443, Cert: old}
+	s.st.AddDaemon(state.Daemon{Type: state.TypeRGW, ID: "h1", Host: "h1"})
+	publish(t, s.leader, s.module, s.st)
+
+	in := s.accept(KindIngress, "", "", 1)
+	in.Op.VIP, in.Op.VRID, in.Op.Hosts, in.Op.Image, in.Op.NewPassword = "10.5.0.200/24", 50, []string{"h1"}, testImage, true
+
+	cert, key := splitPEM(servingPEM(t, now.Add(-time.Hour), now.Add(24*time.Hour), "10.5.0.3", "h1", "10.5.0.200"))
+	out, _ := json.Marshal(map[string]string{"attempt": "0123456789abcdef", "cert": cert})
+	id := "issued/" + in.Op.ID + "/0123456789abcdef"
+
+	s.module.mu.Lock()
+	s.module.ledger[len(s.module.ledger)-1] = in
+	s.module.active, s.module.rgwCert = "h0", string(out)
+	s.module.kv[store.SecretPrefix+state.SecretRGWServer] = oldKey
+	s.module.kv[store.SecretPrefix+id+"/rgw-server.key"] = key
+	s.module.kv[store.SecretPrefix+"ingress/"+in.Op.ID+"/vrrp"] = "abc"
+	s.module.mu.Unlock()
+
+	s.request("r1", `{"version":1,"kind":"revision","host":"h1"}`)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	rgw, vip := "ceph-"+testFSID[:8]+"-rgw-h1", "ceph-"+testFSID[:8]+"-vip-h1"
+	running(t, s, rgw)
+	addInstance(t, s.agent.fake, rgw, 1)
+	s.leader.serves = func(_ string, _ int, chain string) bool { return chain == cert }
+
+	for i := 0; i < 4; i++ {
+		must(t, s.leader.Tick(ctx, 42, 5))
+	}
+
+	// the RGW serves the certificate for the VIP from a new instance; only then keepalived
+	if owned(t, s, vip) {
+		t.Fatal("keepalived before the RGW serves a certificate for the VIP")
+	}
+
+	addInstance(t, s.agent.fake, rgw, 2)
+
+	for i := 0; i < 4; i++ {
+		must(t, s.leader.Tick(ctx, 42, 5))
+	}
+
+	if !owned(t, s, vip) {
+		t.Fatal("keepalived was not granted")
+	}
+
+	running(t, s, vip)
+	keepalivedLog(s, vip, "1", "BACKUP")
+
+	for i := 0; i < 2; i++ {
+		must(t, s.leader.Tick(ctx, 42, 5))
+	}
+
+	if op := s.op(t, in.Op.ID); op.State != "completed" {
+		t.Fatalf("ingress: %+v", op)
+	}
+
+	st, _, err := s.leader.clusterState(ctx, s.leader.bridge())
+	must(t, err)
+
+	if d, _ := st.Find("rgw.h1"); d.Cert != id || st.RGW.VIP != "10.5.0.200/24" || st.RGW.VRRPSecretName() != "ingress/"+in.Op.ID+"/vrrp" {
+		t.Fatalf("state: %+v %+v", d, st.RGW)
 	}
 }

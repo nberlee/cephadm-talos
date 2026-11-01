@@ -375,7 +375,7 @@ func (l *LeaderLoop) addRGW(ctx context.Context, b *Bridge, js store.Backend, gi
 
 	// a certificate this add brought serves every RGW
 	if d.Cert != "" && strings.Contains(d.Cert, op.ID) {
-		if done, err := l.rollRGW(ctx, b, js, gid, epoch, op, d.Cert); err != nil || !done {
+		if done, err := l.rollRGW(ctx, b, js, gid, epoch, op, d.Cert, "roll"); err != nil || !done {
 			return err
 		}
 
@@ -388,12 +388,13 @@ func (l *LeaderLoop) addRGW(ctx context.Context, b *Bridge, js store.Backend, gi
 }
 
 // rollRGW moves every RGW to a certificate, one host at a time (journaled per
-// host below base op.ID.roll.<host>): its keepalived off (vipOff), the RGW's
+// host below base op.ID.<ns>.<host>, ns "roll", or "recover" for finishing an
+// earlier roll): its keepalived off (vipOff), the RGW's
 // record set to the certificate and its host's revision granted, the RGW
 // running a newer instance and answering a TLS handshake with that
 // certificate, then its keepalived back (vipBack). The leader holds every
 // revision request meanwhile. Done reports that every RGW renders it.
-func (l *LeaderLoop) rollRGW(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, op LedgerOp, target string) (bool, error) {
+func (l *LeaderLoop) rollRGW(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, op LedgerOp, target, ns string) (bool, error) {
 	l.holding = holdAll
 
 	if err := l.notFailing(ctx, b, js, gid, op); err != nil {
@@ -418,7 +419,7 @@ func (l *LeaderLoop) rollRGW(ctx context.Context, b *Bridge, js store.Backend, g
 			continue
 		}
 
-		base := op.ID + ".roll." + h.Name
+		base := op.ID + "." + ns + "." + h.Name
 		doc := st.DocName(d)
 
 		rec, started, err := l.readRoll(ctx, b, js, gid, base)
@@ -426,8 +427,27 @@ func (l *LeaderLoop) rollRGW(ctx context.Context, b *Bridge, js store.Backend, g
 			return false, err
 		}
 
-		if rec.Done || d.Cert == target && !started {
-			continue // rolled, or rendering it from the start (no step began)
+		if rec.Done {
+			continue
+		}
+
+		// rendering it from the start (no step began), unless the roll that set
+		// it stopped before this host served it
+		if d.Cert == target && !started {
+			prev, unfinished := strings.Split(target, "/"), false
+
+			if len(prev) >= 2 && prev[1] != op.ID {
+				r, found, err := l.readRoll(ctx, b, js, gid, prev[1]+".roll."+h.Name)
+				if err != nil {
+					return false, err
+				}
+
+				unfinished = found && !r.Done
+			}
+
+			if !unfinished {
+				continue
+			}
 		}
 
 		vips := vipDocs(st, h.Name)
@@ -641,7 +661,7 @@ func (l *LeaderLoop) restoreVIPs(ctx context.Context, b *Bridge, js store.Backen
 
 	bases := map[string]string{op.ID: op.Host}
 	for _, h := range st.Hosts {
-		bases[op.ID+".roll."+h.Name] = h.Name
+		bases[op.ID+".roll."+h.Name], bases[op.ID+".recover."+h.Name] = h.Name, h.Name
 	}
 
 	var lost []string

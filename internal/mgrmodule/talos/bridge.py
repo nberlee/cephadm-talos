@@ -270,7 +270,8 @@ def _auth_get_or_create(args: Dict[str, Any]) -> Dict[str, Any]:
 SECRET_PREFIX = 'cephadm-talos/secrets/'
 SECRET_RE = re.compile(r'\A(?:host/([A-Za-z0-9][A-Za-z0-9._-]{0,127})/mgr-(?:server|client)\.key|rgw/server\.key|rgw/vrrp'
                        r'|issued/(op-[0-9a-f]{16})/[0-9a-f]{16}/mgr-(?:server|client)\.key'
-                       r'|(?:issued/op-[0-9a-f]{16}/[0-9a-f]{16}|user/op-[0-9a-f]{16})/rgw-server\.key)\Z')
+                       r'|(?:issued/op-[0-9a-f]{16}/[0-9a-f]{16}|user/op-[0-9a-f]{16})/rgw-server\.key'
+                       r'|ingress/op-[0-9a-f]{16}/vrrp)\Z')
 
 
 def _secret_get(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -353,7 +354,7 @@ CREDENTIALS = {'auth get', 'auth get-or-create', 'secret get'}
 # calls the module answers itself, for operations of its ledger (ledger.py)
 LOCAL = {'mgr cert', 'retire', 'retire host', 'bind disk', 'confirm osd', 'close create', 'osd out', 'drain', 'mon rm',
          'ok to stop', 'noout set', 'noout unset', 'maintained', 'mgr fail', 'ok to stop daemon', 'upgrade done', 'upgrade refused',
-         'rgw cert', 'rgw cert done'}
+         'rgw cert', 'rgw cert done', 'retire keepalived'}
 
 ALLOWLIST: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     'status': _no_args('status'),
@@ -389,6 +390,7 @@ ALLOWLIST: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     'upgrade refused': _operation,
     'rgw cert': _operation,
     'rgw cert done': _operation_with('keep'),
+    'retire keepalived': _operation_with('daemon'),
 }
 
 
@@ -865,6 +867,8 @@ class Channel:
                     return self._upgrade(call, led, fold, op, (args or {}).get('daemon'))
                 if call == 'rgw cert':
                     return self._rgw_cert(led, fold, op)
+                if call == 'retire keepalived':
+                    return self._retire_keepalived(led, fold, ops, op, (args or {}).get('daemon'))
                 if call == 'rgw cert done':
                     return self._rgw_cert_done(led, fold, ops, op, (args or {}).get('keep'))
                 if call in ('bind disk', 'confirm osd', 'close create'):
@@ -1127,6 +1131,21 @@ class Channel:
                 return 503, {'error': 'the certificate of attempt %s was not written; ask again' % attempt}
         led.append({'id': 'm-' + secrets.token_hex(8), 'kind': 'rgw_cert', 'of': op['id'], 'attempt': attempt})
         return 200, {'outcome': 'done', 'r': 0, 'out': json.dumps({'attempt': attempt, 'cert': cert}), 'outs': ''}
+
+    def _retire_keepalived(self, led: Any, fold: Any, ops: Dict[str, Dict[str, Any]], op: Optional[Dict[str, Any]], daemon: Optional[str]) -> Tuple[int, Dict[str, Any]]:
+        """A keepalived an executable ingress apply left out, retired once the
+        leader removed its document (it holds no key of its own)."""
+        done = {'outcome': 'done', 'r': 0, 'out': '', 'outs': ''}
+        if op is None or op['kind'] != 'apply_ingress' or not daemon or not daemon.startswith('keepalived.'):
+            return 400, {'error': 'no ingress apply, or not a keepalived'}
+        if daemon not in fold.daemons:
+            return 200, done
+        # left out by this operation (a newer one may place it again: the fold
+        # then keeps it)
+        if fold.daemons[daemon] in op['hosts']:
+            return 400, {'error': '%s is in this ingress\'s placement' % daemon}
+        led.append({'id': 'm-' + secrets.token_hex(8), 'kind': 'retire', 'of': op['id'], 'daemon': daemon, 'host': fold.daemons[daemon]})
+        return 200, done
 
     def _rgw_cert_done(self, led: Any, fold: Any, ops: Dict[str, Dict[str, Any]], op: Optional[Dict[str, Any]], keep: Optional[str]) -> Tuple[int, Dict[str, Any]]:
         """After a roll: the certificates that entered the fold before its

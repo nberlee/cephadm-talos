@@ -45,6 +45,7 @@ const (
 	KindUpPause      = "upgrade_pause"
 	KindUpResume     = "upgrade_resume"
 	KindUpStop       = "upgrade_stop"
+	KindIngress      = "apply_ingress"
 	KindRemoveHost   = "remove_host"
 	KindCreateOSD    = "create_osd"
 	KindRemoveOSD    = "remove_osd"
@@ -122,7 +123,7 @@ func (l *LeaderLoop) ledgerOps(ctx context.Context, b *Bridge, js store.Backend,
 				l.holding = ""
 
 				switch {
-				case st.Upgrade != nil, strings.HasPrefix(e.Op.Daemon, "rgw."):
+				case st.Upgrade != nil, strings.HasPrefix(e.Op.Daemon, "rgw."), e.Op.Kind == KindIngress:
 					l.holding = holdAll // a step may be in progress, or an RGW's VIP moved
 				case e.Op.Kind == KindEnterMaint || e.Op.Kind == KindExitMaint || e.Op.Kind == KindPowercycle:
 					l.holding = e.Op.Host
@@ -244,11 +245,12 @@ func (l *LeaderLoop) ledgerOp(ctx context.Context, b *Bridge, js store.Backend, 
 	opKey := JournalPrefix(gid) + "op/" + op.ID
 
 	known := map[string]bool{KindRestart: true, KindRedeploy: true, KindAddDaemon: true, KindRemoveDaemon: true, KindRemoveHost: true, KindCreateOSD: true, KindRemoveOSD: true,
-		KindEnterMaint: true, KindExitMaint: true, KindPowercycle: true, KindUpgrade: true, KindUpPause: true, KindUpResume: true, KindUpStop: true}
-	cluster := op.Kind == KindUpgrade || isControl(op.Kind)
+		KindEnterMaint: true, KindExitMaint: true, KindPowercycle: true, KindUpgrade: true, KindUpPause: true, KindUpResume: true, KindUpStop: true,
+		KindIngress: true}
+	cluster := op.Kind == KindUpgrade || isControl(op.Kind) || op.Kind == KindIngress
 	noDaemon := cluster || op.Kind == KindRemoveHost || op.Kind == KindCreateOSD || op.Kind == KindEnterMaint || op.Kind == KindExitMaint || op.Kind == KindPowercycle
 	if !ledgerIDRe.MatchString(op.ID) || cluster != (op.Host == "") || !cluster && pki.ValidName(op.Host) != nil || !known[op.Kind] ||
-		(op.Kind == KindUpgrade) != (op.Image != "") || isControl(op.Kind) != ledgerIDRe.MatchString(op.Upgrade) ||
+		(op.Kind == KindUpgrade || op.Kind == KindIngress) != (op.Image != "") || (op.Kind == KindIngress) != (op.VIP != "") || isControl(op.Kind) != ledgerIDRe.MatchString(op.Upgrade) ||
 		noDaemon != (op.Daemon == "") || (op.Daemon != "" && !ledgerDaemonRe.MatchString(op.Daemon)) ||
 		(op.Kind == KindCreateOSD) != strings.HasPrefix(op.Device, "/dev/") {
 		return true, writeJSONKey(ctx, js, opKey, JournalOp{Version: journalVersion, Kind: op.Kind, Host: op.Host, State: JournalFailed, Error: "unknown or malformed operation"})
@@ -260,6 +262,30 @@ func (l *LeaderLoop) ledgerOp(ctx context.Context, b *Bridge, js store.Backend, 
 	}
 
 	switch op.Kind {
+	case KindIngress:
+		// keepalived a certificate roll took off come back first, then the
+		// added ones never granted leave the state
+		cleanup := func() error {
+			note := l.restoreVIPs(ctx, b, js, gid, epoch, op)
+
+			var n failNote
+			if note != nil && !errors.As(note, &n) {
+				return note
+			}
+
+			if err := l.ingressFailed(ctx, b, js, gid, op); err != nil {
+				return err
+			}
+
+			return note
+		}
+		if err := l.unstick(ctx, js, opKey, opKey, op, cleanup, l.applyIngress(ctx, b, js, gid, epoch, op)); err != nil {
+			return false, err
+		}
+
+		s, err = l.journalState(ctx, b, js, gid, op.ID)
+
+		return err == nil && terminal(s), err
 	case KindUpgrade, KindUpPause, KindUpResume, KindUpStop:
 		phase := func() error { return l.upgradeControl(ctx, b, js, gid, op) }
 

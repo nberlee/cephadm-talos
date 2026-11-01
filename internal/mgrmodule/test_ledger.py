@@ -293,3 +293,34 @@ class RGWCertFoldTest(unittest.TestCase):
             k, e = entry(5, 9, 'op-%016x' % 9, **bad)
             with self.assertRaises(lg.LedgerError, msg=bad):
                 lg.check_entry(k, json.dumps(e))
+
+
+class IngressFoldTest(unittest.TestCase):
+    IMG = 'quay.io/ceph/keepalived@sha256:' + 'cd' * 32
+
+    def test_hosts_password_and_retirement(self):
+        inv = {'hosts': [{'name': 'h1', 'addr': '10.0.0.1'}, {'name': 'h2', 'addr': '10.0.0.2'}],
+               'daemons': [{'daemon_type': 'rgw', 'daemon_id': h, 'host': h} for h in ('h1', 'h2')]}
+        a = entry(5, 1, 'op-%016x' % 1, kind='apply_ingress', vip='10.0.0.200/24', vrid=50, hosts=['h1', 'h2'], image=self.IMG, new_password=True)
+        b = entry(5, 2, 'op-%016x' % 2, kind='apply_ingress', vip='10.0.0.200/24', vrid=50, hosts=['h1'], image=self.IMG, new_password=False)
+        r = entry(5, 3, 'm-%016x' % 3, kind='retire', of='op-%016x' % 2, daemon='keepalived.h2', host='h2')
+        for k, e in (a, b, r):
+            lg.check_entry(k, json.dumps(e))
+        f = lg.Fold(inv, [a])
+        self.assertEqual((f.vip, f.ingress['hosts'], f.vrrp_secret), ('10.0.0.200', ['h1', 'h2'], 'ingress/op-%016x/vrrp' % 1))
+        self.assertTrue(f.secret_allowed('ingress/op-%016x/vrrp' % 1, None))
+        self.assertFalse(f.secret_allowed('rgw/vrrp', None))
+        # left out: kept until retired; an apply without a password keeps the current one
+        f = lg.Fold(inv, [a, b])
+        self.assertIn('keepalived.h2', f.daemons)
+        self.assertEqual(f.vrrp_secret, 'ingress/op-%016x/vrrp' % 1)
+        self.assertNotIn('keepalived.h2', lg.Fold(inv, [a, b, r]).daemons)
+        for bad in (dict(kind='apply_ingress', vip='10.0.0.200', vrid=50, hosts=['h1'], image=self.IMG, new_password=True),
+                    dict(kind='apply_ingress', vip='10.0.0.200/24', vrid=0, hosts=['h1'], image=self.IMG, new_password=True),
+                    dict(kind='apply_ingress', vip='10.0.0.200/24', vrid=50, hosts=[], image=self.IMG, new_password=True),
+                    dict(kind='apply_ingress', vip='10.0.0.200/24', vrid=50, hosts=['h1', 'h1'], image=self.IMG, new_password=True),
+                    dict(kind='apply_ingress', vip='10.0.0.200/24', vrid=50, hosts=['h1'], image='keepalived:2', new_password=True),
+                    dict(kind='apply_ingress', vip='10.0.0.200/24', vrid=50, hosts=['h1'], image=self.IMG, new_password=True, host='h1')):
+            k, e = entry(5, 9, 'op-%016x' % 9, **bad)
+            with self.assertRaises(lg.LedgerError, msg=bad):
+                lg.check_entry(k, json.dumps(e))

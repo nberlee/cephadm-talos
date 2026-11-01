@@ -174,7 +174,7 @@ func Daemon(s *state.State, h state.Host, d state.Daemon, image string, key Key,
 			return nil, errors.New("vip: no virtual IP or keepalived image")
 		}
 
-		pass, err := secret(state.SecretVRRP)
+		pass, err := secret(s.RGW.VRRPSecretName())
 		if err != nil {
 			return nil, err
 		}

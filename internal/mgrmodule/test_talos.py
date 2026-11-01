@@ -9,6 +9,7 @@ import socket
 import ssl
 import subprocess
 import json
+import re
 import os
 import sys
 import tempfile
@@ -751,6 +752,67 @@ class RGWs(unittest.TestCase):
         [(_, add)] = mod._ledger.executable()
         entries['talos/inc/20/journal/op/' + add['id']] = json.dumps({'state': 'completed'})
         self.assertIn('keepalived', m.Module.remove_daemons(mod, ['rgw.h2']).exception_str)
+
+
+class Ingress(unittest.TestCase):
+    IMG = 'quay.io/ceph/keepalived@sha256:' + 'cd' * 32
+
+    def module(self, approved=(IMG,), password='abc', rgws=('h1', 'h2')):
+        import base64
+        inv = inventory()
+        inv['daemons'] += [{'doc_name': 'ceph-f-rgw-' + h, 'host': h, 'daemon_type': 'rgw', 'daemon_id': h, 'service_name': 'rgw.default',
+                            'desired_image': 'quay.io/ceph/ceph@sha256:a'} for h in rgws]
+        mod, entries = AddAndRemove.module(self, inv)
+        self.written = {}
+        key = 'cephadm-talos/approvals/%020d' % 1
+        signed = json.dumps({'payload': base64.b64encode(json.dumps({'images': list(approved)}).encode()).decode(), 'signature': 'x'})
+
+        def mon(cmd):
+            if cmd['prefix'] == 'config-key ls':
+                return 0, json.dumps([key]), ''
+            if cmd['prefix'] == 'config-key set':
+                self.written[cmd['key']] = cmd['val']
+                return 0, '', ''
+            if cmd['key'] == key:
+                return 0, signed, ''
+            return 0, password, ''
+        mod.mon_command = mon
+        mod.get_module_option = lambda name: self.IMG
+        return mod, entries
+
+    def spec(self, hosts='h1 h2', vip='10.5.0.200/24', **kw):
+        from ceph.deployment.service_spec import IngressSpec, PlacementSpec
+        return IngressSpec(service_id='rgw.default', backend_service='rgw.default', keepalive_only=True, virtual_ip=vip,
+                           placement=PlacementSpec.from_string(hosts), **kw)
+
+    def test_apply_the_keepalived_only_ingress(self):
+        mod, _ = self.module()
+        # the CLI's sealed state has keepalived.h2 without a VIP of its own record: first apply
+        for spec in (self.spec(hosts='h3'), self.spec(vip='10.5.0.200'), self.spec(vip='fd00::1/64'), self.spec(first_virtual_router_id=300),
+                     self.spec(keepalived_password='way-too-long'), self.spec(enable_haproxy_protocol=True)):
+            self.assertTrue(m.Module.apply(mod, [spec]).exception_str, spec)
+        res = m.Module.apply(mod, [self.spec()])
+        self.assertEqual(res.exception_str, '')
+        [(_, e)] = mod._ledger.executable()
+        self.assertEqual((e['kind'], e['vip'], e['vrid'], e['hosts'], e['image'], e['new_password']),
+                         ('apply_ingress', '10.5.0.200/24', 50, ['h1', 'h2'], self.IMG, True))
+        [(k, pw)] = self.written.items()
+        self.assertEqual(k, 'cephadm-talos/secrets/ingress/%s/vrrp' % e['id'])
+        self.assertTrue(re.match(r'\A[A-Za-z0-9]{8}\Z', pw))
+        # later: the same VIP and router id; the password kept, or the same one
+        self.assertTrue(m.Module.apply(mod, [self.spec(vip='10.5.0.201/24')]).exception_str)
+        self.assertTrue(m.Module.apply(mod, [self.spec(first_virtual_router_id=51)]).exception_str)
+        self.assertTrue(m.Module.apply(mod, [self.spec(keepalived_password='other')]).exception_str)
+        self.assertEqual(m.Module.apply(mod, [self.spec(hosts='h1', keepalived_password='abc')]).exception_str, '')
+        self.assertFalse(mod._ledger.executable()[-1][1]['new_password'])
+
+    def test_not_on_a_host_in_maintenance(self):
+        mod, _ = self.module(rgws=('h1', 'h2', 'h3'))
+        self.assertIn('maintenance', m.Module.apply(mod, [self.spec(hosts='h1 h3')]).exception_str)
+
+    def test_the_keepalived_image_must_be_approved(self):
+        mod, _ = self.module(approved=())
+        self.assertIn('approved', m.Module.apply(mod, [self.spec()]).exception_str)
 
 
 class Conflicts(unittest.TestCase):

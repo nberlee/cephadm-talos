@@ -619,7 +619,7 @@ func (l *LeaderLoop) request(ctx context.Context, b *Bridge, js store.Backend, g
 	}
 
 	if req.Host == l.holding || l.holding == holdAll {
-		return fmt.Errorf("%w: %s may have a maintenance in progress", errRetry, req.Host)
+		return fmt.Errorf("%w: an operation that orders %s's documents may be in progress", errRetry, req.Host)
 	}
 
 	return l.revision(ctx, b, js, gid, epoch, id, req.Host, revisionMode{})

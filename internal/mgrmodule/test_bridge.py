@@ -1065,6 +1065,36 @@ class RGWCertCallsTest(unittest.TestCase):
         self.assertIn(b.SECRET_PREFIX + cid + '/rgw-server.key', self.mons.kv)
 
 
+class IngressCallsTest(unittest.TestCase):
+    setUp, call = LedgerCallsTest.setUp, LedgerCallsTest.call
+
+    def test_retire_a_keepalived_left_out(self):
+        img = 'quay.io/ceph/keepalived@sha256:' + 'cd' * 32
+        inv = inventory('mon.h1@h1', 'rgw.h1@h1', 'rgw.h2@h2')
+        self.ch.authority = lambda: (self.led, lg.Fold(inv, self.led.executable()))
+        a = self.led.append({'id': 'op-%016x' % 900, 'kind': 'apply_ingress', 'vip': '10.0.0.200/24', 'vrid': 50, 'hosts': ['h1', 'h2'], 'image': img, 'new_password': True})[1]['id']
+        b_ = self.led.append({'id': 'op-%016x' % 901, 'kind': 'apply_ingress', 'vip': '10.0.0.200/24', 'vrid': 50, 'hosts': ['h1'], 'image': img, 'new_password': False})[1]['id']
+        # one still placed is not retired; one left out is, once
+        self.assertEqual(self.call('retire keepalived', operation=b_, daemon='keepalived.h1')[0], 400)
+        self.assertEqual(self.call('retire keepalived', operation=b_, daemon='keepalived.h2')[1]['outcome'], 'done')
+        self.assertNotIn('keepalived.h2', self.ch.authority()[1].daemons)
+        self.assertEqual(self.call('retire keepalived', operation=b_, daemon='keepalived.h2')[1]['outcome'], 'done')
+        self.assertEqual(self.call('retire keepalived', operation=a, daemon='rgw.h1')[0], 400)
+        # the VIP is in a generated certificate's names
+        code, reply = self.call('rgw cert', operation=b_)
+        self.assertEqual(code, 200)
+
+    def test_a_queued_apply_that_places_it_again_keeps_it(self):
+        img = 'quay.io/ceph/keepalived@sha256:' + 'cd' * 32
+        inv = inventory('mon.h1@h1', 'rgw.h1@h1', 'rgw.h2@h2')
+        self.ch.authority = lambda: (self.led, lg.Fold(inv, self.led.executable()))
+        for n, hosts in ((910, ['h1', 'h2']), (911, ['h1']), (912, ['h1', 'h2'])):
+            self.led.append({'id': 'op-%016x' % n, 'kind': 'apply_ingress', 'vip': '10.0.0.200/24', 'vrid': 50, 'hosts': hosts, 'image': img, 'new_password': False})
+        # the middle apply retires h2's keepalived; the last one places it again
+        self.assertEqual(self.call('retire keepalived', operation='op-%016x' % 911, daemon='keepalived.h2')[1]['outcome'], 'done')
+        self.assertIn('keepalived.h2', self.ch.authority()[1].daemons)
+
+
 class RemovalTest(LedgerCallsTest):
     UUID = '8f2c0a4e-1d3b-4c5a-9e6f-7a8b9c0d1e2f'
 
