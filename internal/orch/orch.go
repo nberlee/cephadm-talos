@@ -6,8 +6,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -629,36 +627,21 @@ func (o *Orch) save() error {
 		return nil // bootstrap, before the first mon: published once it answers
 	}
 
-	recs, err := o.St.Records()
-	if err != nil {
-		return err
-	}
-
 	// the mgr module's inventory (plan 02's schema), now a record of the state:
 	// its revision and time change only with its content
-	inv := o.inventory()
-	inv.Revision, inv.UpdatedAt = 0, time.Time{}
-
-	b, err := json.Marshal(inv)
+	inv, rev, err := render.InventoryRecord(o.St, time.Now())
 	if err != nil {
 		return err
 	}
 
-	sum := sha256.Sum256(b)
-	if r := &o.St.Inventory; r.Hash != hex.EncodeToString(sum[:]) {
-		r.Revision, r.Hash, r.UpdatedAt = r.Revision+1, hex.EncodeToString(sum[:]), time.Now().UTC()
+	o.St.Inventory = rev
 
-		// the cluster record carries the new revision too
-		if recs, err = o.St.Records(); err != nil {
-			return err
-		}
-	}
-
-	inv.Revision, inv.UpdatedAt = o.St.Inventory.Revision, o.St.Inventory.UpdatedAt
-
-	if recs["inventory"], err = json.Marshal(inv); err != nil {
+	recs, err := o.St.Records() // the cluster record carries the revision
+	if err != nil {
 		return err
 	}
+
+	recs["inventory"] = inv
 
 	ctx, cancel := context.WithTimeout(context.Background(), configKeyTimeout)
 	defer cancel()

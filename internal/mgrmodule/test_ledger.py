@@ -161,3 +161,49 @@ class FoldTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+def entry(epoch, seq, ident, **kw):
+    e = dict({'version': 1, 'id': ident, 'gid': 10, 'epoch': epoch, 'seq': seq}, **kw)
+    return lg.entry_key(epoch, seq, ident), e
+
+
+class GenerationTest(unittest.TestCase):
+    INV = {'hosts': [{'name': 'h1', 'addr': '10.0.0.1'}, {'name': 'h2', 'addr': '10.0.0.2'}],
+           'daemons': [{'daemon_type': 'mgr', 'daemon_id': 'h1', 'host': 'h1'}]}
+
+    def test_adds_close_and_retire(self):
+        add = entry(5, 1, 'op-%016x' % 1, kind='add_daemon', daemon='mgr.h2', host='h2')
+        rm = entry(5, 2, 'op-%016x' % 2, kind='remove_daemon', daemon='mgr.h2', host='h2')
+        close = entry(5, 3, 'm-%016x' % 3, kind='close', of='op-%016x' % 2, daemon='mgr.h2', host='h2')
+        retire = entry(5, 4, 'm-%016x' % 4, kind='retire', of='op-%016x' % 2, daemon='mgr.h2', host='h2')
+        readd = entry(5, 5, 'op-%016x' % 5, kind='add_daemon', daemon='mgr.h2', host='h2')
+        for k, e in (add, rm, close, retire, readd):
+            lg.check_entry(k, json.dumps(e))
+        f = lg.Fold(self.INV, [add])
+        self.assertEqual((f.open_generation('mgr.h1'), f.open_generation('mgr.h2')), ('cli', 'op-%016x' % 1))
+        # a removal counts from its retirement; closing ends the generation first
+        self.assertEqual(lg.Fold(self.INV, [add, rm]).open_generation('mgr.h2'), 'op-%016x' % 1)
+        f = lg.Fold(self.INV, [add, rm, close])
+        self.assertTrue('mgr.h2' in f.daemons and f.open_generation('mgr.h2') is None)
+        self.assertNotIn('mgr.h2', lg.Fold(self.INV, [add, rm, close, retire]).daemons)
+        # a new add is a new generation: nothing of the old one counts
+        self.assertEqual(lg.Fold(self.INV, [add, rm, close, retire, readd]).open_generation('mgr.h2'), 'op-%016x' % 5)
+
+    def test_hosts_and_shapes(self):
+        rmh = entry(5, 1, 'op-%016x' % 1, kind='remove_host', host='h2')
+        reth = entry(5, 2, 'm-%016x' % 2, kind='retire_host', of='op-%016x' % 1, host='h2')
+        lg.check_entry(*map(lambda x: x, (rmh[0], json.dumps(rmh[1]))))
+        self.assertNotIn('h2', lg.Fold(self.INV, [rmh, reth]).hosts)
+        self.assertIn('h2', lg.Fold(self.INV, [rmh]).hosts)
+        # an add on a host that is gone does not count
+        add = entry(5, 3, 'op-%016x' % 3, kind='add_daemon', daemon='mon.h2', host='h2')
+        self.assertNotIn('mon.h2', lg.Fold(self.INV, [rmh, reth, add]).daemons)
+        for bad in (dict(kind='add_daemon', daemon='mgr.h1', host='h2'), dict(kind='add_daemon', daemon='osd.1', host='h1'),
+                    dict(kind='remove_daemon', daemon='mon.h1', host='h1'), dict(kind='remove_host', host='h1', daemon='mgr.h1')):
+            k, e = entry(5, 9, 'op-%016x' % 9, **bad)
+            with self.assertRaises(lg.LedgerError, msg=bad):
+                lg.check_entry(k, json.dumps(e))
+        k, e = entry(5, 9, 'm-%016x' % 9, kind='restart', daemon='mgr.h1', host='h1')
+        with self.assertRaises(lg.LedgerError):
+            lg.check_entry(k, json.dumps(e))

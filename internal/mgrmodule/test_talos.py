@@ -502,10 +502,10 @@ def state_entries(inv, cluster, incarnation='cli', seq=1):
 
 
 class Acceptance(unittest.TestCase):
-    def module(self, sealed=True, active=True):
+    def module(self, sealed=True, active=True, inv=None):
         from talos import ledger as lg
         import test_ledger
-        entries = state_entries(inventory(), {'fsid': 'f', 'sealed': sealed})
+        entries = state_entries(inv or inventory(), {'fsid': 'f', 'sealed': sealed})
         mod = object.__new__(m.Module)
         mod.get_store_prefix = lambda prefix: {k: v for k, v in entries.items() if k.startswith(prefix)}
         mod._ledger = lg.Ledger(test_ledger.Mons(), 20, 7)
@@ -556,3 +556,67 @@ class Acceptance(unittest.TestCase):
         for mod in (self.module(sealed=False)[0], self.module(active=False)[0]):
             self.assertTrue(m.Module.daemon_action(mod, 'restart', 'mgr.h3').exception_str)
             self.assertEqual(mod._ledger.executable(), [])
+
+
+class AddAndRemove(unittest.TestCase):
+    def module(self, inv=None):
+        mod, entries = Acceptance.module(self, inv=inv)
+        mod.get_mgr_id = lambda: 'h3'
+        return mod, entries
+
+    def spec(self, typ, placement):
+        from ceph.deployment.service_spec import PlacementSpec, ServiceSpec
+        return ServiceSpec(typ, placement=PlacementSpec.from_string(placement))
+
+    def ops(self, mod):
+        return [(e['kind'], e.get('daemon'), e['host']) for _, e in mod._ledger.executable()]
+
+    def test_daemon_add(self):
+        mod, _ = self.module()
+        res = m.Module.add_daemon(mod, self.spec('mgr', 'h2'))
+        self.assertEqual(res.exception_str, '')
+        self.assertIn('mgr.h2', res.result[0])
+        for spec in (self.spec('mgr', 'h2'), self.spec('mon', 'h1'), self.spec('mon', 'h9'), self.spec('rgw', 'h2'),
+                     self.spec('mon', 'h1 h2'), self.spec('mon', '2 h2'), self.spec('mon', 'label:x'), self.spec('mon', 'h2:10.0.0.0/24'),
+                     self.spec('mon', 'h2=other')):
+            self.assertTrue(m.Module.add_daemon(mod, spec).exception_str, spec)
+        self.assertTrue(m.Module.add_daemon(mod, self.spec('mon', 'h2')).result)
+        self.assertEqual(self.ops(mod), [('add_daemon', 'mgr.h2', 'h2'), ('add_daemon', 'mon.h2', 'h2')])
+
+    def test_daemon_rm_and_host_rm(self):
+        mod, entries = self.module()
+        # the active mgr (h3) and everything but mgrs are refused; so is the last mgr
+        for names in (['mgr.h3'], ['mon.h1'], ['mgr.h9'], ['osd.0']):
+            self.assertTrue(m.Module.remove_daemons(mod, names).exception_str, names)
+        m.Module.add_daemon(mod, self.spec('mgr', 'h2'))
+        [(_, add)] = mod._ledger.executable()
+        entries['talos/inc/20/journal/op/' + add['id']] = json.dumps({'state': 'completed'})
+        res = m.Module.remove_daemons(mod, ['mgr.h2'])
+        self.assertEqual(res.exception_str, '')
+        # a host: not with daemons, not the active mgr's, not with --offline
+        for args in (('h1',), ('h3',), ('h9',), ('h2', False, True)):
+            self.assertTrue(m.Module.remove_host(mod, *args).exception_str, args)
+        # h2 still has its mgr in the fold until the removal is retired
+        self.assertTrue(m.Module.remove_host(mod, 'h2').exception_str)
+        self.assertEqual([k for k, _, _ in self.ops(mod)], ['add_daemon', 'remove_daemon'])
+
+
+class Conflicts(unittest.TestCase):
+    def test_a_host_removal_and_daemons_on_that_host_exclude_each_other(self):
+        inv = inventory()
+        inv['hosts'].append({'name': 'h4', 'addr': '10.5.0.5'})
+        mod, entries = AddAndRemove.module(self, inv)
+        # h4 has no daemons: its removal goes in, then no add on h4 beside it
+        self.assertEqual(m.Module.remove_host(mod, 'h4').exception_str, '')
+        self.assertTrue(m.Module.add_daemon(mod, AddAndRemove.spec(self, 'mgr', 'h4')).exception_str)
+        self.assertEqual([e['kind'] for _, e in mod._ledger.executable()], ['remove_host'])
+
+    def test_a_batch_removal_accepts_all_or_nothing(self):
+        mod, entries = AddAndRemove.module(self)
+        for host in ('h1', 'h2'):
+            m.Module.add_daemon(mod, AddAndRemove.spec(self, 'mgr', host))
+        first, second = [e['id'] for _, e in mod._ledger.executable()]
+        entries['talos/inc/20/journal/op/' + first] = json.dumps({'state': 'completed'})
+        # mgr.h2's add is not finished: neither removal goes in
+        self.assertTrue(m.Module.remove_daemons(mod, ['mgr.h1', 'mgr.h2']).exception_str)
+        self.assertEqual(len(mod._ledger.executable()), 2)

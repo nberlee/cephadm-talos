@@ -1,0 +1,138 @@
+package render
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"strconv"
+	"time"
+
+	"github.com/nberlee/cephadm-talos/internal/pki"
+	"github.com/nberlee/cephadm-talos/internal/state"
+)
+
+// InventorySchema is the version of the inventory record the talos mgr module reads.
+const InventorySchema = 1
+
+// InventoryHost is a host of the inventory.
+type InventoryHost struct {
+	Name        string   `json:"name"`
+	Addr        string   `json:"addr"`
+	Labels      []string `json:"labels"`
+	Maintenance bool     `json:"maintenance,omitempty"`
+}
+
+// InventoryDaemon is a daemon of the inventory.
+type InventoryDaemon struct {
+	DocName      string `json:"doc_name"`
+	Host         string `json:"host"`
+	DaemonType   string `json:"daemon_type"`
+	DaemonID     string `json:"daemon_id"`
+	ServiceName  string `json:"service_name"`
+	DesiredImage string `json:"desired_image"`
+	LocalOnly    bool   `json:"local_only,omitempty"`
+}
+
+// Inventory is the mgr module's view of the cluster (module.py check_inventory).
+type Inventory struct {
+	Schema      int               `json:"schema"`
+	Revision    int               `json:"revision"`
+	UpdatedAt   time.Time         `json:"updated_at"`
+	FSID        string            `json:"fsid"`
+	Image       string            `json:"image"`
+	CephVersion string            `json:"ceph_version"`
+	CertExpiry  *time.Time        `json:"cert_expiry,omitempty"`
+	Hosts       []InventoryHost   `json:"hosts"`
+	Daemons     []InventoryDaemon `json:"daemons"`
+}
+
+// InventoryOf derives the mgr module's view of the cluster from the state,
+// without revision and time (InventoryRecord); no keys.
+func InventoryOf(s *state.State) Inventory {
+	inv := Inventory{
+		Schema: InventorySchema, FSID: s.FSID, Image: s.Image, CephVersion: s.CephVersion,
+		Hosts: []InventoryHost{}, Daemons: []InventoryDaemon{},
+	}
+
+	for _, h := range s.Hosts {
+		inv.Hosts = append(inv.Hosts, InventoryHost{Name: h.Name, Addr: h.Addr, Labels: []string{}, Maintenance: h.Maintenance})
+	}
+
+	for _, d := range s.Daemons {
+		id, typ, svc, img := d.ID, d.Type, d.Type, s.Image
+
+		switch d.Type {
+		case state.TypeOSD:
+			id = "pending-" + s.DocName(d)
+			if d.OSDID != nil {
+				id = strconv.Itoa(*d.OSDID)
+			}
+		case state.TypeRGW:
+			svc = "rgw.default"
+		case state.TypeVIP:
+			typ, svc = "keepalived", "ingress.rgw.default"
+			if s.RGW != nil {
+				img = s.RGW.KeepalivedImage
+			}
+		}
+
+		inv.Daemons = append(inv.Daemons, InventoryDaemon{
+			DocName: s.DocName(d), Host: d.Host, DaemonType: typ, DaemonID: id, ServiceName: svc,
+			DesiredImage: img, LocalOnly: d.LocalOnly,
+		})
+	}
+
+	if t, ok := earliestCertExpiry(s); ok {
+		inv.CertExpiry = &t
+	}
+
+	return inv
+}
+
+// earliestCertExpiry is the first agent or mgr certificate to expire.
+func earliestCertExpiry(s *state.State) (time.Time, bool) {
+	if s.Agent == nil {
+		return time.Time{}, false
+	}
+
+	var first time.Time
+
+	certs := []string{s.Agent.OperatorCert}
+	for _, h := range s.Hosts {
+		certs = append(certs, h.AgentCert, h.AgentClientCert, h.MgrServerCert, h.MgrClientCert)
+	}
+
+	for _, c := range certs {
+		if t, err := pki.NotAfter(c); err == nil && (first.IsZero() || t.Before(first)) {
+			first = t
+		}
+	}
+
+	return first, !first.IsZero()
+}
+
+// InventoryRecord is the inventory record of the state, and the state's
+// inventory revision to keep with it: bumped, with its time, only when the
+// content changed since the state's revision. The caller stores the revision
+// in the state (its cluster record carries it).
+func InventoryRecord(s *state.State, now time.Time) ([]byte, state.InventoryRevision, error) {
+	inv := InventoryOf(s)
+
+	b, err := json.Marshal(inv)
+	if err != nil {
+		return nil, state.InventoryRevision{}, err
+	}
+
+	rev := s.Inventory
+
+	sum := sha256.Sum256(b)
+	if h := hex.EncodeToString(sum[:]); rev.Hash != h {
+		rev = state.InventoryRevision{Revision: rev.Revision + 1, Hash: h, UpdatedAt: now.UTC()}
+	}
+
+	inv.Revision, inv.UpdatedAt = rev.Revision, rev.UpdatedAt
+
+	b, err = json.Marshal(inv)
+
+	return b, rev, err
+}

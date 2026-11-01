@@ -109,6 +109,7 @@ type Node struct {
 		Disks(ctx context.Context, node string) ([]*block.Disk, error)
 		BootID(ctx context.Context, node string) (string, error)
 		Instance(ctx context.Context, node, name string) (string, error)
+		InstanceOwners(ctx context.Context, node string) ([]string, error)
 		RestartInstance(ctx context.Context, node, id string) error
 	}
 	Records *records.Store
@@ -492,6 +493,19 @@ func (n *Node) Report(ctx context.Context) (wire.NodeReport, error) {
 	}
 
 	sort.Strings(r.Containers)
+
+	// the cluster's containers that still have an instance: a removed daemon
+	// is gone once its name is not here
+	owners, err := n.Talos.InstanceOwners(ctx, "")
+	if err != nil {
+		return r, err
+	}
+
+	for _, name := range owners {
+		if strings.HasPrefix(name, n.prefix()) {
+			r.Instances = append(r.Instances, name)
+		}
+	}
 
 	disks, err := n.Talos.Disks(ctx, "")
 	if err != nil {

@@ -134,10 +134,10 @@ type GrantDoc struct {
 // confirmation carries: the same operation id with other inputs is refused.
 func GrantInputs(g Grant) string {
 	b, _ := json.Marshal(struct {
-		FSID      string     `json:"fsid"`
-		Host      string     `json:"host"`
-		Revision  int64      `json:"revision"`
-		Operation string     `json:"operation"`
+		FSID      string        `json:"fsid"`
+		Host      string        `json:"host"`
+		Revision  int64         `json:"revision"`
+		Operation string        `json:"operation"`
 		Docs      []GrantDoc    `json:"docs"`
 		Restart   *GrantRestart `json:"restart,omitempty"`
 	}{g.FSID, g.Host, g.Revision, g.Operation, g.Docs, g.Restart})
@@ -277,7 +277,10 @@ type NodeReport struct {
 	Owned      map[string]string `json:"owned"` // "<kind>/<name>" -> hash of Talos's encoding
 	Drift      []string          `json:"drift,omitempty"`
 	Containers []string          `json:"containers"`
-	Disks      []Disk            `json:"disks"`
+	// Instances are the cluster's containers that have an instance, running or
+	// not cleaned up yet
+	Instances []string `json:"instances,omitempty"`
+	Disks     []Disk   `json:"disks"`
 }
 
 // Disk is one of a node's disks as Talos reports it.

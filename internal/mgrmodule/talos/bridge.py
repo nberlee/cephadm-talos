@@ -251,10 +251,10 @@ def _auth_get(args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _auth_get_or_create(args: Dict[str, Any]) -> Dict[str, Any]:
-    _args(args, {'entity'})
+    _args(args, {'entity', 'operation'})
     e = args['entity']
     m = CREATE_RE.match(e) if isinstance(e, str) else None
-    if m is None:
+    if m is None or not isinstance(args['operation'], str) or not re.match(r'\Aop-[0-9a-f]{16}\Z', args['operation']):
         raise ValueError('entity not allowed')
     return {'prefix': 'auth get-or-create', 'entity': e, 'caps': list(CREATE_CAPS[m.group(1)]), 'format': 'json'}
 
@@ -263,7 +263,8 @@ def _auth_get_or_create(args: Dict[str, Any]) -> Dict[str, Any]:
 # their own prefix: never the CA keys or the agents' keys. A host's mgr keys
 # only for a host the inventory places a mgr on (Channel.bridge).
 SECRET_PREFIX = 'cephadm-talos/secrets/'
-SECRET_RE = re.compile(r'\A(?:host/([A-Za-z0-9][A-Za-z0-9._-]{0,127})/mgr-(?:server|client)\.key|rgw/server\.key|rgw/vrrp)\Z')
+SECRET_RE = re.compile(r'\A(?:host/([A-Za-z0-9][A-Za-z0-9._-]{0,127})/mgr-(?:server|client)\.key|rgw/server\.key|rgw/vrrp'
+                       r'|issued/(op-[0-9a-f]{16})/[0-9a-f]{16}/mgr-(?:server|client)\.key)\Z')
 
 
 def _secret_get(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -285,6 +286,13 @@ def _ledger(args: Dict[str, Any]) -> Dict[str, Any]:
     return {}  # answered by the module, not the mons
 
 
+def _operation(args: Dict[str, Any]) -> Dict[str, Any]:
+    _args(args, {'operation'})
+    if not isinstance(args['operation'], str) or not re.match(r'\Aop-[0-9a-f]{16}\Z', args['operation']):
+        raise ValueError('not an operation id')
+    return {}  # answered by the module (Channel.local)
+
+
 # calls whose output is reduced in the mgr before it is kept and returned
 REDUCE: Dict[str, Callable[[Dict[str, Any]], Callable[[str], str]]] = {
     'config-key keys': lambda args: _keys_page(args['prefix'], args['after']),
@@ -294,6 +302,8 @@ REDUCE: Dict[str, Callable[[Dict[str, Any]], Callable[[str], str]]] = {
 READ_ONLY = {'status', 'health', 'mgr dump', 'config-key keys', 'config-key get', 'entry limit', 'auth get', 'secret get', 'ledger'}
 # calls that release a credential: checked against the fold, while active
 CREDENTIALS = {'auth get', 'auth get-or-create', 'secret get'}
+# calls the module answers itself, for operations of its ledger (ledger.py)
+LOCAL = {'mgr cert', 'retire', 'retire host'}
 
 ALLOWLIST: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     'status': _no_args('status'),
@@ -308,7 +318,43 @@ ALLOWLIST: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     'auth get-or-create': _auth_get_or_create,
     'secret get': _secret_get,
     'ledger': _ledger,
+    'mgr cert': _operation,
+    'retire': _operation,
+    'retire host': _operation,
 }
+
+
+def issue_mgr_certs(ca_cert_pem: bytes, ca_key_pem: bytes, fsid: str, host: str, addr: str) -> Dict[str, str]:
+    """A mgr's server certificate (for its host's address and name) and client
+    certificate, as internal/pki issues them: P-256, 3 years, the identity
+    cephadm-talos://<fsid>/mgr/<host> as URI SAN, one extended key usage each."""
+    import datetime
+    import ipaddress
+    from cryptography import x509
+    from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+    ca = x509.load_pem_x509_certificate(ca_cert_pem)
+    ca_key = serialization.load_pem_private_key(ca_key_pem, password=None)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    out: Dict[str, str] = {}
+    for role, usage in (('server', ExtendedKeyUsageOID.SERVER_AUTH), ('client', ExtendedKeyUsageOID.CLIENT_AUTH)):
+        key = ec.generate_private_key(ec.SECP256R1())
+        sans: List[x509.GeneralName] = [x509.UniformResourceIdentifier('cephadm-talos://%s/mgr/%s' % (fsid, host))]
+        if role == 'server':
+            sans += [x509.DNSName(host), x509.IPAddress(ipaddress.ip_address(addr))]
+        b = (x509.CertificateBuilder()
+             .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, 'mgr ' + host)]))
+             .issuer_name(ca.subject).public_key(key.public_key()).serial_number(x509.random_serial_number())
+             .not_valid_before(now - datetime.timedelta(hours=1)).not_valid_after(now.replace(year=now.year + 3))
+             .add_extension(x509.KeyUsage(digital_signature=True, content_commitment=False, key_encipherment=False, data_encipherment=False,
+                                          key_agreement=False, key_cert_sign=False, crl_sign=False, encipher_only=False, decipher_only=False), critical=True)
+             .add_extension(x509.ExtendedKeyUsage([usage]), critical=False)
+             .add_extension(x509.SubjectAlternativeName(sans), critical=False)
+             .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ca.public_key()), critical=False))  # type: ignore[arg-type]
+        cert = b.sign(ca_key, hashes.SHA256())  # type: ignore[arg-type]
+        out[role + '_cert'] = cert.public_bytes(serialization.Encoding.PEM).decode()
+        out[role + '_key'] = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL,
+                                               serialization.NoEncryption()).decode()
+    return out
 
 
 class Leadership:
@@ -480,13 +526,23 @@ class Server(ThreadingHTTPServer):
                 pass
 
 
+def _daemon_of(entity: str) -> str:
+    """The daemon name ("<type>.<id>") of a CephX entity."""
+    return 'rgw.' + entity[len('client.rgw.'):] if entity.startswith('client.rgw.') else entity
+
+
 class Channel:
     """The module's server on port 4722: confirmations and the bridge."""
 
     def __init__(self, fsid: str, mgr_id: str, leadership: Leadership, bridge_commands: Commands,
                  server_ctx: Optional[ssl.SSLContext], server_key: bytes,
-                 require_identity: Callable[..., str], log: Any, authority: Callable[[], Any]) -> None:
+                 require_identity: Callable[..., str], log: Any, authority: Callable[[], Any],
+                 ca_cert: bytes = b'') -> None:
         self.fsid = fsid
+        self.ca_cert = ca_cert  # the agent CA's certificate, for mgr certificates
+        # mutations sent for a daemon's generation, which a removal waits for
+        self.inflight: Dict[str, List[Job]] = {}
+        self.local_lock = threading.Lock()
         # authority returns (ledger.Ledger, ledger.Fold); it raises while there is none
         self.authority = authority
         self.mgr_id = mgr_id
@@ -541,8 +597,14 @@ class Channel:
                 return 503, {'error': 'no ledger yet: %s' % e}
             if call == 'ledger':
                 return 200, self._ledger_page(led, args['after'])
-            allowed = fold.entity_allowed(args['entity']) if call != 'secret get' else \
-                fold.secret_allowed(args['name'], SECRET_RE.match(args['name']).group(1))
+            if call == 'secret get':
+                m = SECRET_RE.match(args['name'])
+                allowed = fold.secret_allowed(args['name'], m.group(1)) if m.group(2) is None else \
+                    any(fold.open_generation(n) == m.group(2) for n in fold.daemons if n.startswith('mgr.'))
+            elif call == 'auth get-or-create':
+                allowed = True  # checked with its operation under the lock retirement takes (create)
+            else:
+                allowed = fold.entity_allowed(args['entity'])
             if not allowed:
                 return 400, {'error': '%s not allowed: not in the accepted cluster' % call}
             # a credential goes out only while the mons show this incarnation active
@@ -555,6 +617,10 @@ class Channel:
         # (checked before, not atomically with, the change)
         if call not in READ_ONLY and call not in CREDENTIALS and not self.leadership.still_active(self.commands):
             return 409, {'error': 'not confirmed as the active mgr'}
+        if call in LOCAL:
+            return self.local(call, args['operation'])
+        if call == 'auth get-or-create':
+            return self.create(args, cmd, float(deadline))
         rec = Record()
         with self.lock:
             self._expire()
@@ -572,6 +638,8 @@ class Channel:
             with self.lock:
                 del self.records[dispatch]  # nothing was sent
             return 429, {'error': 'too many outstanding bridge calls'}
+        if call == 'auth get-or-create':
+            self._track(_daemon_of(args['entity']), job)
         with self.lock:
             rec.job = job
         if job.ev.wait(float(deadline)):
@@ -588,6 +656,141 @@ class Channel:
             with self.lock:
                 self.records.pop(dispatch, None)
         return 200, {'outcome': 'unknown'}
+
+    # --- calls for the ledger's operations (ledger.py) ------------------------
+
+    def _track(self, daemon: str, job: Job) -> None:
+        with self.lock:
+            self.inflight.setdefault(daemon, []).append(job)
+
+    def _pending(self, daemon: str) -> bool:
+        with self.lock:
+            jobs = [j for j in self.inflight.get(daemon, []) if not j.ev.is_set()]
+            self.inflight[daemon] = jobs
+            return bool(jobs)
+
+    def _mon(self, cmd: Dict[str, Any], daemon: Optional[str] = None,
+             reduce: Optional[Callable[[str], str]] = None) -> Optional[Job]:
+        """One mon command and its answer within the bridge deadline; None
+        without one (a tracked mutation stays tracked until it completes)."""
+        job = self.commands.submit(cmd, reduce)
+        if job is None:
+            return None
+        if daemon is not None:
+            self._track(daemon, job)
+        return job if job.ev.wait(MAX_BRIDGE_DEADLINE) else None
+
+    def create(self, args: Dict[str, Any], cmd: Dict[str, Any], deadline: float) -> Tuple[int, Dict[str, Any]]:
+        """auth get-or-create of the daemon an accepted add deploys, while that
+        add's generation is open: checked, sent and tracked under the lock that
+        retirement takes, so a retirement sees it. Its outcome is never kept."""
+        with self.local_lock:
+            try:
+                led, _ = self.authority()
+                led.settle()  # an unanswered entry (a retirement among them) counts first
+                led, fold = self.authority()
+            except Exception as e:
+                return 503, {'error': 'no settled ledger: %s' % e}
+            daemon = _daemon_of(args['entity'])
+            op = {e['id']: e for _, e in led.executable()}.get(args['operation'])
+            if op is None or op['kind'] != 'add_daemon' or op['daemon'] != daemon or fold.open_generation(daemon) != op['id']:
+                return 400, {'error': 'auth get-or-create not allowed: no add of %s in its open generation' % daemon}
+            if self._pending(daemon):  # an earlier generation's auth rm, among others
+                return 409, {'error': 'mutations for %s are not answered yet; ask again' % daemon}
+            job = self.commands.submit(cmd)
+            if job is None:
+                return 429, {'error': 'too many outstanding bridge calls'}
+            self._track(daemon, job)
+        if not job.ev.wait(deadline):
+            return 200, {'outcome': 'unknown'}
+        if job.too_large:
+            return 200, {'outcome': 'done', 'r': job.r, 'error': 'output larger than %d bytes' % MAX_OUTPUT}
+        return 200, {'outcome': 'done', 'r': job.r, 'out': job.outb, 'outs': job.outs}
+
+    def local(self, call: str, op_id: str) -> Tuple[int, Dict[str, Any]]:
+        with self.local_lock:  # one at a time: they read the fold, then append
+            try:
+                led, _ = self.authority()
+                led.settle()  # an unanswered entry (a close or retire) counts before anything is decided
+                led, fold = self.authority()
+            except Exception as e:
+                return 503, {'error': 'no settled ledger: %s' % e}
+            ops = {e['id']: e for _, e in led.executable()}
+            op = ops.get(op_id)
+            try:
+                if call == 'mgr cert':
+                    return self._mgr_cert(fold, op)
+                if call == 'retire':
+                    return self._retire(led, fold, ops, op)
+                return self._retire_host(led, fold, ops, op)
+            except Exception as e:  # a ledger entry without an answer, among others: asked again
+                return 503, {'error': '%s: %s' % (call, e.__class__.__name__)}
+
+    def _mgr_cert(self, fold: Any, op: Optional[Dict[str, Any]]) -> Tuple[int, Dict[str, Any]]:
+        if op is None or op['kind'] != 'add_daemon' or not op['daemon'].startswith('mgr.') \
+                or fold.open_generation(op['daemon']) != op['id'] or op['host'] not in fold.hosts:
+            return 400, {'error': 'no add of a mgr in its open generation'}
+        name, host = op['daemon'], op['host']
+        job = self._mon({'prefix': 'config-key get', 'key': SECRET_PREFIX + 'agent-ca.key'})
+        if job is None or job.r != 0 or not self.ca_cert:
+            return 503, {'error': 'the agent CA is not available'}
+        certs = issue_mgr_certs(self.ca_cert, job.outb.encode(), self.fsid, host, fold.hosts[host])
+        attempt = secrets.token_hex(8)
+        for role in ('server', 'client'):
+            key = '%sissued/%s/%s/mgr-%s.key' % (SECRET_PREFIX, op['id'], attempt, role)
+            w = self._mon({'prefix': 'config-key set', 'key': key, 'val': certs[role + '_key']}, name)
+            if w is None or w.r != 0:
+                return 503, {'error': 'the key of attempt %s was not written; ask again' % attempt}
+        out = {'attempt': attempt, 'server_cert': certs['server_cert'], 'client_cert': certs['client_cert']}
+        return 200, {'outcome': 'done', 'r': 0, 'out': json.dumps(out), 'outs': ''}
+
+    def _retire(self, led: Any, fold: Any, ops: Dict[str, Dict[str, Any]], op: Optional[Dict[str, Any]]) -> Tuple[int, Dict[str, Any]]:
+        if op is None or op['kind'] != 'remove_daemon':
+            return 400, {'error': 'no removal of a daemon'}
+        name = op['daemon']
+        done = {'outcome': 'done', 'r': 0, 'out': '', 'outs': ''}
+        if any(e['kind'] == 'retire' and e['of'] == op['id'] for e in ops.values()):
+            return 200, done  # retired already
+        if name not in fold.generations:
+            return 400, {'error': '%s is not in the cluster' % name}
+        later = [e for k, e in led.executable() if e['kind'] == 'add_daemon' and e['daemon'] == name and (e['epoch'], e['seq']) > (op['epoch'], op['seq'])]
+        if later:
+            return 400, {'error': '%s was added again after this removal' % name}
+        gen, is_open = fold.generations[name]
+        if is_open:  # nothing more is created or issued for this generation
+            led.append({'id': 'm-' + secrets.token_hex(8), 'kind': 'close', 'of': op['id'], 'daemon': name, 'host': op['host']})
+        if self._pending(name):
+            return 409, {'error': 'mutations for %s are not answered yet; ask again' % name}
+        entity = name  # a mgr's entity is its daemon name
+        # tracked: an unanswered removal holds the retirement until it is answered,
+        # so it cannot land on a later generation's key
+        job = self._mon({'prefix': 'auth rm', 'entity': entity}, name)
+        if job is None or job.r not in (0, -2):  # ENOENT: gone already
+            return 503, {'error': 'auth rm %s: no answer or refused; ask again' % entity}
+        mine = ['%sissued/%s/' % (SECRET_PREFIX, gen)] if gen != 'cli' else \
+            ['%shost/%s/mgr-server.key' % (SECRET_PREFIX, op['host']), '%shost/%s/mgr-client.key' % (SECRET_PREFIX, op['host'])]
+        # the generation's keys only, reduced before the output limit applies
+        keys = self._mon({'prefix': 'config-key ls'}, None, lambda out: json.dumps([k for k in json.loads(out) if any(k.startswith(p) for p in mine)]))
+        if keys is None or keys.r != 0 or keys.too_large:
+            return 503, {'error': 'cannot list the secrets; ask again'}
+        for k in json.loads(keys.outb):
+            if any(k.startswith(p) for p in mine):
+                rm = self._mon({'prefix': 'config-key rm', 'key': k}, name)
+                if rm is None or rm.r not in (0, -2):
+                    return 503, {'error': 'cannot remove a key of %s; ask again' % name}
+        led.append({'id': 'm-' + secrets.token_hex(8), 'kind': 'retire', 'of': op['id'], 'daemon': name, 'host': op['host']})
+        return 200, done
+
+    def _retire_host(self, led: Any, fold: Any, ops: Dict[str, Dict[str, Any]], op: Optional[Dict[str, Any]]) -> Tuple[int, Dict[str, Any]]:
+        if op is None or op['kind'] != 'remove_host':
+            return 400, {'error': 'no removal of a host'}
+        done = {'outcome': 'done', 'r': 0, 'out': '', 'outs': ''}
+        if any(e['kind'] == 'retire_host' and e['of'] == op['id'] for e in ops.values()) or op['host'] not in fold.hosts:
+            return 200, done
+        if any(h == op['host'] for h in fold.daemons.values()):
+            return 400, {'error': '%s still has daemons' % op['host']}
+        led.append({'id': 'm-' + secrets.token_hex(8), 'kind': 'retire_host', 'of': op['id'], 'host': op['host']})
+        return 200, done
 
     def _ledger_page(self, led: Any, after: str) -> Dict[str, Any]:
         """The executable entries after a key, in order, a page at a time."""

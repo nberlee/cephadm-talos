@@ -7,19 +7,17 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"strconv"
 	"time"
 
 	"github.com/nberlee/cephadm-talos/internal/daemons"
 	"github.com/nberlee/cephadm-talos/internal/mgrmodule"
-	"github.com/nberlee/cephadm-talos/internal/pki"
 	"github.com/nberlee/cephadm-talos/internal/render"
 	"github.com/nberlee/cephadm-talos/internal/spec"
 	"github.com/nberlee/cephadm-talos/internal/state"
 )
 
-// InventorySchema is the version of /etc/ceph/talos/inventory.json, read by the talos mgr module.
-const InventorySchema = 1
+// InventorySchema is the version of the inventory record the talos mgr module reads.
+const InventorySchema = render.InventorySchema
 
 // Files the talos mgr module reads (EtcFileConfig names, below /etc).
 const (
@@ -32,98 +30,8 @@ const (
 	mgrModuleDir      = daemons.MgrModuleDir
 )
 
-type invHost struct {
-	Name        string   `json:"name"`
-	Addr        string   `json:"addr"`
-	Labels      []string `json:"labels"`
-	Maintenance bool     `json:"maintenance,omitempty"`
-}
-
-type invDaemon struct {
-	DocName      string `json:"doc_name"`
-	Host         string `json:"host"`
-	DaemonType   string `json:"daemon_type"`
-	DaemonID     string `json:"daemon_id"`
-	ServiceName  string `json:"service_name"`
-	DesiredImage string `json:"desired_image"`
-	LocalOnly    bool   `json:"local_only,omitempty"`
-}
-
-type inventory struct {
-	Schema      int         `json:"schema"`
-	Revision    int         `json:"revision"`
-	UpdatedAt   time.Time   `json:"updated_at"`
-	FSID        string      `json:"fsid"`
-	Image       string      `json:"image"`
-	CephVersion string      `json:"ceph_version"`
-	CertExpiry  *time.Time  `json:"cert_expiry,omitempty"`
-	Hosts       []invHost   `json:"hosts"`
-	Daemons     []invDaemon `json:"daemons"`
-}
-
 // inventory derives the mgr module's view of the cluster from the state; no keys.
-func (o *Orch) inventory() inventory {
-	inv := inventory{
-		Schema: InventorySchema, FSID: o.St.FSID, Image: o.St.Image, CephVersion: o.St.CephVersion,
-		Hosts: []invHost{}, Daemons: []invDaemon{},
-	}
-
-	for _, h := range o.St.Hosts {
-		inv.Hosts = append(inv.Hosts, invHost{Name: h.Name, Addr: h.Addr, Labels: []string{}, Maintenance: h.Maintenance})
-	}
-
-	for _, d := range o.St.Daemons {
-		id, typ, svc, img := d.ID, d.Type, d.Type, o.St.Image
-
-		switch d.Type {
-		case state.TypeOSD:
-			id = "pending-" + o.St.DocName(d)
-			if d.OSDID != nil {
-				id = strconv.Itoa(*d.OSDID)
-			}
-		case state.TypeRGW:
-			svc = "rgw.default"
-		case state.TypeVIP:
-			typ, svc = "keepalived", "ingress.rgw.default"
-			if o.St.RGW != nil {
-				img = o.St.RGW.KeepalivedImage
-			}
-		}
-
-		inv.Daemons = append(inv.Daemons, invDaemon{
-			DocName: o.St.DocName(d), Host: d.Host, DaemonType: typ, DaemonID: id, ServiceName: svc,
-			DesiredImage: img, LocalOnly: d.LocalOnly,
-		})
-	}
-
-	if t, ok := o.earliestCertExpiry(); ok {
-		inv.CertExpiry = &t
-	}
-
-	return inv
-}
-
-// earliestCertExpiry is the first agent or mgr certificate to expire.
-func (o *Orch) earliestCertExpiry() (time.Time, bool) {
-	if o.St.Agent == nil {
-		return time.Time{}, false
-	}
-
-	var first time.Time
-
-	certs := []string{o.St.Agent.OperatorCert}
-	for _, h := range o.St.Hosts {
-		certs = append(certs, h.AgentCert, h.AgentClientCert, h.MgrServerCert, h.MgrClientCert)
-	}
-
-	for _, c := range certs {
-		if t, err := pki.NotAfter(c); err == nil && (first.IsZero() || t.Before(first)) {
-			first = t
-		}
-	}
-
-	return first, !first.IsZero()
-}
+func (o *Orch) inventory() render.Inventory { return render.InventoryOf(o.St) }
 
 // publishedContent is everything the mgr module reads from the nodes (its code
 // and TLS files; the inventory is a record in the store), without the revision:

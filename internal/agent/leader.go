@@ -597,12 +597,12 @@ func (l *LeaderLoop) request(ctx context.Context, b *Bridge, js store.Backend, g
 		return writeJSONKey(ctx, js, opKey, JournalOp{Version: journalVersion, Kind: req.Kind, Host: req.Host, State: JournalFailed, Error: "unknown or malformed request"})
 	}
 
-	return l.revision(ctx, b, js, gid, epoch, id, req.Host)
+	return l.revision(ctx, b, js, gid, epoch, id, req.Host, revisionMode{})
 }
 
 // runRevision carries out a revision of a host under id, or resolves its
 // grant if its outcome was not recorded.
-func (l *LeaderLoop) runRevision(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, id, host string) error {
+func (l *LeaderLoop) runRevision(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, id, host string, mode revisionMode) error {
 	opKey := JournalPrefix(gid) + "op/" + id
 
 	op, found, err := readJSONKey[JournalOp](ctx, js, opKey)
@@ -618,7 +618,7 @@ func (l *LeaderLoop) runRevision(ctx context.Context, b *Bridge, js store.Backen
 		return l.resolve(ctx, b, js, gid, epoch, opKey, op, id)
 	}
 
-	return l.revision(ctx, b, js, gid, epoch, id, host)
+	return l.revision(ctx, b, js, gid, epoch, id, host, mode)
 }
 
 // stateSource is where a new incarnation takes its baseline from: the
@@ -928,8 +928,16 @@ func (l *LeaderLoop) renderHost(ctx context.Context, b *Bridge, st *state.State,
 	return r, nil
 }
 
+// revisionMode changes what a revision grants: the rendering plus the removal
+// of extra owned documents (a removed daemon's), or with strip the removal of
+// every document the node owns (a host on its way out).
+type revisionMode struct {
+	extra []string // keys
+	strip bool
+}
+
 // revision makes a host's documents match the cluster state.
-func (l *LeaderLoop) revision(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, id, host string) error {
+func (l *LeaderLoop) revision(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, id, host string, mode revisionMode) error {
 	opKey := JournalPrefix(gid) + "op/" + id
 	op := JournalOp{Version: journalVersion, Kind: KindRevision, Host: host}
 
@@ -982,13 +990,24 @@ func (l *LeaderLoop) revision(ctx context.Context, b *Bridge, js store.Backend, 
 		return fail(fmt.Errorf("%s is %s %v: nothing is granted until that is resolved", h.Name, rep.State, rep.Drift))
 	}
 
-	r, err := l.renderHost(ctx, b, st, h)
-	if errors.Is(err, errRetry) {
-		return err
-	}
+	var r rendered
 
-	if err != nil {
-		return fail(err)
+	if mode.strip {
+		for k := range rep.Owned {
+			r.remove = append(r.remove, k)
+		}
+
+		sort.Strings(r.remove)
+	} else {
+		if r, err = l.renderHost(ctx, b, st, h); errors.Is(err, errRetry) {
+			return err
+		}
+
+		if err != nil {
+			return fail(err)
+		}
+
+		r.remove = append(r.remove, mode.extra...)
 	}
 
 	// what the host does not have yet

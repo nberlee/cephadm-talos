@@ -75,12 +75,12 @@ func MgrFiles(s *state.State, h state.Host, withMgr bool, secret Secret) (Docume
 		return Documents{}, fmt.Errorf("the mgr of %s has no certificates yet", h.Name)
 	}
 
-	clientKey, err := secret(state.SecretHost(h.Name, state.SecretMgrClient))
+	clientKey, err := secret(h.MgrKeySecret(state.SecretMgrClient))
 	if err != nil {
 		return Documents{}, err
 	}
 
-	serverKey, err := secret(state.SecretHost(h.Name, state.SecretMgrServer))
+	serverKey, err := secret(h.MgrKeySecret(state.SecretMgrServer))
 	if err != nil {
 		return Documents{}, err
 	}

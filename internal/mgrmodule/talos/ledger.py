@@ -23,9 +23,13 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 LEDGER_PREFIX = 'cephadm-talos/ledger/'
 ENTRY_VERSION = 1
-KEY_RE = re.compile(r'\A(\d{20})-(\d{10})-(takeover|op-[0-9a-f]{16})\Z')
-# kinds an operation entry may have (slice A)
-KINDS = ('restart', 'redeploy')
+KEY_RE = re.compile(r'\A(\d{20})-(\d{10})-(takeover|op-[0-9a-f]{16}|m-[0-9a-f]{16})\Z')
+OP_RE = re.compile(r'\Aop-[0-9a-f]{16}\Z')
+# kinds an operation entry may have; ADDS and REMOVES change the fold
+KINDS = ('restart', 'redeploy', 'add_daemon', 'remove_daemon', 'remove_host')
+# the module's own entries (ids m-<hex>), which carry out a removal: close a
+# daemon's generation, retire the daemon, retire a host
+MODULE_KINDS = ('close', 'retire', 'retire_host')
 DAEMON_RE = re.compile(r'\A(mon|mgr|osd|rgw|keepalived)\.([A-Za-z0-9][A-Za-z0-9._-]{0,127})\Z')
 HOST_RE = re.compile(r'\A[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z')
 UUID_RE = re.compile(r'\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z')
@@ -66,9 +70,29 @@ def check_entry(key: str, raw: str) -> Dict[str, Any]:
                 or not all(k.isdigit() and _int(v) for k, v in cut.items()):
             raise LedgerError('takeover entry %s' % key)
         return e
-    if e['seq'] < 1 or e.get('kind') not in KINDS or not isinstance(e.get('daemon'), str) or not DAEMON_RE.match(e['daemon']) \
-            or not isinstance(e.get('host'), str) or not HOST_RE.match(e['host']) \
-            or (e.get('request') is not None and not (isinstance(e['request'], str) and UUID_RE.match(e['request']))):
+    kind, daemon, host = e.get('kind'), e.get('daemon'), e.get('host')
+    ok_daemon = isinstance(daemon, str) and DAEMON_RE.match(daemon) is not None
+    ok_host = isinstance(host, str) and HOST_RE.match(host) is not None
+    if e['seq'] < 1 or not ok_host:
+        raise LedgerError('entry %s' % key)
+    if e['id'].startswith('m-'):
+        if kind not in MODULE_KINDS or not isinstance(e.get('of'), str) or not OP_RE.match(e['of']) \
+                or (kind != 'retire_host' and not ok_daemon):
+            raise LedgerError('module entry %s' % key)
+        return e
+    if kind not in KINDS or (e.get('request') is not None and not (isinstance(e['request'], str) and UUID_RE.match(e['request']))):
+        raise LedgerError('operation entry %s' % key)
+    if kind == 'remove_host':
+        if daemon is not None:
+            raise LedgerError('operation entry %s' % key)
+        return e
+    if not ok_daemon:
+        raise LedgerError('operation entry %s' % key)
+    t, i = daemon.split('.', 1)
+    # mon and mgr ids are their host's name
+    if kind == 'add_daemon' and (t not in ('mon', 'mgr') or i != host):
+        raise LedgerError('operation entry %s' % key)
+    if kind == 'remove_daemon' and (t != 'mgr' or i != host):
         raise LedgerError('operation entry %s' % key)
     return e
 
@@ -117,14 +141,35 @@ def _valid_takeover(entries: Dict[str, Dict[str, Any]], key: str) -> bool:
 
 class Fold:
     """The authorized hosts and daemons: the CLI's sealed state, then the
-    executable operations (none of slice A's kinds changes them)."""
+    executable entries in order. An add counts from acceptance and opens a
+    generation of the daemon (the add's id; "cli" for the CLI's daemons); a
+    close entry closes it, a retire entry takes the daemon out, a retire_host
+    entry the host."""
 
-    def __init__(self, inventory: Dict[str, Any]) -> None:
+    def __init__(self, inventory: Dict[str, Any], entries: List[Tuple[str, Dict[str, Any]]] = ()) -> None:
         self.hosts: Dict[str, str] = {h['name']: h['addr'] for h in inventory['hosts']}
         self.daemons: Dict[str, str] = {}  # "<type>.<id>" -> host
+        self.generations: Dict[str, Tuple[str, bool]] = {}  # "<type>.<id>" -> (generation, open)
         for d in inventory['daemons']:
             if d.get('daemon_id'):
-                self.daemons['%s.%s' % (d['daemon_type'], d['daemon_id'])] = d['host']
+                name = '%s.%s' % (d['daemon_type'], d['daemon_id'])
+                self.daemons[name], self.generations[name] = d['host'], ('cli', True)
+        for _, e in entries:
+            kind = e['kind']
+            if kind == 'add_daemon' and e['host'] in self.hosts:
+                self.daemons[e['daemon']], self.generations[e['daemon']] = e['host'], (e['id'], True)
+            elif kind == 'close' and e['daemon'] in self.generations:
+                self.generations[e['daemon']] = (self.generations[e['daemon']][0], False)
+            elif kind == 'retire':
+                self.daemons.pop(e['daemon'], None)
+                self.generations.pop(e['daemon'], None)
+            elif kind == 'retire_host' and not any(h == e['host'] for h in self.daemons.values()):
+                self.hosts.pop(e['host'], None)
+
+    def open_generation(self, name: str) -> Optional[str]:
+        """The daemon's current generation while it is open, else None."""
+        gen = self.generations.get(name)
+        return gen[0] if gen is not None and gen[1] else None
 
     def has(self, daemon_type: str, daemon_id: Optional[str] = None, host: Optional[str] = None) -> bool:
         for name, h in self.daemons.items():
@@ -224,7 +269,8 @@ class Ledger:
             self._settle()
 
     def append(self, op: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-        """Accept an operation: one entry, after any earlier unknown append is settled."""
+        """Accept an operation, or write a module entry (id m-<hex>): one entry,
+        after any earlier unknown append is settled."""
         with self.lock:
             if not self.ready:
                 raise LedgerError('the ledger is not open')

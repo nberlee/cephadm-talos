@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1043,5 +1044,203 @@ func TestLedgerOperationsThatCannotRunEnd(t *testing.T) {
 
 	if got := s.applied(t); got != third.Key {
 		t.Fatalf("checkpoint %q", got)
+	}
+}
+
+// withCA makes the fake module issue mgr certificates of a CA the agent and
+// the leader trust.
+func (s *leaderSetup) withCA(t *testing.T) {
+	t.Helper()
+
+	ca := newTestCA(t)
+	s.st.Agent = &state.Agent{CACert: ca.cert}
+	publish(t, s.leader, s.module, s.st)
+
+	s.module.mu.Lock()
+	s.module.ca, s.module.active = &ca, "h0"
+	s.module.mu.Unlock()
+
+	s.agent.Node.Policy.CACert, s.leader.CACert = ca.cert, ca.cert
+}
+
+func TestLeaderAddsAndRemovesAMgr(t *testing.T) {
+	s := newLeaderSetup(t)
+	ctx := context.Background()
+	s.withCA(t)
+
+	must(t, s.leader.Tick(ctx, 42, 5)) // the takeover closes the earlier sessions
+
+	add := s.accept(KindAddDaemon, "mgr.h1", "h1", 1)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if op := s.op(t, add.Op.ID); op.State != "completed" {
+		t.Fatalf("add: %+v", op)
+	}
+
+	// the mgr, its module files and its certificates are on h1; its keys are the attempt's
+	st, _, err := s.leader.clusterState(ctx, s.leader.bridge())
+	must(t, err)
+
+	h, _ := st.Host("h1")
+	if _, ok := st.Find("mgr.h1"); !ok || !strings.HasPrefix(h.MgrKeys, add.Op.ID+"/") || h.MgrServerCert == "" {
+		t.Fatalf("state: %+v", h)
+	}
+
+	rev := s.op(t, add.Op.ID+".rev")
+	mgrDoc := "ContainerConfig/ceph-" + testFSID[:8] + "-mgr-h1"
+
+	if _, ok := rev.Docs[mgrDoc]; !ok || rev.Docs["EtcFileConfig/ceph/talos/mgr-server.key"] == "" {
+		t.Fatalf("granted %v", rev.Docs)
+	}
+
+	if inv := s.inventory(t); !strings.Contains(inv, `"daemon_id":"h1","service_name":"mgr"`) {
+		t.Fatalf("inventory %s", inv)
+	}
+
+	// not the active one: out of the state, off the host, then retired
+	s.module.mu.Lock()
+	s.module.active = "h1"
+	s.module.mu.Unlock()
+
+	refused := s.accept(KindRemoveDaemon, "mgr.h1", "h1", 2)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if op := s.op(t, refused.Op.ID); op.State != JournalFailed || !strings.Contains(op.Error, "active") {
+		t.Fatalf("removal of the active mgr: %+v", op)
+	}
+
+	s.module.mu.Lock()
+	s.module.active = "h0"
+	s.module.mu.Unlock()
+
+	rm := s.accept(KindRemoveDaemon, "mgr.h1", "h1", 3)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if op := s.op(t, rm.Op.ID); op.State != "completed" {
+		t.Fatalf("removal: %+v", op)
+	}
+
+	if rev := s.op(t, rm.Op.ID+".rev"); rev.Docs[mgrDoc] != "" || len(rev.Docs) == 0 {
+		t.Fatalf("removal grant %v", rev.Docs)
+	}
+
+	if rep, err := s.agent.Node.Report(ctx); err != nil || rep.Owned[mgrDoc] != "" || rep.Owned["EtcFileConfig/ceph/talos/mgr-server.key"] != "" {
+		t.Fatalf("still owned: %+v %v", rep.Owned, err)
+	}
+
+	s.module.mu.Lock()
+	retired := slices.Clone(s.module.retired)
+	s.module.mu.Unlock()
+
+	if !slices.Equal(retired, []string{"retire " + rm.Op.ID}) {
+		t.Fatalf("retired %v", retired)
+	}
+
+	// a host with daemons is not removed
+	host := s.accept(KindRemoveHost, "", "h1", 4)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if op := s.op(t, host.Op.ID); op.State != JournalFailed || !strings.Contains(op.Error, "mon.h1") {
+		t.Fatalf("host removal: %+v", op)
+	}
+}
+
+func TestLeaderAddsAMonThatJoinsFirst(t *testing.T) {
+	s := newLeaderSetup(t)
+	ctx := context.Background()
+
+	// a cluster whose mon is on h0: h1 gets a second one
+	s.st.RemoveDaemon(state.Daemon{Type: state.TypeMon, ID: "h1", Host: "h1"})
+	s.st.AddDaemon(state.Daemon{Type: state.TypeMon, ID: "h0", Host: "h0", DeployID: "0123456789abcdef"})
+	publish(t, s.leader, s.module, s.st)
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	add := s.accept(KindAddDaemon, "mon.h1", "h1", 1)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	// granted, joining: ceph.conf on h1 does not name it yet, and nothing ends
+	// before it is in the quorum
+	rev := s.op(t, add.Op.ID+".rev")
+	if _, ok := rev.Docs["ContainerConfig/ceph-"+testFSID[:8]+"-mon-h1"]; !ok || rev.State != "completed" {
+		t.Fatalf("joining mon: %+v", rev)
+	}
+
+	st, _, err := s.leader.clusterState(ctx, s.leader.bridge())
+	must(t, err)
+
+	if d, _ := st.Find("mon.h1"); !d.Joining || len(st.MonAddrs()) != 1 {
+		t.Fatalf("state %+v %v", d, st.MonAddrs())
+	}
+
+	s.module.mu.Lock()
+	s.module.quorum = []string{"h0", "h1"}
+	s.module.mu.Unlock()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	st, _, err = s.leader.clusterState(ctx, s.leader.bridge())
+	must(t, err)
+
+	if d, _ := st.Find("mon.h1"); d.Joining || len(st.MonAddrs()) != 2 {
+		t.Fatalf("after joining %+v %v", d, st.MonAddrs())
+	}
+
+	// ceph.conf goes to h0 first, whose agent this test does not serve: the
+	// operation waits and holds the ledger
+	s.module.mu.Lock()
+	_, decided := s.module.kv[JournalPrefix(42)+"op/"+add.Op.ID]
+	s.module.mu.Unlock()
+
+	if decided {
+		t.Fatal("completed before ceph.conf reached every host")
+	}
+}
+
+func (s *leaderSetup) inventory(t *testing.T) string {
+	t.Helper()
+
+	recs, _, err := s.leader.readRecords(context.Background(), s.leader.bridge(), "42")
+	must(t, err)
+
+	return string(recs["inventory"])
+}
+
+func TestAResumedRemovalChecksTheActiveMgr(t *testing.T) {
+	s := newLeaderSetup(t)
+	ctx := context.Background()
+	s.withCA(t)
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	add := s.accept(KindAddDaemon, "mgr.h1", "h1", 1)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if op := s.op(t, add.Op.ID); op.State != "completed" {
+		t.Fatalf("add: %+v", op)
+	}
+
+	// a predecessor published the removal, then stopped before granting it;
+	// meanwhile mgr.h1 became the active one
+	must(t, s.leader.changeState(ctx, s.leader.bridge(), 42, func(st *state.State) error {
+		d, _ := st.Find("mgr.h1")
+		st.RemoveDaemon(d)
+
+		return nil
+	}))
+
+	s.module.mu.Lock()
+	s.module.active = "h1"
+	s.module.mu.Unlock()
+
+	rm := s.accept(KindRemoveDaemon, "mgr.h1", "h1", 2)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if op := s.op(t, rm.Op.ID); op.State != JournalFailed || !strings.Contains(op.Error, "active") {
+		t.Fatalf("removal of the active mgr: %+v", op)
+	}
+
+	if rep, err := s.agent.Node.Report(ctx); err != nil || rep.Owned["ContainerConfig/ceph-"+testFSID[:8]+"-mgr-h1"] == "" {
+		t.Fatalf("its document was removed: %v", err)
 	}
 }

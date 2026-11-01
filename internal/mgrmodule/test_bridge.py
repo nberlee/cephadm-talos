@@ -42,6 +42,9 @@ class FakeLedger:
     def executable(self):
         return list(self.entries)
 
+    def settle(self):
+        pass
+
 
 def authority(*daemons):
     """What the module authorizes: a mon, mgr, rgw and keepalived on h1 unless named."""
@@ -64,6 +67,8 @@ class Mons:
         self.pending = []
         self.late = False
         self.keys = []      # answer to config-key ls
+        self.kv = None      # a config-key store for get, set, rm and ls, if set
+        self.auth_rm = []
 
     def send(self, res, cmd):
         prefix = json.loads(cmd)['prefix']
@@ -77,6 +82,21 @@ class Mons:
                 self.pending.append(res)
                 return
             res.complete(0, json.dumps(mm), '')
+        elif self.kv is not None and prefix in ('config-key get', 'config-key set', 'config-key rm', 'config-key ls'):
+            c = json.loads(cmd)
+            if prefix == 'config-key get':
+                res.complete(0, self.kv[c['key']], '') if c['key'] in self.kv else res.complete(-2, '', 'not found')
+            elif prefix == 'config-key set':
+                self.kv[c['key']] = c['val']
+                res.complete(0, '', '')
+            elif prefix == 'config-key rm':
+                self.kv.pop(c['key'], None)
+                res.complete(0, '', '')
+            else:
+                res.complete(0, json.dumps(sorted(self.kv)), '')
+        elif prefix == 'auth rm':
+            self.auth_rm.append(json.loads(cmd)['entity'])
+            res.complete(0, '', '')
         elif prefix == 'config-key ls':
             res.complete(0, json.dumps(self.keys), '')
         else:
@@ -246,7 +266,7 @@ class BridgeTest(unittest.TestCase):
             'config-key rm': ({'key': k}, {'prefix': 'config-key rm', 'key': k}),
             'entry limit': ({}, {'prefix': 'config get', 'who': 'mon', 'key': 'mon_config_key_max_entry_size', 'format': 'json'}),
             'auth get': ({'entity': 'osd.12'}, {'prefix': 'auth get', 'entity': 'osd.12', 'format': 'json'}),
-            'auth get-or-create': ({'entity': 'client.rgw.h1-a'}, {'prefix': 'auth get-or-create', 'entity': 'client.rgw.h1-a',
+            'auth get-or-create': ({'entity': 'client.rgw.h1-a', 'operation': 'op-%016x' % 1}, {'prefix': 'auth get-or-create', 'entity': 'client.rgw.h1-a',
                                                                   'caps': ['mon', 'allow rw', 'osd', 'allow rwx', 'mgr', 'allow rw'],
                                                                   'format': 'json'}),
         }
@@ -278,16 +298,18 @@ class BridgeTest(unittest.TestCase):
             ('auth get', {'entity': 'client.rgw.H1'}),
             ('auth get', {'entity': 'osd.01'}),
             ('auth get', {'entity': 'mgr.h1', 'caps': []}),
-            ('auth get-or-create', {'entity': 'client.admin'}),
-            ('auth get-or-create', {'entity': 'osd.1'}),
-            ('auth get-or-create', {'entity': 'mon.'}),
-            ('auth get-or-create', {'entity': 'mgr.h1', 'caps': ['mon', 'allow *']}),
+            ('auth get-or-create', {'entity': 'client.admin', 'operation': 'op-%016x' % 1}),
+            ('auth get-or-create', {'entity': 'osd.1', 'operation': 'op-%016x' % 1}),
+            ('auth get-or-create', {'entity': 'mon.', 'operation': 'op-%016x' % 1}),
+            ('auth get-or-create', {'entity': 'mgr.h1', 'operation': 'op-%016x' % 1, 'caps': ['mon', 'allow *']}),
+            ('auth get-or-create', {'entity': 'mgr.h1'}),
+            ('auth get-or-create', {'entity': 'mgr.h1', 'operation': 'op-1'}),
         ]
         for call, args in bad:
             with self.assertRaises(ValueError, msg=(call, args)):
                 b.ALLOWLIST[call](args)
         # the caps given out are copies: a caller cannot change the table
-        b.ALLOWLIST['auth get-or-create']({'entity': 'mgr.h1'})['caps'].append('x')
+        b.ALLOWLIST['auth get-or-create']({'entity': 'mgr.h1', 'operation': 'op-%016x' % 1})['caps'].append('x')
         self.assertEqual(b.CREATE_CAPS['mgr'][-1], 'allow *')
 
     def test_secrets(self):
@@ -321,7 +343,7 @@ class BridgeTest(unittest.TestCase):
                                           ('auth get', {'entity': 'mon.'}), ('auth get', {'entity': 'client.rgw.h1'}),
                                           ('auth get', {'entity': 'mgr.h2'}), ('auth get', {'entity': 'osd.0'}),
                                           ('auth get', {'entity': 'client.bootstrap-osd'}),
-                                          ('auth get-or-create', {'entity': 'mgr.h2'}))):
+                                          ('auth get-or-create', {'entity': 'mgr.h1', 'operation': 'op-%016x' % 1}))):
             self.assertEqual(self.call(ch, call=call, args=args, dispatch_id='%016x' % (700 + i))[0], 400, (call, args))
         for i, (call, args) in enumerate((('auth get', {'entity': 'mgr.h1'}), ('secret get', {'name': 'host/h1/mgr-server.key'}))):
             self.assertEqual(self.call(ch, call=call, args=args, dispatch_id='%016x' % (720 + i))[1]['outcome'], 'done', call)
@@ -343,9 +365,6 @@ class BridgeTest(unittest.TestCase):
         mons.pending[0].complete(0, '[{"key": "secret"}]', '')
         time.sleep(0.05)
         self.assertEqual(ch.outcome('%016x' % 740)[0], 404)  # a late completion is not fetched past the check
-        mons.late = False
-        self.assertEqual(self.call(ch, call='auth get-or-create', args={'entity': 'mgr.h1'}, dispatch_id='%016x' % 741)[1]['outcome'], 'done')
-        self.assertEqual(ch.outcome('%016x' % 741)[0], 404)  # nor an answered get-or-create
 
     def test_the_ledger_in_pages(self):
         ch, mons = self.channel()
@@ -492,7 +511,7 @@ class BridgeTest(unittest.TestCase):
         mons.maps = [mgrmap(43, 'h2')]
         before = [p for _, p in mons.sent if p != 'mgr dump']
         for i, (call, args) in enumerate((('config-key set', {'key': own, 'value': 'v'}), ('config-key rm', {'key': own}),
-                                          ('auth get-or-create', {'entity': 'mgr.h1'}))):
+                                          ('auth get-or-create', {'entity': 'mgr.h1', 'operation': 'op-%016x' % 1}))):
             self.assertEqual(self.call(ch, call=call, args=args, dispatch_id='%016x' % (620 + i))[0], 409, call)
         self.assertEqual([p for _, p in mons.sent if p != 'mgr dump'], before)
         self.assertEqual(self.call(ch, call='health', args={}, dispatch_id='%016x' % 630)[0], 200)
@@ -548,7 +567,9 @@ def pki():
 
     d = tempfile.mkdtemp()
     files = {}
-    for name, data in (('ca.crt', ca.public_bytes(serialization.Encoding.PEM)),) + \
+    for name, data in (('ca.crt', ca.public_bytes(serialization.Encoding.PEM)),
+                       ('ca.key', ca_key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL,
+                                                       serialization.NoEncryption()))) + \
             tuple(zip(('srv.crt', 'srv.key'), leaf('cephadm-talos://f1/mgr/h1', ExtendedKeyUsageOID.SERVER_AUTH, True))) + \
             tuple(zip(('cli.crt', 'cli.key'), leaf('cephadm-talos://f1/agent/h1', ExtendedKeyUsageOID.CLIENT_AUTH))):
         files[name] = os.path.join(d, name)
@@ -679,3 +700,103 @@ class PostJSONTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class LedgerCallsTest(unittest.TestCase):
+    def setUp(self):
+        import test_ledger
+        lmons = Mons([mgrmap(42, 'h1')])
+        lcmds = lmons.commands(2)
+        self.addCleanup(lcmds.stop)
+        lead = b.Leadership('h1', mgrmap(42, 'h1'), lcmds)
+        self.assertTrue(lead.capture())
+        self.mons = Mons([mgrmap(42, 'h1')])
+        self.mons.kv = {}
+        cmds = self.mons.commands(4, 'bridge')
+        self.addCleanup(cmds.stop)
+        files = pki()
+        self.ca = open(files['ca.crt'], 'rb').read()
+        self.mons.kv[b.SECRET_PREFIX + 'agent-ca.key'] = open(files['ca.key']).read()
+        self.led = lg.Ledger(test_ledger.Mons(), 42, 5)
+        self.led.open()
+        inv = inventory('mon.h1@h1', 'mgr.h1@h1')
+        self.ch = b.Channel('f1', 'h1', lead, cmds, None, b'', m.require_identity, Log(), lambda: (self.led, lg.Fold(inv, self.led.executable())), self.ca)
+        self.n = 0
+
+    def call(self, call, **args):
+        self.n += 1
+        return self.ch.bridge({'version': 1, 'call': call, 'args': args, 'deadline': 5, 'dispatch_id': '%016x' % (900 + self.n)})
+
+    def accept(self, kind, daemon, host):
+        op = {'id': 'op-%016x' % (100 + self.n), 'kind': kind, 'host': host}
+        self.n += 1
+        if daemon:
+            op['daemon'] = daemon
+        return self.led.append(op)[1]['id']
+
+    def test_a_mgr_from_add_to_retirement(self):
+        from cryptography import x509
+        from cryptography.x509.oid import ExtendedKeyUsageOID
+        add = self.accept('add_daemon', 'mgr.h2', 'h2')
+        code, reply = self.call('mgr cert', operation=add)
+        self.assertEqual((code, reply['outcome']), (200, 'done'), reply)
+        out = json.loads(reply['out'])
+        srv = x509.load_pem_x509_certificate(out['server_cert'].encode())
+        cli = x509.load_pem_x509_certificate(out['client_cert'].encode())
+        san = srv.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+        self.assertEqual(san.get_values_for_type(x509.UniformResourceIdentifier), ['cephadm-talos://f1/mgr/h2'])
+        self.assertEqual(san.get_values_for_type(x509.DNSName), ['h2'])
+        self.assertEqual([str(i) for i in san.get_values_for_type(x509.IPAddress)], ['10.0.0.2'])
+        self.assertEqual(list(cli.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value), [ExtendedKeyUsageOID.CLIENT_AUTH])
+        # the keys are secrets of this attempt, matching the certificates
+        prefix = '%sissued/%s/%s/' % (b.SECRET_PREFIX, add, out['attempt'])
+        key = serialization.load_pem_private_key(self.mons.kv[prefix + 'mgr-server.key'].encode(), password=None)
+        self.assertEqual(key.public_key().public_numbers(), srv.public_key().public_numbers())
+        name = 'issued/%s/%s/mgr-server.key' % (add, out['attempt'])
+        self.assertEqual(self.call('secret get', name=name)[1]['outcome'], 'done')
+        self.assertEqual(self.call('secret get', name='issued/op-%016x/%s/mgr-server.key' % (7, out['attempt']))[0], 400)
+        self.assertEqual(self.call('auth get-or-create', entity='mgr.h2', operation=add)[1]['outcome'], 'done')
+        self.assertEqual(self.ch.outcome('%016x' % (900 + self.n))[0], 404)  # never kept
+        # not for the CLI's mgr, nor under another operation
+        self.assertEqual(self.call('auth get-or-create', entity='mgr.h1', operation=add)[0], 400)
+        # not for a restart, nor for a mon's add
+        self.assertEqual(self.call('mgr cert', operation=self.accept('restart', 'mgr.h1', 'h1'))[0], 400)
+        self.assertEqual(self.call('mgr cert', operation=self.accept('add_daemon', 'mon.h1', 'h1'))[0], 400)
+        # the removal: a mutation not answered yet holds it, with the generation closed
+        rm = self.accept('remove_daemon', 'mgr.h2', 'h2')
+        stuck = b.Job({})
+        self.ch._track('mgr.h2', stuck)
+        self.assertEqual(self.call('retire', operation=rm)[0], 409)
+        self.assertEqual(self.call('auth get-or-create', entity='mgr.h2', operation=add)[0], 400)
+        self.assertEqual(self.call('mgr cert', operation=add)[0], 400)
+        stuck.complete(0, '', '')
+        # an auth rm without an answer is tracked: the retirement waits for it
+        self.mons.late = True
+        self.assertEqual(self.call('retire', operation=rm)[0], 503)
+        self.assertEqual(self.call('retire', operation=rm)[0], 409)
+        self.mons.late = False
+        self.mons.pending[0].complete(0, '', '')
+        self.mons.auth_rm.append('mgr.h2')  # the late answer was that removal
+        self.assertEqual(self.call('retire', operation=rm)[1]['outcome'], 'done')
+        self.assertEqual(self.mons.auth_rm, ['mgr.h2', 'mgr.h2'])
+        self.assertFalse([k for k in self.mons.kv if k.startswith(b.SECRET_PREFIX + 'issued/')])
+        self.assertEqual([e['kind'] for _, e in self.led.executable() if e['id'].startswith('m-')], ['close', 'retire'])
+        self.assertEqual(self.call('retire', operation=rm)[1]['outcome'], 'done')  # once
+        self.assertEqual(self.mons.auth_rm, ['mgr.h2', 'mgr.h2'])
+        for call, args in (('secret get', {'name': name}), ('auth get', {'entity': 'mgr.h2'})):
+            self.assertEqual(self.call(call, **args)[0], 400, call)
+        # then the host, now without daemons
+        rmh = self.accept('remove_host', None, 'h2')
+        self.assertEqual(self.call('retire host', operation=rmh)[1]['outcome'], 'done')
+        self.assertNotIn('h2', self.ch.authority()[1].hosts)
+        # a host with daemons is not retired
+        self.assertEqual(self.call('retire host', operation=self.accept('remove_host', None, 'h1'))[0], 400)
+
+    def test_the_cli_keys_of_a_removed_mgr_go_too(self):
+        for k in ('host/h1/mgr-server.key', 'host/h1/mgr-client.key', 'host/h1/agent-server.key'):
+            self.mons.kv[b.SECRET_PREFIX + k] = 'x'
+        for i in range(6000):  # a listing larger than the output limit
+            self.mons.kv['mgr/cephadm/talos/inc/42/rec/%d/orphan.%d' % (i, i)] = 'x'
+        rm = self.accept('remove_daemon', 'mgr.h1', 'h1')
+        self.assertEqual(self.call('retire', operation=rm)[1]['outcome'], 'done')
+        self.assertEqual(sorted(k for k in self.mons.kv if '/host/' in k), [b.SECRET_PREFIX + 'host/h1/agent-server.key'])

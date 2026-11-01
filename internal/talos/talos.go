@@ -713,6 +713,35 @@ func (c *Client) Instance(ctx context.Context, node, name string) (string, error
 	return id, nil
 }
 
+// InstanceOwners returns the ContainerConfig containers that have an instance
+// on node, running or not yet cleaned up.
+func (c *Client) InstanceOwners(ctx context.Context, node string) ([]string, error) {
+	cl, nctx, err := c.node(ctx, node, "list instances")
+	if err != nil {
+		return nil, err
+	}
+
+	list, err := safe.StateListAll[*containers.ContainerInstanceSpec](nctx, cl.COSI)
+	if err != nil {
+		return nil, wrap("list containerinstancespec on "+node, err)
+	}
+
+	seen := map[string]bool{}
+
+	var out []string
+
+	for r := range list.All() {
+		if id := r.TypedSpec().ContainerID; !seen[id] {
+			seen[id] = true
+			out = append(out, id)
+		}
+	}
+
+	sort.Strings(out)
+
+	return out, nil
+}
+
 // RestartInstance restarts one instance (Instance) of a ContainerConfig
 // container: Talos stops it within its stop timeout and starts the next one.
 func (c *Client) RestartInstance(ctx context.Context, node, id string) error {

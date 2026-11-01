@@ -26,6 +26,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import orchestrator
 from ceph.deployment.hostspec import HostSpec
+from ceph.deployment.service_spec import ServiceSpec
 from mgr_module import CLICommandBase, CommandResult, HandleCommandResult, MgrModule
 from orchestrator import DaemonDescription, DaemonDescriptionStatus, OrchestratorError, handle_orch_error
 
@@ -466,7 +467,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
         led = getattr(self, '_ledger', None)
         if led is None or not led.ready:
             raise OrchestratorError('this mgr has not opened the ledger: it is not the leader yet')
-        return led, ledger.Fold(cli_baseline(self.get_store_prefix(STORE_PREFIX)))
+        return led, ledger.Fold(cli_baseline(self.get_store_prefix(STORE_PREFIX)), led.executable())
 
     def _journal(self, op_id: str) -> Optional[Dict[str, Any]]:
         """The leader's journal record of an operation, from any incarnation (shown
@@ -482,7 +483,24 @@ class Module(orchestrator.Orchestrator, MgrModule):
                     best = rec
         return best
 
-    def _accept(self, kind: str, daemon: str, host: str) -> str:
+    def _unfinished(self, daemon: Optional[str], host: str) -> Optional[str]:
+        """An accepted operation that conflicts and that the leader's journal does
+        not show finished: for a daemon, one on that daemon or the removal of its
+        host; for a host (daemon None), any on that host."""
+        led, _ = self._authority()
+        for _, e in led.executable():
+            if e['id'].startswith('m-'):
+                continue
+            if daemon is not None and e.get('daemon') != daemon and not (e['kind'] == 'remove_host' and e['host'] == host):
+                continue
+            if daemon is None and e['host'] != host:
+                continue
+            rec = self._journal(e['id'])
+            if rec is None or rec.get('state') not in TERMINAL:
+                return e['id']
+        return None
+
+    def _accept(self, kind: str, daemon: Optional[str], host: str) -> str:
         """Accept an operation: checks, then one ledger entry (ledger.py)."""
         led, fold = self._authority()
         lead = getattr(self, '_leadership', None)
@@ -493,15 +511,17 @@ class Module(orchestrator.Orchestrator, MgrModule):
             led.settle()
         except ledger.LedgerError as e:
             raise OrchestratorError('an earlier operation is not settled yet (%s); try again' % e)
-        # one operation at a time per daemon: a lying journal can only refuse commands
-        for _, e in led.executable():
-            if e['daemon'] == daemon:
-                rec = self._journal(e['id'])
-                if rec is None or rec.get('state') not in TERMINAL:
-                    raise OrchestratorError('%s has operation %s in progress (orch talos operation %s)' % (daemon, e['id'], e['id']))
+        # one operation at a time per daemon (per host for a host's removal): a
+        # lying journal can only refuse commands
+        busy = self._unfinished(daemon, host)
+        if busy:
+            raise OrchestratorError('%s has operation %s in progress (orch talos operation %s)' % (daemon or host, busy, busy))
         op_id = 'op-' + os.urandom(8).hex()
+        entry = {'id': op_id, 'kind': kind, 'host': host}
+        if daemon:
+            entry['daemon'] = daemon
         try:
-            led.append({'id': op_id, 'kind': kind, 'daemon': daemon, 'host': host})
+            led.append(entry)
         except ledger.OutcomeUnknown:
             raise OrchestratorError('the mons did not answer: operation %s may have been accepted (orch talos operation %s)' % (op_id, op_id))
         except ledger.LedgerError as e:
@@ -539,7 +559,8 @@ class Module(orchestrator.Orchestrator, MgrModule):
                             inv['fsid'], self.get_mgr_id(), leadership, bridge_cmds,
                             bridge.server_context(os.path.join(TALOS_DIR, 'agent-ca.crt'), os.path.join(TALOS_DIR, 'mgr-server.crt'),
                                                   os.path.join(TALOS_DIR, 'mgr-server.key')),
-                            bridge.read(os.path.join(TALOS_DIR, 'mgr-server.key')), require_identity, self.log, self._authority)
+                            bridge.read(os.path.join(TALOS_DIR, 'mgr-server.key')), require_identity, self.log, self._authority,
+                            bridge.read(os.path.join(TALOS_DIR, 'agent-ca.crt')))
                         c.start()
                         channel = c  # only a started channel; a failed start is retried
                     if leadership.capture():
@@ -627,6 +648,66 @@ class Module(orchestrator.Orchestrator, MgrModule):
             raise OrchestratorError('%s is not a daemon of the cluster' % daemon_name)
         op_id = self._accept(action, daemon_name, host)
         return 'Scheduled to %s %s on host %s (operation %s)' % (action, daemon_name, host, op_id)
+
+    @handle_orch_error
+    def add_daemon(self, spec: ServiceSpec) -> List[str]:
+        if spec.service_type not in ('mon', 'mgr'):
+            raise OrchestratorError('daemon add %s is not supported by this backend: only mon and mgr' % spec.service_type)
+        p = spec.placement
+        if p is None or len(p.hosts) != 1 or p.count not in (None, 1) or p.count_per_host or p.label or p.host_pattern:
+            raise OrchestratorError('place exactly one daemon on one named host')
+        h = p.hosts[0]
+        if h.network or h.name:
+            raise OrchestratorError('a network or daemon name is not supported by this backend: mon and mgr ids are host names')
+        if spec.config or spec.networks or getattr(spec, 'extra_container_args', None) or getattr(spec, 'extra_entrypoint_args', None) \
+                or getattr(spec, 'custom_configs', None):
+            raise OrchestratorError('spec options are not supported by this backend')
+        _, fold = self._authority()
+        if h.hostname not in fold.hosts:
+            raise OrchestratorError('%s is not a host of the cluster' % h.hostname)
+        name = '%s.%s' % (spec.service_type, h.hostname)
+        if name in fold.daemons:
+            raise OrchestratorError('%s exists already' % name)
+        op_id = self._accept('add_daemon', name, h.hostname)
+        return ['Scheduled to deploy %s on host %s (operation %s)' % (name, h.hostname, op_id)]
+
+    @handle_orch_error
+    def remove_daemons(self, names: List[str]) -> List[str]:
+        _, fold = self._authority()
+        mgrs = {n for n in fold.daemons if n.startswith('mgr.')}
+        active = 'mgr.' + self.get_mgr_id()
+        for n in names:
+            if not n.startswith('mgr.'):
+                raise OrchestratorError('daemon rm %s is not supported by this backend: only mgr' % n)
+            if n not in fold.daemons:
+                raise OrchestratorError('%s is not a daemon of the cluster' % n)
+            if n == active:
+                raise OrchestratorError('%s is the active mgr: fail it over first (ceph mgr fail)' % n)
+        if not mgrs - set(names):
+            raise OrchestratorError('the cluster would have no mgr left')
+        if len(set(names)) != len(names):
+            raise OrchestratorError('a daemon named twice')
+        for n in names:  # every name checked before any is accepted
+            busy = self._unfinished(n, fold.daemons[n])
+            if busy:
+                raise OrchestratorError('%s has operation %s in progress (orch talos operation %s)' % (n, busy, busy))
+        return ['Scheduled to remove %s from host %s (operation %s)' % (n, fold.daemons[n], self._accept('remove_daemon', n, fold.daemons[n]))
+                for n in names]
+
+    @handle_orch_error
+    def remove_host(self, host: str, force: bool = False, offline: bool = False, rm_crush_entry: bool = False) -> str:
+        if offline or rm_crush_entry:
+            raise OrchestratorError('--offline and --rm-crush-entry are not supported by this backend')
+        _, fold = self._authority()
+        if host not in fold.hosts:
+            raise OrchestratorError('%s is not a host of the cluster' % host)
+        on = sorted(n for n, h in fold.daemons.items() if h == host)
+        if on:
+            raise OrchestratorError('%s still has daemons: %s' % (host, ', '.join(on)))
+        if host == self.get_mgr_id():
+            raise OrchestratorError('%s runs the active mgr' % host)
+        op_id = self._accept('remove_host', None, host)
+        return 'Scheduled to remove host %s (operation %s)' % (host, op_id)
 
     @TalosCLICommand.Read('orch talos operation')
     def _operation(self, id: str) -> HandleCommandResult:

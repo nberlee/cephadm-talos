@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -50,6 +51,11 @@ type fakeBridge struct {
 	own string
 	// ledger is the module's executable ledger, in order
 	ledger []LedgerEntry
+	// ca issues mgr certificates; quorum and active answer status and mgr dump
+	ca      *testCA
+	quorum  []string
+	active  string
+	retired []string
 }
 
 func (m *fakeBridge) run(req wire.BridgeRequest) map[string]any {
@@ -92,6 +98,38 @@ func (m *fakeBridge) run(req wire.BridgeRequest) map[string]any {
 		delete(m.kv, str("key"))
 
 		return map[string]any{"outcome": "done", "r": 0}
+	case "mgr cert":
+		attempt := fmt.Sprintf("%016x", len(m.calls))
+		out := map[string]string{"attempt": attempt}
+
+		for _, role := range []string{"server", "client"} {
+			usage := x509.ExtKeyUsageClientAuth
+			if role == "server" {
+				usage = x509.ExtKeyUsageServerAuth
+			}
+
+			cert, key := m.ca.pair(pki.RoleMgr, "h1", usage, m.fsid)
+			out[role+"_cert"] = cert
+			m.kv[store.SecretPrefix+"issued/"+str("operation")+"/"+attempt+"/mgr-"+role+".key"] = key
+		}
+
+		b, _ := json.Marshal(out)
+
+		return map[string]any{"outcome": "done", "r": 0, "out": string(b)}
+	case "retire", "retire host":
+		m.retired = append(m.retired, req.Call+" "+str("operation"))
+
+		return map[string]any{"outcome": "done", "r": 0, "out": ""}
+	case "status":
+		b, _ := json.Marshal(map[string]any{"quorum_names": m.quorum})
+
+		return map[string]any{"outcome": "done", "r": 0, "out": string(b)}
+	case "mgr dump":
+		b, _ := json.Marshal(map[string]any{"active_name": m.active, "active_gid": 42})
+
+		return map[string]any{"outcome": "done", "r": 0, "out": string(b)}
+	case "auth get-or-create":
+		return map[string]any{"outcome": "done", "r": 0, "out": `[{"entity":"` + str("entity") + `","key":"` + fakeKey + `"}]`}
 	case "ledger":
 		page := [][2]any{}
 

@@ -17,6 +17,7 @@ import (
 
 	"github.com/nberlee/cephadm-talos/internal/mgrmodule"
 	"github.com/nberlee/cephadm-talos/internal/pki"
+	"github.com/nberlee/cephadm-talos/internal/render"
 	"github.com/nberlee/cephadm-talos/internal/spec"
 	"github.com/nberlee/cephadm-talos/internal/state"
 	"github.com/nberlee/cephadm-talos/internal/talos/talostest"
@@ -57,7 +58,7 @@ func TestInventory(t *testing.T) {
 		t.Fatalf("inventory header %+v", inv)
 	}
 
-	got := map[string]invDaemon{}
+	got := map[string]render.InventoryDaemon{}
 	for _, d := range inv.Daemons {
 		got[d.DaemonType+"."+d.DaemonID] = d
 	}
@@ -452,7 +453,7 @@ func TestInventoryRevisionFollowsItsContent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var inv inventory
+	var inv render.Inventory
 	if err := json.Unmarshal(b, &inv); err != nil || inv.Revision != 2 || len(inv.Hosts) != 2 {
 		t.Errorf("published inventory %+v: %v", inv, err)
 	}

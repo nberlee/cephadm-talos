@@ -453,10 +453,79 @@ func (b *Bridge) Ledger(ctx context.Context, after string) (entries []LedgerEntr
 	return entries, page.More, nil
 }
 
+// MgrCerts are certificates the module issued for a mgr (bridge.py
+// issue_mgr_certs); their keys are secrets of the attempt.
+type MgrCerts struct {
+	Attempt    string `json:"attempt"`
+	ServerCert string `json:"server_cert"`
+	ClientCert string `json:"client_cert"`
+}
+
+// MgrCert asks the module for the certificates of a mgr an accepted add
+// deploys.
+func (b *Bridge) MgrCert(ctx context.Context, op string) (MgrCerts, error) {
+	out, err := b.do(ctx, "mgr cert", map[string]any{"operation": op})
+	if err != nil {
+		return MgrCerts{}, err
+	}
+
+	var c MgrCerts
+	if err := json.Unmarshal([]byte(out), &c); err != nil || c.Attempt == "" || c.ServerCert == "" || c.ClientCert == "" {
+		return MgrCerts{}, errors.New("bridge: mgr cert: malformed answer")
+	}
+
+	return c, nil
+}
+
+// Retire asks the module to retire what an accepted removal removed: call
+// "retire" for a daemon (auth rm, its keys), "retire host" for a host.
+func (b *Bridge) Retire(ctx context.Context, call, op string) error {
+	_, err := b.do(ctx, call, map[string]any{"operation": op})
+
+	return err
+}
+
+// Quorum returns the names of the mons in quorum.
+func (b *Bridge) Quorum(ctx context.Context) ([]string, error) {
+	out, err := b.do(ctx, "status", map[string]any{})
+	if err != nil {
+		return nil, err
+	}
+
+	var st struct {
+		Quorum []string `json:"quorum_names"`
+	}
+
+	if err := json.Unmarshal([]byte(out), &st); err != nil {
+		return nil, fmt.Errorf("bridge: status: %w", err)
+	}
+
+	return st.Quorum, nil
+}
+
+// ActiveMgr returns the name of the active mgr.
+func (b *Bridge) ActiveMgr(ctx context.Context) (string, error) {
+	out, err := b.do(ctx, "mgr dump", map[string]any{})
+	if err != nil {
+		return "", err
+	}
+
+	var m struct {
+		ActiveName string `json:"active_name"`
+	}
+
+	if err := json.Unmarshal([]byte(out), &m); err != nil || m.ActiveName == "" {
+		return "", errors.New("bridge: mgr dump: no active mgr")
+	}
+
+	return m.ActiveName, nil
+}
+
 // AuthGetOrCreate returns the secret of a mgr or RGW identity, created with
-// the caps the module fixes for its type if mon auth has none.
-func (b *Bridge) AuthGetOrCreate(ctx context.Context, entity string) (string, error) {
-	out, err := b.do(ctx, "auth get-or-create", map[string]any{"entity": entity})
+// the caps the module fixes for its type if mon auth has none; op is the
+// accepted add whose daemon it is.
+func (b *Bridge) AuthGetOrCreate(ctx context.Context, entity, op string) (string, error) {
+	out, err := b.do(ctx, "auth get-or-create", map[string]any{"entity": entity, "operation": op})
 	if err != nil {
 		return "", err
 	}
