@@ -106,7 +106,7 @@ def check_entry(key: str, raw: str) -> Dict[str, Any]:
     # mon and mgr ids are their host's name
     if kind == 'add_daemon' and (t not in ('mon', 'mgr') or i != host):
         raise LedgerError('operation entry %s' % key)
-    if kind == 'remove_daemon' and (t != 'mgr' or i != host):
+    if kind == 'remove_daemon' and (t not in ('mon', 'mgr') or i != host):
         raise LedgerError('operation entry %s' % key)
     if kind == 'remove_osd' and (t != 'osd' or not re.match(r'\A(0|[1-9][0-9]{0,8})\Z', i) or not isinstance(e.get('uuid'), str)
                                  or not UUID_RE_OSD.match(e['uuid']) or type(e.get('zap')) is not bool or type(e.get('force')) is not bool):

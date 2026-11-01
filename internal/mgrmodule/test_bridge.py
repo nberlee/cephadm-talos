@@ -73,6 +73,9 @@ class Mons:
         self.safe = []      # osd safe-to-destroy's safe ids
         self.osd_calls = []
         self.metadata = {}  # osd metadata by id
+        self.monmap = []    # quorum_status's monmap names
+        self.quorum = []    # quorum_status's quorum_names
+        self.mon_rm = []
 
     def send(self, res, cmd):
         prefix = json.loads(cmd)['prefix']
@@ -108,6 +111,14 @@ class Mons:
         elif prefix == 'osd metadata':
             i = json.loads(cmd)['id']
             res.complete(0, json.dumps(self.metadata[i]), '') if i in self.metadata else res.complete(-2, '', 'no metadata')
+        elif prefix == 'quorum_status':
+            res.complete(0, json.dumps({'monmap': {'mons': [{'name': n} for n in self.monmap]}, 'quorum_names': self.quorum}), '')
+        elif prefix == 'mon rm':
+            name = json.loads(cmd)['name']
+            self.mon_rm.append(name)
+            self.monmap = [n for n in self.monmap if n != name]
+            self.quorum = [n for n in self.quorum if n != name]
+            res.complete(0, '', '')
         elif prefix == 'auth rm':
             self.auth_rm.append(json.loads(cmd)['entity'])
             res.complete(0, '', '')
@@ -874,6 +885,32 @@ class CreationTest(LedgerCallsTest):
                         ('sda=QEMU_HARDDISK_QM000012', False), ('sda=QEMU_HARDDISK_XQM00001', False), ('', False),
                         ('sdb=OTHER,sda=QEMU_HARDDISK_QM00001', True)):
             self.assertEqual(b.device_matches(ids, 'QM00001'), ok, ids)
+
+
+class MonRemovalTest(unittest.TestCase):
+    setUp, call, accept = LedgerCallsTest.setUp, LedgerCallsTest.call, LedgerCallsTest.accept
+
+    def test_mon_rm_keeps_a_quorum_and_retires_without_auth_rm(self):
+        inv = inventory('mon.h1@h1', 'mon.h2@h2', 'mgr.h1@h1')
+        self.ch.authority = lambda: (self.led, lg.Fold(inv, self.led.executable()))
+        rm = self.accept('remove_daemon', 'mon.h2', 'h2')
+        # h1 is down: the quorum without h2 would be empty
+        self.mons.monmap, self.mons.quorum = ['h1', 'h2'], ['h2']
+        self.assertEqual(self.call('mon rm', operation=rm)[0], 409)
+        self.assertEqual(self.mons.mon_rm, [])
+        # one of two healthy mons can go (unlike mon ok-to-stop)
+        self.mons.quorum = ['h1', 'h2']
+        self.assertEqual(self.call('mon rm', operation=rm)[1]['outcome'], 'done')
+        self.assertEqual((self.mons.mon_rm, self.mons.monmap), (['h2'], ['h1']))
+        # once out of the monmap it is done, without another mon rm
+        self.assertEqual(self.call('mon rm', operation=rm)[1]['outcome'], 'done')
+        self.assertEqual(self.mons.mon_rm, ['h2'])
+        self.assertEqual(self.call('retire', operation=rm)[1]['outcome'], 'done')
+        self.assertEqual(self.mons.auth_rm, [])
+        self.assertNotIn('mon.h2', self.ch.authority()[1].daemons)
+        # only for a mon's removal
+        other = self.accept('remove_daemon', 'mgr.h1', 'h1')
+        self.assertEqual(self.call('mon rm', operation=other)[0], 400)
 
 
 class RemovalTest(LedgerCallsTest):

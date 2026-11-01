@@ -585,8 +585,8 @@ class AddAndRemove(unittest.TestCase):
 
     def test_daemon_rm_and_host_rm(self):
         mod, entries = self.module()
-        # the active mgr (h3) and everything but mgrs are refused; so is the last mgr
-        for names in (['mgr.h3'], ['mon.h1'], ['mgr.h9'], ['osd.0']):
+        # the active mgr (h3), the last mon (h1) and everything but mons and mgrs are refused
+        for names in (['mgr.h3'], ['mon.h1'], ['mgr.h9'], ['osd.0'], ['keepalived.h2']):
             self.assertTrue(m.Module.remove_daemons(mod, names).exception_str, names)
         m.Module.add_daemon(mod, self.spec('mgr', 'h2'))
         [(_, add)] = mod._ledger.executable()
@@ -599,6 +599,17 @@ class AddAndRemove(unittest.TestCase):
         # h2 still has its mgr in the fold until the removal is retired
         self.assertTrue(m.Module.remove_host(mod, 'h2').exception_str)
         self.assertEqual([k for k, _, _ in self.ops(mod)], ['add_daemon', 'remove_daemon'])
+
+    def test_daemon_rm_of_a_mon(self):
+        mod, entries = self.module()
+        m.Module.add_daemon(mod, self.spec('mon', 'h2'))
+        [(_, add)] = mod._ledger.executable()
+        entries['talos/inc/20/journal/op/' + add['id']] = json.dumps({'state': 'completed'})
+        # not both: the cluster would have no mon left
+        self.assertTrue(m.Module.remove_daemons(mod, ['mon.h1', 'mon.h2']).exception_str)
+        res = m.Module.remove_daemons(mod, ['mon.h1'])
+        self.assertEqual(res.exception_str, '')
+        self.assertEqual(self.ops(mod)[-1], ('remove_daemon', 'mon.h1', 'h1'))
 
 
 class Conflicts(unittest.TestCase):

@@ -595,28 +595,41 @@ func (l *LeaderLoop) addDaemon(ctx context.Context, b *Bridge, js store.Backend,
 		}
 
 		// only now ceph.conf names it, so clients never start against an empty address
-		for _, h := range st.Hosts {
-			if h.Maintenance {
-				continue
-			}
-
-			done, ok, err := l.step(ctx, b, js, gid, epoch, op.ID+".conf."+h.Name, h.Name, revisionMode{})
-			if err != nil || !done {
-				return err
-			}
-
-			if !ok {
-				return finish(ctx, js, gid, op, JournalFailed, fmt.Errorf("ceph.conf did not reach %s", h.Name))
-			}
+		if done, err := l.confEverywhere(ctx, b, js, gid, epoch, st, op); err != nil || !done {
+			return err
 		}
 	}
 
 	return finish(ctx, js, gid, op, wire.OpCompleted, nil)
 }
 
-// removeDaemon removes a mgr that is not the active one: out of the state, its
-// documents off its host, then, once its instance is gone, the module retires
-// it (auth rm, its keys).
+// confEverywhere grants every host not in maintenance the revision of its
+// ceph.conf after a mon change, one phase per host; done reports that all
+// ended (a host it did not reach fails the operation).
+func (l *LeaderLoop) confEverywhere(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, st *state.State, op LedgerOp) (bool, error) {
+	for _, h := range st.Hosts {
+		if h.Maintenance {
+			continue
+		}
+
+		done, ok, err := l.step(ctx, b, js, gid, epoch, op.ID+".conf."+h.Name, h.Name, revisionMode{})
+		if err != nil || !done {
+			return false, err
+		}
+
+		if !ok {
+			return false, finish(ctx, js, gid, op, JournalFailed, fmt.Errorf("ceph.conf did not reach %s", h.Name))
+		}
+	}
+
+	return true, nil
+}
+
+// removeDaemon removes a mgr that is not the active one, or a mon: out of the
+// state, its documents off its host, then, once its instance is gone, the
+// module retires it (auth rm and its keys for a mgr). A mon leaves the monmap
+// first, as in cephadm, and ceph.conf stops naming it on every host before
+// its retirement.
 func (l *LeaderLoop) removeDaemon(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, op LedgerOp) error {
 	st, _, err := l.clusterState(ctx, b)
 	if err != nil {
@@ -626,20 +639,28 @@ func (l *LeaderLoop) removeDaemon(ctx context.Context, b *Bridge, js store.Backe
 	typ, id, _ := strings.Cut(op.Daemon, ".")
 
 	h, ok := st.Host(op.Host)
-	if !ok || typ != state.TypeMgr || id != op.Host {
+	if !ok || (typ != state.TypeMgr && typ != state.TypeMon) || id != op.Host {
 		return finish(ctx, js, gid, op, JournalFailed, fmt.Errorf("%s cannot be removed from %s", op.Daemon, op.Host))
 	}
 
-	doc := st.DocName(state.Daemon{Type: state.TypeMgr, ID: id, Host: h.Name})
+	doc := st.DocName(state.Daemon{Type: typ, ID: id, Host: h.Name})
 
 	rs, err := l.journalState(ctx, b, js, gid, op.ID+".rev")
 	if err != nil {
 		return err
 	}
 
+	// the module checks the quorum without it and takes it out of the monmap
+	// (done once it is out), before its document goes
+	if typ == state.TypeMon && !terminal(rs) {
+		if err := b.Retire(ctx, "mon rm", op.ID); err != nil {
+			return err
+		}
+	}
+
 	// checked again before every step up to the removal of its document, also
 	// on a resumed operation: a standby may have become the active one
-	if !terminal(rs) {
+	if typ == state.TypeMgr && !terminal(rs) {
 		active, err := b.ActiveMgr(ctx)
 		if err != nil {
 			return err
@@ -659,7 +680,7 @@ func (l *LeaderLoop) removeDaemon(ctx context.Context, b *Bridge, js store.Backe
 		if err := l.changeState(ctx, b, gid, func(st *state.State) error {
 			st.RemoveDaemon(d)
 
-			if h, ok := st.Host(op.Host); ok {
+			if h, ok := st.Host(op.Host); ok && typ == state.TypeMgr {
 				h.MgrServerCert, h.MgrClientCert, h.MgrKeys = "", "", ""
 				st.AddHost(h)
 			}
@@ -686,6 +707,12 @@ func (l *LeaderLoop) removeDaemon(ctx context.Context, b *Bridge, js store.Backe
 
 	if slices.Contains(rep.Instances, doc) {
 		return fmt.Errorf("%w: %s has not stopped yet", errRetry, op.Daemon)
+	}
+
+	if typ == state.TypeMon {
+		if done, err := l.confEverywhere(ctx, b, js, gid, epoch, st, op); err != nil || !done {
+			return err
+		}
 	}
 
 	if err := b.Retire(ctx, "retire", op.ID); err != nil {

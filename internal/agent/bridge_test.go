@@ -128,7 +128,7 @@ func (m *fakeBridge) run(req wire.BridgeRequest) map[string]any {
 		b, _ := json.Marshal(m.osds)
 
 		return map[string]any{"outcome": "done", "r": 0, "out": string(b)}
-	case "retire", "retire host":
+	case "retire", "retire host", "mon rm":
 		m.retired = append(m.retired, req.Call+" "+str("operation"))
 
 		return map[string]any{"outcome": "done", "r": 0, "out": ""}

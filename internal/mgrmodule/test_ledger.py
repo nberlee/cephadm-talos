@@ -200,7 +200,8 @@ class GenerationTest(unittest.TestCase):
         add = entry(5, 3, 'op-%016x' % 3, kind='add_daemon', daemon='mon.h2', host='h2')
         self.assertNotIn('mon.h2', lg.Fold(self.INV, [rmh, reth, add]).daemons)
         for bad in (dict(kind='add_daemon', daemon='mgr.h1', host='h2'), dict(kind='add_daemon', daemon='osd.1', host='h1'),
-                    dict(kind='remove_daemon', daemon='mon.h1', host='h1'), dict(kind='remove_host', host='h1', daemon='mgr.h1')):
+                    dict(kind='remove_daemon', daemon='mon.h1', host='h2'), dict(kind='remove_daemon', daemon='osd.1', host='h1'),
+                    dict(kind='remove_host', host='h1', daemon='mgr.h1')):
             k, e = entry(5, 9, 'op-%016x' % 9, **bad)
             with self.assertRaises(lg.LedgerError, msg=bad):
                 lg.check_entry(k, json.dumps(e))

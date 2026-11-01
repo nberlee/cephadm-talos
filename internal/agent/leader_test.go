@@ -1495,3 +1495,50 @@ func TestAnOperationFailingTooLongIsGivenUp(t *testing.T) {
 		t.Fatalf("the add was not given up: %+v", op)
 	}
 }
+
+func TestLeaderRemovesAMonFromTheMonmapFirst(t *testing.T) {
+	s := newLeaderSetup(t)
+	ctx := context.Background()
+
+	// mons on h0 and h1: the one on h1 goes
+	s.st.AddDaemon(state.Daemon{Type: state.TypeMon, ID: "h0", Host: "h0", DeployID: "0123456789abcdef"})
+	publish(t, s.leader, s.module, s.st)
+
+	s.request("r1", `{"version":1,"kind":"revision","host":"h1"}`)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	monDoc := "ContainerConfig/ceph-" + testFSID[:8] + "-mon-h1"
+	if rep, err := s.agent.Node.Report(ctx); err != nil || rep.Owned[monDoc] == "" {
+		t.Fatalf("the mon is not deployed: %v", err)
+	}
+
+	rm := s.accept(KindRemoveDaemon, "mon.h1", "h1", 1)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	// out of the monmap before its document went; ceph.conf next, on every host
+	s.module.mu.Lock()
+	calls := slices.Clone(s.module.retired)
+	_, decided := s.module.kv[JournalPrefix(42)+"op/"+rm.Op.ID]
+	s.module.mu.Unlock()
+
+	if !slices.Equal(calls, []string{"mon rm " + rm.Op.ID}) {
+		t.Fatalf("module calls %v", calls)
+	}
+
+	if rep, err := s.agent.Node.Report(ctx); err != nil || rep.Owned[monDoc] != "" {
+		t.Fatalf("the mon's document stayed: %v", err)
+	}
+
+	st, _, err := s.leader.clusterState(ctx, s.leader.bridge())
+	must(t, err)
+
+	if _, ok := st.Find("mon.h1"); ok || len(st.MonAddrs()) != 1 {
+		t.Fatalf("state still has the mon: %v", st.MonAddrs())
+	}
+
+	// ceph.conf goes to h0 first, whose agent this test does not serve: no
+	// retirement before it reached every host
+	if decided {
+		t.Fatal("completed before ceph.conf reached every host")
+	}
+}

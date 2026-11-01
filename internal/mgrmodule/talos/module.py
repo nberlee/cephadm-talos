@@ -685,17 +685,17 @@ class Module(orchestrator.Orchestrator, MgrModule):
     def remove_daemons(self, names: List[str]) -> List[str]:
         self._settle()
         _, fold = self._authority()
-        mgrs = {n for n in fold.daemons if n.startswith('mgr.')}
         active = 'mgr.' + self.get_mgr_id()
         for n in names:
-            if not n.startswith('mgr.'):
-                raise OrchestratorError('daemon rm %s is not supported by this backend: only mgr' % n)
+            if not n.startswith(('mgr.', 'mon.')):
+                raise OrchestratorError('daemon rm %s is not supported by this backend: only mon and mgr' % n)
             if n not in fold.daemons:
                 raise OrchestratorError('%s is not a daemon of the cluster' % n)
             if n == active:
                 raise OrchestratorError('%s is the active mgr: fail it over first (ceph mgr fail)' % n)
-        if not mgrs - set(names):
-            raise OrchestratorError('the cluster would have no mgr left')
+        for t in ('mon', 'mgr'):
+            if any(n.startswith(t + '.') for n in names) and not {n for n in fold.daemons if n.startswith(t + '.')} - set(names):
+                raise OrchestratorError('the cluster would have no %s left' % t)
         if len(set(names)) != len(names):
             raise OrchestratorError('a daemon named twice')
         for n in names:  # every name checked before any is accepted

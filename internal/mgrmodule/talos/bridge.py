@@ -342,7 +342,7 @@ READ_ONLY = {'status', 'health', 'mgr dump', 'config-key keys', 'config-key get'
 # calls that release a credential: checked against the fold, while active
 CREDENTIALS = {'auth get', 'auth get-or-create', 'secret get'}
 # calls the module answers itself, for operations of its ledger (ledger.py)
-LOCAL = {'mgr cert', 'retire', 'retire host', 'bind disk', 'confirm osd', 'close create', 'osd out', 'drain'}
+LOCAL = {'mgr cert', 'retire', 'retire host', 'bind disk', 'confirm osd', 'close create', 'osd out', 'drain', 'mon rm'}
 
 ALLOWLIST: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     'status': _no_args('status'),
@@ -367,6 +367,7 @@ ALLOWLIST: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     'osd dump': _osd_dump,
     'retire': _operation,
     'retire host': _operation,
+    'mon rm': _operation,
 }
 
 
@@ -790,6 +791,8 @@ class Channel:
                     return self._removal(call, led, fold, ops, op)
                 if call == 'retire':
                     return self._retire(led, fold, ops, op)
+                if call == 'mon rm':
+                    return self._mon_rm(led, fold, ops, op)
                 if call in ('bind disk', 'confirm osd', 'close create'):
                     return self._creation(call, led, fold, op, args or {})
                 return self._retire_host(led, fold, ops, op)
@@ -831,6 +834,9 @@ class Channel:
             led.append({'id': 'm-' + secrets.token_hex(8), 'kind': 'close', 'of': op['id'], 'daemon': name, 'host': op['host']})
         if self._pending(name):
             return 409, {'error': 'mutations for %s are not answered yet; ask again' % name}
+        if name.startswith('mon.'):  # the mon. key is shared: nothing of its own to remove
+            led.append({'id': 'm-' + secrets.token_hex(8), 'kind': 'retire', 'of': op['id'], 'daemon': name, 'host': op['host']})
+            return 200, done
         entity = name  # a mgr's entity is its daemon name
         # tracked: an unanswered removal holds the retirement until it is answered,
         # so it cannot land on a later generation's key
@@ -849,6 +855,45 @@ class Channel:
                 if rm is None or rm.r not in (0, -2):
                     return 503, {'error': 'cannot remove a key of %s; ask again' % name}
         led.append({'id': 'm-' + secrets.token_hex(8), 'kind': 'retire', 'of': op['id'], 'daemon': name, 'host': op['host']})
+        return 200, done
+
+    def _mon_rm(self, led: Any, fold: Any, ops: Dict[str, Dict[str, Any]], op: Optional[Dict[str, Any]]) -> Tuple[int, Dict[str, Any]]:
+        """A mon's removal from the monmap before its documents go, as cephadm's
+        MonService.pre_remove: only while the quorum without it is a majority of
+        the monmap without it (_check_safe_to_destroy)."""
+        done = {'outcome': 'done', 'r': 0, 'out': '', 'outs': ''}
+        if op is None or op['kind'] != 'remove_daemon' or not op['daemon'].startswith('mon.'):
+            return 400, {'error': 'no removal of a mon'}
+        name = op['daemon']
+        mon_id = name.split('.', 1)[1]
+        if any(e['kind'] == 'retire' and e['of'] == op['id'] for e in ops.values()):
+            return 200, done
+        if name not in fold.daemons:
+            return 400, {'error': '%s is not in the cluster' % name}
+        later = [e for k, e in led.executable() if e['kind'] == 'add_daemon' and e['daemon'] == name and (e['epoch'], e['seq']) > (op['epoch'], op['seq'])]
+        if later:
+            return 400, {'error': '%s was added again after this removal' % name}
+        # a monmap read must not be older than a mon rm this module already sent
+        if self._pending(name):
+            return 409, {'error': 'mutations for %s are not answered yet; ask again' % name}
+        q = self._mon({'prefix': 'quorum_status', 'format': 'json'})
+        if q is None or q.r != 0 or q.too_large:
+            return 503, {'error': 'cannot read the quorum; ask again'}
+        try:
+            status = json.loads(q.outb)
+            mons = [m['name'] for m in status['monmap']['mons']]
+            quorum = list(status['quorum_names'])
+        except (ValueError, KeyError, TypeError):
+            return 503, {'error': 'cannot read the quorum; ask again'}
+        if mon_id not in mons:
+            return 200, done  # removed already
+        rest = [m for m in mons if m != mon_id]
+        rest_quorum = [m for m in quorum if m != mon_id]
+        if not rest or len(rest_quorum) <= len(rest) / 2:
+            return 409, {'error': 'removing %s would break the mon quorum (quorum %s of %s)' % (name, rest_quorum, rest)}
+        job = self._mon({'prefix': 'mon rm', 'name': mon_id}, name)
+        if job is None or job.r not in (0, -2):  # ENOENT: gone already
+            return 503, {'error': 'mon rm %s: no answer or refused; ask again' % mon_id}
         return 200, done
 
     def _creation(self, call: str, led: Any, fold: Any, op: Optional[Dict[str, Any]], args: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
