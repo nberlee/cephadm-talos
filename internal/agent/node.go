@@ -127,6 +127,9 @@ type Node struct {
 		ContainerStatuses(ctx context.Context, node string) (map[string]containers.ContainerStatusSpec, error)
 		RestartInstance(ctx context.Context, node, id string) error
 		RebootNow(ctx context.Context, node string) error
+		Hostname(ctx context.Context, node string) (string, error)
+		Addresses(ctx context.Context, node string) ([]string, error)
+		Logs(ctx context.Context, node, name string) (string, error)
 	}
 	Records *records.Store
 	// JobsDir is where the node's jobs write their claims and results (the
@@ -715,6 +718,22 @@ func (n *Node) Report(ctx context.Context) (wire.NodeReport, error) {
 		}
 	}
 
+	// a keepalived's VRRP state, from its own log (vip.sh marks each start)
+	for name := range r.Running {
+		if strings.HasPrefix(name, n.prefix()+"vip-") {
+			logs, err := n.Talos.Logs(ctx, "", name)
+			if err != nil {
+				continue // unknown: not reported
+			}
+
+			if r.VRRP == nil {
+				r.VRRP = map[string]wire.VRRP{}
+			}
+
+			r.VRRP[name] = vrrpState(logs)
+		}
+	}
+
 	if r.BootID, err = n.Talos.BootID(ctx, ""); err != nil {
 		return r, err
 	}
@@ -1047,6 +1066,23 @@ func (n *Node) apply(ctx context.Context, until time.Time, revision int64, docs 
 		return Ownership{}, started, err
 	}
 
+	// and the RGW certificates, for this node (plan 03, step 6e)
+	if n.Policy != nil {
+		identity := func() (id NodeIdentity, err error) {
+			if id.Hostname, err = n.Talos.Hostname(ctx, ""); err != nil {
+				return id, err
+			}
+
+			id.Addrs, err = n.Talos.Addresses(ctx, "")
+
+			return id, err
+		}
+
+		if err := n.Policy.rgwCerts(curTyped, typed, sent, identity, time.Now()); err != nil {
+			return Ownership{}, started, err
+		}
+	}
+
 	// every document must pass the admission policy (plan 03, item 13); disk
 	// entries are reserved here, before the intent
 	if err := n.admit(ctx, docs, typed, cur, sent); err != nil {
@@ -1230,6 +1266,28 @@ func (n *Node) RestartBefore(ctx context.Context, until time.Time, revision int6
 	}
 
 	return true, n.Talos.RestartInstance(ctx, "", instance)
+}
+
+// vrrpState is the latest start marker vip.sh printed in a keepalived's log
+// and the last VRRP transition after it ("" before any).
+func vrrpState(logs string) wire.VRRP {
+	const start = "CEPHADM-TALOS-VIP-START "
+
+	i := strings.LastIndex(logs, start)
+	if i < 0 {
+		return wire.VRRP{}
+	}
+
+	marker, _, _ := strings.Cut(logs[i+len(start):], "\n")
+	v, at := wire.VRRP{Start: strings.TrimSpace(marker)}, -1
+
+	for _, s := range []string{"MASTER", "BACKUP", "FAULT"} {
+		if j := strings.LastIndex(logs[i:], "Entering "+s+" STATE"); j > at {
+			v.State, at = s, j
+		}
+	}
+
+	return v
 }
 
 // RebootBefore reboots the node for a confirmed grant: only a node handed

@@ -332,9 +332,20 @@ type NodeReport struct {
 	// Running is, for each of the cluster's containers that runs, the image
 	// it runs (the resolved digest, "sha256:<hex>")
 	Running map[string]string `json:"running,omitempty"`
+	// VRRP is, for each running keepalived of the cluster, the latest start
+	// its log shows and its VRRP state since (absent if the log was unreadable)
+	VRRP map[string]VRRP `json:"vrrp,omitempty"`
 	Disks   []Disk            `json:"disks"`
 	// BootID is the node's boot id; it changes with every boot
 	BootID string `json:"boot_id,omitempty"`
+}
+
+// VRRP is a keepalived's latest start marker (vip.sh prints one per start)
+// and its VRRP state since: MASTER, BACKUP, FAULT, or "" before any. A
+// replaced instance is ready once its marker differs from the one before.
+type VRRP struct {
+	Start string `json:"start"`
+	State string `json:"state"`
 }
 
 // Disk is one of a node's disks as Talos reports it.

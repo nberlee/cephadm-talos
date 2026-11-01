@@ -943,6 +943,30 @@ func (c *Client) Hostname(ctx context.Context, node string) (string, error) {
 	return r.TypedSpec().Hostname, nil
 }
 
+// Addresses returns a node's own IP addresses (without prefix length), as
+// Talos reports them in its address status.
+func (c *Client) Addresses(ctx context.Context, node string) ([]string, error) {
+	cl, nctx, err := c.node(ctx, node, "get addressstatuses")
+	if err != nil {
+		return nil, err
+	}
+
+	list, err := safe.StateListAll[*network.AddressStatus](nctx, cl.COSI)
+	if err != nil {
+		return nil, wrap("list addressstatuses on "+node, err)
+	}
+
+	var out []string
+
+	for r := range list.All() {
+		if a := r.TypedSpec().Address; a.IsValid() {
+			out = append(out, a.Addr().String())
+		}
+	}
+
+	return out, nil
+}
+
 // Version returns the Talos server version tag of a node.
 func (c *Client) Version(ctx context.Context, node string) (string, error) {
 	cl, nctx, err := c.node(ctx, node, "version")

@@ -43,6 +43,7 @@ type Params struct {
 	ZapUnlabelled bool
 	Port          int      // rgw/vip: RGW HTTPS port
 	TLSPEM        string   // rgw: certificate + key
+	TLSUser       bool     // rgw: the operator's certificate, not a generated one
 	VIP           string   // vip: CIDR of the virtual IP
 	VRID          int      // vip: VRRP router id
 	VRRPPass      string   // vip: VRRP password (max 8 chars)
@@ -179,6 +180,11 @@ func RGW(p Params) *spec.ContainerConfig {
 	c.ContainerEnvironment = append(c.ContainerEnvironment,
 		fmt.Sprintf("PORT=%d", p.Port),
 		"TLS_PEM="+base64.StdEncoding.EncodeToString([]byte(p.TLSPEM)))
+
+	if p.TLSUser {
+		c.ContainerEnvironment = append(c.ContainerEnvironment, "TLS_USER=1")
+	}
+
 	// no capabilities except binding a port below 1024 (443)
 	c.SecurityConfig = spec.Restricted("NET_BIND_SERVICE")
 	c.ContainerStopTimeout = RGWStopTimeout

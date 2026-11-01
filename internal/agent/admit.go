@@ -7,12 +7,12 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"github.com/nberlee/cephadm-talos/internal/wire"
 	"net/netip"
 	"regexp"
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/distribution/reference"
 	"github.com/siderolabs/talos/pkg/machinery/config/types/runtime"
@@ -24,6 +24,7 @@ import (
 	"github.com/nberlee/cephadm-talos/internal/pki"
 	"github.com/nberlee/cephadm-talos/internal/spec"
 	"github.com/nberlee/cephadm-talos/internal/state"
+	"github.com/nberlee/cephadm-talos/internal/wire"
 )
 
 // Policy is the agent's admission policy (plan 03, item 13). Every granted
@@ -483,6 +484,14 @@ func (p *Policy) admitContainer(d Doc, td typedDoc, f facts) error {
 			return errors.New("TLS_PEM: not a certificate with its key")
 		}
 
+		switch env["TLS_USER"] {
+		case "":
+		case "1":
+			params.TLSUser = true
+		default:
+			return errors.New("TLS_USER: not a flag")
+		}
+
 		params.TLSPEM = string(pemb)
 
 		return same(td, daemons.RGW(params))
@@ -790,6 +799,138 @@ func mgrPairs(cur, typed map[string]typedDoc, sent map[string]string) error {
 		if hasCert {
 			if _, err := tls.X509KeyPair([]byte(cert), []byte(key)); err != nil {
 				return fmt.Errorf("%s: the key does not match its certificate", pair[1])
+			}
+		}
+	}
+
+	return nil
+}
+
+// NodeIdentity is what a node is to its clients: its hostname and addresses
+// as Talos reports them.
+type NodeIdentity struct {
+	Hostname string
+	Addrs    []string
+}
+
+// rgwCerts checks the RGW certificates on the documents a node holds after a
+// revision that changes an RGW or keepalived document (plan 03, step 6e):
+// within their validity now; a generated one (TLS_USER unset) for the
+// RGW's ADDR, which must be one of the node's own addresses, its hostname,
+// and the VIP of every keepalived of the cluster the node holds. The
+// operator's certificate names what its clients use, its own choice.
+func (p *Policy) rgwCerts(cur, typed map[string]typedDoc, sent map[string]string, identity func() (NodeIdentity, error), now time.Time) error {
+	touched := false
+
+	for k := range sent {
+		if name, ok := strings.CutPrefix(k, "ContainerConfig/"+p.prefix()); ok && (strings.HasPrefix(name, "rgw-") || strings.HasPrefix(name, "vip-")) {
+			touched = true
+		}
+	}
+
+	if !touched {
+		return nil
+	}
+
+	// read only when a generated certificate's names are checked
+	var (
+		node  NodeIdentity
+		known bool
+	)
+
+	// the cluster's RGW and keepalived documents as the node will hold them
+	after := map[string]typedDoc{}
+
+	for k, td := range cur {
+		after[k] = td
+	}
+
+	for k, h := range sent {
+		if h == "" {
+			delete(after, k)
+		} else if td, ok := typed[k]; ok {
+			after[k] = td
+		}
+	}
+
+	var vips []string
+
+	rgws := map[string]map[string]string{}
+
+	for k, td := range after {
+		name, ok := strings.CutPrefix(k, "ContainerConfig/"+p.prefix())
+		if !ok {
+			continue
+		}
+
+		c, isC := td.doc.(*spec.ContainerConfig)
+		if !isC {
+			continue
+		}
+
+		env, err := envMap(c.ContainerEnvironment)
+		if err != nil {
+			return fmt.Errorf("%s: %w", k, err)
+		}
+
+		switch {
+		case strings.HasPrefix(name, "vip-"):
+			pfx, err := netip.ParsePrefix(env["VIP"])
+			if err != nil {
+				return fmt.Errorf("%s: VIP: not an address with its prefix length", k)
+			}
+
+			vips = append(vips, pfx.Addr().String())
+		case strings.HasPrefix(name, "rgw-"):
+			rgws[k] = env
+		}
+	}
+
+	for k, env := range rgws {
+		pemb, err := base64.StdEncoding.DecodeString(env["TLS_PEM"])
+		if err != nil {
+			return fmt.Errorf("%s: TLS_PEM: not base64", k)
+		}
+
+		// the first certificate of the PEM is the serving one
+		var cert *x509.Certificate
+
+		for rest := pemb; cert == nil; {
+			var block *pem.Block
+			if block, rest = pem.Decode(rest); block == nil {
+				return fmt.Errorf("%s: TLS_PEM: no certificate", k)
+			}
+
+			if block.Type == "CERTIFICATE" {
+				if cert, err = x509.ParseCertificate(block.Bytes); err != nil {
+					return fmt.Errorf("%s: TLS_PEM: not a certificate", k)
+				}
+			}
+		}
+
+		if now.Before(cert.NotBefore) || now.After(cert.NotAfter) {
+			return fmt.Errorf("%s: the certificate is not valid now (%s to %s)", k, cert.NotBefore.UTC().Format(time.RFC3339), cert.NotAfter.UTC().Format(time.RFC3339))
+		}
+
+		if env["TLS_USER"] == "1" {
+			continue
+		}
+
+		if !known {
+			if node, err = identity(); err != nil {
+				return err
+			}
+
+			known = true
+		}
+
+		if !slices.Contains(node.Addrs, env["ADDR"]) {
+			return fmt.Errorf("%s: ADDR is not an address of this node", k)
+		}
+
+		for _, name := range append([]string{env["ADDR"], node.Hostname}, vips...) {
+			if err := cert.VerifyHostname(name); err != nil {
+				return fmt.Errorf("%s: the certificate is not for %s", k, name)
 			}
 		}
 	}

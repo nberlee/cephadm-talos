@@ -165,7 +165,7 @@ func Daemon(s *state.State, h state.Host, d state.Daemon, image string, key Key,
 		}
 
 		p.Keyring = daemons.Keyring("client.rgw."+d.ID, k)
-		p.Port, p.TLSPEM = s.RGW.Port, s.RGW.Cert+tlsKey
+		p.Port, p.TLSPEM, p.TLSUser = s.RGW.Port, s.RGW.Cert+tlsKey, s.RGW.UserCert
 
 		return daemons.RGW(p), nil
 	case state.TypeVIP:
