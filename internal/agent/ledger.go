@@ -306,8 +306,9 @@ func (l *LeaderLoop) unstick(ctx context.Context, js store.Backend, opKey, phase
 	}
 
 	// a grant whose outcome is not known, of the operation or any of its
-	// phases (<id>.rev, <id>.strip, <id>.conf.<host>), is never given up this way
-	keys, rerr := js.List(ctx, phaseKey)
+	// phases (<id>.rev, <id>.strip, <id>.conf.<host>), is never given up this way;
+	// listed by their directory, the only kind of prefix the bridge lists
+	keys, rerr := js.List(ctx, phaseKey[:strings.LastIndex(phaseKey, "/")+1])
 	if rerr != nil {
 		return rerr
 	}

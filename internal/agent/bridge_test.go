@@ -225,6 +225,13 @@ func (m *fakeBridge) serve(t *testing.T, ca testCA, mgr string) (host, port stri
 			return
 		}
 
+		// the module lists directories only (STORE_DUMP_RE)
+		if prefix, _ := req.Args["prefix"].(string); req.Call == "config-key keys" && !strings.HasSuffix(prefix, "/") {
+			w.WriteHeader(http.StatusBadRequest)
+
+			return
+		}
+
 		m.calls = append(m.calls, req.Call)
 		out := m.run(req)
 		m.outcomes[req.DispatchID] = out

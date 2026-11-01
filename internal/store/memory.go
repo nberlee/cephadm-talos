@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -80,6 +81,11 @@ func (b *Memory) Remove(_ context.Context, keys []string) error {
 
 // List implements Backend.
 func (b *Memory) List(_ context.Context, prefix string) ([]string, error) {
+	// as the bridge: a directory only
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
+		return nil, fmt.Errorf("store: list %s: not a directory", prefix)
+	}
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
 

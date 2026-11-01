@@ -898,10 +898,21 @@ class RemovalTest(LedgerCallsTest):
         self.assertEqual(self.call('drain', operation=rm)[0], 409)
         self.assertEqual(self.call('retire', operation=rm)[0], 400)
         self.mons.safe = [3]
+        # nor while it is in (an empty OSD is safe to destroy)
+        self.mons.osds = [{'osd': 3, 'uuid': self.UUID, 'up': 1, 'in': 1}]
+        self.assertEqual(self.call('drain', operation=rm)[0], 409)
+        self.mons.osds = [{'osd': 3, 'uuid': self.UUID, 'up': 1, 'in': 0}]
         self.assertEqual(self.call('drain', operation=rm)[1]['outcome'], 'done')
         # it must be down before the purge
         self.assertEqual(self.call('retire', operation=rm)[0], 409)
-        self.mons.osds = [{'osd': 3, 'uuid': self.UUID, 'up': 0}]
+        # stopped, safe-to-destroy cannot tell any more in a degraded cluster:
+        # the drained entry is the check; an OSD marked in again is not purged
+        self.mons.safe = []
+        self.mons.osds = [{'osd': 3, 'uuid': self.UUID, 'up': 0, 'in': 1}]
+        for call in ('osd out', 'drain', 'retire'):
+            self.assertEqual(self.call(call, operation=rm)[0], 409, call)
+        self.assertEqual(self.mons.osd_calls, ['osd out'])  # not out again
+        self.mons.osds = [{'osd': 3, 'uuid': self.UUID, 'up': 0, 'in': 0}]
         self.assertEqual(self.call('retire', operation=rm)[1]['outcome'], 'done')
         self.assertEqual(self.mons.osd_calls, ['osd out', 'osd purge-actual'])
         self.assertNotIn('osd.3', self.ch.authority()[1].daemons)

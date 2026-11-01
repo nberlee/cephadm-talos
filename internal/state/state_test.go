@@ -1,8 +1,8 @@
 package state
 
 import (
-	"fmt"
 	"encoding/base64"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"

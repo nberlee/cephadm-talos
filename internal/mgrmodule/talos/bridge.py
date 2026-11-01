@@ -326,9 +326,9 @@ def _osd_dump(args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _osds(out: str) -> str:
-    """osd dump reduced to each OSD's id, uuid and whether it is up."""
+    """osd dump reduced to each OSD's id, uuid and whether it is up and in."""
     d = json.loads(out)
-    return json.dumps([{'osd': o['osd'], 'uuid': o.get('uuid', ''), 'up': bool(o.get('up'))} for o in d.get('osds', [])])
+    return json.dumps([{'osd': o['osd'], 'uuid': o.get('uuid', ''), 'up': bool(o.get('up')), 'in': bool(o.get('in'))} for o in d.get('osds', [])])
 
 
 # calls whose output is reduced in the mgr before it is kept and returned
@@ -919,7 +919,7 @@ class Channel:
     def _removal(self, call: str, led: Any, fold: Any, ops: Dict[str, Dict[str, Any]], op: Optional[Dict[str, Any]]) -> Tuple[int, Dict[str, Any]]:
         """The module's steps of an OSD removal, each checked against the OSD map
         by id and uuid first: out, drain (safe to destroy unless forced, while it
-        runs), and the retirement (down, safe again unless forced, purge)."""
+        runs), and the retirement (down, still out unless forced, purge)."""
         done = {'outcome': 'done', 'r': 0, 'out': '', 'outs': ''}
         if op is None or op['kind'] != 'remove_osd':
             return 400, {'error': 'no removal of an OSD'}
@@ -939,6 +939,10 @@ class Channel:
             return 400, {'error': '%s in the OSD map is another OSD' % name}
         drained = any(e['kind'] == 'drained' and e['of'] == op['id'] for e in ops.values())
         mid = 'm-' + secrets.token_hex(8)
+        # after its drain the OSD stays out: one marked in again may hold data
+        # the drain never checked, and a new `osd out` would hide that
+        if drained and not op['force'] and entry is not None and entry.get('in'):
+            return 409, {'error': '%s was marked in again after its drain' % name}
         if call == 'osd out':
             if entry is None:
                 return 200, done
@@ -951,8 +955,8 @@ class Channel:
                 return 400, {'error': '%s is not in the OSD map' % name}
             # checked while it runs on the first removal; an OSD a failed removal
             # already stopped is checked as it is
-            if not op['force'] and not self._safe(osd):
-                return 409, {'error': '%s is not safe to destroy yet' % name}
+            if not op['force'] and (entry.get('in') or not self._safe(osd)):
+                return 409, {'error': '%s is not out and safe to destroy yet' % name}
             led.append({'id': mid, 'kind': 'drained', 'of': op['id'], 'daemon': name, 'host': op['host']})
             return 200, done
         # the retirement
@@ -961,8 +965,9 @@ class Channel:
         if entry is not None:
             if entry['up']:
                 return 409, {'error': '%s is not down yet' % name}
-            if not op['force'] and not self._safe(osd):
-                return 409, {'error': '%s is not safe to destroy' % name}
+            # the drained entry is the safety check, as in cephadm (the OSD out
+            # since, checked above): once stopped, safe-to-destroy answers only
+            # while every PG is active+clean
             job = self._mon({'prefix': 'osd purge-actual', 'id': osd, 'yes_i_really_mean_it': True}, name)
             if job is None or job.r != 0:
                 return 503, {'error': 'osd purge-actual %s: no answer or refused; ask again' % name}

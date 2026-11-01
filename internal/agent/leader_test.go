@@ -1462,3 +1462,36 @@ func testRemoval(t *testing.T, zapRC int) {
 		t.Fatalf("the zap is not acknowledged: %+v", op)
 	}
 }
+
+func TestAnOperationFailingTooLongIsGivenUp(t *testing.T) {
+	s := newLeaderSetup(t)
+	ctx := context.Background()
+	s.withCA(t)
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	// the module refuses the mgr's certificate every time
+	s.module.mu.Lock()
+	s.module.refuse = "mgr cert"
+	s.module.mu.Unlock()
+
+	add := s.accept(KindAddDaemon, "mgr.h1", "h1", 1)
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	s.module.mu.Lock()
+	_, ended := s.module.kv[JournalPrefix(42)+"op/"+add.Op.ID]
+	s.module.mu.Unlock()
+
+	if ended {
+		t.Fatal("given up at once")
+	}
+
+	// failing since longer than stuckAfter (the leader's own clock stays fresh)
+	s.leader.failing[add.Op.ID] = time.Now().Add(-stuckAfter - time.Minute)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if op := s.op(t, add.Op.ID); op.State != JournalFailed || !strings.Contains(op.Error, "failing for") {
+		t.Fatalf("the add was not given up: %+v", op)
+	}
+}

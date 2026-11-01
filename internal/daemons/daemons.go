@@ -7,10 +7,10 @@
 package daemons
 
 import (
-	"encoding/hex"
 	"crypto/sha256"
 	"embed"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"slices"
@@ -32,26 +32,26 @@ type Params struct {
 	Name       string // ContainerConfig name
 	Image      string
 	FSID       string
-	ID         string   // daemon id (mon/mgr: hostname)
-	Addr       string   // public address of the host
-	Keyring    string   // keyring file contents for this daemon
-	Device     string   // OSD only
-	OSDUUID    string   // OSD only: the uuid of the prepared OSD
-	OSDID      int      // OSD only: the id of the prepared OSD
-	DiskSerial string   // OSD prepare only: the serial the device must have
+	ID         string // daemon id (mon/mgr: hostname)
+	Addr       string // public address of the host
+	Keyring    string // keyring file contents for this daemon
+	Device     string // OSD only
+	OSDUUID    string // OSD only: the uuid of the prepared OSD
+	OSDID      int    // OSD only: the id of the prepared OSD
+	DiskSerial string // OSD prepare only: the serial the device must have
 	// ZapUnlabelled: a zap without the label check, which needs an approval
 	ZapUnlabelled bool
-	Port       int      // rgw/vip: RGW HTTPS port
-	TLSPEM     string   // rgw: certificate + key
-	VIP        string   // vip: CIDR of the virtual IP
-	VRID       int      // vip: VRRP router id
-	VRRPPass   string   // vip: VRRP password (max 8 chars)
-	Priority   int      // vip: VRRP priority
-	Peers      []string // vip: addresses of the other vip hosts
-	Mode       string   // mon only: "bootstrap" or "join"
-	Addrv      string   // mon only: address vector, e.g. [v2:10.5.0.3:3300,v1:10.5.0.3:6789]
-	DeployID   string   // changes when the daemon is (re)created, not on redeploy/upgrade
-	DependsOn  []string
+	Port          int      // rgw/vip: RGW HTTPS port
+	TLSPEM        string   // rgw: certificate + key
+	VIP           string   // vip: CIDR of the virtual IP
+	VRID          int      // vip: VRRP router id
+	VRRPPass      string   // vip: VRRP password (max 8 chars)
+	Priority      int      // vip: VRRP priority
+	Peers         []string // vip: addresses of the other vip hosts
+	Mode          string   // mon only: "bootstrap" or "join"
+	Addrv         string   // mon only: address vector, e.g. [v2:10.5.0.3:3300,v1:10.5.0.3:6789]
+	DeployID      string   // changes when the daemon is (re)created, not on redeploy/upgrade
+	DependsOn     []string
 }
 
 // Daemons restart after RestartDelay, backing off to RestartMaxDelay (plan 03,
