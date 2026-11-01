@@ -713,6 +713,38 @@ func (c *Client) Instance(ctx context.Context, node, name string) (string, error
 	return id, nil
 }
 
+// InstanceEnvironment returns the environment of a container's newest
+// instance (Instance): what it runs with. It may hold keys: never print it.
+func (c *Client) InstanceEnvironment(ctx context.Context, node, name string) ([]string, error) {
+	cl, nctx, err := c.node(ctx, node, "get instances of "+name)
+	if err != nil {
+		return nil, err
+	}
+
+	list, err := safe.StateListAll[*containers.ContainerInstanceSpec](nctx, cl.COSI)
+	if err != nil {
+		return nil, wrap("list containerinstancespec on "+node, err)
+	}
+
+	var (
+		env   []string
+		gen   uint64
+		found bool
+	)
+
+	for r := range list.All() {
+		if s := r.TypedSpec(); s.ContainerID == name && (!found || s.Generation > gen) {
+			env, gen, found = s.Environment, s.Generation, true
+		}
+	}
+
+	if !found {
+		return nil, fmt.Errorf("%s on %s: %w: no instance", name, node, ErrNotFound)
+	}
+
+	return env, nil
+}
+
 // InstanceOwners returns the ContainerConfig containers that have an instance
 // on node, running or not yet cleaned up.
 func (c *Client) InstanceOwners(ctx context.Context, node string) ([]string, error) {

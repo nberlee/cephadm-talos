@@ -53,7 +53,7 @@ The CLI writes the secrets before the state, so a crash in between can leave a p
 | Kind | Key | Where |
 |---|---|---|
 | mon (joining) | `mon.` with `mon allow *` | its document's environment; the mon store on the ceph volume |
-| bootstrap mon | `mon.`, `client.admin`, `client.bootstrap-osd`, the first mgr's key | its document's environment, until the document is replaced by the joining template (a redeploy does it; the handoff does not yet, see "Known gaps") |
+| bootstrap mon | `mon.`, `client.admin`, `client.bootstrap-osd`, the first mgr's key | its document's environment until the handoff, which replaces it with the joining template (only `mon.`) before it hands the host over and waits for the mon back in the quorum; afterwards `client.admin` is on the workstation only |
 | mgr | `mgr.<id>` (caps: `mon profile mgr`, `osd allow *`, `mds allow *`) | its document's environment, and a keyring file on the ceph volume |
 | OSD | `osd.<n>` | not in its document: activation reads it from the OSD's own disk |
 | RGW | `client.rgw.<id>` (`mon allow rw`, `osd allow rwx`, `mgr allow rw`) | its document's environment, and a keyring file on the ceph volume |
@@ -266,7 +266,6 @@ Each is on the [roadmap](../ROADMAP.md), milestone 4, with where it is fixed, un
 - **A disk whose zap failed** keeps its label: a new OSD preparation refuses it, and only the CLI (`shell`) can zap it now.
 - **An uncertain job** (started, no result) freezes further jobs on its node until the operator resolves it; there is no command for that yet.
 - **A mutation an earlier mgr process sent** (an `auth get-or-create`, a key write, a `mon rm`) cannot be fenced by a later removal or re-add: the mons offer no conditional auth or monmap change, and the module tracks only its own process's unanswered commands. A `mon rm` still pending at the mons when its mgr failed over could remove a mon of the same name added after the removal finished.
-- **The bootstrap mon's document keeps `client.admin`** and the first keys until it is redeployed; the handoff does not replace it yet.
 - **Confirmations are not bound to the active incarnation**: a mgr host's certificates are enough to confirm.
 - **Admission** checks an operator's RGW certificate only for its validity period (its names are the operator's); approvals are protected against rollback per agent only, and a withdrawn image keeps running (see "Approvals").
 - **No revocation** of certificates and no renewal after the handoff; the module reloads its server identity and signing key only on restart. Generated RGW certificates (2 years) are reissued when their names change, not before they expire.

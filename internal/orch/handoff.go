@@ -10,11 +10,13 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"time"
 
 	"github.com/nberlee/cephadm-talos/internal/agent"
 	"github.com/nberlee/cephadm-talos/internal/pki"
+	"github.com/nberlee/cephadm-talos/internal/spec"
 	"github.com/nberlee/cephadm-talos/internal/state"
 	"github.com/nberlee/cephadm-talos/internal/wire"
 )
@@ -91,6 +93,11 @@ func (o *Orch) Handoff(ctx context.Context) error {
 	}
 
 	for _, h := range o.St.Hosts {
+		// no machine config keeps the bootstrap keyring (plan 03, step 7)
+		if err := o.joinMons(ctx, h); err != nil {
+			return fmt.Errorf("%s: %w (not sealed: run `cephadm-talos handoff` again)", h.Name, err)
+		}
+
 		if err := o.handOver(ctx, h); err != nil {
 			return fmt.Errorf("%s: %w (not sealed: run `cephadm-talos handoff` again)", h.Name, err)
 		}
@@ -125,6 +132,81 @@ func (o *Orch) Handoff(ctx context.Context) error {
 	o.printf("the cluster is handed over: its leader writes the state from now on\n")
 
 	return nil
+}
+
+// joinMons replaces a host's mon documents rendered for bootstrap (with
+// client.admin, client.bootstrap-osd and the first mgr's key) by the joining
+// template the leader renders (only the mon. key, the same deploy id): the mon
+// restarts once on its existing store, and the handoff waits until it is back
+// in the quorum. A mon with that rendering already is left alone.
+func (o *Orch) joinMons(ctx context.Context, h state.Host) error {
+	mons := o.St.DaemonsOf(state.TypeMon, h.Name)
+	if len(mons) == 0 || o.Talos.DryRun {
+		return nil
+	}
+
+	current, err := o.Talos.MachineConfig(ctx, h.Addr)
+	if err != nil {
+		return err
+	}
+
+	for _, d := range mons {
+		doc, err := o.redeployDoc(d, h, o.St.Image)
+		if err != nil {
+			return err
+		}
+
+		name := o.St.DocName(d)
+
+		// the apply only while the node has another rendering; then, every time
+		// (also on a resumed handoff), the newest instance must run with the
+		// joining template, not merely be running
+		if docsChanged(current, []*spec.ContainerConfig{doc}) {
+			o.printf("%s: mon.%s gets the joining template (no bootstrap keyring)\n", h.Name, d.ID)
+
+			if err := o.apply(ctx, h.Addr, doc); err != nil {
+				return err
+			}
+		}
+
+		if err := o.waitJoined(ctx, h, name); err != nil {
+			return fmt.Errorf("mon.%s: %w", d.ID, err)
+		}
+
+		if err := o.waitRunning(ctx, h.Addr, name, 10*time.Minute); err != nil {
+			return err
+		}
+
+		adm, err := o.adminHost()
+		if err != nil {
+			return err
+		}
+
+		quorum := fmt.Sprintf(`for i in $(seq 100); do ceph quorum_status --format json | python3 -c 'import json,sys; sys.exit(0 if %q in json.load(sys.stdin)["quorum_names"] else 1)' && exit 0; sleep 3; done; echo "mon.%s is not in the quorum" >&2; exit 1`, d.ID, d.ID)
+		if _, err := o.Job(ctx, adm.Addr, quorum, 10*time.Minute); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// waitJoined waits until a mon's newest instance runs with the joining
+// template (MODE=join in its environment, which is compared, never printed).
+func (o *Orch) waitJoined(ctx context.Context, h state.Host, name string) error {
+	deadline := time.Now().Add(5 * time.Minute)
+
+	for time.Now().Before(deadline) {
+		if env, err := o.Talos.InstanceEnvironment(ctx, h.Addr, name); err == nil && slices.Contains(env, "MODE=join") {
+			return nil
+		}
+
+		if err := sleep(ctx, 2*time.Second); err != nil {
+			return err
+		}
+	}
+
+	return errors.New("its instance still runs the bootstrap rendering")
 }
 
 // handOver asks one node's agent to take ownership, with the operator
