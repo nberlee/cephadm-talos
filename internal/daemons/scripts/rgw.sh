@@ -7,6 +7,6 @@ keyring "$D/keyring"
 log "starting rgw.$ID on https port $PORT"
 exec radosgw -f -n "client.rgw.$ID" --keyring "$D/keyring" \
 	--rgw-frontends "beast ssl_port=$PORT ssl_certificate=/tmp/rgw.pem" \
-	--rgw_graceful_stop=true \
+	--rgw_graceful_stop=true --rgw_exit_timeout_secs=120 \
 	--admin_socket="/var/run/ceph/ceph-client.rgw.$ID.asok" \
 	--default-log-to-file=false --default-log-to-stderr=true

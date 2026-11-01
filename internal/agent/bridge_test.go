@@ -60,6 +60,8 @@ type fakeBridge struct {
 	approval string
 	// osds answer osd dump
 	osds []OSD
+	// rgwCert answers rgw cert (JSON: attempt and cert)
+	rgwCert string
 }
 
 func (m *fakeBridge) run(req wire.BridgeRequest) map[string]any {
@@ -130,6 +132,14 @@ func (m *fakeBridge) run(req wire.BridgeRequest) map[string]any {
 		return map[string]any{"outcome": "done", "r": 0, "out": string(b)}
 	case "retire", "retire host", "mon rm", "ok to stop", "noout set", "noout unset", "maintained", "upgrade done", "upgrade refused", "ok to stop daemon":
 		m.retired = append(m.retired, req.Call+" "+str("operation"))
+
+		return map[string]any{"outcome": "done", "r": 0, "out": ""}
+	case "rgw cert":
+		m.retired = append(m.retired, req.Call+" "+str("operation"))
+
+		return map[string]any{"outcome": "done", "r": 0, "out": m.rgwCert}
+	case "rgw cert done":
+		m.retired = append(m.retired, req.Call+" "+str("operation")+" "+str("keep"))
 
 		return map[string]any{"outcome": "done", "r": 0, "out": ""}
 	case "mgr fail":

@@ -269,7 +269,8 @@ def _auth_get_or_create(args: Dict[str, Any]) -> Dict[str, Any]:
 # only for a host the inventory places a mgr on (Channel.bridge).
 SECRET_PREFIX = 'cephadm-talos/secrets/'
 SECRET_RE = re.compile(r'\A(?:host/([A-Za-z0-9][A-Za-z0-9._-]{0,127})/mgr-(?:server|client)\.key|rgw/server\.key|rgw/vrrp'
-                       r'|issued/(op-[0-9a-f]{16})/[0-9a-f]{16}/mgr-(?:server|client)\.key)\Z')
+                       r'|issued/(op-[0-9a-f]{16})/[0-9a-f]{16}/mgr-(?:server|client)\.key'
+                       r'|(?:issued/op-[0-9a-f]{16}/[0-9a-f]{16}|user/op-[0-9a-f]{16})/rgw-server\.key)\Z')
 
 
 def _secret_get(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -318,6 +319,8 @@ def _operation_with(*more: str) -> Callable[[Dict[str, Any]], Dict[str, Any]]:
             raise ValueError('not a mgr gid')
         if 'daemon' in more and not (isinstance(args['daemon'], str) and ledger.DAEMON_RE.match(args['daemon'])):
             raise ValueError('not a daemon name')
+        if 'keep' in more and not (isinstance(args['keep'], str) and ledger.RGW_CERT_RE.match(args['keep'])):
+            raise ValueError('not an RGW certificate id')
         return {}  # answered by the module (Channel.local)
     return build
 
@@ -349,7 +352,8 @@ READ_ONLY = {'status', 'health', 'mgr dump', 'config-key keys', 'config-key get'
 CREDENTIALS = {'auth get', 'auth get-or-create', 'secret get'}
 # calls the module answers itself, for operations of its ledger (ledger.py)
 LOCAL = {'mgr cert', 'retire', 'retire host', 'bind disk', 'confirm osd', 'close create', 'osd out', 'drain', 'mon rm',
-         'ok to stop', 'noout set', 'noout unset', 'maintained', 'mgr fail', 'ok to stop daemon', 'upgrade done', 'upgrade refused'}
+         'ok to stop', 'noout set', 'noout unset', 'maintained', 'mgr fail', 'ok to stop daemon', 'upgrade done', 'upgrade refused',
+         'rgw cert', 'rgw cert done'}
 
 ALLOWLIST: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     'status': _no_args('status'),
@@ -383,6 +387,8 @@ ALLOWLIST: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     'ok to stop daemon': _operation_with('daemon'),
     'upgrade done': _operation,
     'upgrade refused': _operation,
+    'rgw cert': _operation,
+    'rgw cert done': _operation_with('keep'),
 }
 
 
@@ -406,7 +412,7 @@ def issue_mgr_certs(ca_cert_pem: bytes, ca_key_pem: bytes, fsid: str, host: str,
         b = (x509.CertificateBuilder()
              .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, 'mgr ' + host)]))
              .issuer_name(ca.subject).public_key(key.public_key()).serial_number(x509.random_serial_number())
-             .not_valid_before(now - datetime.timedelta(hours=1)).not_valid_after(now.replace(year=now.year + 3))
+             .not_valid_before(now - datetime.timedelta(hours=1)).not_valid_after(now + datetime.timedelta(days=3 * 365))
              .add_extension(x509.KeyUsage(digital_signature=True, content_commitment=False, key_encipherment=False, data_encipherment=False,
                                           key_agreement=False, key_cert_sign=False, crl_sign=False, encipher_only=False, decipher_only=False), critical=True)
              .add_extension(x509.ExtendedKeyUsage([usage]), critical=False)
@@ -417,6 +423,49 @@ def issue_mgr_certs(ca_cert_pem: bytes, ca_key_pem: bytes, fsid: str, host: str,
         out[role + '_key'] = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL,
                                                serialization.NoEncryption()).decode()
     return out
+
+
+def new_rgw_ca(fsid: str) -> Tuple[str, str]:
+    """An RGW CA (P-256, 10 years), as the CLI creates one: certificate, key."""
+    import datetime
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, 'cephadm-talos RGW CA ' + fsid)])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
+            .serial_number(x509.random_serial_number()).not_valid_before(now - datetime.timedelta(hours=1))
+            .not_valid_after(now + datetime.timedelta(days=10 * 365))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+            .add_extension(x509.KeyUsage(digital_signature=True, content_commitment=False, key_encipherment=False, data_encipherment=False,
+                                         key_agreement=False, key_cert_sign=True, crl_sign=True, encipher_only=False, decipher_only=False), critical=True)
+            .sign(key, hashes.SHA256()))
+    return (cert.public_bytes(serialization.Encoding.PEM).decode(),
+            key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption()).decode())
+
+
+def issue_rgw_cert(ca_cert_pem: bytes, ca_key_pem: bytes, ips: List[str], names: List[str]) -> Tuple[str, str]:
+    """An RGW serving certificate (P-256, 2 years, server auth) for addresses
+    and names: certificate, key."""
+    import datetime
+    import ipaddress
+    from cryptography import x509
+    from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+    ca = x509.load_pem_x509_certificate(ca_cert_pem)
+    ca_key = serialization.load_pem_private_key(ca_key_pem, password=None)
+    key = ec.generate_private_key(ec.SECP256R1())
+    now = datetime.datetime.now(datetime.timezone.utc)
+    sans: List[x509.GeneralName] = [x509.DNSName(n) for n in names] + [x509.IPAddress(ipaddress.ip_address(i)) for i in ips]
+    cert = (x509.CertificateBuilder()
+            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, 'rgw')]))
+            .issuer_name(ca.subject).public_key(key.public_key()).serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(hours=1)).not_valid_after(now + datetime.timedelta(days=2 * 365))
+            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+            .add_extension(x509.SubjectAlternativeName(sans), critical=False)
+            .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ca.public_key()), critical=False)  # type: ignore[arg-type]
+            .sign(ca_key, hashes.SHA256()))  # type: ignore[arg-type]
+    return (cert.public_bytes(serialization.Encoding.PEM).decode() + ca.public_bytes(serialization.Encoding.PEM).decode(),
+            key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption()).decode())
 
 
 class Leadership:
@@ -814,6 +863,10 @@ class Channel:
                     return self._mgr_fail(fold, op, (args or {}).get('gid'))
                 if call in ('ok to stop daemon', 'upgrade done', 'upgrade refused'):
                     return self._upgrade(call, led, fold, op, (args or {}).get('daemon'))
+                if call == 'rgw cert':
+                    return self._rgw_cert(led, fold, op)
+                if call == 'rgw cert done':
+                    return self._rgw_cert_done(led, fold, ops, op, (args or {}).get('keep'))
                 if call in ('bind disk', 'confirm osd', 'close create'):
                     return self._creation(call, led, fold, op, args or {})
                 return self._retire_host(led, fold, ops, op)
@@ -858,13 +911,16 @@ class Channel:
         if name.startswith('mon.'):  # the mon. key is shared: nothing of its own to remove
             led.append({'id': 'm-' + secrets.token_hex(8), 'kind': 'retire', 'of': op['id'], 'daemon': name, 'host': op['host']})
             return 200, done
-        entity = name  # a mgr's entity is its daemon name
+        # a mgr's entity is its daemon name; an RGW's is client.rgw.<id>
+        entity = 'client.' + name if name.startswith('rgw.') else name
         # tracked: an unanswered removal holds the retirement until it is answered,
         # so it cannot land on a later generation's key
         job = self._mon({'prefix': 'auth rm', 'entity': entity}, name)
         if job is None or job.r not in (0, -2):  # ENOENT: gone already
             return 503, {'error': 'auth rm %s: no answer or refused; ask again' % entity}
-        mine = ['%sissued/%s/' % (SECRET_PREFIX, gen)] if gen != 'cli' else \
+        # a mgr's keys go with it; an RGW's serving certificate is shared, its keys
+        # go once no RGW renders it (rgw cert done)
+        mine = [] if name.startswith('rgw.') else ['%sissued/%s/' % (SECRET_PREFIX, gen)] if gen != 'cli' else \
             ['%shost/%s/mgr-server.key' % (SECRET_PREFIX, op['host']), '%shost/%s/mgr-client.key' % (SECRET_PREFIX, op['host'])]
         # the generation's keys only, reduced before the output limit applies
         keys = self._mon({'prefix': 'config-key ls'}, None, lambda out: json.dumps([k for k in json.loads(out) if any(k.startswith(p) for p in mine)]))
@@ -1005,6 +1061,90 @@ class Channel:
         if job.r != 0:
             return 409, {'error': '%s: %s' % (cmd['prefix'], job.outs.strip()[:500])}
         return 200, done
+
+    def _secret(self, name: str) -> Optional[str]:
+        job = self._mon({'prefix': 'config-key get', 'key': SECRET_PREFIX + name})
+        return job.outb if job is not None and job.r == 0 and not job.too_large else None
+
+    def _secret_or_absent(self, name: str) -> Tuple[bool, Optional[str]]:
+        """(answered, value): value None when the mons answered that it is absent."""
+        job = self._mon({'prefix': 'config-key get', 'key': SECRET_PREFIX + name})
+        if job is None or job.too_large or job.r not in (0, -2):
+            return False, None
+        return True, (job.outb if job.r == 0 else None)
+
+    def _rgw_ca(self, fold: Any) -> Optional[Tuple[str, str]]:
+        """The RGW CA (certificate, key): the module's own (one entry, written
+        once), else the CLI's (its key a secret, its certificate in the sealed
+        state), else a new one; None without an answer."""
+        # a CA write without an answer may still land: wait for it, so a retry
+        # does not create another CA it would then overwrite
+        if self._pending('rgw/ca'):
+            return None
+        ok, pair = self._secret_or_absent('rgw/ca.pem')
+        if not ok:
+            return None
+        if pair:
+            m = re.search(r'-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----', pair, re.S)
+            return (pair[:m.start()], m.group(0) + '\n') if m else None
+        ok, cli_key = self._secret_or_absent('rgw/ca.key')
+        if not ok:
+            return None
+        if cli_key and fold.cli_rgw.get('ca_cert'):
+            return fold.cli_rgw['ca_cert'], cli_key
+        cert, key = new_rgw_ca(self.fsid)
+        w = self._mon({'prefix': 'config-key set', 'key': SECRET_PREFIX + 'rgw/ca.pem', 'val': cert + key}, 'rgw/ca')
+        return (cert, key) if w is not None and w.r == 0 else None
+
+    def _rgw_cert(self, led: Any, fold: Any, op: Optional[Dict[str, Any]]) -> Tuple[int, Dict[str, Any]]:
+        """A generated RGW serving certificate for an executable RGW add or
+        ingress apply, from the module's RGW CA, for the names the fold gives:
+        every RGW host's name and address and the VIP. Once per operation: asked
+        again, it returns the one it issued."""
+        if op is None or not (op['kind'] == 'add_daemon' and op['daemon'].startswith('rgw.') and not op.get('cert')
+                              or op['kind'] == 'apply_ingress'):
+            return 400, {'error': 'no RGW add or ingress that needs a generated certificate'}
+        done = [cid for cid in fold.rgw_certs if cid.startswith('issued/%s/' % op['id'])]
+        if done:
+            attempt = done[0].split('/')[2]
+            cert = self._secret('%s/rgw-server.crt' % done[0])
+            if cert is None:
+                return 503, {'error': 'cannot read the certificate; ask again'}
+            return 200, {'outcome': 'done', 'r': 0, 'out': json.dumps({'attempt': attempt, 'cert': cert}), 'outs': ''}
+        ca = self._rgw_ca(fold)
+        if ca is None:
+            return 503, {'error': 'the RGW CA is not available; ask again'}
+        ca_cert, ca_key = ca
+        hosts = {h for n, h in fold.daemons.items() if n.startswith('rgw.')} | ({op['host']} if op['kind'] == 'add_daemon' else set())
+        names = sorted(hosts)
+        ips = sorted({fold.hosts[h] for h in hosts if h in fold.hosts} | ({fold.vip} if fold.vip else set()))
+        cert, key = issue_rgw_cert(ca_cert.encode(), ca_key.encode(), ips, names)
+        attempt = secrets.token_hex(8)
+        base = 'issued/%s/%s' % (op['id'], attempt)
+        for name, val in (('%s/rgw-server.key' % base, key), ('%s/rgw-server.crt' % base, cert)):
+            w = self._mon({'prefix': 'config-key set', 'key': SECRET_PREFIX + name, 'val': val})
+            if w is None or w.r != 0:
+                return 503, {'error': 'the certificate of attempt %s was not written; ask again' % attempt}
+        led.append({'id': 'm-' + secrets.token_hex(8), 'kind': 'rgw_cert', 'of': op['id'], 'attempt': attempt})
+        return 200, {'outcome': 'done', 'r': 0, 'out': json.dumps({'attempt': attempt, 'cert': cert}), 'outs': ''}
+
+    def _rgw_cert_done(self, led: Any, fold: Any, ops: Dict[str, Dict[str, Any]], op: Optional[Dict[str, Any]], keep: Optional[str]) -> Tuple[int, Dict[str, Any]]:
+        """After a roll: the certificates that entered the fold before its
+        operation are retired, except the one every RGW renders now, and their
+        keys removed."""
+        if op is None or keep not in fold.rgw_certs:
+            return 400, {'error': 'no executable operation, or not a certificate of the cluster'}
+        if not any(e['kind'] == 'rgw_cert_done' and e['of'] == op['id'] and e['keep'] == keep for e in ops.values()):
+            led.append({'id': 'm-' + secrets.token_hex(8), 'kind': 'rgw_cert_done', 'of': op['id'], 'keep': keep})
+        _, after = self.authority()
+        # every retired certificate's keys, also those an earlier call left behind
+        for cid, c in after.rgw_certs.items():
+            if c['retired']:
+                for name in (['rgw/server.key'] if cid == 'cli' else ['%s/rgw-server.key' % cid, '%s/rgw-server.crt' % cid]):
+                    rm = self._mon({'prefix': 'config-key rm', 'key': SECRET_PREFIX + name})
+                    if rm is None or rm.r not in (0, -2):
+                        return 503, {'error': 'cannot remove the key of %s; ask again' % cid}
+        return 200, {'outcome': 'done', 'r': 0, 'out': '', 'outs': ''}
 
     def _creation(self, call: str, led: Any, fold: Any, op: Optional[Dict[str, Any]], args: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
         """The module's steps of an OSD creation: bind it to its disk once,

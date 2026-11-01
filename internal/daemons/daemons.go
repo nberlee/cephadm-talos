@@ -62,8 +62,8 @@ const (
 	RestartMaxDelay = 2 * time.Minute
 )
 
-// RGWStopTimeout lets radosgw drain: rgw_exit_timeout_secs (120s by default)
-// plus 10s. With rgw_graceful_stop it finishes requests in flight first.
+// RGWStopTimeout lets radosgw drain: rgw_exit_timeout_secs (pinned to 120s
+// by rgw.sh) plus 10s. With rgw_graceful_stop it finishes requests in flight first.
 const RGWStopTimeout = 130 * time.Second
 
 // rawScript returns an embedded script without common.sh, for a job's command.

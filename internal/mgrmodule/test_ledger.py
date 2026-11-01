@@ -264,3 +264,32 @@ class UpgradeFoldTest(unittest.TestCase):
         k, e = entry(5, 9, 'm-%016x' % 9, kind='upgrade_done', of='op-%016x' % 1, host='h1')
         with self.assertRaises(lg.LedgerError):
             lg.check_entry(k, json.dumps(e))
+
+
+class RGWCertFoldTest(unittest.TestCase):
+    INV = {'hosts': [{'name': 'h1', 'addr': '10.0.0.1'}, {'name': 'h2', 'addr': '10.0.0.2'}],
+           'daemons': [{'daemon_type': 'rgw', 'daemon_id': 'h1', 'host': 'h1'}], 'cli_rgw': {'vip': '10.0.0.200/24', 'port': 443}}
+
+    def test_certificates_enter_and_retire(self):
+        a = entry(5, 1, 'op-%016x' % 1, kind='add_daemon', daemon='rgw.h2', host='h2', port=443)
+        issued = entry(5, 2, 'm-%016x' % 2, kind='rgw_cert', of='op-%016x' % 1, attempt='ab' * 8)
+        b = entry(5, 3, 'op-%016x' % 3, kind='add_daemon', daemon='rgw.h1', host='h1', port=443, cert='-----BEGIN CERTIFICATE-----')
+        done = entry(5, 4, 'm-%016x' % 4, kind='rgw_cert_done', of='op-%016x' % 1, keep='issued/op-%016x/%s' % (1, 'ab' * 8))
+        for k, e in (a, issued, b, done):
+            lg.check_entry(k, json.dumps(e))
+        f = lg.Fold(self.INV, [a, issued, b])
+        self.assertEqual(f.vip, '10.0.0.200')
+        self.assertEqual(sorted(f.rgw_certs), ['cli', 'issued/op-%016x/%s' % (1, 'ab' * 8), 'user/op-%016x' % 3])
+        self.assertTrue(f.secret_allowed('rgw/server.key', None))
+        self.assertTrue(f.secret_allowed('user/op-%016x/rgw-server.key' % 3, None))
+        # done for op 1 retires what entered before op 1 (the CLI's), not op 3's queued certificate
+        f = lg.Fold(self.INV, [a, issued, b, done])
+        self.assertFalse(f.secret_allowed('rgw/server.key', None))
+        self.assertTrue(f.secret_allowed('issued/op-%016x/%s/rgw-server.key' % (1, 'ab' * 8), None))
+        self.assertTrue(f.secret_allowed('user/op-%016x/rgw-server.key' % 3, None))
+        self.assertFalse(f.secret_allowed('user/op-%016x/rgw-server.key' % 9, None))
+        for bad in (dict(kind='add_daemon', daemon='rgw.h2', host='h2'), dict(kind='add_daemon', daemon='rgw.h2', host='h2', port=0),
+                    dict(kind='add_daemon', daemon='mgr.h2', host='h2', port=443), dict(kind='add_daemon', daemon='rgw.h1', host='h2', port=443)):
+            k, e = entry(5, 9, 'op-%016x' % 9, **bad)
+            with self.assertRaises(lg.LedgerError, msg=bad):
+                lg.check_entry(k, json.dumps(e))

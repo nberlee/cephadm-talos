@@ -1031,6 +1031,40 @@ class UpgradeCallsTest(unittest.TestCase):
         self.assertEqual(len([e for _, e in self.led.executable() if e['kind'] in ('upgrade_done', 'upgrade_refused')]), 1)
 
 
+class RGWCertCallsTest(unittest.TestCase):
+    setUp, call, accept = LedgerCallsTest.setUp, LedgerCallsTest.call, LedgerCallsTest.accept
+
+    def test_issue_once_retire_and_keep_shared_keys(self):
+        from cryptography import x509
+        inv = dict(inventory('mon.h1@h1', 'rgw.h1@h1'), cli_rgw={'vip': '10.0.0.200/24'})
+        self.ch.authority = lambda: (self.led, lg.Fold(inv, self.led.executable()))
+        add = self.led.append({'id': 'op-%016x' % 800, 'kind': 'add_daemon', 'daemon': 'rgw.h2', 'host': 'h2', 'port': 443})[1]['id']
+        code, reply = self.call('rgw cert', operation=add)
+        self.assertEqual(code, 200)
+        out = json.loads(reply['out'])
+        cert = x509.load_pem_x509_certificate(out['cert'].encode())
+        sans = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+        self.assertEqual(sorted(sans.get_values_for_type(x509.DNSName)), ['h1', 'h2'])
+        self.assertEqual(sorted(str(i) for i in sans.get_values_for_type(x509.IPAddress)), ['10.0.0.1', '10.0.0.2', '10.0.0.200'])
+        cid = 'issued/%s/%s' % (add, out['attempt'])
+        self.assertIn(b.SECRET_PREFIX + cid + '/rgw-server.key', self.mons.kv)
+        self.assertIn(b.SECRET_PREFIX + 'rgw/ca.pem', self.mons.kv)  # the module's CA, one entry
+        # asked again: the same certificate
+        self.assertEqual(json.loads(self.call('rgw cert', operation=add)[1]['out']), out)
+        self.assertTrue(self.ch.authority()[1].secret_allowed(cid + '/rgw-server.key', None))
+        # after the roll: the CLI's retired and its key removed
+        self.mons.kv[b.SECRET_PREFIX + 'rgw/server.key'] = 'k'
+        self.assertEqual(self.call('rgw cert done', operation=add, keep=cid)[1]['outcome'], 'done')
+        self.assertNotIn(b.SECRET_PREFIX + 'rgw/server.key', self.mons.kv)
+        self.assertIn(b.SECRET_PREFIX + cid + '/rgw-server.key', self.mons.kv)
+        self.assertFalse(self.ch.authority()[1].secret_allowed('rgw/server.key', None))
+        # an RGW's retirement removes its auth entity, never the shared certificate's keys
+        rm = self.led.append({'id': 'op-%016x' % 801, 'kind': 'remove_daemon', 'daemon': 'rgw.h1', 'host': 'h1'})[1]['id']
+        self.assertEqual(self.call('retire', operation=rm)[1]['outcome'], 'done')
+        self.assertEqual(self.mons.auth_rm, ['client.rgw.h1'])
+        self.assertIn(b.SECRET_PREFIX + cid + '/rgw-server.key', self.mons.kv)
+
+
 class RemovalTest(LedgerCallsTest):
     UUID = '8f2c0a4e-1d3b-4c5a-9e6f-7a8b9c0d1e2f'
 

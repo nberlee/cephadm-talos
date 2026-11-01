@@ -146,16 +146,17 @@ func Daemon(s *state.State, h state.Host, d state.Daemon, image string, key Key,
 
 		return daemons.OSD(p), nil
 	case state.TypeRGW:
-		if s.RGW == nil || s.RGW.Cert == "" {
+		cert, keySecret, ok := s.RGWCertOf(d)
+		if !ok {
 			return nil, errors.New("rgw: no serving certificate yet")
 		}
 
-		tlsKey, err := secret(state.SecretRGWServer)
+		tlsKey, err := secret(keySecret)
 		if err != nil {
 			return nil, err
 		}
 
-		if _, err := tls.X509KeyPair([]byte(s.RGW.Cert), []byte(tlsKey)); err != nil {
+		if _, err := tls.X509KeyPair([]byte(cert.Cert), []byte(tlsKey)); err != nil {
 			return nil, errors.New("rgw: the serving key does not match its certificate")
 		}
 
@@ -165,7 +166,7 @@ func Daemon(s *state.State, h state.Host, d state.Daemon, image string, key Key,
 		}
 
 		p.Keyring = daemons.Keyring("client.rgw."+d.ID, k)
-		p.Port, p.TLSPEM, p.TLSUser = s.RGW.Port, s.RGW.Cert+tlsKey, s.RGW.UserCert
+		p.Port, p.TLSPEM, p.TLSUser = s.RGW.Port, cert.Cert+tlsKey, cert.User
 
 		return daemons.RGW(p), nil
 	case state.TypeVIP:

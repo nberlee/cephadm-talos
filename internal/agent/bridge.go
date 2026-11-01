@@ -425,6 +425,9 @@ type LedgerOp struct {
 	// upgrade_start: the target image; the controls: the start they control
 	Image   string `json:"image,omitempty"`
 	Upgrade string `json:"upgrade,omitempty"`
+	// add_daemon of an RGW: its port, and the operator's certificate chain
+	Port int    `json:"port,omitempty"`
+	Cert string `json:"cert,omitempty"`
 }
 
 // Ledger returns the executable operations after a ledger key, in the order
@@ -484,6 +487,37 @@ func (b *Bridge) MgrCert(ctx context.Context, op string) (MgrCerts, error) {
 	}
 
 	return c, nil
+}
+
+// RGWCert is a generated RGW serving certificate the module issued for an
+// operation: its attempt and the certificate chain.
+type RGWCert struct {
+	Attempt string `json:"attempt"`
+	Cert    string `json:"cert"`
+}
+
+// RGWCert asks the module for a generated RGW serving certificate for an RGW
+// add or an ingress apply; asked again, it returns the same one.
+func (b *Bridge) RGWCert(ctx context.Context, op string) (RGWCert, error) {
+	out, err := b.do(ctx, "rgw cert", map[string]any{"operation": op})
+	if err != nil {
+		return RGWCert{}, err
+	}
+
+	var c RGWCert
+	if err := json.Unmarshal([]byte(out), &c); err != nil || c.Attempt == "" || c.Cert == "" {
+		return RGWCert{}, errors.New("bridge: rgw cert: malformed answer")
+	}
+
+	return c, nil
+}
+
+// RGWCertDone tells the module which certificate every RGW renders after an
+// operation's roll: the ones before it are retired and their keys removed.
+func (b *Bridge) RGWCertDone(ctx context.Context, op, keep string) error {
+	_, err := b.do(ctx, "rgw cert done", map[string]any{"operation": op, "keep": keep})
+
+	return err
 }
 
 // Retire asks the module to retire what an accepted removal removed: call

@@ -122,8 +122,8 @@ func (l *LeaderLoop) ledgerOps(ctx context.Context, b *Bridge, js store.Backend,
 				l.holding = ""
 
 				switch {
-				case st.Upgrade != nil:
-					l.holding = holdAll // a step may be in progress
+				case st.Upgrade != nil, strings.HasPrefix(e.Op.Daemon, "rgw."):
+					l.holding = holdAll // a step may be in progress, or an RGW's VIP moved
 				case e.Op.Kind == KindEnterMaint || e.Op.Kind == KindExitMaint || e.Op.Kind == KindPowercycle:
 					l.holding = e.Op.Host
 				}
@@ -313,6 +313,10 @@ func (l *LeaderLoop) ledgerOp(ctx context.Context, b *Bridge, js store.Backend, 
 			onFail = func() error { return l.cleanCreate(ctx, b, js, gid, epoch, op) }
 		}
 
+		if op.Kind == KindAddDaemon && strings.HasPrefix(op.Daemon, "rgw.") {
+			onFail = func() error { return l.restoreVIPs(ctx, b, js, gid, epoch, op) }
+		}
+
 		if op.Kind == KindEnterMaint {
 			onFail = func() error { return l.unmark(ctx, b, js, gid, op.Host, op.ID) }
 		}
@@ -328,6 +332,26 @@ func (l *LeaderLoop) ledgerOp(ctx context.Context, b *Bridge, js store.Backend, 
 		s, err = l.journalState(ctx, b, js, gid, op.ID)
 
 		return err == nil && terminal(s), err
+	}
+
+	// an RGW beside a keepalived restarts with the VIP moved first; without the
+	// state it is not known whether one is beside it
+	st, _, err := l.clusterState(ctx, b)
+	if err != nil {
+		return false, err
+	}
+
+	if d, ok := daemonOf(st, op.Daemon); ok && d.Type == state.TypeRGW {
+		if h, ok := st.Host(d.Host); ok && len(vipDocs(st, h.Name)) > 0 {
+			restore := func() error { return l.restoreVIPs(ctx, b, js, gid, epoch, op) }
+			if err := l.unstick(ctx, js, opKey, opKey, op, restore, l.rgwRestart(ctx, b, js, gid, epoch, op, h, vipDocs(st, h.Name))); err != nil {
+				return false, err
+			}
+
+			s, err = l.journalState(ctx, b, js, gid, op.ID)
+
+			return err == nil && terminal(s), err
+		}
 	}
 
 	if op.Kind == KindRedeploy {
@@ -413,17 +437,31 @@ func (l *LeaderLoop) unstick(ctx context.Context, js store.Backend, opKey, phase
 		}
 	}
 
-	// what failing leaves behind is cleaned up first (a creation is closed)
+	// what failing leaves behind is cleaned up first (a creation is closed); a
+	// cleanup that could not finish says what is left
+	note := ""
+
 	if onFail != nil {
 		if ferr := onFail(); ferr != nil {
-			return ferr
+			var n failNote
+			if !errors.As(ferr, &n) {
+				return ferr
+			}
+
+			note = "; " + string(n)
 		}
 	}
 
 	delete(l.failing, op.ID)
 
-	return writeJSONKey(ctx, js, opKey, JournalOp{Version: journalVersion, Kind: op.Kind, Host: op.Host, State: JournalFailed, Error: fmt.Sprintf("failing for %s: %v", stuckAfter, err)})
+	return writeJSONKey(ctx, js, opKey, JournalOp{Version: journalVersion, Kind: op.Kind, Host: op.Host, State: JournalFailed, Error: fmt.Sprintf("failing for %s: %v%s", stuckAfter, err, note)})
 }
+
+// failNote is a cleanup's account of what it could not undo: the operation
+// fails with it in its error.
+type failNote string
+
+func (n failNote) Error() string { return string(n) }
 
 // daemonOf finds a ledger daemon name ("<type>.<id>") in the cluster state.
 func daemonOf(st *state.State, name string) (state.Daemon, bool) {
@@ -594,6 +632,10 @@ func (l *LeaderLoop) addDaemon(ctx context.Context, b *Bridge, js store.Backend,
 
 	typ, id, _ := strings.Cut(op.Daemon, ".")
 
+	if typ == state.TypeRGW {
+		return l.addRGW(ctx, b, js, gid, epoch, op)
+	}
+
 	h, ok := st.Host(op.Host)
 	if !ok || h.Name != op.Host || id != op.Host || (typ != state.TypeMon && typ != state.TypeMgr) {
 		return finish(ctx, js, gid, op, JournalFailed, fmt.Errorf("%s cannot be deployed on %s", op.Daemon, op.Host))
@@ -724,8 +766,13 @@ func (l *LeaderLoop) removeDaemon(ctx context.Context, b *Bridge, js store.Backe
 	typ, id, _ := strings.Cut(op.Daemon, ".")
 
 	h, ok := st.Host(op.Host)
-	if !ok || (typ != state.TypeMgr && typ != state.TypeMon) || id != op.Host {
+	if !ok || (typ != state.TypeMgr && typ != state.TypeMon && typ != state.TypeRGW) || id != op.Host {
 		return finish(ctx, js, gid, op, JournalFailed, fmt.Errorf("%s cannot be removed from %s", op.Daemon, op.Host))
+	}
+
+	// the VIP leaves a host before its RGW (the module refuses this too)
+	if typ == state.TypeRGW && len(vipDocs(st, h.Name)) > 0 {
+		return finish(ctx, js, gid, op, JournalFailed, fmt.Errorf("%s has a keepalived: the ingress leaves it first", h.Name))
 	}
 
 	doc := st.DocName(state.Daemon{Type: typ, ID: id, Host: h.Name})

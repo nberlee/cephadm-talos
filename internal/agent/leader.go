@@ -132,6 +132,8 @@ type LeaderLoop struct {
 	// holding is the host of the ledger operation in progress that orders its
 	// host's documents itself (maintenance): its revision requests wait
 	holding string
+	// serves replaces the TLS handshake with an RGW in tests (servesCert)
+	serves func(addr string, port int, chain string) bool
 	// stateInc is the incarnation the cluster state is read from: the
 	// leader's own once it published its baseline
 	stateInc string

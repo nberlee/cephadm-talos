@@ -52,6 +52,8 @@ type Node struct {
 	// HoldRestarts keeps restarted instances from being replaced (a daemon
 	// still stopping)
 	HoldRestarts bool
+	// ContainerLogs is what Logs streams for a container (two lines otherwise)
+	ContainerLogs map[string]string
 	// VersionTag is what Version reports (default v1.15.0-alpha.2)
 	VersionTag string
 	// FailBeforeApply makes the next ApplyConfiguration fail without storing
@@ -298,6 +300,14 @@ func (f *Node) Restart(ctx context.Context, req *machine.RestartRequest) (*machi
 func (f *Node) Logs(req *machine.LogsRequest, srv machine.MachineService_LogsServer) error {
 	if req.Namespace != "taloscontainers" || req.Driver != common.ContainerDriver_CONTAINERD {
 		return errors.New("wrong namespace or driver")
+	}
+
+	f.Mu.Lock()
+	logs, set := f.ContainerLogs[req.Id]
+	f.Mu.Unlock()
+
+	if set {
+		return srv.Send(&common.Data{Bytes: []byte(logs)})
 	}
 
 	for _, chunk := range []string{"line 1\n", "line 2\n"} {

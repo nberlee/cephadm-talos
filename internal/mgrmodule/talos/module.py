@@ -115,13 +115,43 @@ def inventory_from_store(entries: Dict[str, str], incarnation: str = INCARNATION
     return check_inventory(inv, key)
 
 
+def rgw_cert_pair(pem: str) -> Tuple[str, str]:
+    """The operator's RGW certificate chain and its key from one PEM: the key
+    must be the first certificate's, the certificate valid now."""
+    import datetime
+    from cryptography import x509
+    from cryptography.hazmat.primitives import serialization
+    blocks = re.findall(r'-----BEGIN ([A-Z ]+)-----.*?-----END \1-----', pem, re.S)
+    texts = [m.group(0) for m in re.finditer(r'-----BEGIN ([A-Z ]+)-----.*?-----END \1-----', pem, re.S)]
+    chain = [t for t, b in zip(texts, blocks) if b == 'CERTIFICATE']
+    keys = [t for t, b in zip(texts, blocks) if b.endswith('PRIVATE KEY')]
+    if not chain or len(keys) != 1:
+        raise OrchestratorError('rgw_frontend_ssl_certificate: a certificate chain and one private key')
+    try:
+        cert = x509.load_pem_x509_certificate(chain[0].encode())
+        key = serialization.load_pem_private_key(keys[0].encode(), None)
+    except Exception:
+        raise OrchestratorError('rgw_frontend_ssl_certificate: does not parse')
+    pub = serialization.PublicFormat.SubjectPublicKeyInfo
+    if cert.public_key().public_bytes(serialization.Encoding.PEM, pub) != key.public_key().public_bytes(serialization.Encoding.PEM, pub):
+        raise OrchestratorError('rgw_frontend_ssl_certificate: the key is not the certificate\'s')
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if not cert.not_valid_before_utc <= now <= cert.not_valid_after_utc:
+        raise OrchestratorError('rgw_frontend_ssl_certificate: the certificate is not valid now')
+    joined = '\n'.join(chain) + '\n'
+    if len(joined) > 16384:
+        raise OrchestratorError('rgw_frontend_ssl_certificate: the chain is larger than 16 KiB')
+    return joined, keys[0] + '\n'
+
+
 def cli_baseline(entries: Dict[str, str]) -> Dict[str, Any]:
     """The inventory of the CLI's sealed state, the root of what the module
     authorizes (ledger.Fold): no incarnation can write it through the bridge."""
     cluster, key = record_from_store(entries, INCARNATION, 'cluster')
     if not isinstance(cluster, dict) or cluster.get('sealed') is not True:
         raise InventoryError('the CLI has not handed the cluster over (%s is not sealed)' % key)
-    return inventory_from_store(entries, INCARNATION)
+    # with the CLI's RGW settings (public: port, VIP, CA certificate)
+    return dict(inventory_from_store(entries, INCARNATION), cli_rgw=cluster.get('rgw') or {})
 
 
 def record_from_store(entries: Dict[str, str], incarnation: str, name: str) -> Tuple[Any, str]:
@@ -515,7 +545,59 @@ class Module(orchestrator.Orchestrator, MgrModule):
         if host in fold.maintenance:
             raise OrchestratorError('%s is in maintenance (ceph orch host maintenance exit %s)' % (host, host))
 
-    def _accept(self, kind: str, daemon: Optional[str], host: str, **extra: Any) -> str:
+    def _rgw_port(self) -> Optional[int]:
+        """The RGWs' port: the newest RGW add's, else the CLI's, None before any."""
+        led, _ = self._authority()
+        for _, e in reversed(led.executable()):
+            if e['kind'] == 'add_daemon' and e['daemon'].startswith('rgw.'):
+                return int(e['port'])
+        try:
+            cluster, _ = record_from_store(self.get_store_prefix(STORE_PREFIX), INCARNATION, 'cluster')
+            return int(((cluster or {}).get('rgw') or {}).get('port')) or None
+        except Exception:
+            return None
+
+    def _add_rgw(self, spec: Any) -> List[str]:
+        """One RGW of service default on one host: with a generated certificate,
+        or the operator's (`daemon add -i`, rgw_frontend_ssl_certificate)."""
+        from ceph.deployment.service_spec import RGWSpec
+        p = spec.placement
+        if spec.service_id != 'default':
+            raise OrchestratorError('the RGW service is default: daemon add rgw default <host>')
+        if p is None or len(p.hosts) != 1 or p.count not in (None, 1) or p.count_per_host or p.label or p.host_pattern \
+                or p.hosts[0].network or p.hosts[0].name:
+            raise OrchestratorError('place exactly one RGW on one named host')
+        host = p.hosts[0].hostname
+        certs = spec.rgw_frontend_ssl_certificate
+        pem = '\n'.join(certs) if isinstance(certs, list) else (certs or '')
+        want = RGWSpec(service_id='default', placement=p, rgw_frontend_port=spec.rgw_frontend_port, ssl=spec.ssl,
+                       rgw_frontend_ssl_certificate=spec.rgw_frontend_ssl_certificate)
+        if spec.to_json() != want.to_json():
+            raise OrchestratorError('only the port and the operator\'s certificate are supported for an RGW by this backend')
+        self._settle()
+        _, fold = self._authority()
+        if host not in fold.hosts:
+            raise OrchestratorError('%s is not a host of the cluster' % host)
+        name = 'rgw.' + host
+        if name in fold.daemons:
+            raise OrchestratorError('%s exists already' % name)
+        current = self._rgw_port()
+        port = spec.rgw_frontend_port or current or 443
+        if current is not None and port != current:
+            raise OrchestratorError('the RGWs serve on port %d' % current)
+        op_id = 'op-' + os.urandom(8).hex()
+        extra: Dict[str, Any] = {'port': port}
+        if pem:
+            chain, key = rgw_cert_pair(pem)
+            # the key first, as a secret of this operation; the chain is public
+            r, _, outs = self.mon_command({'prefix': 'config-key set', 'key': '%suser/%s/rgw-server.key' % (bridge.SECRET_PREFIX, op_id), 'val': key})
+            if r != 0:
+                raise OrchestratorError('the key was not written: %s' % outs)
+            extra['cert'] = chain
+        op_id = self._accept('add_daemon', name, host, op_id=op_id, **extra)
+        return ['Scheduled to deploy %s on host %s (operation %s)' % (name, host, op_id)]
+
+    def _accept(self, kind: str, daemon: Optional[str], host: str, op_id: Optional[str] = None, **extra: Any) -> str:
         """Accept an operation: checks, then one ledger entry (ledger.py)."""
         led, fold = self._authority()
         lead = getattr(self, '_leadership', None)
@@ -533,7 +615,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
             raise OrchestratorError('%s has operation %s in progress (orch talos operation %s)' % (daemon or host, busy, busy))
         if kind != 'exit_maintenance':
             self._not_in_maintenance(host)
-        op_id = 'op-' + os.urandom(8).hex()
+        op_id = op_id or 'op-' + os.urandom(8).hex()
         entry = {'id': op_id, 'kind': kind, 'host': host, **extra}
         if daemon:
             entry['daemon'] = daemon
@@ -668,8 +750,10 @@ class Module(orchestrator.Orchestrator, MgrModule):
 
     @handle_orch_error
     def add_daemon(self, spec: ServiceSpec) -> List[str]:
+        if spec.service_type == 'rgw':
+            return self._add_rgw(spec)
         if spec.service_type not in ('mon', 'mgr'):
-            raise OrchestratorError('daemon add %s is not supported by this backend: only mon and mgr' % spec.service_type)
+            raise OrchestratorError('daemon add %s is not supported by this backend: only mon, mgr and rgw' % spec.service_type)
         p = spec.placement
         if p is None or len(p.hosts) != 1 or p.count not in (None, 1) or p.count_per_host or p.label or p.host_pattern:
             raise OrchestratorError('place exactly one daemon on one named host')
@@ -694,10 +778,13 @@ class Module(orchestrator.Orchestrator, MgrModule):
         _, fold = self._authority()
         active = 'mgr.' + self.get_mgr_id()
         for n in names:
-            if not n.startswith(('mgr.', 'mon.')):
-                raise OrchestratorError('daemon rm %s is not supported by this backend: only mon and mgr' % n)
+            if not n.startswith(('mgr.', 'mon.', 'rgw.')):
+                raise OrchestratorError('daemon rm %s is not supported by this backend: only mon, mgr and rgw' % n)
             if n not in fold.daemons:
                 raise OrchestratorError('%s is not a daemon of the cluster' % n)
+            # the VIP leaves a host before its RGW: an ingress without that host first
+            if n.startswith('rgw.') and any(d.startswith('keepalived.') and h == fold.daemons[n] for d, h in fold.daemons.items()):
+                raise OrchestratorError('%s has a keepalived of the ingress: apply the ingress without %s first' % (fold.daemons[n], fold.daemons[n]))
             if n == active:
                 raise OrchestratorError('%s is the active mgr: fail it over first (ceph mgr fail)' % n)
         for t in ('mon', 'mgr'):

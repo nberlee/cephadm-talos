@@ -31,6 +31,8 @@ KINDS = ('restart', 'redeploy', 'add_daemon', 'remove_daemon', 'remove_host', 'c
 # the upgrade's kinds, operations and module entries: about the cluster, without a host
 UPGRADE_CONTROLS = ('upgrade_pause', 'upgrade_resume', 'upgrade_stop')
 UPGRADE_KINDS = ('upgrade_start',) + UPGRADE_CONTROLS + ('upgrade_done', 'upgrade_refused')
+# entries about the cluster, without a host: the upgrade's and the RGW certificates'
+HOSTLESS = UPGRADE_KINDS + ('rgw_cert', 'rgw_cert_done')
 IMAGE_RE = re.compile(r'\A[a-z0-9][a-z0-9._/:-]{0,254}@sha256:[0-9a-f]{64}\Z')
 # kinds that are about a whole host: every other operation on it waits for them
 HOST_KINDS = ('remove_host', 'enter_maintenance', 'exit_maintenance', 'powercycle_host')
@@ -38,7 +40,10 @@ HOST_KINDS = ('remove_host', 'enter_maintenance', 'exit_maintenance', 'powercycl
 STOPS, STARTS = ('enter_maintenance', 'powercycle_host'), ('exit_maintenance', 'powercycle_host')
 # the module's own entries (ids m-<hex>), which carry out a removal: close a
 # daemon's generation, retire the daemon, retire a host; end a host's maintenance
-MODULE_KINDS = ('close', 'retire', 'retire_host', 'bind', 'confirm', 'close_create', 'drained', 'maintained', 'upgrade_done', 'upgrade_refused')
+MODULE_KINDS = ('close', 'retire', 'retire_host', 'bind', 'confirm', 'close_create', 'drained', 'maintained', 'upgrade_done', 'upgrade_refused',
+                'rgw_cert', 'rgw_cert_done')
+# an RGW serving certificate's id (internal/state RGWCert): generated, the operator's, the CLI's
+RGW_CERT_RE = re.compile(r'\A(?:issued/op-[0-9a-f]{16}/[0-9a-f]{16}|user/op-[0-9a-f]{16}|cli)\Z')
 DEVICE_RE = re.compile(r'\A/dev/[A-Za-z0-9][A-Za-z0-9._:/-]{0,200}\Z')
 SERIAL_RE = re.compile(r'\A[A-Za-z0-9._-]{1,64}\Z')
 UUID_RE_OSD = re.compile(r'\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z')
@@ -85,14 +90,14 @@ def check_entry(key: str, raw: str) -> Dict[str, Any]:
     kind, daemon, host = e.get('kind'), e.get('daemon'), e.get('host')
     ok_daemon = isinstance(daemon, str) and DAEMON_RE.match(daemon) is not None
     ok_host = isinstance(host, str) and HOST_RE.match(host) is not None
-    if e['seq'] < 1 or not (ok_host or kind in UPGRADE_KINDS and 'host' not in e):
+    if e['seq'] < 1 or not (ok_host or kind in HOSTLESS and 'host' not in e):
         raise LedgerError('entry %s' % key)
     if e['id'].startswith('m-'):
         if kind not in MODULE_KINDS or not isinstance(e.get('of'), str) or not OP_RE.match(e['of']):
             raise LedgerError('module entry %s' % key)
         if kind in ('close', 'retire', 'drained') and not ok_daemon:
             raise LedgerError('module entry %s' % key)
-        if (kind in UPGRADE_KINDS) != ('host' not in e) or kind in UPGRADE_KINDS and daemon is not None:
+        if (kind in HOSTLESS) != ('host' not in e) or kind in HOSTLESS and daemon is not None:
             raise LedgerError('module entry %s' % key)
         if kind == 'bind' and not (isinstance(e.get('serial'), str) and SERIAL_RE.match(e['serial'])
                                    and isinstance(e.get('link'), str) and e['link'].startswith('/dev/disk/by-id/')
@@ -100,6 +105,10 @@ def check_entry(key: str, raw: str) -> Dict[str, Any]:
             raise LedgerError('bind entry %s' % key)
         if kind == 'confirm' and not (ok_daemon and daemon.startswith('osd.') and isinstance(e.get('uuid'), str) and UUID_RE_OSD.match(e['uuid'])):
             raise LedgerError('confirm entry %s' % key)
+        if kind == 'rgw_cert' and not (isinstance(e.get('attempt'), str) and re.match(r'\A[0-9a-f]{16}\Z', e['attempt'])):
+            raise LedgerError('rgw_cert entry %s' % key)
+        if kind == 'rgw_cert_done' and not (isinstance(e.get('keep'), str) and RGW_CERT_RE.match(e['keep'])):
+            raise LedgerError('rgw_cert_done entry %s' % key)
         return e
     if kind not in KINDS or (e.get('request') is not None and not (isinstance(e['request'], str) and UUID_RE.match(e['request']))):
         raise LedgerError('operation entry %s' % key)
@@ -131,14 +140,20 @@ def check_entry(key: str, raw: str) -> Dict[str, Any]:
         raise LedgerError('operation entry %s' % key)
     t, i = daemon.split('.', 1)
     # mon and mgr ids are their host's name
-    if kind == 'add_daemon' and (t not in ('mon', 'mgr') or i != host):
+    if kind == 'add_daemon' and (t not in ('mon', 'mgr', 'rgw') or i != host):
         raise LedgerError('operation entry %s' % key)
-    if kind == 'remove_daemon' and (t not in ('mon', 'mgr') or i != host):
+    if kind == 'remove_daemon' and (t not in ('mon', 'mgr', 'rgw') or i != host):
+        raise LedgerError('operation entry %s' % key)
+    # an RGW's add: its port, and the operator's certificate chain (public) if any
+    if kind == 'add_daemon' and t == 'rgw' and (type(e.get('port')) is not int or not 0 < e['port'] < 65536
+                                                or 'cert' in e and not (isinstance(e['cert'], str) and 0 < len(e['cert']) <= 16384)):
+        raise LedgerError('operation entry %s' % key)
+    if kind == 'add_daemon' and t != 'rgw' and ('port' in e or 'cert' in e):
         raise LedgerError('operation entry %s' % key)
     if kind == 'remove_osd' and (t != 'osd' or not re.match(r'\A(0|[1-9][0-9]{0,8})\Z', i) or not isinstance(e.get('uuid'), str)
                                  or not UUID_RE_OSD.match(e['uuid']) or type(e.get('zap')) is not bool or type(e.get('force')) is not bool):
         raise LedgerError('operation entry %s' % key)
-    if kind in ('restart', 'redeploy', 'add_daemon', 'remove_daemon') and set(e) - {'version', 'id', 'kind', 'daemon', 'host', 'gid', 'epoch', 'seq', 'request'}:
+    if kind in ('restart', 'redeploy', 'add_daemon', 'remove_daemon') and set(e) - {'version', 'id', 'kind', 'daemon', 'host', 'gid', 'epoch', 'seq', 'request', 'port', 'cert'}:
         raise LedgerError('operation entry %s' % key)
     return e
 
@@ -204,16 +219,29 @@ class Fold:
         # the upgrade in progress: {'op', 'image', 'paused'} from its start's
         # acceptance until done, refused, or a stop's acceptance
         self.upgrade: Optional[Dict[str, Any]] = None
+        # RGW serving certificates by id, in the order they entered (the CLI's
+        # first if the sealed state has an RGW), with the position they entered
+        # at; a retired one is no longer released
+        self.rgw_certs: Dict[str, Dict[str, Any]] = {}
+        # the CLI's RGW settings, and the ingress VIP (address without prefix)
+        self.cli_rgw: Dict[str, Any] = inventory.get('cli_rgw') or {}
+        self.vip: Optional[str] = (self.cli_rgw.get('vip') or '').split('/')[0] or None
+        if any(d.get('daemon_type') == 'rgw' and d.get('daemon_id') for d in inventory['daemons']):
+            self.rgw_certs['cli'] = {'pos': -1, 'retired': False}
+        positions: Dict[str, int] = {}
         for d in inventory['daemons']:
             if d.get('daemon_id'):
                 name = '%s.%s' % (d['daemon_type'], d['daemon_id'])
                 self.daemons[name], self.generations[name] = d['host'], ('cli', True)
                 if d.get('osd_uuid'):
                     self.uuids[name] = d['osd_uuid']
-        for _, e in entries:
+        for n, (_, e) in enumerate(entries):
+            positions[e['id']] = n
             kind = e['kind']
             if kind == 'add_daemon' and e['host'] in self.hosts:
                 self.daemons[e['daemon']], self.generations[e['daemon']] = e['host'], (e['id'], True)
+                if e.get('cert'):
+                    self.rgw_certs['user/' + e['id']] = {'pos': n, 'retired': False}
             elif kind == 'close' and e['daemon'] in self.generations:
                 self.generations[e['daemon']] = (self.generations[e['daemon']][0], False)
             elif kind == 'retire':
@@ -227,6 +255,13 @@ class Fold:
                 self.maintenance.add(e['host'])
             elif kind == 'maintained':
                 self.maintenance.discard(e['host'])
+            elif kind == 'rgw_cert':
+                # counted from its issuing operation's place, like an operator's from its add
+                self.rgw_certs.setdefault('issued/%s/%s' % (e['of'], e['attempt']), {'pos': positions.get(e['of'], n), 'retired': False})
+            elif kind == 'rgw_cert_done' and e['of'] in positions:
+                for cid, c in self.rgw_certs.items():
+                    if cid != e['keep'] and c['pos'] < positions[e['of']]:
+                        c['retired'] = True
             elif kind == 'upgrade_start' and self.upgrade is None:
                 self.upgrade = {'op': e['id'], 'image': e['image'], 'paused': False}
             elif self.upgrade is not None and e.get('upgrade', e.get('of')) == self.upgrade['op'] and kind in UPGRADE_KINDS:
@@ -278,7 +313,10 @@ class Fold:
         if host is not None:
             return self.has('mgr', host=host)
         if name == 'rgw/server.key':
-            return self.has('rgw')
+            return self.has('rgw') and not self.rgw_certs.get('cli', {'retired': True})['retired']
+        if name.endswith('/rgw-server.key'):
+            c = self.rgw_certs.get(name[:-len('/rgw-server.key')])
+            return self.has('rgw') and c is not None and not c['retired']
         if name == 'rgw/vrrp':
             return self.has('keepalived')
         return False

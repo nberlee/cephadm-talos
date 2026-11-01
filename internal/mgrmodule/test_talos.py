@@ -706,6 +706,53 @@ class Upgrade(unittest.TestCase):
         self.assertEqual(kinds, [('upgrade_start', None), ('upgrade_pause', start['id']), ('upgrade_stop', start['id'])])
 
 
+class RGWs(unittest.TestCase):
+    def module(self):
+        mod, entries = AddAndRemove.module(self)
+        self.written = {}
+        mod.mon_command = lambda cmd: (self.written.__setitem__(cmd['key'], cmd['val']) or 0, '', '')
+        return mod, entries
+
+    def spec(self, host='h2', port=None, cert=None, **kw):
+        from ceph.deployment.service_spec import PlacementSpec, RGWSpec
+        return RGWSpec(service_id='default', placement=PlacementSpec.from_string(host), rgw_frontend_port=port,
+                       rgw_frontend_ssl_certificate=cert, **kw)
+
+    def operator_pem(self):
+        from talos import bridge as b
+        ca, ca_key = b.new_rgw_ca('f')
+        cert, key = b.issue_rgw_cert(ca.encode(), ca_key.encode(), [], ['s3.example.com'])
+        return cert + key
+
+    def test_add_with_a_generated_or_the_operators_certificate(self):
+        mod, _ = self.module()
+        for spec in (self.spec(port=8443, rgw_realm='r'), self.spec(host='h9'), self.spec(host='h1 h2'), self.spec(cert='nonsense')):
+            self.assertTrue(m.Module.add_daemon(mod, spec).exception_str, spec)
+        self.assertEqual(m.Module.add_daemon(mod, self.spec()).exception_str, '')
+        [(_, first)] = mod._ledger.executable()
+        self.assertEqual((first['daemon'], first['port']), ('rgw.h2', 443))
+        self.assertNotIn('cert', first)
+        # the port is the first RGW's
+        self.assertIn('443', m.Module.add_daemon(mod, self.spec(host='h1', port=8443)).exception_str)
+        res = m.Module.add_daemon(mod, self.spec(host='h1', cert=self.operator_pem()))
+        self.assertEqual(res.exception_str, '')
+        second = mod._ledger.executable()[-1][1]
+        # the key is a secret of the operation, the chain in the entry
+        self.assertIn('BEGIN CERTIFICATE', second['cert'])
+        self.assertNotIn('PRIVATE KEY', second['cert'])
+        [(key, val)] = self.written.items()
+        self.assertEqual(key, 'cephadm-talos/secrets/user/%s/rgw-server.key' % second['id'])
+        self.assertIn('PRIVATE KEY', val)
+
+    def test_rm_waits_for_the_ingress_to_leave_the_host(self):
+        mod, entries = self.module()
+        # h2 runs keepalived.h2 in the CLI's state: its RGW stays
+        m.Module.add_daemon(mod, self.spec())
+        [(_, add)] = mod._ledger.executable()
+        entries['talos/inc/20/journal/op/' + add['id']] = json.dumps({'state': 'completed'})
+        self.assertIn('keepalived', m.Module.remove_daemons(mod, ['rgw.h2']).exception_str)
+
+
 class Conflicts(unittest.TestCase):
     def test_a_host_removal_and_daemons_on_that_host_exclude_each_other(self):
         inv = inventory()
