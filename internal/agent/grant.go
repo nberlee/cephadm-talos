@@ -85,7 +85,7 @@ func (g *Granter) readOp(id string) (wire.Operation, bool, error) {
 
 	// a damaged record is no evidence of anything: it blocks like missing records do
 	switch op.State {
-	case wire.OpReserved, wire.OpRefused, wire.OpStarted, wire.OpCompleted, wire.OpUncertain, wire.OpAbandoned:
+	case wire.OpReserved, wire.OpRefused, wire.OpStarted, wire.OpCompleted, wire.OpUncertain, wire.OpAbandoned, wire.OpFailed:
 	default:
 		return wire.Operation{}, false, fmt.Errorf("record %s: unknown state", opRecord(id))
 	}
@@ -121,7 +121,7 @@ func (g *Granter) checkGrant(gr wire.Grant, leader string) error {
 		return errors.New("the grant's mgr is not the sender's host")
 	case pki.ValidName(gr.Mgr) != nil || gr.GID <= 0 || gr.Epoch <= 0 || gr.Revision <= 0 || !operationRe.MatchString(gr.Operation):
 		return errors.New("malformed grant")
-	case len(gr.Docs) == 0 && gr.Restart == nil:
+	case len(gr.Docs) == 0 && gr.Restart == nil && gr.Ack == nil:
 		return errors.New("a grant without documents")
 	case len(gr.Docs) > 0 && gr.Restart != nil:
 		return errors.New("a grant with documents and a restart")
@@ -159,7 +159,7 @@ func (g *Granter) Grant(ctx context.Context, gr wire.Grant) (wire.Operation, err
 // unresolved returns an operation other than id that started and has no
 // recorded outcome, or whose outcome is uncertain: nothing else is applied
 // until it is reconciled, also after a restart.
-func (g *Granter) unresolved(id string) (string, error) {
+func (g *Granter) unresolved(id string, withJob bool) (string, error) {
 	names, err := g.Records.List("op-")
 	if err != nil {
 		return "", err
@@ -175,7 +175,8 @@ func (g *Granter) unresolved(id string) (string, error) {
 			return "", err
 		}
 
-		if found && (op.State == wire.OpStarted || op.State == wire.OpUncertain) {
+		// an unresolved job holds back other jobs on the node, not documents
+		if found && (op.State == wire.OpStarted || op.State == wire.OpUncertain) && (op.Job == nil || withJob) {
 			return op.Operation, nil
 		}
 	}
@@ -199,7 +200,9 @@ func (g *Granter) prune() error {
 			return err
 		}
 
-		if found && (op.State == wire.OpCompleted || op.State == wire.OpRefused || op.State == wire.OpAbandoned) {
+		// a job's record stays until the leader acknowledged its outcome
+		if found && (op.State == wire.OpCompleted || op.State == wire.OpRefused || op.State == wire.OpAbandoned || op.State == wire.OpFailed) &&
+			(op.Job == nil || op.Acked) {
 			done = append(done, op)
 		}
 	}
@@ -291,7 +294,79 @@ func (g *Granter) reconcile(ctx context.Context) error {
 			continue
 		}
 
+		// an acknowledgement whose grant was decided later: finished, or dropped
+		if op.Job != nil && !op.Acked && op.AckBy != "" {
+			by, found, err := g.readOp(op.AckBy)
+			if err != nil {
+				return err
+			}
+
+			switch {
+			case found && by.State == wire.OpCompleted:
+				if err := g.acknowledge(op); err != nil {
+					return err
+				}
+
+				op.Acked = true
+			case !found || by.State == wire.OpRefused || by.State == wire.OpAbandoned:
+				op.AckBy = ""
+				if err := g.writeOp(op); err != nil {
+					return err
+				}
+			}
+		}
+
+		// an acknowledged job's files go once its document and instance are gone
+		if op.Job != nil && op.Acked {
+			if err := g.Node.cleanJob(ctx, *op.Job); err != nil {
+				return err
+			}
+
+			continue
+		}
+
 		if op.State != wire.OpStarted && op.State != wire.OpUncertain {
+			continue
+		}
+
+		// a job: applied first (as for documents), then its result or container
+		if op.Job != nil {
+			applied, refused := false, false
+
+			switch {
+			case outcome == "uncertain" && op.Revision == rev:
+				continue
+			case outcome != "" && op.Revision == rev:
+				applied, refused = outcome == wire.OpCompleted, outcome != wire.OpCompleted
+			case outcome == "uncertain":
+				continue
+			case op.Result == nil && op.State == wire.OpUncertain && owned >= op.Revision:
+				applied = true // uncertain from the job: its result may still appear
+			case owned >= op.Revision:
+				applied = true
+			default:
+				refused = true
+			}
+
+			if refused {
+				op.State, op.Error = wire.OpRefused, "reconciled: the job's document was not applied"
+			} else if applied {
+				st, res, err := g.Node.JobOutcome(ctx, *op.Job)
+				if err != nil {
+					return err
+				}
+
+				if st == "" || (st == wire.OpUncertain && op.State == wire.OpUncertain) {
+					continue
+				}
+
+				op.State, op.Result, op.Error = st, res, "the job ended"
+			}
+
+			if err := g.writeOp(op); err != nil {
+				return err
+			}
+
 			continue
 		}
 
@@ -369,7 +444,14 @@ func (g *Granter) grant(ctx context.Context, gr wire.Grant) (wire.Operation, err
 		}
 	}
 
-	if other, err := g.unresolved(gr.Operation); err != nil || other != "" {
+	job, ack, err := g.jobOf(gr)
+	if err != nil {
+		op := wire.Operation{Version: wire.Version, Operation: gr.Operation, Revision: gr.Revision, InputsHash: hash, GID: gr.GID, State: wire.OpRefused, Error: err.Error()}
+
+		return op, nil // refused before anything is recorded
+	}
+
+	if other, err := g.unresolved(gr.Operation, job != nil); err != nil || other != "" {
 		if err == nil {
 			err = fmt.Errorf("operation %s is unresolved: nothing else is applied until it is reconciled", other)
 		}
@@ -377,11 +459,20 @@ func (g *Granter) grant(ctx context.Context, gr wire.Grant) (wire.Operation, err
 		return wire.Operation{}, err
 	}
 
-	op := wire.Operation{Version: wire.Version, Operation: gr.Operation, Revision: gr.Revision, InputsHash: hash, GID: gr.GID, State: wire.OpReserved}
+	op := wire.Operation{Version: wire.Version, Operation: gr.Operation, Revision: gr.Revision, InputsHash: hash, GID: gr.GID, State: wire.OpReserved, Job: job}
 
 	// the reservation is durable before anything else happens (plan 03, item 5)
 	if err := g.writeOp(op); err != nil {
 		return wire.Operation{}, err
+	}
+
+	// the acknowledgement this grant carries is recorded with its job first,
+	// so it is finished also after a crash or an apply decided later
+	if ack != nil && ack.AckBy != gr.Operation {
+		ack.AckBy = gr.Operation
+		if err := g.writeOp(*ack); err != nil {
+			return wire.Operation{}, err
+		}
 	}
 
 	// without a confirmation nothing happened, and the reservation is dropped:
@@ -426,6 +517,29 @@ func (g *Granter) grant(ctx context.Context, gr wire.Grant) (wire.Operation, err
 		return g.restart(ctx, gr, op, until)
 	}
 
+	// an acknowledgement alone changes no document; its revision is fenced like
+	// an applied one, so it cannot be replayed once its record is pruned
+	if len(gr.Docs) == 0 {
+		if err := g.Node.AckBefore(ctx, until, gr.Revision); err != nil {
+			op.State, op.Error = wire.OpRefused, err.Error()
+
+			return op, g.writeOp(op)
+		}
+
+		op.State, op.Error = wire.OpCompleted, ""
+		if err := g.writeOp(op); err != nil {
+			return op, err
+		}
+
+		if ack != nil {
+			if err := g.acknowledge(*ack); err != nil {
+				return op, err
+			}
+		}
+
+		return op, g.prune()
+	}
+
 	op.State = wire.OpStarted
 	if err := g.writeOp(op); err != nil {
 		return wire.Operation{}, err
@@ -444,6 +558,8 @@ func (g *Granter) grant(ctx context.Context, gr wire.Grant) (wire.Operation, err
 	_, err = g.Node.ApplyBefore(ctx, until, gr.Revision, docs)
 
 	switch {
+	case err == nil && op.Job != nil:
+		op.State, op.Error = wire.OpStarted, "" // until the job ended and its result is read
 	case err == nil:
 		op.State, op.Error = wire.OpCompleted, ""
 	case errors.Is(err, ErrNotApplied):
@@ -454,6 +570,13 @@ func (g *Granter) grant(ctx context.Context, gr wire.Grant) (wire.Operation, err
 
 	if err := g.writeOp(op); err != nil {
 		return op, err
+	}
+
+	// the acknowledged job is done: a tombstone first, so it never runs again
+	if ack != nil && op.State == wire.OpCompleted {
+		if err := g.acknowledge(*ack); err != nil {
+			return op, err
+		}
 	}
 
 	return op, g.prune()
@@ -894,4 +1017,119 @@ func (g *Granter) HandleHandoff(w http.ResponseWriter, r *http.Request) {
 // NewGranter returns a Granter; one grant runs at a time.
 func NewGranter(n *Node, ch *Channel, clientTLS *tls.Config, recs *records.Store) *Granter {
 	return &Granter{Node: n, Channel: ch, ClientTLS: clientTLS, Records: recs, mu: make(chan struct{}, 1), reports: make(chan struct{}, 1)}
+}
+
+// tombRecord prefixes the tombstones of acknowledged jobs, never pruned.
+const tombRecord = "tomb-"
+
+// jobOf finds the job a grant runs (at most one, not a tombstoned id) and the
+// job record an acknowledgement in it matches. A grant that removes a job
+// document whose result is not acknowledged needs that acknowledgement.
+func (g *Granter) jobOf(gr wire.Grant) (*wire.JobRef, *wire.Operation, error) {
+	var job *wire.JobRef
+
+	for _, d := range gr.Docs {
+		if d.Kind != "ContainerConfig" || d.YAML == nil {
+			continue
+		}
+
+		ref, ok := g.Node.Policy.jobOf(Doc{Kind: d.Kind, Name: d.Name, YAML: []byte(*d.YAML)})
+		if !ok {
+			continue
+		}
+
+		if job != nil {
+			return nil, nil, errors.New("a grant with more than one job")
+		}
+
+		if _, err := g.Records.Read(tombRecord + ref.ID); err == nil {
+			return nil, nil, fmt.Errorf("job %s is finished and acknowledged", ref.ID)
+		}
+
+		job = &ref
+	}
+
+	names, err := g.Records.List("op-")
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var ack *wire.Operation
+
+	acked := false // the acknowledgement names a job acknowledged before: no change
+
+	for _, n := range names {
+		op, found, err := g.readOp(strings.TrimPrefix(n, "op-"))
+		if err != nil {
+			return nil, nil, err
+		}
+
+		if !found || op.Job == nil {
+			continue
+		}
+
+		if op.Acked {
+			acked = acked || (gr.Ack != nil && gr.Ack.Job == op.Job.ID && gr.Ack.Inputs == op.Job.Inputs)
+
+			continue
+		}
+
+		// a removal, or a replacement by anything but the same job again
+		removed := false
+
+		for _, d := range gr.Docs {
+			if d.Kind != "ContainerConfig" || d.Name != op.Job.Doc {
+				continue
+			}
+
+			same := false
+			if d.YAML != nil {
+				ref, ok := g.Node.Policy.jobOf(Doc{Kind: d.Kind, Name: d.Name, YAML: []byte(*d.YAML)})
+				same = ok && ref.ID == op.Job.ID && ref.Inputs == op.Job.Inputs
+			}
+
+			removed = removed || !same
+		}
+
+		rc := -1
+		if op.Result != nil {
+			rc = op.Result.RC
+		}
+
+		matches := gr.Ack != nil && gr.Ack.Job == op.Job.ID && gr.Ack.Inputs == op.Job.Inputs && gr.Ack.RC == rc
+		ended := op.State != wire.OpReserved && op.State != wire.OpStarted
+
+		switch {
+		case matches && ended:
+			o := op
+			ack = &o
+		case removed:
+			return nil, nil, fmt.Errorf("the job document %s is removed without an acknowledgement of its outcome", op.Job.Doc)
+		}
+	}
+
+	if gr.Ack != nil && ack == nil && !acked {
+		if _, err := g.Records.Read(tombRecord + gr.Ack.Job); err != nil {
+			return nil, nil, errors.New("the acknowledgement matches no ended job's recorded outcome")
+		}
+	}
+
+	return job, ack, nil
+}
+
+// acknowledge marks a job's outcome acknowledged: its tombstone (in the
+// records and next to its result, for the job script) comes first; the result
+// files go once the document and its instance are gone (reconcile).
+func (g *Granter) acknowledge(op wire.Operation) error {
+	if err := g.Records.Write(tombRecord+op.Job.ID, []byte(op.Job.Inputs)); err != nil {
+		return err
+	}
+
+	if err := g.Node.writeJobFile(op.Job.ID, "tombstone", op.Job.Inputs); err != nil {
+		return err
+	}
+
+	op.Acked = true
+
+	return g.writeOp(op)
 }

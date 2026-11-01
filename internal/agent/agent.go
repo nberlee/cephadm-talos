@@ -566,7 +566,7 @@ func Main(ctx context.Context) error {
 	// from the agent's own document, which only the CLI writes; no
 	// repositories admit no image
 	repos := strings.Fields(os.Getenv(daemons.EnvImageRepos))
-	node := &Node{Talos: tc, Records: recs, FSID: self.FSID, Host: self.Name, Policy: &Policy{
+	node := &Node{Talos: tc, Records: recs, JobsDir: filepath.Join(records.Mount, records.JobsDir), FSID: self.FSID, Host: self.Name, Policy: &Policy{
 		FSID: self.FSID, Host: self.Name, CACert: string(pems[0]), Repos: repos, ApprovalKey: os.Getenv(daemons.EnvApprovalKey),
 	}}
 	a := &Agent{

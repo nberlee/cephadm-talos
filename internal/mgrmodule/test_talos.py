@@ -620,3 +620,26 @@ class Conflicts(unittest.TestCase):
         # mgr.h2's add is not finished: neither removal goes in
         self.assertTrue(m.Module.remove_daemons(mod, ['mgr.h1', 'mgr.h2']).exception_str)
         self.assertEqual(len(mod._ledger.executable()), 2)
+
+
+class CreateOSDs(unittest.TestCase):
+    def dg(self, host, *paths, **kw):
+        from ceph.deployment.drive_group import DeviceSelection, DriveGroupSpec
+        from ceph.deployment.service_spec import PlacementSpec
+        return DriveGroupSpec(placement=PlacementSpec(host_pattern=host), data_devices=DeviceSelection(paths=list(paths)), **kw)
+
+    def test_one_osd_on_one_disk(self):
+        mod, _ = AddAndRemove.module(self)
+        res = m.Module.create_osds(mod, self.dg('h2', '/dev/sdb'))
+        self.assertEqual(res.exception_str, '')
+        [(_, e)] = mod._ledger.executable()
+        self.assertEqual((e['kind'], e['host'], e['device']), ('create_osd', 'h2', '/dev/sdb'))
+        # not beside an unfinished one on the same disk; not elsewhere than one host
+        for dg in (self.dg('h2', '/dev/sdb'), self.dg('h9', '/dev/sdb'), self.dg('h*', '/dev/sdb'), self.dg('h2', '/dev/sdb', '/dev/sdc'),
+                   self.dg('h2', 'sdb'), self.dg('h2', '/dev/sdc', encrypted=True)):
+            self.assertTrue(m.Module.create_osds(mod, dg).exception_str, dg)
+        self.assertTrue(m.Module.create_osds(mod, self.dg('h2', '/dev/sdc'), skip_validation=True).exception_str)
+        for kw in ({'preview_only': True}, {'crush_device_class': 'ssd'}, {'data_allocate_fraction': 0.5}, {'block_db_size': '10G'},
+                   {'osd_id_claims': {'h2': ['3']}}, {'extra_entrypoint_args': ['--x']}):
+            self.assertTrue(m.Module.create_osds(mod, self.dg('h2', '/dev/sdd', **kw)).exception_str, kw)
+        self.assertEqual(m.Module.create_osds(mod, self.dg('h2', '/dev/sdc')).exception_str, '')

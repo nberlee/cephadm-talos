@@ -3,9 +3,13 @@ package agent
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"github.com/nberlee/cephadm-talos/internal/spec"
 	"net/http"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
@@ -34,7 +38,11 @@ const (
 	KindAddDaemon    = "add_daemon"
 	KindRemoveDaemon = "remove_daemon"
 	KindRemoveHost   = "remove_host"
+	KindCreateOSD    = "create_osd"
 )
+
+// maxAckAttempts bounds the attempts to acknowledge a failed creation's job.
+const maxAckAttempts = 50
 
 // stuckAfter is how long an operation waits for an agent that does not answer
 // before it fails and the next one runs.
@@ -187,9 +195,11 @@ func (l *LeaderLoop) ledgerOp(ctx context.Context, b *Bridge, js store.Backend, 
 	op := e.Op
 	opKey := JournalPrefix(gid) + "op/" + op.ID
 
-	known := map[string]bool{KindRestart: true, KindRedeploy: true, KindAddDaemon: true, KindRemoveDaemon: true, KindRemoveHost: true}
+	known := map[string]bool{KindRestart: true, KindRedeploy: true, KindAddDaemon: true, KindRemoveDaemon: true, KindRemoveHost: true, KindCreateOSD: true}
+	noDaemon := op.Kind == KindRemoveHost || op.Kind == KindCreateOSD
 	if !ledgerIDRe.MatchString(op.ID) || pki.ValidName(op.Host) != nil || !known[op.Kind] ||
-		(op.Kind == KindRemoveHost) != (op.Daemon == "") || (op.Daemon != "" && !ledgerDaemonRe.MatchString(op.Daemon)) {
+		noDaemon != (op.Daemon == "") || (op.Daemon != "" && !ledgerDaemonRe.MatchString(op.Daemon)) ||
+		(op.Kind == KindCreateOSD) != strings.HasPrefix(op.Device, "/dev/") {
 		return true, writeJSONKey(ctx, js, opKey, JournalOp{Version: journalVersion, Kind: op.Kind, Host: op.Host, State: JournalFailed, Error: "unknown or malformed operation"})
 	}
 
@@ -199,10 +209,12 @@ func (l *LeaderLoop) ledgerOp(ctx context.Context, b *Bridge, js store.Backend, 
 	}
 
 	switch op.Kind {
-	case KindAddDaemon, KindRemoveDaemon, KindRemoveHost:
+	case KindAddDaemon, KindRemoveDaemon, KindRemoveHost, KindCreateOSD:
 		var phase func() error
 
 		switch op.Kind {
+		case KindCreateOSD:
+			phase = func() error { return l.createOSD(ctx, b, js, gid, epoch, op) }
 		case KindAddDaemon:
 			phase = func() error { return l.addDaemon(ctx, b, js, gid, epoch, op) }
 		case KindRemoveDaemon:
@@ -211,7 +223,12 @@ func (l *LeaderLoop) ledgerOp(ctx context.Context, b *Bridge, js store.Backend, 
 			phase = func() error { return l.removeHost(ctx, b, js, gid, epoch, op) }
 		}
 
-		if err := l.unstick(ctx, js, opKey, opKey, op, phase()); err != nil {
+		var onFail func() error
+		if op.Kind == KindCreateOSD {
+			onFail = func() error { return l.cleanCreate(ctx, b, js, gid, epoch, op) }
+		}
+
+		if err := l.unstick(ctx, js, opKey, opKey, op, onFail, phase()); err != nil {
 			return false, err
 		}
 
@@ -230,7 +247,7 @@ func (l *LeaderLoop) ledgerOp(ctx context.Context, b *Bridge, js store.Backend, 
 		}
 
 		if !terminal(rs) {
-			if err := l.unstick(ctx, js, opKey, opKey, op, l.runRevision(ctx, b, js, gid, epoch, rev, op.Host, revisionMode{})); err != nil {
+			if err := l.unstick(ctx, js, opKey, opKey, op, nil, l.runRevision(ctx, b, js, gid, epoch, rev, op.Host, revisionMode{})); err != nil {
 				return false, err
 			}
 
@@ -244,7 +261,7 @@ func (l *LeaderLoop) ledgerOp(ctx context.Context, b *Bridge, js store.Backend, 
 		}
 	}
 
-	if err := l.unstick(ctx, js, opKey, opKey, op, l.restartOp(ctx, b, js, gid, epoch, op)); err != nil {
+	if err := l.unstick(ctx, js, opKey, opKey, op, nil, l.restartOp(ctx, b, js, gid, epoch, op)); err != nil {
 		return false, err
 	}
 
@@ -258,7 +275,7 @@ func (l *LeaderLoop) ledgerOp(ctx context.Context, b *Bridge, js store.Backend, 
 // the next one runs, unless a grant of it or of one of its phases (journal keys
 // phaseKey and phaseKey.*) has an unknown outcome; the time it started failing
 // is kept in memory only.
-func (l *LeaderLoop) unstick(ctx context.Context, js store.Backend, opKey, phaseKey string, op LedgerOp, err error) error {
+func (l *LeaderLoop) unstick(ctx context.Context, js store.Backend, opKey, phaseKey string, op LedgerOp, onFail func() error, err error) error {
 	if err == nil {
 		delete(l.failing, op.ID)
 
@@ -299,6 +316,13 @@ func (l *LeaderLoop) unstick(ctx context.Context, js store.Backend, opKey, phase
 
 		if found && (cur.State == JournalGranting || cur.State == wire.OpUncertain) {
 			return err
+		}
+	}
+
+	// what failing leaves behind is cleaned up first (a creation is closed)
+	if onFail != nil {
+		if ferr := onFail(); ferr != nil {
+			return ferr
 		}
 	}
 
@@ -705,4 +729,308 @@ func (l *LeaderLoop) removeHost(ctx context.Context, b *Bridge, js store.Backend
 	}
 
 	return finish(ctx, js, gid, op, wire.OpCompleted, nil)
+}
+
+// journalRecord is an operation's record in any incarnation's journal: a
+// terminal one wins, else this incarnation's own.
+func (l *LeaderLoop) journalRecord(ctx context.Context, b *Bridge, js store.Backend, gid int64, id string) (JournalOp, bool, error) {
+	all, err := b.Store(ctx, store.Prefix+"inc/")
+	if err != nil {
+		return JournalOp{}, false, err
+	}
+
+	keys, err := all.List(ctx, store.Prefix+"inc/")
+	if err != nil {
+		return JournalOp{}, false, err
+	}
+
+	for _, k := range keys {
+		if !strings.HasSuffix(k, "/journal/op/"+id) {
+			continue
+		}
+
+		op, found, err := readJSONKey[JournalOp](ctx, all, k)
+		if err != nil {
+			return JournalOp{}, false, err
+		}
+
+		if found && terminal(op.State) {
+			return op, true, nil
+		}
+	}
+
+	return readJSONKey[JournalOp](ctx, js, JournalPrefix(gid)+"op/"+id)
+}
+
+// deployOf is the deployment id of an OSD creation: its preparation job's id.
+func deployOf(op string) string {
+	sum := sha256.Sum256([]byte(op + ":prepare"))
+
+	return hex.EncodeToString(sum[:8])
+}
+
+// prepared reads the OSD id and uuid a preparation job reported.
+func prepared(out string) (int, string, bool) {
+	id, uuid := -1, ""
+
+	for _, l := range strings.Split(out, "\n") {
+		if v, ok := strings.CutPrefix(strings.TrimSpace(l), "osd_id "); ok {
+			if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+				id = n
+			}
+		}
+
+		if v, ok := strings.CutPrefix(strings.TrimSpace(l), "osd_uuid "); ok {
+			uuid = v
+		}
+	}
+
+	return id, uuid, id >= 0 && uuid != ""
+}
+
+// createOSD creates an OSD on a disk: the module binds the creation to the
+// disk, the deployment goes into the state before the preparation job, the
+// job's OSD id and uuid follow, then one revision with the OSD daemon and the
+// job's acknowledgement, the OSD up in the OSD map, and the module's
+// confirmation. A creation that fails is closed by the module.
+func (l *LeaderLoop) createOSD(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, op LedgerOp) error {
+	st, _, err := l.clusterState(ctx, b)
+	if err != nil {
+		return err
+	}
+
+	h, ok := st.Host(op.Host)
+	if !ok || h.Name != op.Host {
+		return l.failCreate(ctx, b, js, gid, epoch, op, fmt.Errorf("no host %s", op.Host))
+	}
+
+	deploy := deployOf(op.ID)
+
+	var d state.Daemon
+
+	found := false
+
+	for _, x := range st.Daemons {
+		if x.Type == state.TypeOSD && x.DeployID == deploy {
+			d, found = x, true
+		}
+	}
+
+	if !found {
+		var rep wire.NodeReport
+		if _, err := l.call(ctx, h, http.MethodGet, "/v1/node", nil, &rep); err != nil {
+			return err
+		}
+
+		serial, link := "", ""
+
+		for _, disk := range rep.Disks {
+			if disk.DevPath != op.Device && !slices.Contains(disk.Symlinks, op.Device) {
+				continue
+			}
+
+			serial = strings.TrimSpace(disk.Serial)
+
+			for _, s := range disk.Symlinks {
+				if serial != "" && strings.HasPrefix(s, "/dev/disk/by-id/") && strings.Contains(s, serial) {
+					link = s
+				}
+			}
+		}
+
+		if serial == "" || link == "" {
+			return l.failCreate(ctx, b, js, gid, epoch, op, fmt.Errorf("%s on %s has no serial and /dev/disk/by-id link: an OSD cannot be bound to it", op.Device, op.Host))
+		}
+
+		d = state.Daemon{Type: state.TypeOSD, ID: op.Host + "-" + filepath.Base(op.Device), Host: op.Host, Device: op.Device, DeployID: deploy, DiskSerial: serial, DevicePath: link}
+		if x, exists := st.Find("osd." + d.ID); exists && x.DeployID != deploy {
+			return l.failCreate(ctx, b, js, gid, epoch, op, fmt.Errorf("%s already has an OSD on %s", op.Host, op.Device))
+		}
+
+		// the module binds the creation to this disk and job before anything else
+		if err := b.BindDisk(ctx, op.ID, serial, link, deploy); err != nil {
+			return err
+		}
+
+		if err := l.changeState(ctx, b, gid, func(st *state.State) error {
+			st.AddDaemon(d)
+
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+
+	prep := op.ID + ".prep"
+
+	if d.OSDID == nil {
+		key, err := b.AuthGetFor(ctx, "client.bootstrap-osd", op.ID)
+		if err != nil {
+			return err
+		}
+
+		job, err := render.OSDPrepare(st, h, d, func(string) (string, error) { return key, nil })
+		if err != nil {
+			return l.failCreate(ctx, b, js, gid, epoch, op, err)
+		}
+
+		y, err := spec.Render(job)
+		if err != nil {
+			return err
+		}
+
+		done, _, err := l.step(ctx, b, js, gid, epoch, prep, op.Host, revisionMode{add: []Doc{{Kind: "ContainerConfig", Name: job.MetaName, YAML: y}}})
+		if err != nil || !done {
+			return err
+		}
+
+		rec, _, err := l.journalRecord(ctx, b, js, gid, prep)
+		if err != nil {
+			return err
+		}
+
+		if rec.State != wire.OpCompleted || rec.Result == nil {
+			return l.failCreate(ctx, b, js, gid, epoch, op, fmt.Errorf("the preparation ended %s %s", rec.State, rec.Error))
+		}
+
+		id, uuid, ok := prepared(rec.Result.Output)
+		if !ok {
+			return l.failCreate(ctx, b, js, gid, epoch, op, errors.New("the preparation reported no OSD id and uuid"))
+		}
+
+		if err := l.changeState(ctx, b, gid, func(st *state.State) error {
+			x, ok := st.Find("osd." + d.ID)
+			if !ok || x.DeployID != deploy {
+				return fmt.Errorf("the deployment of %s is gone", d.ID)
+			}
+
+			x.OSDID, x.OSDUUID = &id, uuid
+			st.AddDaemon(x)
+
+			return nil
+		}); err != nil {
+			return err
+		}
+
+		d.OSDID, d.OSDUUID = &id, uuid
+	}
+
+	// the OSD daemon, and the job's result acknowledged with its document's removal
+	rec, _, err := l.journalRecord(ctx, b, js, gid, prep)
+	if err != nil {
+		return err
+	}
+
+	mode := revisionMode{}
+	if rec.Job != nil && rec.Result != nil {
+		mode.extra = []string{"ContainerConfig/" + rec.Job.Doc}
+		mode.ack = &wire.JobAck{Job: rec.Job.ID, Inputs: rec.Job.Inputs, RC: rec.Result.RC}
+	}
+
+	done, ok, err := l.step(ctx, b, js, gid, epoch, op.ID+".rev", op.Host, mode)
+	if err != nil || !done {
+		return err
+	}
+
+	if !ok {
+		return l.failCreate(ctx, b, js, gid, epoch, op, fmt.Errorf("the revision of %s did not apply", op.Host))
+	}
+
+	osds, err := b.OSDs(ctx)
+	if err != nil {
+		return err
+	}
+
+	up := false
+	for _, o := range osds {
+		up = up || (o.ID == *d.OSDID && o.UUID == d.OSDUUID && o.Up)
+	}
+
+	if !up {
+		return fmt.Errorf("%w: osd.%d is not up yet", errRetry, *d.OSDID)
+	}
+
+	if _, err := b.do(ctx, "confirm osd", map[string]any{"operation": op.ID, "osd": *d.OSDID}); err != nil {
+		return err
+	}
+
+	return finish(ctx, js, gid, op, wire.OpCompleted, nil)
+}
+
+// failCreate ends a creation that failed: its preparation job's outcome is
+// acknowledged with its document's removal, a deployment that never got an
+// OSD leaves the state (so the disk can be tried again), the module closes the
+// creation (no more bootstrap-osd for it), and it ends as failed. Each step is
+// asked again on the next tick until it is done.
+func (l *LeaderLoop) failCreate(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, op LedgerOp, cause error) error {
+	if err := l.cleanCreate(ctx, b, js, gid, epoch, op); err != nil {
+		return err
+	}
+
+	return finish(ctx, js, gid, op, JournalFailed, cause)
+}
+
+// cleanCreate is what a failed or timed-out creation leaves behind, undone:
+// an error means not done yet, asked again on the next tick.
+func (l *LeaderLoop) cleanCreate(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, op LedgerOp) error {
+	rec, found, err := l.journalRecord(ctx, b, js, gid, op.ID+".prep")
+	if err != nil {
+		return err
+	}
+
+	if found && rec.Job != nil && terminal(rec.State) {
+		rc := -1
+		if rec.Result != nil {
+			rc = rec.Result.RC
+		}
+
+		// attempts are numbered: one that ended without applying (a refused
+		// confirmation, among others) is followed by a new one, one unresolved is asked again
+		mode := revisionMode{extra: []string{"ContainerConfig/" + rec.Job.Doc}, ack: &wire.JobAck{Job: rec.Job.ID, Inputs: rec.Job.Inputs, RC: rc}}
+		acked := false
+
+		for n := 1; n <= maxAckAttempts && !acked; n++ {
+			id := fmt.Sprintf("%s.ack.%d", op.ID, n)
+
+			s, err := l.journalState(ctx, b, js, gid, id)
+			if err != nil {
+				return err
+			}
+
+			if terminal(s) && s != wire.OpCompleted && s != JournalNoChange {
+				continue // a new attempt
+			}
+
+			done, ok, err := l.step(ctx, b, js, gid, epoch, id, op.Host, mode)
+			if err != nil {
+				return err
+			}
+
+			if !done {
+				return fmt.Errorf("%w: the acknowledgement of %s is not decided yet", errRetry, op.ID)
+			}
+
+			acked = ok
+		}
+
+		if !acked {
+			return fmt.Errorf("%w: the preparation's outcome of %s is not acknowledged yet", errRetry, op.ID)
+		}
+	}
+
+	deploy := deployOf(op.ID)
+
+	if err := l.changeState(ctx, b, gid, func(st *state.State) error {
+		for _, d := range st.Daemons {
+			if d.Type == state.TypeOSD && d.DeployID == deploy && d.OSDID == nil {
+				st.RemoveDaemon(d)
+			}
+		}
+
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	return b.Retire(ctx, "close create", op.ID)
 }

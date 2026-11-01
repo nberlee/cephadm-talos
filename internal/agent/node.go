@@ -9,8 +9,14 @@ import (
 	"errors"
 	"fmt"
 	"github.com/nberlee/cephadm-talos/internal/approval"
+	"github.com/siderolabs/talos/pkg/machinery/resources/containers"
 	"io"
+	"os"
+	"path/filepath"
+	"regexp"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -117,9 +123,13 @@ type Node struct {
 		BootID(ctx context.Context, node string) (string, error)
 		Instance(ctx context.Context, node, name string) (string, error)
 		InstanceOwners(ctx context.Context, node string) ([]string, error)
+		ContainerStatuses(ctx context.Context, node string) (map[string]containers.ContainerStatusSpec, error)
 		RestartInstance(ctx context.Context, node, id string) error
 	}
 	Records *records.Store
+	// JobsDir is where the node's jobs write their claims and results (the
+	// cephadm-talos volume's jobs directory)
+	JobsDir string
 	// Policy admits the documents Apply applies; nil admits nothing
 	Policy *Policy
 	// FSID is the cluster's, Host the agent's host
@@ -692,7 +702,7 @@ func (n *Node) Report(ctx context.Context) (wire.NodeReport, error) {
 	}
 
 	for _, d := range disks {
-		r.Disks = append(r.Disks, wire.Disk{Serial: d.TypedSpec().Serial, Symlinks: d.TypedSpec().Symlinks})
+		r.Disks = append(r.Disks, wire.Disk{Serial: d.TypedSpec().Serial, Symlinks: d.TypedSpec().Symlinks, DevPath: d.TypedSpec().DevPath})
 	}
 
 	return r, nil
@@ -1234,4 +1244,173 @@ func (n *Node) RestartOutcome(ctx context.Context, instance, boot string, at tim
 	}
 
 	return "", nil
+}
+
+// jobFile is a file of a job in the jobs directory (job.sh: <fsid>.<job>.<what>).
+func (n *Node) jobFile(job, what string) string {
+	return filepath.Join(n.JobsDir, n.FSID+"."+job+"."+what)
+}
+
+// writeJobFile writes a job's file atomically (a tombstone).
+func (n *Node) writeJobFile(job, what, contents string) error {
+	if n.JobsDir == "" {
+		return errors.New("no jobs directory")
+	}
+
+	tmp := n.jobFile(job, what) + ".tmp"
+
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+
+	if _, err := f.WriteString(contents + "\n"); err != nil {
+		f.Close() //nolint:errcheck
+
+		return err
+	}
+
+	if err := f.Sync(); err != nil {
+		f.Close() //nolint:errcheck
+
+		return err
+	}
+
+	if err := f.Close(); err != nil {
+		return err
+	}
+
+	if err := os.Rename(tmp, n.jobFile(job, what)); err != nil {
+		return err
+	}
+
+	d, err := os.Open(n.JobsDir)
+	if err != nil {
+		return err
+	}
+	defer d.Close() //nolint:errcheck
+
+	return d.Sync()
+}
+
+// maxJobOutput bounds the output a job's result keeps in its record.
+const maxJobOutput = 16 << 10
+
+// resultRCRe is the first line of a job's result (job.sh).
+var resultRCRe = regexp.MustCompile(`^rc (0|-?[1-9][0-9]{0,4})$`)
+
+// JobOutcome decides a job from its result file and its container: completed
+// (rc 0) or failed with its result; refused if it left no started record or
+// its result is for other inputs; uncertain if it started and left no result;
+// "" while it runs.
+func (n *Node) JobOutcome(ctx context.Context, job wire.JobRef) (string, *wire.JobResult, error) {
+	// nothing is decided while the job's container runs: its result is
+	// visible before the job synced and exited
+	st, err := n.Talos.ContainerStatuses(ctx, "")
+	if err != nil {
+		return "", nil, err
+	}
+
+	s, ok := st[job.Doc]
+	if !ok || (s.State != containers.ContainerStateCompleted && s.State != containers.ContainerStateFailed) {
+		return "", nil, nil
+	}
+
+	b, err := os.ReadFile(n.jobFile(job.ID, "result"))
+	if err == nil {
+		head, rest, ok1 := strings.Cut(string(b), "\n")
+		in, out, ok2 := strings.Cut(rest, "\n")
+
+		m := resultRCRe.FindStringSubmatch(head)
+		if !ok1 || !ok2 || m == nil {
+			return wire.OpUncertain, nil, nil // a damaged result is no evidence
+		}
+
+		rc, _ := strconv.Atoi(m[1])
+
+		if in != "inputs "+job.Inputs {
+			return wire.OpRefused, nil, nil
+		}
+
+		if len(out) > maxJobOutput {
+			out = out[len(out)-maxJobOutput:]
+		}
+
+		res := &wire.JobResult{RC: rc, Output: out}
+		if rc != 0 {
+			return wire.OpFailed, res, nil
+		}
+
+		return wire.OpCompleted, res, nil
+	}
+
+	if !errors.Is(err, os.ErrNotExist) {
+		return "", nil, err
+	}
+
+	if _, err := os.Stat(n.jobFile(job.ID, "started")); err == nil {
+		return wire.OpUncertain, nil, nil
+	}
+
+	return wire.OpRefused, nil, nil
+}
+
+// cleanJob removes an acknowledged job's result and started record once its
+// document and instance are gone; the claim and the tombstone stay.
+func (n *Node) cleanJob(ctx context.Context, job wire.JobRef) error {
+	owners, err := n.Talos.InstanceOwners(ctx, "")
+	if err != nil || slices.Contains(owners, job.Doc) {
+		return err
+	}
+
+	cfg, err := n.Talos.MachineConfig(ctx, "")
+	if err != nil {
+		return err
+	}
+
+	if cur, err := parseDocs(cfg); err != nil || cur["ContainerConfig/"+job.Doc] != "" {
+		return err
+	}
+
+	for _, what := range []string{"result", "started"} {
+		if err := os.Remove(n.jobFile(job.ID, what)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// AckBefore admits a grant that only acknowledges a job: its revision must be
+// newer than the node's and the fence, and is fenced, while the confirmation
+// still counts.
+func (n *Node) AckBefore(ctx context.Context, until time.Time, revision int64) error {
+	if err := n.lock(ctx); err != nil {
+		return err
+	}
+	defer n.unlock()
+
+	own, found, err := n.ownership()
+	if err != nil {
+		return err
+	}
+
+	if !found {
+		return errors.New("the node has not been handed over")
+	}
+
+	floor, err := n.fence()
+	if err != nil {
+		return err
+	}
+
+	if revision <= max(own.Revision, floor) {
+		return fmt.Errorf("revision %d is not newer than %d", revision, max(own.Revision, floor))
+	}
+
+	if !until.IsZero() && !time.Now().Before(until) {
+		return errors.New("the confirmation expired before the acknowledgement")
+	}
+
+	return n.writeJSON(fenceRecord, fence{Schema: ownershipSchema, Revision: revision})
 }

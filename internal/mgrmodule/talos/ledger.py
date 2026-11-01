@@ -26,10 +26,13 @@ ENTRY_VERSION = 1
 KEY_RE = re.compile(r'\A(\d{20})-(\d{10})-(takeover|op-[0-9a-f]{16}|m-[0-9a-f]{16})\Z')
 OP_RE = re.compile(r'\Aop-[0-9a-f]{16}\Z')
 # kinds an operation entry may have; ADDS and REMOVES change the fold
-KINDS = ('restart', 'redeploy', 'add_daemon', 'remove_daemon', 'remove_host')
+KINDS = ('restart', 'redeploy', 'add_daemon', 'remove_daemon', 'remove_host', 'create_osd')
 # the module's own entries (ids m-<hex>), which carry out a removal: close a
 # daemon's generation, retire the daemon, retire a host
-MODULE_KINDS = ('close', 'retire', 'retire_host')
+MODULE_KINDS = ('close', 'retire', 'retire_host', 'bind', 'confirm', 'close_create')
+DEVICE_RE = re.compile(r'\A/dev/[A-Za-z0-9][A-Za-z0-9._:/-]{0,200}\Z')
+SERIAL_RE = re.compile(r'\A[A-Za-z0-9._-]{1,64}\Z')
+UUID_RE_OSD = re.compile(r'\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z')
 DAEMON_RE = re.compile(r'\A(mon|mgr|osd|rgw|keepalived)\.([A-Za-z0-9][A-Za-z0-9._-]{0,127})\Z')
 HOST_RE = re.compile(r'\A[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z')
 UUID_RE = re.compile(r'\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z')
@@ -76,14 +79,25 @@ def check_entry(key: str, raw: str) -> Dict[str, Any]:
     if e['seq'] < 1 or not ok_host:
         raise LedgerError('entry %s' % key)
     if e['id'].startswith('m-'):
-        if kind not in MODULE_KINDS or not isinstance(e.get('of'), str) or not OP_RE.match(e['of']) \
-                or (kind != 'retire_host' and not ok_daemon):
+        if kind not in MODULE_KINDS or not isinstance(e.get('of'), str) or not OP_RE.match(e['of']):
             raise LedgerError('module entry %s' % key)
+        if kind in ('close', 'retire') and not ok_daemon:
+            raise LedgerError('module entry %s' % key)
+        if kind == 'bind' and not (isinstance(e.get('serial'), str) and SERIAL_RE.match(e['serial'])
+                                   and isinstance(e.get('link'), str) and e['link'].startswith('/dev/disk/by-id/')
+                                   and isinstance(e.get('job'), str) and re.match(r'\A[0-9a-f]{16}\Z', e['job'])):
+            raise LedgerError('bind entry %s' % key)
+        if kind == 'confirm' and not (ok_daemon and daemon.startswith('osd.') and isinstance(e.get('uuid'), str) and UUID_RE_OSD.match(e['uuid'])):
+            raise LedgerError('confirm entry %s' % key)
         return e
     if kind not in KINDS or (e.get('request') is not None and not (isinstance(e['request'], str) and UUID_RE.match(e['request']))):
         raise LedgerError('operation entry %s' % key)
     if kind == 'remove_host':
         if daemon is not None:
+            raise LedgerError('operation entry %s' % key)
+        return e
+    if kind == 'create_osd':
+        if daemon is not None or not isinstance(e.get('device'), str) or not DEVICE_RE.match(e['device']):
             raise LedgerError('operation entry %s' % key)
         return e
     if not ok_daemon:
@@ -150,10 +164,15 @@ class Fold:
         self.hosts: Dict[str, str] = {h['name']: h['addr'] for h in inventory['hosts']}
         self.daemons: Dict[str, str] = {}  # "<type>.<id>" -> host
         self.generations: Dict[str, Tuple[str, bool]] = {}  # "<type>.<id>" -> (generation, open)
+        self.uuids: Dict[str, str] = {}  # "osd.<id>" -> uuid
+        # creations of OSDs: op id -> {'host', 'bind': entry or None, 'confirmed', 'closed'}
+        self.creations: Dict[str, Dict[str, Any]] = {}
         for d in inventory['daemons']:
             if d.get('daemon_id'):
                 name = '%s.%s' % (d['daemon_type'], d['daemon_id'])
                 self.daemons[name], self.generations[name] = d['host'], ('cli', True)
+                if d.get('osd_uuid'):
+                    self.uuids[name] = d['osd_uuid']
         for _, e in entries:
             kind = e['kind']
             if kind == 'add_daemon' and e['host'] in self.hosts:
@@ -165,6 +184,22 @@ class Fold:
                 self.generations.pop(e['daemon'], None)
             elif kind == 'retire_host' and not any(h == e['host'] for h in self.daemons.values()):
                 self.hosts.pop(e['host'], None)
+            elif kind == 'create_osd' and e['host'] in self.hosts:
+                self.creations[e['id']] = {'host': e['host'], 'bind': None, 'confirmed': False, 'closed': False}
+            elif kind == 'bind' and e['of'] in self.creations and self.creations[e['of']]['bind'] is None:
+                self.creations[e['of']]['bind'] = e
+            elif kind == 'confirm' and e['of'] in self.creations and e['daemon'] not in self.daemons:
+                c = self.creations[e['of']]
+                c['confirmed'] = True
+                self.daemons[e['daemon']], self.generations[e['daemon']], self.uuids[e['daemon']] = c['host'], (e['of'], True), e['uuid']
+            elif kind == 'close_create' and e['of'] in self.creations:
+                self.creations[e['of']]['closed'] = True
+
+    def creating(self, op_id: str) -> Optional[Dict[str, Any]]:
+        """An OSD creation that may still use client.bootstrap-osd: bound, neither
+        confirmed nor closed."""
+        c = self.creations.get(op_id)
+        return c if c is not None and c['bind'] is not None and not c['confirmed'] and not c['closed'] else None
 
     def open_generation(self, name: str) -> Optional[str]:
         """The daemon's current generation while it is open, else None."""

@@ -118,6 +118,30 @@ type Grant struct {
 	// Approval is the newest approval of the operator the leader has; the
 	// agent verifies it and records it if it is higher than its own
 	Approval *approval.Signed `json:"approval,omitempty"`
+	// Ack acknowledges a job's recorded result; a grant that removes a job
+	// document whose result is not acknowledged needs it
+	Ack *JobAck `json:"ack,omitempty"`
+}
+
+// JobAck names a job's result the leader stored: the job, its inputs and its
+// rc (-1 for an outcome without a result: refused or uncertain).
+type JobAck struct {
+	Job    string `json:"job"`
+	Inputs string `json:"inputs"`
+	RC     int    `json:"rc"`
+}
+
+// JobRef is the job a grant runs, recorded before anything is applied.
+type JobRef struct {
+	ID     string `json:"id"`
+	Inputs string `json:"inputs"`
+	Doc    string `json:"doc"` // its ContainerConfig name
+}
+
+// JobResult is a job's result as its result file had it, bounded.
+type JobResult struct {
+	RC     int    `json:"rc"`
+	Output string `json:"output,omitempty"`
 }
 
 // GrantRestart names the daemon document a grant restarts.
@@ -145,7 +169,8 @@ func GrantInputs(g Grant) string {
 		Docs      []GrantDoc       `json:"docs"`
 		Restart   *GrantRestart    `json:"restart,omitempty"`
 		Approval  *approval.Signed `json:"approval,omitempty"`
-	}{g.FSID, g.Host, g.Revision, g.Operation, g.Docs, g.Restart, g.Approval})
+		Ack       *JobAck          `json:"ack,omitempty"`
+	}{g.FSID, g.Host, g.Revision, g.Operation, g.Docs, g.Restart, g.Approval, g.Ack})
 
 	sum := sha256.Sum256(b)
 
@@ -169,6 +194,8 @@ const (
 	// OpAbandoned: the leader gave the operation up before the agent received
 	// it; a later delivery of the same id is refused
 	OpAbandoned = "abandoned"
+	// OpFailed: the grant's job ran and its command failed (Result has the rc)
+	OpFailed = "failed"
 )
 
 // Operation is an agent's record of a grant, its answer to the grant and to a
@@ -186,6 +213,14 @@ type Operation struct {
 	Instance string `json:"instance,omitempty"`
 	BootID   string `json:"boot_id,omitempty"`
 	At       int64  `json:"at,omitempty"`
+	// a job's grant: the job, its result once read, and whether the leader
+	// acknowledged it (until then the record is kept)
+	Job    *JobRef    `json:"job,omitempty"`
+	Result *JobResult `json:"result,omitempty"`
+	Acked  bool       `json:"acked,omitempty"`
+	// AckBy is the operation whose grant acknowledges this job, recorded
+	// before that grant is applied; once it completed, the job is acknowledged
+	AckBy string `json:"ack_by,omitempty"`
 }
 
 // Abandon is the leader giving up a grant whose outcome it does not know and
@@ -292,4 +327,5 @@ type NodeReport struct {
 type Disk struct {
 	Serial   string   `json:"serial"`
 	Symlinks []string `json:"symlinks"`
+	DevPath  string   `json:"dev_path,omitempty"`
 }

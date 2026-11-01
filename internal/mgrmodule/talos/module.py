@@ -491,6 +491,8 @@ class Module(orchestrator.Orchestrator, MgrModule):
         for _, e in led.executable():
             if e['id'].startswith('m-'):
                 continue
+            if daemon is not None and e.get('daemon') is None and e['kind'] != 'remove_host':
+                continue
             if daemon is not None and e.get('daemon') != daemon and not (e['kind'] == 'remove_host' and e['host'] == host):
                 continue
             if daemon is None and e['host'] != host:
@@ -693,6 +695,65 @@ class Module(orchestrator.Orchestrator, MgrModule):
                 raise OrchestratorError('%s has operation %s in progress (orch talos operation %s)' % (n, busy, busy))
         return ['Scheduled to remove %s from host %s (operation %s)' % (n, fold.daemons[n], self._accept('remove_daemon', n, fold.daemons[n]))
                 for n in names]
+
+    @handle_orch_error
+    def create_osds(self, drive_group: Any, skip_validation: bool = False) -> str:
+        """One OSD on one disk of one host (`ceph orch daemon add osd HOST:DEVICE`)."""
+        if skip_validation:
+            raise OrchestratorError('--skip-validation is not supported by this backend')
+        p = drive_group.placement
+        pattern = getattr(p, 'host_pattern', None)
+        host = getattr(pattern, 'pattern', pattern)
+        if p is None or not isinstance(host, str) or p.hosts or p.label or p.count is not None or p.count_per_host is not None:
+            raise OrchestratorError('name exactly one host')
+        sel = drive_group.data_devices
+        paths = getattr(sel, 'paths', None) or []
+        if sel is None or len(paths) != 1 or any(getattr(sel, a, None) for a in ('model', 'vendor', 'size', 'rotational', 'limit', 'all', 'actuators')):
+            raise OrchestratorError('name exactly one data device by its path')
+        dev = getattr(paths[0], 'path', None)
+        if not isinstance(dev, str) or not re.match(r'\A/dev/[A-Za-z0-9][A-Za-z0-9._:/-]{0,200}\Z', dev) \
+                or getattr(paths[0], 'crush_device_class', None):
+            raise OrchestratorError('the data device must be a /dev/ path without other attributes')
+        # everything else of the drive group at its default: the spec must be the
+        # one `daemon add osd HOST:DEVICE` builds for exactly this host and disk
+        from ceph.deployment.drive_group import DeviceSelection, DriveGroupSpec
+        from ceph.deployment.service_spec import PlacementSpec
+        if drive_group.method not in (None, 'raw'):
+            raise OrchestratorError('the %s method is not supported by this backend' % drive_group.method)
+        want = DriveGroupSpec(placement=PlacementSpec(host_pattern=host), data_devices=DeviceSelection(paths=[dev]), method=drive_group.method)
+        if getattr(drive_group, 'preview_only', False) or drive_group.to_json() != want.to_json():
+            raise OrchestratorError('only one OSD on one disk, without other drive group options, is supported by this backend')
+        _, fold = self._authority()
+        if host not in fold.hosts:
+            raise OrchestratorError('%s is not a host of the cluster' % host)
+        op_id = self._accept_create(host, dev)
+        return 'Scheduled to create an OSD on %s:%s (operation %s)' % (host, dev, op_id)
+
+    def _accept_create(self, host: str, device: str) -> str:
+        """Accept an OSD creation: not beside an unfinished one on the same disk
+        name or a host removal."""
+        led, _ = self._authority()
+        lead = getattr(self, '_leadership', None)
+        if lead is None or not lead.still_active():
+            raise OrchestratorError('this mgr is not confirmed as the active one; try again')
+        try:
+            led.settle()
+        except ledger.LedgerError as e:
+            raise OrchestratorError('an earlier operation is not settled yet (%s); try again' % e)
+        for _, e in led.executable():
+            if e['id'].startswith('m-') or e['host'] != host or not (e['kind'] == 'remove_host' or e.get('device') == device):
+                continue
+            rec = self._journal(e['id'])
+            if rec is None or rec.get('state') not in TERMINAL:
+                raise OrchestratorError('%s has operation %s in progress (orch talos operation %s)' % (host, e['id'], e['id']))
+        op_id = 'op-' + os.urandom(8).hex()
+        try:
+            led.append({'id': op_id, 'kind': 'create_osd', 'host': host, 'device': device})
+        except ledger.OutcomeUnknown:
+            raise OrchestratorError('the mons did not answer: operation %s may have been accepted (orch talos operation %s)' % (op_id, op_id))
+        except ledger.LedgerError as e:
+            raise OrchestratorError('not accepted: %s' % e)
+        return op_id
 
     @handle_orch_error
     def remove_host(self, host: str, force: bool = False, offline: bool = False, rm_crush_entry: bool = False) -> str:

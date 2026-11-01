@@ -47,7 +47,7 @@ func testNodeFake(t *testing.T) (*Node, *talos.Client, *talostest.Node) {
 
 	pol := &Policy{FSID: testFSID, Host: "h1", Repos: []string{"quay.io/ceph/ceph"}, ApprovalKey: testApprovalPub}
 
-	n := &Node{Talos: tc, Records: &records.Store{Dir: t.TempDir()}, FSID: testFSID, Host: "h1", Policy: pol}
+	n := &Node{Talos: tc, Records: &records.Store{Dir: t.TempDir()}, JobsDir: t.TempDir(), FSID: testFSID, Host: "h1", Policy: pol}
 
 	// the operator approved the test image
 	must(t, n.RecordApproval(context.Background(), testApproval(t, 1)))

@@ -58,6 +58,8 @@ type fakeBridge struct {
 	retired []string
 	// approval is the operator's newest approval in config-key, "" for none
 	approval string
+	// osds answer osd dump
+	osds []OSD
 }
 
 func (m *fakeBridge) run(req wire.BridgeRequest) map[string]any {
@@ -116,6 +118,14 @@ func (m *fakeBridge) run(req wire.BridgeRequest) map[string]any {
 		}
 
 		b, _ := json.Marshal(out)
+
+		return map[string]any{"outcome": "done", "r": 0, "out": string(b)}
+	case "bind disk", "confirm osd", "close create":
+		m.retired = append(m.retired, req.Call+" "+str("operation"))
+
+		return map[string]any{"outcome": "done", "r": 0, "out": ""}
+	case "osd dump":
+		b, _ := json.Marshal(m.osds)
 
 		return map[string]any{"outcome": "done", "r": 0, "out": string(b)}
 	case "retire", "retire host":

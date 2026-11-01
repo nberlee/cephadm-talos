@@ -7,6 +7,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"github.com/nberlee/cephadm-talos/internal/wire"
 	"net/netip"
 	"regexp"
 	"slices"
@@ -781,4 +782,35 @@ func mgrPairs(cur, typed map[string]typedDoc, sent map[string]string) error {
 	}
 
 	return nil
+}
+
+// jobOf returns the job a granted document runs: an OSD preparation or a
+// zap, with its id and inputs as the document has them (admission checks
+// them against the agent's own computation).
+func (p *Policy) jobOf(d Doc) (wire.JobRef, bool) {
+	td, err := checkDoc(d)
+	if err != nil {
+		return wire.JobRef{}, false
+	}
+
+	c, ok := td.doc.(*spec.ContainerConfig)
+	if !ok {
+		return wire.JobRef{}, false
+	}
+
+	rest, ok := strings.CutPrefix(d.Name, p.prefix())
+	if !ok {
+		return wire.JobRef{}, false
+	}
+
+	env, err := envMap(c.ContainerEnvironment)
+	if err != nil {
+		return wire.JobRef{}, false
+	}
+
+	if k := p.containerKind(d.Name, rest, env); k != "osd-prepare" && k != "job" {
+		return wire.JobRef{}, false
+	}
+
+	return wire.JobRef{ID: env["JOB"], Inputs: env["JOB_INPUTS"], Doc: d.Name}, true
 }

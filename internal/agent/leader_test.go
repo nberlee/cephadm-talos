@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/nberlee/cephadm-talos/internal/approval"
+	"github.com/siderolabs/talos/pkg/machinery/resources/block"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -1244,5 +1246,125 @@ func TestAResumedRemovalChecksTheActiveMgr(t *testing.T) {
 
 	if rep, err := s.agent.Node.Report(ctx); err != nil || rep.Owned["ContainerConfig/ceph-"+testFSID[:8]+"-mgr-h1"] == "" {
 		t.Fatalf("its document was removed: %v", err)
+	}
+}
+
+func TestLeaderCreatesAnOSD(t *testing.T) {
+	s, create := creationSetup(t)
+	ctx := context.Background()
+	deploy := deployOf(create.Op.ID)
+
+	// bound, recorded, and the preparation job granted and running
+	st, _, err := s.leader.clusterState(ctx, s.leader.bridge())
+	must(t, err)
+
+	if d, ok := st.Find("osd.h1-sdb"); !ok || d.DeployID != deploy || d.DiskSerial != "QM00003" || d.OSDID != nil {
+		t.Fatalf("deployment %+v", d)
+	}
+
+	uuid := "8f2c0a4e-1d3b-4c5a-9e6f-7a8b9c0d1e2f"
+	finishJob(t, s.agent, create.Op.ID+".prep", 0, "osd_id 5\nosd_uuid "+uuid)
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	// the OSD and the job's acknowledgement granted; not confirmed before it is up
+	if op := s.op(t, create.Op.ID+".rev"); op.State != "completed" || op.Docs["ContainerConfig/ceph-"+testFSID[:8]+"-osd-h1-sdb"] == "" {
+		t.Fatalf("revision %+v", op)
+	}
+
+	if op, _, _ := s.agent.readOp(create.Op.ID + ".prep"); !op.Acked {
+		t.Fatalf("the job's result is not acknowledged: %+v", op)
+	}
+
+	s.module.mu.Lock()
+	s.module.osds = []OSD{{ID: 5, UUID: uuid, Up: true}}
+	s.module.mu.Unlock()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if op := s.op(t, create.Op.ID); op.State != "completed" {
+		t.Fatalf("creation %+v", op)
+	}
+
+	s.module.mu.Lock()
+	calls := slices.Clone(s.module.retired)
+	s.module.mu.Unlock()
+
+	if !slices.Contains(calls, "bind disk "+create.Op.ID) || !slices.Contains(calls, "confirm osd "+create.Op.ID) {
+		t.Fatalf("module calls %v", calls)
+	}
+
+	st, _, err = s.leader.clusterState(ctx, s.leader.bridge())
+	must(t, err)
+
+	if d, _ := st.Find("osd.h1-sdb"); d.OSDID == nil || *d.OSDID != 5 || d.OSDUUID != uuid {
+		t.Fatalf("osd %+v", d)
+	}
+}
+
+// creationSetup is a leader with h1's disk sdb approved for one preparation
+// and an accepted creation of an OSD on it, after its first tick.
+func creationSetup(t *testing.T) (*leaderSetup, LedgerEntry) {
+	t.Helper()
+
+	s := newLeaderSetup(t)
+	ctx := context.Background()
+
+	disk := block.NewDisk(block.NamespaceName, "sdb")
+	disk.TypedSpec().Serial, disk.TypedSpec().DevPath = "QM00003", "/dev/sdb"
+	disk.TypedSpec().Symlinks = []string{"/dev/disk/by-id/ata-QEMU_HARDDISK_QM00003"}
+	must(t, s.agent.fake.St.Create(ctx, disk))
+
+	appr, err := approval.Sign(testApprovalPriv, approval.Approval{Version: approval.Version, FSID: testFSID, Serial: 2, Images: []string{testImage},
+		Disks: []approval.Disk{{Host: "h1", Serial: "QM00003", Action: approval.Prepare, Since: 2}}})
+	must(t, err)
+
+	b, _ := json.Marshal(appr)
+	s.module.mu.Lock()
+	s.module.approval = string(b)
+	s.module.mu.Unlock()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	create := s.accept(KindCreateOSD, "", "h1", 1)
+	create.Op.Device = "/dev/sdb"
+	s.module.mu.Lock()
+	s.module.ledger[len(s.module.ledger)-1] = create
+	s.module.mu.Unlock()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	return s, create
+}
+
+func TestAFailedPreparationClosesTheCreation(t *testing.T) {
+	s, create := creationSetup(t)
+	ctx := context.Background()
+
+	finishJob(t, s.agent, create.Op.ID+".prep", 1, "ceph-volume failed")
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if op := s.op(t, create.Op.ID); op.State != JournalFailed || !strings.Contains(op.Error, "failed") {
+		t.Fatalf("creation %+v", op)
+	}
+
+	s.module.mu.Lock()
+	calls := slices.Clone(s.module.retired)
+	s.module.mu.Unlock()
+
+	if !slices.Contains(calls, "close create "+create.Op.ID) {
+		t.Fatalf("not closed: %v", calls)
+	}
+
+	// the job's outcome acknowledged, and the deployment gone: the disk can be tried again
+	if op, _, _ := s.agent.readOp(create.Op.ID + ".prep"); !op.Acked {
+		t.Fatalf("the failed job is not acknowledged: %+v", op)
+	}
+
+	st, _, err := s.leader.clusterState(ctx, s.leader.bridge())
+	must(t, err)
+
+	if _, ok := st.Find("osd.h1-sdb"); ok {
+		t.Fatal("the deployment of a failed preparation stayed")
 	}
 }

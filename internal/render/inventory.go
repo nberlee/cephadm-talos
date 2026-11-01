@@ -31,6 +31,8 @@ type InventoryDaemon struct {
 	ServiceName  string `json:"service_name"`
 	DesiredImage string `json:"desired_image"`
 	LocalOnly    bool   `json:"local_only,omitempty"`
+	// OSDUUID is a prepared OSD's uuid, which the module checks removals against
+	OSDUUID string `json:"osd_uuid,omitempty"`
 }
 
 // Inventory is the mgr module's view of the cluster (module.py check_inventory).
@@ -78,7 +80,7 @@ func InventoryOf(s *state.State) Inventory {
 
 		inv.Daemons = append(inv.Daemons, InventoryDaemon{
 			DocName: s.DocName(d), Host: d.Host, DaemonType: typ, DaemonID: id, ServiceName: svc,
-			DesiredImage: img, LocalOnly: d.LocalOnly,
+			DesiredImage: img, LocalOnly: d.LocalOnly, OSDUUID: d.OSDUUID,
 		})
 	}
 

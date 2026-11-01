@@ -243,7 +243,10 @@ CREATE_RE = re.compile(r'\A(mgr|client\.rgw)\.%s\Z' % DAEMON_ID_RE)
 
 
 def _auth_get(args: Dict[str, Any]) -> Dict[str, Any]:
-    _args(args, {'entity'})
+    # client.bootstrap-osd names the OSD creation it serves
+    _args(args, {'entity', 'operation'} if args.get('entity') == 'client.bootstrap-osd' else {'entity'})
+    if 'operation' in args and not (isinstance(args['operation'], str) and re.match(r'\Aop-[0-9a-f]{16}\Z', args['operation'])):
+        raise ValueError('not an operation id')
     e = args['entity']
     if not isinstance(e, str) or not AUTH_GET_RE.match(e):
         raise ValueError('entity not allowed')
@@ -298,24 +301,48 @@ def _approval(args: Dict[str, Any]) -> Dict[str, Any]:
     return {}  # answered by the module (Channel.approval)
 
 
-def _operation(args: Dict[str, Any]) -> Dict[str, Any]:
-    _args(args, {'operation'})
-    if not isinstance(args['operation'], str) or not re.match(r'\Aop-[0-9a-f]{16}\Z', args['operation']):
-        raise ValueError('not an operation id')
-    return {}  # answered by the module (Channel.local)
+def _operation_with(*more: str) -> Callable[[Dict[str, Any]], Dict[str, Any]]:
+    def build(args: Dict[str, Any]) -> Dict[str, Any]:
+        _args(args, {'operation', *more})
+        if not isinstance(args['operation'], str) or not re.match(r'\Aop-[0-9a-f]{16}\Z', args['operation']):
+            raise ValueError('not an operation id')
+        if 'serial' in more and not (isinstance(args['serial'], str) and re.match(r'\A[A-Za-z0-9._-]{1,64}\Z', args['serial'])
+                                     and isinstance(args['link'], str) and re.match(r'\A/dev/disk/by-id/[A-Za-z0-9._:-]{1,200}\Z', args['link'])
+                                     and isinstance(args['job'], str) and re.match(r'\A[0-9a-f]{16}\Z', args['job'])):
+            raise ValueError('not a disk binding')
+        if 'osd' in more and not (type(args['osd']) is int and 0 <= args['osd'] < 1 << 30):
+            raise ValueError('not an OSD id')
+        return {}  # answered by the module (Channel.local)
+    return build
+
+
+_operation = _operation_with()
+
+
+def _osd_dump(args: Dict[str, Any]) -> Dict[str, Any]:
+    if args:
+        raise ValueError('osd dump takes no arguments')
+    return {'prefix': 'osd dump', 'format': 'json'}
+
+
+def _osds(out: str) -> str:
+    """osd dump reduced to each OSD's id, uuid and whether it is up."""
+    d = json.loads(out)
+    return json.dumps([{'osd': o['osd'], 'uuid': o.get('uuid', ''), 'up': bool(o.get('up'))} for o in d.get('osds', [])])
 
 
 # calls whose output is reduced in the mgr before it is kept and returned
 REDUCE: Dict[str, Callable[[Dict[str, Any]], Callable[[str], str]]] = {
     'config-key keys': lambda args: _keys_page(args['prefix'], args['after']),
+    'osd dump': lambda args: _osds,
 }
 
 # calls that change nothing: an answered one is not kept
-READ_ONLY = {'status', 'health', 'mgr dump', 'config-key keys', 'config-key get', 'entry limit', 'auth get', 'secret get', 'ledger', 'approval'}
+READ_ONLY = {'status', 'health', 'mgr dump', 'config-key keys', 'config-key get', 'entry limit', 'auth get', 'secret get', 'ledger', 'approval', 'osd dump'}
 # calls that release a credential: checked against the fold, while active
 CREDENTIALS = {'auth get', 'auth get-or-create', 'secret get'}
 # calls the module answers itself, for operations of its ledger (ledger.py)
-LOCAL = {'mgr cert', 'retire', 'retire host'}
+LOCAL = {'mgr cert', 'retire', 'retire host', 'bind disk', 'confirm osd', 'close create'}
 
 ALLOWLIST: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     'status': _no_args('status'),
@@ -332,6 +359,10 @@ ALLOWLIST: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     'ledger': _ledger,
     'approval': _approval,
     'mgr cert': _operation,
+    'bind disk': _operation_with('serial', 'link', 'job'),
+    'confirm osd': _operation_with('osd'),
+    'close create': _operation,
+    'osd dump': _osd_dump,
     'retire': _operation,
     'retire host': _operation,
 }
@@ -539,6 +570,22 @@ class Server(ThreadingHTTPServer):
                 pass
 
 
+UUID_RE = re.compile(r'\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z')
+
+
+def device_matches(device_ids: str, serial: str) -> bool:
+    """Whether an OSD's device_ids (comma-separated <dev>=<identifier>) name a
+    disk with this serial: the identifier is the serial, or has it as its
+    '_'-separated parts (Ceph's vendor_model_serial, or udev's ID_SERIAL)."""
+    s = serial.replace(' ', '_')
+    for item in device_ids.split(','):
+        _, _, ident = item.partition('=')
+        ident = ident.replace(' ', '_')
+        if ident == s or ident.endswith('_' + s) or ident.startswith(s + '_') or ('_' + s + '_') in ident:
+            return True
+    return False
+
+
 def _daemon_of(entity: str) -> str:
     """The daemon name ("<type>.<id>") of a CephX entity."""
     return 'rgw.' + entity[len('client.rgw.'):] if entity.startswith('client.rgw.') else entity
@@ -618,6 +665,8 @@ class Channel:
                     any(fold.open_generation(n) == m.group(2) for n in fold.daemons if n.startswith('mgr.'))
             elif call == 'auth get-or-create':
                 allowed = True  # checked with its operation under the lock retirement takes (create)
+            elif args['entity'] == 'client.bootstrap-osd':
+                allowed = fold.creating(args['operation']) is not None and args['operation'] in {e['id'] for _, e in led.executable()}
             else:
                 allowed = fold.entity_allowed(args['entity'])
             if not allowed:
@@ -633,7 +682,7 @@ class Channel:
         if call not in READ_ONLY and call not in CREDENTIALS and not self.leadership.still_active(self.commands):
             return 409, {'error': 'not confirmed as the active mgr'}
         if call in LOCAL:
-            return self.local(call, args['operation'])
+            return self.local(call, args['operation'], args)
         if call == 'auth get-or-create':
             return self.create(args, cmd, float(deadline))
         rec = Record()
@@ -722,7 +771,7 @@ class Channel:
             return 200, {'outcome': 'done', 'r': job.r, 'error': 'output larger than %d bytes' % MAX_OUTPUT}
         return 200, {'outcome': 'done', 'r': job.r, 'out': job.outb, 'outs': job.outs}
 
-    def local(self, call: str, op_id: str) -> Tuple[int, Dict[str, Any]]:
+    def local(self, call: str, op_id: str, args: Optional[Dict[str, Any]] = None) -> Tuple[int, Dict[str, Any]]:
         with self.local_lock:  # one at a time: they read the fold, then append
             try:
                 led, _ = self.authority()
@@ -737,6 +786,8 @@ class Channel:
                     return self._mgr_cert(fold, op)
                 if call == 'retire':
                     return self._retire(led, fold, ops, op)
+                if call in ('bind disk', 'confirm osd', 'close create'):
+                    return self._creation(call, led, fold, op, args or {})
                 return self._retire_host(led, fold, ops, op)
             except Exception as e:  # a ledger entry without an answer, among others: asked again
                 return 503, {'error': '%s: %s' % (call, e.__class__.__name__)}
@@ -794,6 +845,53 @@ class Channel:
                 if rm is None or rm.r not in (0, -2):
                     return 503, {'error': 'cannot remove a key of %s; ask again' % name}
         led.append({'id': 'm-' + secrets.token_hex(8), 'kind': 'retire', 'of': op['id'], 'daemon': name, 'host': op['host']})
+        return 200, done
+
+    def _creation(self, call: str, led: Any, fold: Any, op: Optional[Dict[str, Any]], args: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        """The module's steps of an OSD creation: bind it to its disk once,
+        confirm it from the OSD map and the OSD's metadata, or close it."""
+        done = {'outcome': 'done', 'r': 0, 'out': '', 'outs': ''}
+        if op is None or op['kind'] != 'create_osd' or op['id'] not in fold.creations:
+            return 400, {'error': 'no creation of an OSD'}
+        c = fold.creations[op['id']]
+        mid = 'm-' + secrets.token_hex(8)
+        if call == 'bind disk':
+            b = c['bind']
+            if b is not None:
+                same = (b['serial'], b['link'], b['job']) == (args['serial'], args['link'], args['job'])
+                return (200, done) if same else (400, {'error': 'the creation is bound to another disk or job'})
+            if c['closed']:
+                return 400, {'error': 'the creation is closed'}
+            led.append({'id': mid, 'kind': 'bind', 'of': op['id'], 'host': op['host'], 'serial': args['serial'], 'link': args['link'], 'job': args['job']})
+            return 200, done
+        if call == 'close create':
+            if c['confirmed']:
+                return 400, {'error': 'the creation is confirmed'}
+            if not c['closed']:
+                led.append({'id': mid, 'kind': 'close_create', 'of': op['id'], 'host': op['host']})
+            return 200, done
+        # confirm osd
+        if c['confirmed']:
+            return 200, done
+        if fold.creating(op['id']) is None:
+            return 400, {'error': 'the creation is not bound, or closed'}
+        osd = args['osd']
+        name = 'osd.%d' % osd
+        if name in fold.daemons:
+            return 400, {'error': '%s is an OSD of the cluster already' % name}
+        dump = self._mon({'prefix': 'osd dump', 'format': 'json'}, None, _osds)
+        if dump is None or dump.r != 0 or dump.too_large:
+            return 503, {'error': 'cannot read the OSD map; ask again'}
+        entry = [o for o in json.loads(dump.outb) if o['osd'] == osd]
+        if not entry or not entry[0]['up'] or not UUID_RE.match(entry[0]['uuid']):
+            return 409, {'error': '%s is not up in the OSD map yet' % name}
+        meta = self._mon({'prefix': 'osd metadata', 'id': osd, 'format': 'json'})
+        if meta is None or meta.r != 0 or meta.too_large:
+            return 409, {'error': 'no metadata of %s yet' % name}
+        md = json.loads(meta.outb)
+        if md.get('hostname') != op['host'] or not device_matches(md.get('device_ids', ''), c['bind']['serial']):
+            return 409, {'error': 'the metadata of %s does not name the bound host and disk' % name}
+        led.append({'id': mid, 'kind': 'confirm', 'of': op['id'], 'host': op['host'], 'daemon': name, 'uuid': entry[0]['uuid']})
         return 200, done
 
     def _retire_host(self, led: Any, fold: Any, ops: Dict[str, Dict[str, Any]], op: Optional[Dict[str, Any]]) -> Tuple[int, Dict[str, Any]]:

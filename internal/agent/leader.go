@@ -77,6 +77,9 @@ type JournalOp struct {
 	// Docs are the granted documents' hashes, "" for a removal
 	Docs  map[string]string `json:"docs,omitempty"`
 	Error string            `json:"error,omitempty"`
+	// a job's grant: the job and its result as the agent read it
+	Job    *wire.JobRef    `json:"job,omitempty"`
+	Result *wire.JobResult `json:"result,omitempty"`
 }
 
 // Takeover is a new leader's progress in taking over from earlier
@@ -945,6 +948,10 @@ func (l *LeaderLoop) renderHost(ctx context.Context, b *Bridge, st *state.State,
 type revisionMode struct {
 	extra []string // keys
 	strip bool
+	// add are documents granted besides the rendering (a job); ack
+	// acknowledges a job's result in the same grant
+	add []Doc
+	ack *wire.JobAck
 }
 
 // revision makes a host's documents match the cluster state.
@@ -1019,6 +1026,16 @@ func (l *LeaderLoop) revision(ctx context.Context, b *Bridge, js store.Backend, 
 		}
 
 		r.remove = append(r.remove, mode.extra...)
+
+		for _, d := range mode.add {
+			td, err := checkDoc(d)
+			if err != nil {
+				return fail(err)
+			}
+
+			r.docs = append(r.docs, Doc{Kind: d.Kind, Name: d.Name, YAML: td.yaml})
+			r.hashes[d.Key()] = td.hash
+		}
 	}
 
 	// what the host does not have yet
@@ -1044,7 +1061,9 @@ func (l *LeaderLoop) revision(ctx context.Context, b *Bridge, js store.Backend, 
 		}
 	}
 
-	if len(grant) == 0 {
+	// nothing to change, unless an acknowledgement goes along (of a job whose
+	// document is gone already, or was never applied)
+	if len(grant) == 0 && mode.ack == nil {
 		op.State, op.Docs = JournalNoChange, nil
 
 		return writeJSONKey(ctx, js, opKey, op)
@@ -1064,7 +1083,7 @@ func (l *LeaderLoop) revision(ctx context.Context, b *Bridge, js store.Backend, 
 
 	disks := make([]Disk, 0, len(rep.Disks))
 	for _, d := range rep.Disks {
-		disks = append(disks, Disk(d))
+		disks = append(disks, Disk{Serial: d.Serial, Symlinks: d.Symlinks})
 	}
 
 	pol := &Policy{FSID: l.Self.FSID, Host: h.Name, Repos: l.Repos, CACert: l.CACert}
@@ -1090,7 +1109,7 @@ func (l *LeaderLoop) revision(ctx context.Context, b *Bridge, js store.Backend, 
 
 	g := wire.Grant{
 		Version: wire.Version, FSID: l.Self.FSID, Host: h.Name, Mgr: l.Self.Name, MgrAddr: me.Addr, GID: gid, Epoch: epoch,
-		Revision: op.Revision, Operation: id, Docs: grant, Approval: l.approval,
+		Revision: op.Revision, Operation: id, Docs: grant, Approval: l.approval, Ack: mode.ack,
 	}
 
 	var res wire.Operation
@@ -1108,7 +1127,7 @@ func (l *LeaderLoop) record(ctx context.Context, js store.Backend, opKey string,
 		return nil // not finished: asked again on the next tick
 	}
 
-	op.State, op.Error = res.State, res.Error
+	op.State, op.Error, op.Job, op.Result = res.State, res.Error, res.Job, res.Result
 	l.log("%s on %s: %s %s", strings.TrimPrefix(opKey, store.Prefix), op.Host, op.State, op.Error)
 
 	return writeJSONKey(ctx, js, opKey, op)

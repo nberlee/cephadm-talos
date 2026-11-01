@@ -3,8 +3,11 @@ package agent
 import (
 	"context"
 	"crypto/x509"
+	"fmt"
 	"github.com/nberlee/cephadm-talos/internal/pki"
 	"github.com/nberlee/cephadm-talos/internal/spec"
+	"github.com/siderolabs/talos/pkg/machinery/resources/containers"
+	"os"
 	"strings"
 	"testing"
 
@@ -109,9 +112,11 @@ func TestUnapprovedImagesAndDisksAreRefused(t *testing.T) {
 	first = grantOf(t, 5, "op-p2", prep("0123456789abcdef"))
 	first.Approval = &withEntry
 
-	if op, err := g.Grant(ctx, first); err != nil || op.State != wire.OpCompleted {
+	if op, err := g.Grant(ctx, first); err != nil || op.State != wire.OpStarted || op.Job == nil {
 		t.Fatalf("approved prepare: %+v %v", op, err)
 	}
+
+	finishJob(t, g, "op-p2", 0, "osd_id 3")
 
 	// the entry belongs to that job now: another deployment on the disk is refused
 	second := grantOf(t, 6, "op-p3", prep("fedcba9876543210"))
@@ -140,7 +145,7 @@ func TestUnapprovedImagesAndDisksAreRefused(t *testing.T) {
 		t.Fatalf("an unlabelled zap without an entry: %+v %v", op, err)
 	}
 
-	if op, err := g.Grant(ctx, grantOf(t, 9, "op-z2", zap("aaaaa2", false))); err != nil || op.State != wire.OpCompleted {
+	if op, err := g.Grant(ctx, grantOf(t, 9, "op-z2", zap("aaaaa2", false))); err != nil || op.State != wire.OpStarted {
 		t.Fatalf("a zap with its label check: %+v %v", op, err)
 	}
 }
@@ -230,17 +235,20 @@ func TestDiskEntriesAreUsedOnceAndKept(t *testing.T) {
 
 	one := probeGrant(3, "op-b2", "aaaaaa")
 	one.Docs = []wire.GrantDoc{{Kind: "ContainerConfig", Name: n1, YAML: &y1}}
+	one.Approval = both.Approval
 
-	if op, err := g.Grant(ctx, one); err != nil || op.State != wire.OpCompleted {
+	if op, err := g.Grant(ctx, one); err != nil || op.State != wire.OpStarted {
 		t.Fatalf("the entry was reserved by the refused grant: %+v %v", op, err)
 	}
+
+	finishJob(t, g, "op-b2", 0, "")
 
 	// approving the disk again is a new entry: another job may use it
 	two := probeGrant(4, "op-b3", "aaaaaa")
 	two.Docs = []wire.GrantDoc{{Kind: "ContainerConfig", Name: n2, YAML: &y2}}
 	two.Approval = sign(3, 2, 3)
 
-	if op, err := g.Grant(ctx, two); err != nil || op.State != wire.OpCompleted {
+	if op, err := g.Grant(ctx, two); err != nil || op.State != wire.OpStarted {
 		t.Fatalf("a job on a new entry: %+v %v", op, err)
 	}
 
@@ -274,5 +282,298 @@ func TestAnApprovalBeforeTheHandoffIsKept(t *testing.T) {
 
 	if _, err := n.Approval(ctx); err == nil {
 		t.Fatal("a missing approval record went unnoticed")
+	}
+}
+
+// finishJob ends the job of an operation as job.sh does: its result file, then
+// a reconcile reads it.
+func finishJob(t *testing.T, g *testGranter, opID string, rc int, out string) wire.Operation {
+	t.Helper()
+
+	op, found, err := g.readOp(opID)
+	if err != nil || !found || op.Job == nil {
+		t.Fatalf("no job operation %s: %v", opID, err)
+	}
+
+	must(t, os.WriteFile(g.Node.jobFile(op.Job.ID, "result"), []byte(fmt.Sprintf("rc %d\ninputs %s\n%s", rc, op.Job.Inputs, out)), 0o644))
+
+	// and its container ended
+	cs := containers.NewContainerStatus(containers.NamespaceName, op.Job.Doc)
+	cs.TypedSpec().State = containers.ContainerStateCompleted
+	if rc != 0 {
+		cs.TypedSpec().State = containers.ContainerStateFailed
+	}
+
+	must(t, g.fake.St.Create(context.Background(), cs))
+	must(t, g.Reconcile(context.Background()))
+
+	op, _, err = g.readOp(opID)
+	must(t, err)
+
+	return op
+}
+
+func TestAJobFromGrantToTombstone(t *testing.T) {
+	g := newTestGranter(t)
+	ctx := context.Background()
+
+	disk := block.NewDisk(block.NamespaceName, "sdb")
+	disk.TypedSpec().Serial, disk.TypedSpec().DevPath = "QM00003", "/dev/sdb"
+	disk.TypedSpec().Symlinks = []string{"/dev/disk/by-id/ata-QEMU_HARDDISK_QM00003"}
+	must(t, g.fake.St.Create(ctx, disk))
+
+	st := state.New(testFSID)
+	st.Image = testImage
+	dev := "/dev/disk/by-id/ata-QEMU_HARDDISK_QM00003"
+
+	zap := func(id string) (string, string) {
+		c := daemons.Zap(daemons.Params{Name: st.DocName(state.Daemon{Type: "job", ID: id}), Image: testImage, FSID: testFSID, ID: "job", Device: dev, DiskSerial: "QM00003"},
+			id, daemons.ZapInputs("h1", dev, "QM00003", false, ""))
+
+		return c.MetaName, string(mustRender(c))
+	}
+
+	name, y := zap("aaaaa1")
+	gr := probeGrant(2, "op-j1", "aaaaaa")
+	gr.Docs = []wire.GrantDoc{{Kind: "ContainerConfig", Name: name, YAML: &y}}
+
+	if op, err := g.Grant(ctx, gr); err != nil || op.State != wire.OpStarted || op.Job.ID != "aaaaa1" {
+		t.Fatalf("job: %+v %v", op, err)
+	}
+
+	// still running: nothing decided
+	must(t, g.Reconcile(ctx))
+
+	if op, _, _ := g.readOp("op-j1"); op.State != wire.OpStarted {
+		t.Fatalf("decided while running: %+v", op)
+	}
+
+	op := finishJob(t, g, "op-j1", 0, "zapped")
+	if op.State != wire.OpCompleted || op.Result == nil || op.Result.RC != 0 || op.Result.Output != "zapped" {
+		t.Fatalf("result: %+v", op)
+	}
+
+	// its document goes only with an acknowledgement of exactly that outcome
+	remove := func(rev int64, id string, ack *wire.JobAck) (wire.Operation, error) {
+		gr := probeGrant(rev, id, "aaaaaa")
+		gr.Docs, gr.Ack = []wire.GrantDoc{{Kind: "ContainerConfig", Name: name}}, ack
+
+		return g.Grant(ctx, gr)
+	}
+
+	for i, ack := range []*wire.JobAck{nil, {Job: "aaaaa1", Inputs: op.Job.Inputs, RC: 1}, {Job: "aaaaa1", Inputs: "00", RC: 0}} {
+		if res, err := remove(int64(3+i), fmt.Sprintf("op-r%d", i), ack); err != nil || res.State != wire.OpRefused {
+			t.Errorf("removal %d: %+v %v", i, res, err)
+		}
+	}
+
+	if res, err := remove(6, "op-r9", &wire.JobAck{Job: "aaaaa1", Inputs: op.Job.Inputs, RC: 0}); err != nil || res.State != wire.OpCompleted {
+		t.Fatalf("acknowledged removal: %+v %v", res, err)
+	}
+
+	if op, _, _ := g.readOp("op-j1"); !op.Acked {
+		t.Fatalf("not acknowledged: %+v", op)
+	}
+
+	if _, err := os.Stat(g.Node.jobFile("aaaaa1", "tombstone")); err != nil {
+		t.Fatalf("no tombstone for the job script: %v", err)
+	}
+
+	// the result goes once the document and instance are gone; the tombstone stays
+	must(t, g.Reconcile(ctx))
+
+	if _, err := os.Stat(g.Node.jobFile("aaaaa1", "result")); !os.IsNotExist(err) {
+		t.Fatalf("result kept: %v", err)
+	}
+
+	// the job never runs again, under any operation id
+	gr = probeGrant(7, "op-j2", "aaaaaa")
+	gr.Docs = []wire.GrantDoc{{Kind: "ContainerConfig", Name: name, YAML: &y}}
+
+	if res, err := g.Grant(ctx, gr); err != nil || res.State != wire.OpRefused || !strings.Contains(res.Error, "acknowledged") {
+		t.Fatalf("a tombstoned job: %+v %v", res, err)
+	}
+
+	// a job that started and left no result is uncertain: it holds back other
+	// jobs on the node, not documents
+	name2, y2 := zap("aaaaa2")
+	gr = probeGrant(8, "op-j3", "aaaaaa")
+	gr.Docs = []wire.GrantDoc{{Kind: "ContainerConfig", Name: name2, YAML: &y2}}
+
+	if res, err := g.Grant(ctx, gr); err != nil || res.State != wire.OpStarted {
+		t.Fatalf("second job: %+v %v", res, err)
+	}
+
+	must(t, os.WriteFile(g.Node.jobFile("aaaaa2", "started"), []byte("started\n"), 0o644))
+
+	cs := containers.NewContainerStatus(containers.NamespaceName, name2)
+	cs.TypedSpec().State = containers.ContainerStateFailed
+	must(t, g.fake.St.Create(ctx, cs))
+	must(t, g.Reconcile(ctx))
+
+	if res, _, _ := g.readOp("op-j3"); res.State != wire.OpUncertain {
+		t.Fatalf("job without a result: %+v", res)
+	}
+
+	name3, y3 := zap("aaaaa3")
+	gr = probeGrant(9, "op-j4", "aaaaaa")
+	gr.Docs = []wire.GrantDoc{{Kind: "ContainerConfig", Name: name3, YAML: &y3}}
+
+	if _, err := g.Grant(ctx, gr); err == nil || !strings.Contains(err.Error(), "op-j3") {
+		t.Fatalf("a job beside an uncertain one: %v", err)
+	}
+
+	if res, err := g.Grant(ctx, probeGrant(10, "op-d1", "bbbbbb")); err != nil || res.State != wire.OpCompleted {
+		t.Fatalf("a document beside an uncertain job: %+v %v", res, err)
+	}
+}
+
+func TestJobOutcomeEdges(t *testing.T) {
+	g := newTestGranter(t)
+	ctx := context.Background()
+
+	disk := block.NewDisk(block.NamespaceName, "sdb")
+	disk.TypedSpec().Serial, disk.TypedSpec().DevPath = "QM00003", "/dev/sdb"
+	disk.TypedSpec().Symlinks = []string{"/dev/disk/by-id/ata-QEMU_HARDDISK_QM00003"}
+	must(t, g.fake.St.Create(ctx, disk))
+
+	st := state.New(testFSID)
+	dev := "/dev/disk/by-id/ata-QEMU_HARDDISK_QM00003"
+	zap := func(id string) (string, string) {
+		c := daemons.Zap(daemons.Params{Name: st.DocName(state.Daemon{Type: "job", ID: id}), Image: testImage, FSID: testFSID, ID: "job", Device: dev, DiskSerial: "QM00003"},
+			id, daemons.ZapInputs("h1", dev, "QM00003", false, ""))
+
+		return c.MetaName, string(mustRender(c))
+	}
+
+	name, y := zap("bbbbb1")
+	gr := probeGrant(2, "op-e1", "aaaaaa")
+	gr.Docs = []wire.GrantDoc{{Kind: "ContainerConfig", Name: name, YAML: &y}}
+
+	op, err := g.Grant(ctx, gr)
+	must(t, err)
+
+	// a result while the container still runs decides nothing
+	must(t, os.WriteFile(g.Node.jobFile("bbbbb1", "result"), []byte("rc 0\ninputs "+op.Job.Inputs+"\nok"), 0o644))
+	must(t, g.Reconcile(ctx))
+
+	if op, _, _ := g.readOp("op-e1"); op.State != wire.OpStarted {
+		t.Fatalf("decided while running: %+v", op)
+	}
+
+	// a damaged result is no evidence: uncertain
+	must(t, os.WriteFile(g.Node.jobFile("bbbbb1", "result"), []byte("rc 0 trailing\ninputs "+op.Job.Inputs+"\nok"), 0o644))
+
+	cs := containers.NewContainerStatus(containers.NamespaceName, name)
+	cs.TypedSpec().State = containers.ContainerStateCompleted
+	must(t, g.fake.St.Create(ctx, cs))
+	must(t, g.Reconcile(ctx))
+
+	if op, _, _ := g.readOp("op-e1"); op.State != wire.OpUncertain {
+		t.Fatalf("a damaged result: %+v", op)
+	}
+
+	// replacing the job's document by another document needs the acknowledgement too
+	probe := daemons.Probe(name, testImage)
+	y2 := string(mustRender(probe))
+	gr = probeGrant(3, "op-e2", "aaaaaa")
+	gr.Docs = []wire.GrantDoc{{Kind: "ContainerConfig", Name: name, YAML: &y2}}
+
+	if res, err := g.Grant(ctx, gr); err != nil || res.State != wire.OpRefused || !strings.Contains(res.Error, "acknowledgement") {
+		t.Fatalf("a replacement without an acknowledgement: %+v %v", res, err)
+	}
+
+	// an acknowledgement whose grant completed while the agent was down is finished
+	rec, _, _ := g.readOp("op-e1")
+	rec.AckBy = "op-e3"
+	must(t, g.writeOp(rec))
+	must(t, g.writeOp(wire.Operation{Version: wire.Version, Operation: "op-e3", Revision: 4, InputsHash: "00", GID: 42, State: wire.OpCompleted}))
+	must(t, g.Reconcile(ctx))
+
+	if rec, _, _ := g.readOp("op-e1"); !rec.Acked {
+		t.Fatalf("the acknowledgement was not finished: %+v", rec)
+	}
+
+	if _, err := os.Stat(g.Node.jobFile("bbbbb1", "tombstone")); err != nil {
+		t.Fatal("no tombstone")
+	}
+}
+
+func TestARefusedJobIsAcknowledgedWithoutDocuments(t *testing.T) {
+	g := newTestGranter(t)
+	ctx := context.Background()
+
+	disk := block.NewDisk(block.NamespaceName, "sdb")
+	disk.TypedSpec().Serial, disk.TypedSpec().DevPath = "QM00003", "/dev/sdb"
+	disk.TypedSpec().Symlinks = []string{"/dev/disk/by-id/ata-QEMU_HARDDISK_QM00003"}
+	must(t, g.fake.St.Create(ctx, disk))
+
+	st := state.New(testFSID)
+	st.Image = testImage
+	st.AddHost(state.Host{Name: "h1", Addr: "10.5.0.3"})
+	h, _ := st.Host("h1")
+	d := state.Daemon{Type: state.TypeOSD, ID: "h1-sdb", Host: "h1", DeployID: "0123456789abcdef", DiskSerial: "QM00003", DevicePath: "/dev/disk/by-id/ata-QEMU_HARDDISK_QM00003"}
+
+	c, err := render.OSDPrepare(st, h, d, func(string) (string, error) { return fakeKey, nil })
+	must(t, err)
+
+	// no approval of the disk: refused at admission, its record kept for the leader
+	op, err := g.Grant(ctx, grantOf(t, 2, "op-a1", c))
+	if err != nil || op.State != wire.OpRefused || op.Job == nil {
+		t.Fatalf("prepare: %+v %v", op, err)
+	}
+
+	gr := probeGrant(3, "op-a2", "aaaaaa")
+	gr.Docs, gr.Ack = nil, &wire.JobAck{Job: op.Job.ID, Inputs: op.Job.Inputs, RC: -1}
+
+	if res, err := g.Grant(ctx, gr); err != nil || res.State != wire.OpCompleted {
+		t.Fatalf("acknowledgement alone: %+v %v", res, err)
+	}
+
+	if rec, _, _ := g.readOp("op-a1"); !rec.Acked {
+		t.Fatalf("not acknowledged: %+v", rec)
+	}
+}
+
+func TestAcknowledgementsAreIdempotentAndFenced(t *testing.T) {
+	g := newTestGranter(t)
+	ctx := context.Background()
+
+	st := state.New(testFSID)
+	st.Image = testImage
+	st.AddHost(state.Host{Name: "h1", Addr: "10.5.0.3"})
+	h, _ := st.Host("h1")
+	d := state.Daemon{Type: state.TypeOSD, ID: "h1-sdb", Host: "h1", DeployID: "0123456789abcdef", DiskSerial: "QM00003", DevicePath: "/dev/disk/by-id/ata-QEMU_HARDDISK_QM00003"}
+
+	c, err := render.OSDPrepare(st, h, d, func(string) (string, error) { return fakeKey, nil })
+	must(t, err)
+
+	op, err := g.Grant(ctx, grantOf(t, 2, "op-f1", c))
+	if err != nil || op.State != wire.OpRefused {
+		t.Fatalf("prepare: %+v %v", op, err)
+	}
+
+	ack := func(rev int64, id string) wire.Operation {
+		gr := probeGrant(rev, id, "aaaaaa")
+		gr.Docs, gr.Ack = nil, &wire.JobAck{Job: op.Job.ID, Inputs: op.Job.Inputs, RC: -1}
+
+		res, err := g.Grant(ctx, gr)
+		must(t, err)
+
+		return res
+	}
+
+	if res := ack(5, "op-f2"); res.State != wire.OpCompleted {
+		t.Fatalf("first acknowledgement: %+v", res)
+	}
+
+	// the same acknowledgement again changes nothing and is no error
+	if res := ack(6, "op-f3"); res.State != wire.OpCompleted {
+		t.Fatalf("repeated acknowledgement: %+v", res)
+	}
+
+	// a revision at or below the fence is refused
+	if res := ack(4, "op-f4"); res.State != wire.OpRefused {
+		t.Fatalf("an acknowledgement below the fence: %+v", res)
 	}
 }

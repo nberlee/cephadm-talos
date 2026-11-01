@@ -417,6 +417,7 @@ type LedgerOp struct {
 	Epoch   int64  `json:"epoch"`
 	Seq     int64  `json:"seq"`
 	Request string `json:"request,omitempty"`
+	Device  string `json:"device,omitempty"` // create_osd: the disk as the operator named it
 }
 
 // Ledger returns the executable operations after a ledger key, in the order
@@ -504,6 +505,47 @@ func (b *Bridge) Approval(ctx context.Context) (*approval.Signed, error) {
 	}
 
 	return &s, nil
+}
+
+// BindDisk asks the module to bind an accepted OSD creation to its disk and
+// preparation job (once; the same binding again is no change).
+func (b *Bridge) BindDisk(ctx context.Context, op, serial, link, job string) error {
+	_, err := b.do(ctx, "bind disk", map[string]any{"operation": op, "serial": serial, "link": link, "job": job})
+
+	return err
+}
+
+// OSD is an OSD of the OSD map.
+type OSD struct {
+	ID   int    `json:"osd"`
+	UUID string `json:"uuid"`
+	Up   bool   `json:"up"`
+}
+
+// OSDs returns the OSD map's OSDs.
+func (b *Bridge) OSDs(ctx context.Context) ([]OSD, error) {
+	out, err := b.do(ctx, "osd dump", map[string]any{})
+	if err != nil {
+		return nil, err
+	}
+
+	var osds []OSD
+	if err := json.Unmarshal([]byte(out), &osds); err != nil {
+		return nil, fmt.Errorf("bridge: osd dump: %w", err)
+	}
+
+	return osds, nil
+}
+
+// AuthGetFor returns a key an accepted operation needs (client.bootstrap-osd
+// for an OSD creation).
+func (b *Bridge) AuthGetFor(ctx context.Context, entity, op string) (string, error) {
+	out, err := b.do(ctx, "auth get", map[string]any{"entity": entity, "operation": op})
+	if err != nil {
+		return "", err
+	}
+
+	return parseAuth(out, entity)
 }
 
 // Quorum returns the names of the mons in quorum.

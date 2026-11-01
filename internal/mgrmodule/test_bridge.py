@@ -69,6 +69,8 @@ class Mons:
         self.keys = []      # answer to config-key ls
         self.kv = None      # a config-key store for get, set, rm and ls, if set
         self.auth_rm = []
+        self.osds = []      # osd dump's osds
+        self.metadata = {}  # osd metadata by id
 
     def send(self, res, cmd):
         prefix = json.loads(cmd)['prefix']
@@ -94,6 +96,11 @@ class Mons:
                 res.complete(0, '', '')
             else:
                 res.complete(0, json.dumps(sorted(self.kv)), '')
+        elif prefix == 'osd dump':
+            res.complete(0, json.dumps({'osds': self.osds}), '')
+        elif prefix == 'osd metadata':
+            i = json.loads(cmd)['id']
+            res.complete(0, json.dumps(self.metadata[i]), '') if i in self.metadata else res.complete(-2, '', 'no metadata')
         elif prefix == 'auth rm':
             self.auth_rm.append(json.loads(cmd)['entity'])
             res.complete(0, '', '')
@@ -272,7 +279,8 @@ class BridgeTest(unittest.TestCase):
         }
         for call, (args, cmd) in good.items():
             self.assertEqual(b.ALLOWLIST[call](args), cmd, call)
-        for e in ('mon.', 'mgr.h1', 'osd.0', 'client.rgw.h2', 'client.bootstrap-osd'):
+        b.ALLOWLIST['auth get']({'entity': 'client.bootstrap-osd', 'operation': 'op-%016x' % 1})
+        for e in ('mon.', 'mgr.h1', 'osd.0', 'client.rgw.h2'):
             b.ALLOWLIST['auth get']({'entity': e})
         bad = [
             ('config-key keys', {'prefix': 'mgr/cephadm/', 'after': ''}),
@@ -729,6 +737,8 @@ class LedgerCallsTest(unittest.TestCase):
 
     def accept(self, kind, daemon, host):
         op = {'id': 'op-%016x' % (100 + self.n), 'kind': kind, 'host': host}
+        if kind == 'create_osd':
+            op['device'] = '/dev/sdb'
         self.n += 1
         if daemon:
             op['daemon'] = daemon
@@ -813,3 +823,46 @@ class ApprovalCallTest(unittest.TestCase):
         mons.kv['cephadm-talos/approvals/x'] = 'not one'
         self.assertEqual(call(2)[1]['out'], '{"serial": 10}')
         self.assertEqual(ch.bridge({'version': 1, 'call': 'approval', 'args': {'x': 1}, 'deadline': 5, 'dispatch_id': '%016x' % 3})[0], 400)
+
+
+class CreationTest(LedgerCallsTest):
+    def test_an_osd_from_bind_to_confirmation(self):
+        create = self.accept('create_osd', None, 'h1')
+        self.led.entries  # noqa
+        # bootstrap-osd only once the creation is bound
+        self.assertEqual(self.call('auth get', entity='client.bootstrap-osd', operation=create)[0], 400)
+        bind = dict(operation=create, serial='QM00003', link='/dev/disk/by-id/ata-QEMU_HARDDISK_QM00003', job='0123456789abcdef')
+        self.assertEqual(self.call('bind disk', **bind)[1]['outcome'], 'done')
+        self.assertEqual(self.call('bind disk', **bind)[1]['outcome'], 'done')  # the same again
+        self.assertEqual(self.call('bind disk', **dict(bind, serial='QM00009'))[0], 400)
+        self.assertEqual(self.call('auth get', entity='client.bootstrap-osd', operation=create)[1]['outcome'], 'done')
+        # confirmed only when the OSD is up and its metadata names the host and disk
+        self.assertEqual(self.call('confirm osd', operation=create, osd=7)[0], 409)
+        uuid = '8f2c0a4e-1d3b-4c5a-9e6f-7a8b9c0d1e2f'
+        self.mons.osds = [{'osd': 7, 'uuid': uuid, 'up': 1}]
+        self.mons.metadata[7] = {'hostname': 'h2', 'device_ids': 'sdb=QEMU_HARDDISK_QM00003'}
+        self.assertEqual(self.call('confirm osd', operation=create, osd=7)[0], 409)
+        self.mons.metadata[7] = {'hostname': 'h1', 'device_ids': 'sdb=QEMU_HARDDISK_QM00004'}
+        self.assertEqual(self.call('confirm osd', operation=create, osd=7)[0], 409)
+        self.mons.metadata[7] = {'hostname': 'h1', 'device_ids': 'sdb=QEMU_HARDDISK_QM00003'}
+        self.assertEqual(self.call('confirm osd', operation=create, osd=7)[1]['outcome'], 'done')
+        fold = self.ch.authority()[1]
+        self.assertEqual((fold.daemons.get('osd.7'), fold.uuids.get('osd.7')), ('h1', uuid))
+        # confirmed: no more bootstrap-osd, no close
+        self.assertEqual(self.call('auth get', entity='client.bootstrap-osd', operation=create)[0], 400)
+        self.assertEqual(self.call('close create', operation=create)[0], 400)
+
+    def test_a_closed_creation_releases_nothing(self):
+        create = self.accept('create_osd', None, 'h1')
+        self.call('bind disk', operation=create, serial='QM00003', link='/dev/disk/by-id/ata-x_QM00003', job='0123456789abcdef')
+        self.assertEqual(self.call('close create', operation=create)[1]['outcome'], 'done')
+        self.assertEqual(self.call('auth get', entity='client.bootstrap-osd', operation=create)[0], 400)
+        self.assertEqual(self.call('confirm osd', operation=create, osd=7)[0], 400)
+        # not for another kind of operation
+        self.assertEqual(self.call('auth get', entity='client.bootstrap-osd', operation=self.accept('restart', 'mgr.h1', 'h1'))[0], 400)
+
+    def test_device_ids(self):
+        for ids, ok in (('sda=QEMU_HARDDISK_QM00001', True), ('sda=QM00001', True), ('nvme0n1=Micron_MTFD_QM00001_1', True),
+                        ('sda=QEMU_HARDDISK_QM000012', False), ('sda=QEMU_HARDDISK_XQM00001', False), ('', False),
+                        ('sdb=OTHER,sda=QEMU_HARDDISK_QM00001', True)):
+            self.assertEqual(b.device_matches(ids, 'QM00001'), ok, ids)

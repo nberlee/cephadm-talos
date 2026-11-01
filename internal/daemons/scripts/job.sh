@@ -26,6 +26,12 @@ create() {
 	return "$rc"
 }
 
+# a job the leader acknowledged never runs again (plan 03, step 6c)
+if [ -e "$J.tombstone" ]; then
+	log "job $JOB is finished and acknowledged; refusing"
+	exit 64
+fi
+
 # the claim binds the id to its inputs, before anything else is trusted
 if [ -e "$J.claim" ]; then
 	if [ "$(cat "$J.claim")" != "$JOB_INPUTS" ]; then
@@ -72,10 +78,12 @@ if [ "${JOB_IGNORE_TERM:-}" = 1 ]; then
 	trap '' TERM
 fi
 
+# the output kept in the result is bounded: its last 16 KiB
 set +e
-out=$(bash -c "$CMD" 2>&1)
+bash -c "$CMD" >/tmp/job.out 2>&1
 rc=$?
 set -e
+out=$(tail -c 16384 /tmp/job.out)
 { echo "rc $rc"; echo "inputs $JOB_INPUTS"; printf '%s' "$out"; } | put "$J.result" || exit 70
 printf '%s\n' "$out"
 exit "$rc"
