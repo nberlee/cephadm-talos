@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"github.com/nberlee/cephadm-talos/internal/approval"
 	"slices"
 	"strings"
 	"sync"
@@ -44,9 +45,33 @@ func testNodeFake(t *testing.T) (*Node, *talos.Client, *talostest.Node) {
 	tc := &talos.Client{Dial: func(ctx context.Context, _ talos.Conn) (*client.Client, error) { return f.Dial(ctx) }}
 	t.Cleanup(func() { tc.Close() }) //nolint:errcheck
 
-	pol := &Policy{FSID: testFSID, Host: "h1", Repos: []string{"quay.io/ceph/ceph"}}
+	pol := &Policy{FSID: testFSID, Host: "h1", Repos: []string{"quay.io/ceph/ceph"}, ApprovalKey: testApprovalPub}
 
-	return &Node{Talos: tc, Records: &records.Store{Dir: t.TempDir()}, FSID: testFSID, Host: "h1", Policy: pol}, tc, f
+	n := &Node{Talos: tc, Records: &records.Store{Dir: t.TempDir()}, FSID: testFSID, Host: "h1", Policy: pol}
+
+	// the operator approved the test image
+	must(t, n.RecordApproval(context.Background(), testApproval(t, 1)))
+
+	return n, tc, f
+}
+
+// the test approval key, and approvals signed with it
+var testApprovalPriv, testApprovalPub = func() (string, string) {
+	priv, pub, err := approval.NewKey()
+	if err != nil {
+		panic(err)
+	}
+
+	return priv, pub
+}()
+
+func testApproval(t *testing.T, serial int64, disks ...approval.Disk) approval.Signed {
+	t.Helper()
+
+	s, err := approval.Sign(testApprovalPriv, approval.Approval{Version: approval.Version, FSID: testFSID, Serial: serial, Images: []string{testImage}, Disks: disks})
+	must(t, err)
+
+	return s
 }
 
 func yamlOf(t *testing.T, d any) []byte {

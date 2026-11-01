@@ -413,6 +413,15 @@ func (g *Granter) grant(ctx context.Context, gr wire.Grant) (wire.Operation, err
 		return unconfirmed(errors.New("the confirmation expired before the apply"))
 	}
 
+	// the operator's approval the grant carries: verified, and recorded if newer
+	if gr.Approval != nil {
+		if err := g.Node.RecordApproval(ctx, *gr.Approval); err != nil {
+			op.State, op.Error = wire.OpRefused, err.Error()
+
+			return op, g.writeOp(op)
+		}
+	}
+
 	if gr.Restart != nil {
 		return g.restart(ctx, gr, op, until)
 	}

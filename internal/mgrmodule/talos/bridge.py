@@ -286,6 +286,18 @@ def _ledger(args: Dict[str, Any]) -> Dict[str, Any]:
     return {}  # answered by the module, not the mons
 
 
+# the operator's approvals (internal/approval), signed on the workstation; the
+# agents verify them, the module only finds the newest
+APPROVAL_PREFIX = 'cephadm-talos/approvals/'
+APPROVAL_KEY_RE = re.compile(r'\Acephadm-talos/approvals/\d{20}\Z')
+
+
+def _approval(args: Dict[str, Any]) -> Dict[str, Any]:
+    if args:
+        raise ValueError('approval takes no arguments')
+    return {}  # answered by the module (Channel.approval)
+
+
 def _operation(args: Dict[str, Any]) -> Dict[str, Any]:
     _args(args, {'operation'})
     if not isinstance(args['operation'], str) or not re.match(r'\Aop-[0-9a-f]{16}\Z', args['operation']):
@@ -299,7 +311,7 @@ REDUCE: Dict[str, Callable[[Dict[str, Any]], Callable[[str], str]]] = {
 }
 
 # calls that change nothing: an answered one is not kept
-READ_ONLY = {'status', 'health', 'mgr dump', 'config-key keys', 'config-key get', 'entry limit', 'auth get', 'secret get', 'ledger'}
+READ_ONLY = {'status', 'health', 'mgr dump', 'config-key keys', 'config-key get', 'entry limit', 'auth get', 'secret get', 'ledger', 'approval'}
 # calls that release a credential: checked against the fold, while active
 CREDENTIALS = {'auth get', 'auth get-or-create', 'secret get'}
 # calls the module answers itself, for operations of its ledger (ledger.py)
@@ -318,6 +330,7 @@ ALLOWLIST: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     'auth get-or-create': _auth_get_or_create,
     'secret get': _secret_get,
     'ledger': _ledger,
+    'approval': _approval,
     'mgr cert': _operation,
     'retire': _operation,
     'retire host': _operation,
@@ -590,6 +603,8 @@ class Channel:
         cap = self.leadership.captured()
         if cap is None:
             return 503, {'error': 'no captured incarnation'}
+        if call == 'approval':
+            return self.approval()
         if call == 'ledger' or call in CREDENTIALS:
             try:
                 led, fold = self.authority()
@@ -791,6 +806,20 @@ class Channel:
             return 400, {'error': '%s still has daemons' % op['host']}
         led.append({'id': 'm-' + secrets.token_hex(8), 'kind': 'retire_host', 'of': op['id'], 'host': op['host']})
         return 200, done
+
+    def approval(self) -> Tuple[int, Dict[str, Any]]:
+        """The newest approval in config-key, as written ("" if there is none)."""
+        keys = self._mon({'prefix': 'config-key ls'}, None,
+                         lambda out: json.dumps(sorted(k for k in json.loads(out) if APPROVAL_KEY_RE.match(k))[-1:]))
+        if keys is None or keys.r != 0 or keys.too_large:
+            return 503, {'error': 'cannot list the approvals; ask again'}
+        newest = json.loads(keys.outb)
+        if not newest:
+            return 200, {'outcome': 'done', 'r': 0, 'out': '', 'outs': ''}
+        job = self._mon({'prefix': 'config-key get', 'key': newest[0]})
+        if job is None or job.r != 0 or job.too_large:
+            return 503, {'error': 'cannot read the approval; ask again'}
+        return 200, {'outcome': 'done', 'r': 0, 'out': job.outb, 'outs': ''}
 
     def _ledger_page(self, led: Any, after: str) -> Dict[str, Any]:
         """The executable entries after a key, in order, a page at a time."""

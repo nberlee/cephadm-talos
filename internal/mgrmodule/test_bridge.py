@@ -800,3 +800,16 @@ class LedgerCallsTest(unittest.TestCase):
         rm = self.accept('remove_daemon', 'mgr.h1', 'h1')
         self.assertEqual(self.call('retire', operation=rm)[1]['outcome'], 'done')
         self.assertEqual(sorted(k for k in self.mons.kv if '/host/' in k), [b.SECRET_PREFIX + 'host/h1/agent-server.key'])
+
+
+class ApprovalCallTest(unittest.TestCase):
+    def test_the_newest_approval(self):
+        ch, mons = BridgeTest.channel(self)
+        mons.kv = {}
+        call = lambda n: ch.bridge({'version': 1, 'call': 'approval', 'args': {}, 'deadline': 5, 'dispatch_id': '%016x' % n})
+        self.assertEqual(call(1)[1]['out'], '')
+        for serial in (1, 2, 10):
+            mons.kv['cephadm-talos/approvals/%020d' % serial] = '{"serial": %d}' % serial
+        mons.kv['cephadm-talos/approvals/x'] = 'not one'
+        self.assertEqual(call(2)[1]['out'], '{"serial": 10}')
+        self.assertEqual(ch.bridge({'version': 1, 'call': 'approval', 'args': {'x': 1}, 'deadline': 5, 'dispatch_id': '%016x' % 3})[0], 400)

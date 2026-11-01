@@ -6,6 +6,8 @@
 package state
 
 import (
+	"encoding/base64"
+	"syscall"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -82,6 +84,12 @@ type Agent struct {
 	CAKey        string `json:"-"` // a secret (Secrets)
 	OperatorCert string `json:"operator_cert"`
 	OperatorKey  string `json:"operator_key"`
+	// ApprovalKey is the public key every agent pins (internal/approval);
+	// ApprovalPriv, its private key, and Approval, the last approval the CLI
+	// signed (JSON of approval.Signed), stay on the workstation only
+	ApprovalKey  string `json:"approval_key,omitempty"`
+	ApprovalPriv string `json:"approval_priv,omitempty"`
+	Approval     string `json:"approval,omitempty"`
 }
 
 // RGW holds the object gateway settings shared by all rgw and vip daemons.
@@ -212,6 +220,10 @@ type Local struct {
 	// OperatorCert and OperatorKey are the CLI's client certificate (agent CA)
 	OperatorCert string `json:"operator_cert,omitempty"`
 	OperatorKey  string `json:"operator_key,omitempty"`
+	// ApprovalPriv signs approvals; Approval is the last one signed, the
+	// authority over the approvals' history (internal/approval)
+	ApprovalPriv string `json:"approval_priv,omitempty"`
+	Approval     string `json:"approval,omitempty"`
 	// AdminKey is the client.admin secret, as on a cephadm admin host
 	AdminKey string `json:"admin_key,omitempty"`
 }
@@ -264,7 +276,7 @@ func Load(fsid string) (*State, error) {
 	}
 
 	if l.OperatorCert != "" {
-		st.Agent = &Agent{OperatorCert: l.OperatorCert, OperatorKey: l.OperatorKey}
+		st.Agent = &Agent{OperatorCert: l.OperatorCert, OperatorKey: l.OperatorKey, ApprovalPriv: l.ApprovalPriv, Approval: l.Approval}
 	}
 
 	if l.AdminKey != "" {
@@ -281,8 +293,24 @@ func (s *State) Dir() string { return filepath.Dir(s.path) }
 // operator key) and marks the cluster as current. The cluster's part is
 // published to the store by the caller (Records).
 func (s *State) Save() error {
+	unlock, err := Lock(s.FSID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	return s.SaveLocked()
+}
+
+// SaveLocked is Save for a caller that holds the cluster's Lock. A newer
+// approval on disk than this state has (another process signed it) is kept.
+func (s *State) SaveLocked() error {
 	if err := os.MkdirAll(s.Dir(), 0o700); err != nil {
 		return err
+	}
+
+	if disk, err := LastApproval(s.FSID); err == nil && s.Agent != nil && approvalSerial(disk) > approvalSerial(s.Agent.Approval) {
+		s.Agent.Approval = disk
 	}
 
 	l := Local{Schema: SchemaVersion, FSID: s.FSID, Talosconfig: s.Talosconfig, Context: s.Context, AdminKey: s.Keys["client.admin"]}
@@ -293,6 +321,7 @@ func (s *State) Save() error {
 
 	if s.Agent != nil {
 		l.OperatorCert, l.OperatorKey = s.Agent.OperatorCert, s.Agent.OperatorKey
+		l.ApprovalPriv, l.Approval = s.Agent.ApprovalPriv, s.Agent.Approval
 	}
 
 	b, err := json.MarshalIndent(l, "", "  ")
@@ -300,7 +329,8 @@ func (s *State) Save() error {
 		return err
 	}
 
-	if err := os.WriteFile(s.path+".tmp", b, 0o600); err != nil {
+	// synced before the rename: the last signed approval must survive a crash
+	if err := writeSynced(s.path+".tmp", b); err != nil {
 		return err
 	}
 
@@ -308,7 +338,103 @@ func (s *State) Save() error {
 		return err
 	}
 
+	// the rename itself is durable before anything relies on it
+	if d, err := os.Open(s.Dir()); err == nil {
+		serr := d.Sync()
+		d.Close() //nolint:errcheck
+
+		if serr != nil {
+			return serr
+		}
+	}
+
 	return os.WriteFile(filepath.Join(Root(), "current"), []byte(s.FSID+"\n"), 0o600)
+}
+
+// LastApproval reads the last approval this workstation signed for a cluster
+// from its local state on disk (JSON of approval.Signed, "" before any).
+func LastApproval(fsid string) (string, error) {
+	b, err := os.ReadFile(filepath.Join(Root(), fsid, "local.json"))
+	if err != nil {
+		return "", err
+	}
+
+	var l Local
+	if err := json.Unmarshal(b, &l); err != nil {
+		return "", err
+	}
+
+	return l.Approval, nil
+}
+
+// approvalSerial is the serial of a signed approval as the workstation keeps
+// it (JSON of approval.Signed), 0 if there is none; only for ordering local copies.
+func approvalSerial(signed string) int64 {
+	var s struct {
+		Payload string `json:"payload"`
+	}
+
+	if json.Unmarshal([]byte(signed), &s) != nil {
+		return 0
+	}
+
+	b, err := base64.StdEncoding.DecodeString(s.Payload)
+	if err != nil {
+		return 0
+	}
+
+	var a struct {
+		Serial int64 `json:"serial"`
+	}
+
+	if json.Unmarshal(b, &a) != nil {
+		return 0
+	}
+
+	return a.Serial
+}
+
+// Lock takes an exclusive lock for a cluster's workstation state until the
+// returned function is called.
+func Lock(fsid string) (func(), error) {
+	if err := os.MkdirAll(filepath.Join(Root(), fsid), 0o700); err != nil {
+		return nil, err
+	}
+
+	f, err := os.OpenFile(filepath.Join(Root(), fsid, "lock"), os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		f.Close() //nolint:errcheck
+
+		return nil, err
+	}
+
+	return func() { f.Close() }, nil //nolint:errcheck
+}
+
+// writeSynced writes a file and syncs it.
+func writeSynced(path string, b []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+
+	if _, err := f.Write(b); err != nil {
+		f.Close() //nolint:errcheck
+
+		return err
+	}
+
+	if err := f.Sync(); err != nil {
+		f.Close() //nolint:errcheck
+
+		return err
+	}
+
+	return f.Close()
 }
 
 // InventoryRevision identifies a content of the mgr module's inventory.
@@ -435,7 +561,7 @@ func (s *State) Records() (map[string][]byte, error) {
 
 	if s.Agent != nil {
 		a := *s.Agent
-		a.OperatorCert, a.OperatorKey = "", ""
+		a.OperatorCert, a.OperatorKey, a.ApprovalPriv, a.Approval = "", "", "", ""
 		c.Agent = &a
 	}
 
@@ -521,6 +647,7 @@ func (s *State) ApplyRecords(recs map[string][]byte) error {
 
 	if s.Agent != nil && operator != nil {
 		s.Agent.OperatorCert, s.Agent.OperatorKey = operator.OperatorCert, operator.OperatorKey
+		s.Agent.ApprovalPriv, s.Agent.Approval = operator.ApprovalPriv, operator.Approval
 	}
 
 	return nil

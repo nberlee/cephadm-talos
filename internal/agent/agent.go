@@ -190,7 +190,7 @@ func (a *Agent) daemonVersions(ctx context.Context, rec *Record, statuses map[st
 
 		// a refresh out of time asks no more: the attempts stay for the next one
 		if v.version == "" && v.attempts < versionAttempts && ctx.Err() == nil &&
-			a.Node.Policy.Check([]Doc{{Kind: "ContainerConfig", Name: name, YAML: td.yaml}}, disks, names) == nil {
+			a.admitted(ctx, Doc{Kind: "ContainerConfig", Name: name, YAML: td.yaml}, disks, names) {
 			v.attempts++
 
 			if version, err := daemonVersion(ctx, a.Exec, name, entity); err == nil {
@@ -567,7 +567,7 @@ func Main(ctx context.Context) error {
 	// repositories admit no image
 	repos := strings.Fields(os.Getenv(daemons.EnvImageRepos))
 	node := &Node{Talos: tc, Records: recs, FSID: self.FSID, Host: self.Name, Policy: &Policy{
-		FSID: self.FSID, Host: self.Name, CACert: string(pems[0]), Repos: repos,
+		FSID: self.FSID, Host: self.Name, CACert: string(pems[0]), Repos: repos, ApprovalKey: os.Getenv(daemons.EnvApprovalKey),
 	}}
 	a := &Agent{
 		Talos: tc, Life: ctx, Channel: ch, Records: recs, Node: node, Granter: NewGranter(node, ch, clientTLS, recs),
@@ -586,7 +586,7 @@ func Main(ctx context.Context) error {
 	wg.Go(func() { a.Run(ctx) })
 
 	// the leader, while this host's mgr is the active one and heartbeats it
-	leader := &LeaderLoop{Self: self, Channel: ch, ClientTLS: clientTLS, Repos: repos, CACert: string(pems[0])}
+	leader := &LeaderLoop{Self: self, Channel: ch, ClientTLS: clientTLS, Repos: repos, CACert: string(pems[0]), ApprovalKey: os.Getenv(daemons.EnvApprovalKey)}
 	wg.Go(func() { leader.Run(ctx) })
 
 	srv := &http.Server{
@@ -631,4 +631,12 @@ func Main(ctx context.Context) error {
 	}
 
 	return serveErr
+}
+
+// admitted reports whether a document passes the admission policy with the
+// agent's highest approval.
+func (a *Agent) admitted(ctx context.Context, d Doc, disks []Disk, names []string) bool {
+	appr, err := a.Node.Approval(ctx)
+
+	return err == nil && a.Node.Policy.Check([]Doc{d}, disks, names, appr) == nil
 }

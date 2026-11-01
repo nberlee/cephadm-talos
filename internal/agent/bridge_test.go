@@ -56,6 +56,8 @@ type fakeBridge struct {
 	quorum  []string
 	active  string
 	retired []string
+	// approval is the operator's newest approval in config-key, "" for none
+	approval string
 }
 
 func (m *fakeBridge) run(req wire.BridgeRequest) map[string]any {
@@ -120,6 +122,8 @@ func (m *fakeBridge) run(req wire.BridgeRequest) map[string]any {
 		m.retired = append(m.retired, req.Call+" "+str("operation"))
 
 		return map[string]any{"outcome": "done", "r": 0, "out": ""}
+	case "approval":
+		return map[string]any{"outcome": "done", "r": 0, "out": m.approval}
 	case "status":
 		b, _ := json.Marshal(map[string]any{"quorum_names": m.quorum})
 

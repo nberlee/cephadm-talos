@@ -7,6 +7,8 @@
 package daemons
 
 import (
+	"encoding/hex"
+	"crypto/sha256"
 	"embed"
 	"encoding/base64"
 	"fmt"
@@ -37,6 +39,8 @@ type Params struct {
 	OSDUUID    string   // OSD only: the uuid of the prepared OSD
 	OSDID      int      // OSD only: the id of the prepared OSD
 	DiskSerial string   // OSD prepare only: the serial the device must have
+	// ZapUnlabelled: a zap without the label check, which needs an approval
+	ZapUnlabelled bool
 	Port       int      // rgw/vip: RGW HTTPS port
 	TLSPEM     string   // rgw: certificate + key
 	VIP        string   // vip: CIDR of the virtual IP
@@ -233,6 +237,8 @@ const (
 	EnvClientCert = "CEPHADM_TALOS_AGENT_CLIENT_CERT"
 	EnvClientKey  = "CEPHADM_TALOS_AGENT_CLIENT_KEY"
 	EnvImageRepos = "CEPHADM_TALOS_IMAGE_REPOS"
+	// EnvApprovalKey is the public key of the operator's approvals (internal/approval)
+	EnvApprovalKey = "CEPHADM_TALOS_APPROVAL_KEY"
 )
 
 // ImageRepository is the repository of an image reference, normalized as
@@ -252,7 +258,7 @@ const AgentUID = 50
 // Agent renders the node agent: Talos access to its own node over the machined
 // socket, its status served on the host network (internal/agent). repos are
 // the image repositories its admission policy allows.
-func Agent(name, recordsInit, image string, repos []string, caPEM, certPEM, keyPEM, clientCertPEM, clientKeyPEM string) *spec.ContainerConfig {
+func Agent(name, recordsInit, image string, repos []string, approvalKey, caPEM, certPEM, keyPEM, clientCertPEM, clientKeyPEM string) *spec.ContainerConfig {
 	b64 := func(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
 
 	c := spec.Container(name, image)
@@ -263,6 +269,7 @@ func Agent(name, recordsInit, image string, repos []string, caPEM, certPEM, keyP
 		EnvClientCert + "=" + b64(clientCertPEM),
 		EnvClientKey + "=" + b64(clientKeyPEM),
 		EnvImageRepos + "=" + strings.Join(repos, " "),
+		EnvApprovalKey + "=" + approvalKey,
 	}
 	c.RunAsConfig = spec.RunAs(AgentUID, AgentUID)
 	c.SecurityConfig = spec.Restricted()
@@ -361,7 +368,42 @@ func Zap(p Params, job, inputs string) *spec.ContainerConfig {
 	c := DeviceJob(p, job, inputs, rawScript("zap"))
 	c.ContainerEnvironment = append(c.ContainerEnvironment, "DEVICE="+p.Device, "DISK_SERIAL="+p.DiskSerial)
 
+	// the script requires a BlueStore label of this cluster (and of this OSD)
+	// unless the operator approved zapping the disk as it is
+	if p.ZapUnlabelled {
+		c.ContainerEnvironment = append(c.ContainerEnvironment, "ZAP_UNLABELLED=1")
+	}
+
+	if p.OSDUUID != "" {
+		c.ContainerEnvironment = append(c.ContainerEnvironment, "ZAP_OSD_UUID="+p.OSDUUID)
+	}
+
 	return c
+}
+
+// JobInputs hashes what a job does; its records refuse the same id with other
+// inputs.
+func JobInputs(parts ...string) string {
+	h := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
+
+	return hex.EncodeToString(h[:])
+}
+
+// PrepareInputs are the inputs of an OSD deployment's preparation: the
+// cluster, the host, the disk by its stable device and serial, the deployment.
+func PrepareInputs(fsid, host, device, serial, deployID string) string {
+	return JobInputs("osd-prepare", fsid, host, device, serial, deployID)
+}
+
+// ZapInputs are the inputs of a zap: the host, the disk, and what the job
+// checks before it wipes (the label, or none with an approval; an OSD's uuid).
+func ZapInputs(host, device, serial string, unlabelled bool, osdUUID string) string {
+	mode := "label"
+	if unlabelled {
+		mode = "unlabelled"
+	}
+
+	return JobInputs("zap", host, device, serial, mode, osdUUID)
 }
 
 // HostJob is a privileged Job with the host's /var/lib/ceph volume, for cleanup.

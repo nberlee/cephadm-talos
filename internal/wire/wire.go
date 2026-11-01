@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"github.com/nberlee/cephadm-talos/internal/approval"
 )
 
 // Version is the wire format version.
@@ -114,6 +115,9 @@ type Grant struct {
 	// Restart, instead of documents, restarts the current instance of one
 	// daemon document the agent owns with this hash
 	Restart *GrantRestart `json:"restart,omitempty"`
+	// Approval is the newest approval of the operator the leader has; the
+	// agent verifies it and records it if it is higher than its own
+	Approval *approval.Signed `json:"approval,omitempty"`
 }
 
 // GrantRestart names the daemon document a grant restarts.
@@ -134,13 +138,14 @@ type GrantDoc struct {
 // confirmation carries: the same operation id with other inputs is refused.
 func GrantInputs(g Grant) string {
 	b, _ := json.Marshal(struct {
-		FSID      string        `json:"fsid"`
-		Host      string        `json:"host"`
-		Revision  int64         `json:"revision"`
-		Operation string        `json:"operation"`
-		Docs      []GrantDoc    `json:"docs"`
-		Restart   *GrantRestart `json:"restart,omitempty"`
-	}{g.FSID, g.Host, g.Revision, g.Operation, g.Docs, g.Restart})
+		FSID      string           `json:"fsid"`
+		Host      string           `json:"host"`
+		Revision  int64            `json:"revision"`
+		Operation string           `json:"operation"`
+		Docs      []GrantDoc       `json:"docs"`
+		Restart   *GrantRestart    `json:"restart,omitempty"`
+		Approval  *approval.Signed `json:"approval,omitempty"`
+	}{g.FSID, g.Host, g.Revision, g.Operation, g.Docs, g.Restart, g.Approval})
 
 	sum := sha256.Sum256(b)
 

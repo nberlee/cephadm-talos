@@ -96,6 +96,23 @@ func (o *Orch) Handoff(ctx context.Context) error {
 		}
 	}
 
+	// the operator's first approval: the cluster's images, no disks (plan 03,
+	// step 6c); without it the agents admit no image from the leader
+	if last, _, err := o.lastApproval(); err != nil {
+		return err
+	} else if last == nil {
+		imgs := []string{o.St.Image}
+		if o.St.RGW != nil && o.St.RGW.KeepalivedImage != "" {
+			imgs = append(imgs, o.St.RGW.KeepalivedImage)
+		}
+
+		if _, err := o.Approve(ctx, ApprovalChange{AddImages: imgs}); err != nil {
+			return fmt.Errorf("the first approval: %w (not sealed: run `cephadm-talos handoff` again)", err)
+		}
+	} else if _, err := o.Approve(ctx, ApprovalChange{}); err != nil { // published, if it was not yet
+		return fmt.Errorf("the approval: %w (not sealed: run `cephadm-talos handoff` again)", err)
+	}
+
 	o.St.Sealed = true
 
 	if err := o.save(); err != nil {

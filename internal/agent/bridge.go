@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/nberlee/cephadm-talos/internal/approval"
 	"io"
 	"net"
 	"net/http"
@@ -483,6 +484,26 @@ func (b *Bridge) Retire(ctx context.Context, call, op string) error {
 	_, err := b.do(ctx, call, map[string]any{"operation": op})
 
 	return err
+}
+
+// Approval returns the newest approval of the operator in config-key, nil if
+// there is none (the module reads it; the agents verify it).
+func (b *Bridge) Approval(ctx context.Context) (*approval.Signed, error) {
+	out, err := b.do(ctx, "approval", map[string]any{})
+	if err != nil {
+		return nil, err
+	}
+
+	if out == "" {
+		return nil, nil
+	}
+
+	var s approval.Signed
+	if err := json.Unmarshal([]byte(out), &s); err != nil || s.Payload == "" {
+		return nil, errors.New("bridge: approval: malformed")
+	}
+
+	return &s, nil
 }
 
 // Quorum returns the names of the mons in quorum.

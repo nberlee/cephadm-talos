@@ -12,9 +12,7 @@
 package render
 
 import (
-	"crypto/sha256"
 	"crypto/tls"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -215,11 +213,7 @@ func vipParams(s *state.State, p *daemons.Params, d state.Daemon) {
 
 // JobInputs hashes what a job does; its records refuse the same id with other
 // inputs.
-func JobInputs(parts ...string) string {
-	h := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
-
-	return hex.EncodeToString(h[:])
-}
+func JobInputs(parts ...string) string { return daemons.JobInputs(parts...) }
 
 // OSDPrepareName is the document of an OSD deployment's preparation job.
 func OSDPrepareName(s *state.State, d state.Daemon) string {
@@ -229,7 +223,7 @@ func OSDPrepareName(s *state.State, d state.Daemon) string {
 // OSDPrepareInputs are the inputs of an OSD deployment's preparation: the
 // cluster, the host, the disk by its stable device and serial, the deployment.
 func OSDPrepareInputs(s *state.State, h state.Host, d state.Daemon) string {
-	return JobInputs("osd-prepare", s.FSID, h.Name, d.DevicePath, d.DiskSerial, d.DeployID)
+	return daemons.PrepareInputs(s.FSID, h.Name, d.DevicePath, d.DiskSerial, d.DeployID)
 }
 
 // OSDPrepare renders the job that prepares an OSD's disk, with the
@@ -251,12 +245,13 @@ func OSDPrepare(s *state.State, h state.Host, d state.Daemon, key Key) (*spec.Co
 }
 
 // Zap renders the job that zaps a device, bound to its serial; id is a fresh
-// six-hex job id.
-func Zap(s *state.State, h state.Host, id, device, serial string) *spec.ContainerConfig {
+// six-hex job id. Without unlabelled, the job requires a BlueStore label of
+// this cluster on the device.
+func Zap(s *state.State, h state.Host, id, device, serial string, unlabelled bool) *spec.ContainerConfig {
 	return daemons.Zap(daemons.Params{
 		Name: s.DocName(state.Daemon{Type: "job", ID: id}), Image: s.Image, FSID: s.FSID, ID: "job",
-		Device: device, DiskSerial: serial,
-	}, id, JobInputs("zap", h.Name, device, serial))
+		Device: device, DiskSerial: serial, ZapUnlabelled: unlabelled,
+	}, id, daemons.ZapInputs(h.Name, device, serial, unlabelled, ""))
 }
 
 // Probe renders the container that reads an image's Ceph version; id is a

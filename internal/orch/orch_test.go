@@ -6,6 +6,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"github.com/nberlee/cephadm-talos/internal/approval"
 	"io"
 	"maps"
 	"os"
@@ -375,5 +377,76 @@ func TestUserCertKeepsTheKeyOutOfTheCertificate(t *testing.T) {
 
 	if strings.Contains(c, "PRIVATE KEY") || c != cert+caCert {
 		t.Fatalf("published certificate:\n%s", c)
+	}
+}
+
+// The handoff publishes the first approval; `approve` signs the next one from
+// the workstation's copy, which config-key cannot override (plan 03, step 6c).
+func TestApprovals(t *testing.T) {
+	o := fakeOrch(t, talostest.New(t, images()))
+	ctx := context.Background()
+
+	if err := o.setupAgent(ctx, "node", "registry/agent:dev", false); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := o.Handoff(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	o.St.AddHost(state.Host{Name: "h1", Addr: "node"}) // a host the disk entries name
+
+	read := func(serial int64) approval.Approval {
+		t.Helper()
+
+		raw, err := o.StoreBackend.Get(ctx, fmt.Sprintf("%s%020d", ApprovalPrefix, serial))
+		if err != nil {
+			t.Fatalf("approval %d: %v", serial, err)
+		}
+
+		var s approval.Signed
+		if err := json.Unmarshal(raw, &s); err != nil {
+			t.Fatal(err)
+		}
+
+		a, err := approval.Verify(o.St.Agent.ApprovalKey, s, o.St.FSID)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		return a
+	}
+
+	if a := read(1); !a.Image(o.St.Image) || len(a.Disks) != 0 {
+		t.Fatalf("first approval %+v", a)
+	}
+
+	a, err := o.Approve(ctx, ApprovalChange{Prepare: []string{"h1:QM00003"}, Zap: []string{"h1:QM00004"}})
+	if err != nil || a.Serial != 2 || len(a.Disks) != 2 || !a.Image(o.St.Image) {
+		t.Fatalf("second approval %+v %v", a, err)
+	}
+
+	// an image-only change carries the disk entries over with their since
+	a, err = o.Approve(ctx, ApprovalChange{AddImages: []string{"quay.io/ceph/ceph@sha256:" + strings.Repeat("ef", 32)}})
+	if d, ok := a.Entry("h1", "QM00003", approval.Prepare); err != nil || !ok || d.Since != 2 || read(3).Serial != 3 {
+		t.Fatalf("third approval %+v %v", a, err)
+	}
+
+	// an unanswered publication is published again, unchanged, before anything else
+	if err := o.StoreBackend.Remove(ctx, []string{fmt.Sprintf("%s%020d", ApprovalPrefix, 3)}); err != nil {
+		t.Fatal(err)
+	}
+
+	if a, err := o.Approve(ctx, ApprovalChange{}); err != nil || a.Serial != 3 || read(3).Serial != 3 {
+		t.Fatalf("republished %+v %v", a, err)
+	}
+
+	// a newer approval in config-key than this workstation signed is refused
+	if err := o.StoreBackend.SetMany(ctx, []store.KV{{Key: fmt.Sprintf("%s%020d", ApprovalPrefix, 9), Value: []byte("{}")}}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := o.Approve(ctx, ApprovalChange{Drop: []string{"h1:QM00004:zap"}}); err == nil {
+		t.Fatal("approved over a newer approval in config-key")
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/nberlee/cephadm-talos/internal/approval"
 	"github.com/nberlee/cephadm-talos/internal/daemons"
 	"github.com/nberlee/cephadm-talos/internal/pki"
 	"github.com/nberlee/cephadm-talos/internal/spec"
@@ -46,6 +47,11 @@ func (o *Orch) setupAgent(ctx context.Context, node, image string, refresh bool)
 	var err error
 
 	if a.CACert, a.CAKey, err = pki.NewCA("cephadm-talos agent CA "+o.St.Short(), agentCAYears); err != nil {
+		return err
+	}
+
+	// the operator's approvals: the private key never leaves the workstation
+	if a.ApprovalPriv, a.ApprovalKey, err = approval.NewKey(); err != nil {
 		return err
 	}
 
@@ -189,7 +195,7 @@ func (o *Orch) agentDocs(h state.Host) []any {
 	return []any{
 		spec.RecordsVolume(),
 		daemons.RecordsInit(init, o.St.Agent.Image),
-		daemons.Agent(o.agentDocName(h), init, o.St.Agent.Image, o.imageRepos(), o.St.Agent.CACert, h.AgentCert, h.AgentKey, h.AgentClientCert, h.AgentClientKey),
+		daemons.Agent(o.agentDocName(h), init, o.St.Agent.Image, o.imageRepos(), o.St.Agent.ApprovalKey, o.St.Agent.CACert, h.AgentCert, h.AgentKey, h.AgentClientCert, h.AgentClientKey),
 	}
 }
 

@@ -35,7 +35,8 @@ func newLeaderSetup(t *testing.T) *leaderSetup {
 
 	ca := newTestCA(t)
 
-	m := &fakeBridge{kv: map[string]string{}, outcomes: map[string]map[string]any{}, page: 1000, fsid: testFSID}
+	appr, _ := json.Marshal(testApproval(t, 1))
+	m := &fakeBridge{kv: map[string]string{}, outcomes: map[string]map[string]any{}, page: 1000, fsid: testFSID, approval: string(appr)}
 	host, port := m.serve(t, ca, "h0")
 
 	oldDial, oldBridge := dialPort, bridgePort
@@ -72,6 +73,7 @@ func newLeaderSetup(t *testing.T) *leaderSetup {
 	l := &LeaderLoop{
 		Self: pki.Identity{FSID: testFSID, Role: pki.RoleAgent, Name: "h0"}, Channel: ch, ClientTLS: clientTLS,
 		Repos: []string{"quay.io/ceph/ceph"}, bridgeAddr: host, agentURL: func(state.Host) string { return srv.URL }, logf: t.Logf,
+		ApprovalKey: testApprovalPub,
 	}
 
 	// what the CLI publishes: two hosts, a mon on h1

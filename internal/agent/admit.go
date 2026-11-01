@@ -16,6 +16,7 @@ import (
 	"github.com/distribution/reference"
 	"github.com/siderolabs/talos/pkg/machinery/config/types/runtime"
 
+	"github.com/nberlee/cephadm-talos/internal/approval"
 	"github.com/nberlee/cephadm-talos/internal/cephx"
 	"github.com/nberlee/cephadm-talos/internal/daemons"
 	"github.com/nberlee/cephadm-talos/internal/mgrmodule"
@@ -35,6 +36,19 @@ type Policy struct {
 	Host   string   // the agent's host: the mgr TLS files must be this host's mgr's
 	Repos  []string // image repositories the cluster's images come from
 	CACert string   // the agent CA, PEM
+	// ApprovalKey is the public key of the operator's approvals
+	// (internal/approval): images and disk jobs are admitted only as the
+	// highest approval the agent verified allows
+	ApprovalKey string
+}
+
+// diskUse is a job of a grant that needs a disk entry of the approval; its
+// candidates are the entries for its disk and action (an entry used by another
+// job does not count: the Node picks).
+type diskUse struct {
+	candidates  []approval.Disk
+	action      string
+	job, inputs string
 }
 
 // Disk is what Talos reports of one of the node's disks.
@@ -48,6 +62,10 @@ type facts struct {
 	disks []Disk
 	// containers are the ContainerConfig names the node has or the revision adds
 	containers map[string]bool
+	// appr is the approval admission follows (nil: none, no image is admitted);
+	// the disk entries the revision's jobs use are collected in uses
+	appr *approval.Approval
+	uses *[]diskUse
 }
 
 var (
@@ -71,8 +89,8 @@ var containerKinds = []string{"osd-prepare", "mon", "mgr", "osd", "rgw", "vip", 
 // Check runs the policy over a revision's documents as Apply does, against
 // the node's disks and the ContainerConfig names it has; removals pass. The
 // leader can check a revision before it grants it.
-func (p *Policy) Check(docs []Doc, disks []Disk, containers []string) error {
-	f := facts{disks: disks, containers: map[string]bool{}}
+func (p *Policy) Check(docs []Doc, disks []Disk, containers []string, appr *approval.Approval) error {
+	f := facts{disks: disks, containers: map[string]bool{}, appr: appr, uses: &[]diskUse{}}
 	for _, c := range containers {
 		f.containers[c] = true
 	}
@@ -186,7 +204,11 @@ func (p *Policy) docName(typ, id string) string {
 }
 
 // image checks an image reference: a digest from one of the allowed repositories.
-func (p *Policy) image(ref string) error {
+func (p *Policy) image(ref string, f facts) error {
+	if f.appr == nil || !f.appr.Image(ref) {
+		return errors.New("image: not approved by the operator")
+	}
+
 	n, err := reference.ParseNormalizedNamed(ref)
 	if err != nil {
 		return errors.New("image: not a reference")
@@ -346,7 +368,7 @@ func (p *Policy) admitContainer(d Doc, td typedDoc, f facts) error {
 		return errors.New("not a kind a grant can carry, or its id is not the one in its name")
 	}
 
-	if err := p.image(c.ContainerImage); err != nil {
+	if err := p.image(c.ContainerImage, f); err != nil {
 		return err
 	}
 
@@ -516,8 +538,6 @@ func (p *Policy) admitJob(kind string, d Doc, td typedDoc, env map[string]string
 		return errors.New("JOB: not the job id in the document's name")
 	case params.ID != "job" || params.Addr != "" || params.DeployID != "":
 		return errors.New("ID, ADDR, DEPLOY_ID: not a job's")
-	case !inputsRe.MatchString(env["JOB_INPUTS"]):
-		return errors.New("JOB_INPUTS: not an inputs hash")
 	}
 
 	serial, err := device(env["DEVICE"], f)
@@ -531,19 +551,61 @@ func (p *Policy) admitJob(kind string, d Doc, td typedDoc, env map[string]string
 
 	params.Device, params.DiskSerial = env["DEVICE"], serial
 
+	// a disk job uses an approved disk entry once (plan 03, step 6c); a zap
+	// without one runs the label check of its script
+	use := func(action string) error {
+		if f.appr == nil {
+			return errors.New("no approval of the operator")
+		}
+
+		es := f.appr.Entries(p.Host, serial, action)
+		if len(es) == 0 {
+			return fmt.Errorf("the operator did not approve to %s this disk", action)
+		}
+
+		*f.uses = append(*f.uses, diskUse{candidates: es, action: action, job: job, inputs: env["JOB_INPUTS"]}) // checked by the template below
+
+		return nil
+	}
+
 	if kind == "osd-prepare" {
+		if err := use(approval.Prepare); err != nil {
+			return err
+		}
+
 		if params.Keyring, err = keyring(env["CEPHADM_TALOS_KEYRING"], "client.bootstrap-osd"); err != nil {
 			return err
 		}
 
-		return same(td, daemons.OSDPrepare(params, job, env["JOB_INPUTS"]))
+		// the inputs come from the checked parameters, not from the grant
+		return same(td, daemons.OSDPrepare(params, job, daemons.PrepareInputs(p.FSID, p.Host, params.Device, serial, job)))
 	}
 
 	if _, err := keyring(env["CEPHADM_TALOS_KEYRING"], ""); err != nil {
 		return err
 	}
 
-	return same(td, daemons.Zap(params, job, env["JOB_INPUTS"]))
+	switch env["ZAP_UNLABELLED"] {
+	case "":
+	case "1":
+		if err := use(approval.Zap); err != nil {
+			return err
+		}
+
+		params.ZapUnlabelled = true
+	default:
+		return errors.New("ZAP_UNLABELLED: not a flag")
+	}
+
+	if u := env["ZAP_OSD_UUID"]; u != "" {
+		if !uuidRe.MatchString(u) {
+			return errors.New("ZAP_OSD_UUID: not a uuid")
+		}
+
+		params.OSDUUID = u
+	}
+
+	return same(td, daemons.Zap(params, job, daemons.ZapInputs(p.Host, params.Device, serial, params.ZapUnlabelled, params.OSDUUID)))
 }
 
 // admitFile checks one of the cluster's files below /etc/ceph.
@@ -670,4 +732,53 @@ func privateKey(contents string) error {
 	}
 
 	return errors.New("not a private key")
+}
+
+// mgrPairs checks the mgr's client and server pairs (certificate and key) on
+// the documents a node holds after a revision that changes either half: both or
+// neither, and a key that is its certificate's.
+func mgrPairs(cur, typed map[string]typedDoc, sent map[string]string) error {
+	content := func(name string) (string, bool) {
+		k := "EtcFileConfig/" + name
+
+		td, ok := cur[k]
+		if h, granted := sent[k]; granted {
+			if h == "" {
+				return "", false
+			}
+
+			td, ok = typed[k], true
+		}
+
+		f, isFile := td.doc.(*runtime.EtcFileConfigV1Alpha1)
+		if !ok || !isFile {
+			return "", false
+		}
+
+		return f.Contents, true
+	}
+
+	for _, pair := range [][2]string{{daemons.MgrCertFile, daemons.MgrKeyFile}, {daemons.MgrServerCertFile, daemons.MgrServerKeyFile}} {
+		_, a := sent["EtcFileConfig/"+pair[0]]
+		_, b := sent["EtcFileConfig/"+pair[1]]
+
+		if !a && !b {
+			continue
+		}
+
+		cert, hasCert := content(pair[0])
+		key, hasKey := content(pair[1])
+
+		if hasCert != hasKey {
+			return fmt.Errorf("%s and %s: one without the other", pair[0], pair[1])
+		}
+
+		if hasCert {
+			if _, err := tls.X509KeyPair([]byte(cert), []byte(key)); err != nil {
+				return fmt.Errorf("%s: the key does not match its certificate", pair[1])
+			}
+		}
+	}
+
+	return nil
 }

@@ -1,6 +1,8 @@
 package state
 
 import (
+	"fmt"
+	"encoding/base64"
 	"os"
 	"path/filepath"
 	"strings"
@@ -132,5 +134,72 @@ func TestSecretsCoverEveryPrivateValue(t *testing.T) {
 
 	if back.Agent.CAKey != "ca-key" || back.RGW.VRRPPass != "vrrp-pass" || back.Hosts[0].MgrClientKey != "mgr-2" || back.Contacts[0].AgentKey != "contact-1" {
 		t.Fatalf("secrets lost: %+v %+v %+v", back.Agent, back.RGW, back.Hosts)
+	}
+}
+
+// The approval key signs what agents admit: it is neither published nor a
+// secret the mgr could read (plan 03, step 6c).
+func TestTheApprovalKeyStaysOnTheWorkstation(t *testing.T) {
+	t.Setenv("CEPHADM_TALOS_HOME", t.TempDir())
+
+	s := New("eb8dac3e-0ba7-4795-8feb-a80e8593331f")
+	s.Agent = &Agent{CACert: "C", ApprovalKey: "public-key", ApprovalPriv: "private-key", Approval: "last-approval", OperatorCert: "op"}
+
+	recs, err := s.Records()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	all := ""
+	for _, r := range recs {
+		all += string(r)
+	}
+
+	for _, v := range s.Secrets() {
+		all += v
+	}
+
+	if strings.Contains(all, "private-key") || strings.Contains(all, "last-approval") || !strings.Contains(all, "public-key") {
+		t.Fatalf("published or secret: %s", all)
+	}
+
+	if err := s.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	back, err := Load(s.FSID)
+	if err != nil || back.Agent == nil || back.Agent.ApprovalPriv != "private-key" || back.Agent.Approval != "last-approval" {
+		t.Fatalf("not kept on the workstation: %+v %v", back.Agent, err)
+	}
+}
+
+// A save keeps a newer approval another process signed meanwhile.
+func TestASaveKeepsANewerApproval(t *testing.T) {
+	t.Setenv("CEPHADM_TALOS_HOME", t.TempDir())
+
+	signed := func(serial int) string {
+		p := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf(`{"serial":%d}`, serial)))
+
+		return `{"payload":"` + p + `","signature":"x"}`
+	}
+
+	s := New("eb8dac3e-0ba7-4795-8feb-a80e8593331f")
+	s.Agent = &Agent{OperatorCert: "op", Approval: signed(2)}
+	must(t, s.Save())
+
+	old := New(s.FSID)
+	old.Agent = &Agent{OperatorCert: "op", Approval: signed(1)}
+	must(t, old.Save())
+
+	if got, err := LastApproval(s.FSID); err != nil || got != signed(2) {
+		t.Fatalf("approval on disk %s %v", got, err)
+	}
+}
+
+func must(t *testing.T, err error) {
+	t.Helper()
+
+	if err != nil {
+		t.Fatal(err)
 	}
 }

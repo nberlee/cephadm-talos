@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/base64"
+	"github.com/nberlee/cephadm-talos/internal/approval"
 	"strings"
 	"testing"
 
@@ -121,6 +122,18 @@ func testPolicy(o *Orch) *agent.Policy {
 	return &agent.Policy{FSID: o.St.FSID, Host: "h1", Repos: o.imageRepos(), CACert: o.St.Agent.CACert}
 }
 
+// testApproval approves the cluster's images and the test disk for every job.
+func testApproval(o *Orch) *approval.Approval {
+	imgs := []string{o.St.Image}
+	if o.St.RGW != nil && o.St.RGW.KeepalivedImage != "" {
+		imgs = append(imgs, o.St.RGW.KeepalivedImage)
+	}
+
+	return &approval.Approval{Version: approval.Version, FSID: o.St.FSID, Serial: 1, Images: imgs, Disks: []approval.Disk{
+		{Host: "h1", Serial: "QM00001", Action: approval.Prepare, Since: 1}, {Host: "h1", Serial: "QM00001", Action: approval.Zap, Since: 1},
+	}}
+}
+
 var testDisks = []agent.Disk{{Serial: "QM00001", Symlinks: []string{"/dev/disk/by-id/ata-QEMU_HARDDISK_QM00001", "/dev/disk/by-path/pci-0000:00:1f.2-ata-1"}}}
 
 // The agents admit every document the CLI renders: the leader renders them
@@ -140,13 +153,13 @@ func TestAgentsAdmitWhatTheCLIRenders(t *testing.T) {
 		}
 	}
 
-	if err := testPolicy(o).Check(docs, testDisks, names); err != nil {
+	if err := testPolicy(o).Check(docs, testDisks, names, testApproval(o)); err != nil {
 		t.Fatal(err)
 	}
 
 	// the image probe, before an upgrade
 	probe := docOf(t, daemonsProbe(o, "c0ffee"))
-	if err := testPolicy(o).Check([]agent.Doc{probe}, nil, nil); err != nil {
+	if err := testPolicy(o).Check([]agent.Doc{probe}, nil, nil, testApproval(o)); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -290,7 +303,7 @@ func TestAgentsRefuseWhatTheTemplatesDoNot(t *testing.T) {
 
 	for name, mk := range cases {
 		d := docOf(t, mk())
-		if err := pol.Check([]agent.Doc{d}, testDisks, names); err == nil {
+		if err := pol.Check([]agent.Doc{d}, testDisks, names, testApproval(o)); err == nil {
 			t.Errorf("%s admitted", name)
 		} else if strings.Contains(err.Error(), adm) || strings.Contains(err.Error(), "a;reboot") || strings.Contains(err.Error(), "SECRETVALUE") {
 			t.Errorf("%s: the error carries a value: %v", name, err)
@@ -315,13 +328,13 @@ func TestPolicyErrorsAndDuplicates(t *testing.T) {
 	// a misspelt field next to a private key: Talos's decoder quotes values
 	bad := []byte("apiVersion: v1alpha1\nkind: EtcFileConfig\nname: " + mgrKeyFile + "\nmode: 0o600\ncontent: |\n" +
 		"  " + strings.ReplaceAll(strings.TrimSpace(h.MgrClientKey), "\n", "\n  ") + "\n")
-	err := pol.Check([]agent.Doc{{Kind: "EtcFileConfig", Name: mgrKeyFile, YAML: bad}}, nil, nil)
+	err := pol.Check([]agent.Doc{{Kind: "EtcFileConfig", Name: mgrKeyFile, YAML: bad}}, nil, nil, testApproval(o))
 
 	if err == nil || strings.Contains(err.Error(), "PRIVATE KEY") || strings.Contains(err.Error(), strings.Split(h.MgrClientKey, "\n")[1]) {
 		t.Fatalf("undecodable key document: %v", err)
 	}
 
-	if err := pol.Check([]agent.Doc{{Kind: "EtcFileConfig", Name: mgrKeyFile, YAML: []byte("contents: [" + h.MgrClientKey)}}, nil, nil); err == nil || strings.Contains(err.Error(), "PRIVATE KEY") {
+	if err := pol.Check([]agent.Doc{{Kind: "EtcFileConfig", Name: mgrKeyFile, YAML: []byte("contents: [" + h.MgrClientKey)}}, nil, nil, testApproval(o)); err == nil || strings.Contains(err.Error(), "PRIVATE KEY") {
 		t.Fatalf("broken YAML: %v", err)
 	}
 
@@ -330,7 +343,7 @@ func TestPolicyErrorsAndDuplicates(t *testing.T) {
 	evil := daemonsProbe(o, "c0ffee")
 	evil.ContainerEntrypoint = []string{"/bin/sh", "-c", "id"}
 
-	if err := pol.Check([]agent.Doc{docOf(t, evil), good}, nil, nil); err == nil {
+	if err := pol.Check([]agent.Doc{docOf(t, evil), good}, nil, nil, testApproval(o)); err == nil {
 		t.Fatal("a duplicate passed the pre-check")
 	}
 }
@@ -354,7 +367,7 @@ func TestPolicyKindByIDNotPrefix(t *testing.T) {
 	}
 
 	pol := &agent.Policy{FSID: o.St.FSID, Host: "prepare", Repos: o.imageRepos(), CACert: o.St.Agent.CACert}
-	if err := pol.Check([]agent.Doc{docOf(t, c)}, testDisks, nil); err != nil {
+	if err := pol.Check([]agent.Doc{docOf(t, c)}, testDisks, nil, testApproval(o)); err != nil {
 		t.Fatal(err)
 	}
 }

@@ -141,7 +141,7 @@ func TestCephConfAndImageRepository(t *testing.T) {
 		}
 	}
 
-	a := Agent("ceph-0123abcd-agent-h1", "ceph-0123abcd-records-init-h1", "registry/agent:1", []string{"quay.io/ceph/ceph", "quay.io/ceph/keepalived"}, "ca", "c", "k", "cc", "ck")
+	a := Agent("ceph-0123abcd-agent-h1", "ceph-0123abcd-records-init-h1", "registry/agent:1", []string{"quay.io/ceph/ceph", "quay.io/ceph/keepalived"}, "approval-key", "ca", "c", "k", "cc", "ck")
 	if !strings.Contains(strings.Join(a.ContainerEnvironment, "\n"), EnvImageRepos+"=quay.io/ceph/ceph quay.io/ceph/keepalived") {
 		t.Error("the agent document misses its image repositories")
 	}

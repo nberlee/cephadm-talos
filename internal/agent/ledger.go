@@ -423,7 +423,7 @@ func (l *LeaderLoop) restartOp(ctx context.Context, b *Bridge, js store.Backend,
 
 	g := wire.Grant{
 		Version: wire.Version, FSID: l.Self.FSID, Host: h.Name, Mgr: l.Self.Name, MgrAddr: me.Addr, GID: gid, Epoch: epoch,
-		Revision: op.Revision, Operation: lop.ID, Restart: &wire.GrantRestart{Kind: "ContainerConfig", Name: st.DocName(d), Hash: hash},
+		Revision: op.Revision, Operation: lop.ID, Restart: &wire.GrantRestart{Kind: "ContainerConfig", Name: st.DocName(d), Hash: hash}, Approval: l.approval,
 	}
 
 	var res wire.Operation

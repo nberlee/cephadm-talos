@@ -63,7 +63,7 @@ func fakeOrch(t *testing.T, f *talostest.Node) *Orch {
 	t.Cleanup(func() { tc.Close() }) //nolint:errcheck
 
 	st := state.New("eb8dac3e-0ba7-4795-8feb-a80e8593331f")
-	st.Image, st.CephVersion, st.Arch = "quay.io/ceph/ceph@sha256:abc", SupportedCeph, SupportedArch
+	st.Image, st.CephVersion, st.Arch = "quay.io/ceph/ceph@sha256:"+strings.Repeat("ab", 32), SupportedCeph, SupportedArch
 
 	o := &Orch{Talos: tc, St: st, Out: io.Discard, StoreBackend: &store.Memory{}, AuthGet: noAuth}
 	if err := errors.Join(o.openStore(context.Background(), ""), o.openSecrets(context.Background(), "")); err != nil {

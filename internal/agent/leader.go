@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/nberlee/cephadm-talos/internal/approval"
 	"io"
 	"log"
 	"net"
@@ -116,6 +117,11 @@ type LeaderLoop struct {
 	bridgeAddr string
 	// failing: since when a ledger operation keeps failing (ledger.go)
 	failing map[string]time.Time
+	// ApprovalKey verifies the operator's approvals; approval is the newest
+	// one the bridge returned this tick, which every grant carries
+	ApprovalKey string
+	approval    *approval.Signed
+	appr        *approval.Approval
 	// closed are the hosts whose earlier sessions this incarnation closed
 	closed map[string]bool
 	// stateInc is the incarnation the cluster state is read from: the
@@ -224,6 +230,11 @@ func (l *LeaderLoop) Tick(ctx context.Context, gid, epoch int64) error {
 	// requests are carried out on this incarnation's own state only
 	if !to.Published {
 		return nil
+	}
+
+	// the operator's newest approval, for every grant of this tick
+	if err := l.loadApproval(ctx, b); err != nil {
+		return err
 	}
 
 	// every id with a request or an operation: an imported grant is resolved
@@ -1057,7 +1068,7 @@ func (l *LeaderLoop) revision(ctx context.Context, b *Bridge, js store.Backend, 
 	}
 
 	pol := &Policy{FSID: l.Self.FSID, Host: h.Name, Repos: l.Repos, CACert: l.CACert}
-	if err := pol.Check(docs, disks, rep.Containers); err != nil {
+	if err := pol.Check(docs, disks, rep.Containers, l.appr); err != nil {
 		return fail(err)
 	}
 
@@ -1079,7 +1090,7 @@ func (l *LeaderLoop) revision(ctx context.Context, b *Bridge, js store.Backend, 
 
 	g := wire.Grant{
 		Version: wire.Version, FSID: l.Self.FSID, Host: h.Name, Mgr: l.Self.Name, MgrAddr: me.Addr, GID: gid, Epoch: epoch,
-		Revision: op.Revision, Operation: id, Docs: grant,
+		Revision: op.Revision, Operation: id, Docs: grant, Approval: l.approval,
 	}
 
 	var res wire.Operation
@@ -1136,4 +1147,28 @@ func (l *LeaderLoop) resolve(ctx context.Context, b *Bridge, js store.Backend, g
 	}
 
 	return l.record(ctx, js, opKey, op, res)
+}
+
+// loadApproval reads the operator's newest approval and verifies it; an agent
+// checks it again. Without one, grants carry none and admit no image.
+func (l *LeaderLoop) loadApproval(ctx context.Context, b *Bridge) error {
+	s, err := b.Approval(ctx)
+	if err != nil {
+		return err
+	}
+
+	l.approval, l.appr = nil, nil
+
+	if s == nil {
+		return nil
+	}
+
+	a, err := approval.Verify(l.ApprovalKey, *s, l.Self.FSID)
+	if err != nil {
+		return fmt.Errorf("the operator's approval: %w", err)
+	}
+
+	l.approval, l.appr = s, &a
+
+	return nil
 }

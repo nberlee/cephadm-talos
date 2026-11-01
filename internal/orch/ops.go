@@ -849,9 +849,12 @@ func (o *Orch) zap(ctx context.Context, h state.Host, device, serial string) err
 	return err
 }
 
-// zapDoc renders the job that zaps a device, bound to its serial.
+// zapDoc renders the job that zaps a device, bound to its serial. The CLI
+// applies it itself, with os:admin, to a disk of an OSD it recorded, which
+// may carry no label (a preparation that failed): the job skips the label
+// check that agents require without the operator's approval.
 func (o *Orch) zapDoc(h state.Host, id, device, serial string) *spec.ContainerConfig {
-	return render.Zap(o.St, h, id, device, serial)
+	return render.Zap(o.St, h, id, device, serial, true)
 }
 
 // osdIfExists runs a command for an OSD only if that very OSD (id and uuid)

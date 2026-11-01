@@ -121,7 +121,7 @@ func TestRenderingChangesNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_ = Zap(s, h1, "a1b2c3", osd.DevicePath, osd.DiskSerial)
+	_ = Zap(s, h1, "a1b2c3", osd.DevicePath, osd.DiskSerial, false)
 	_ = Probe(s, "c0ffee", image)
 	_ = CephConf(s)
 	_ = OSDPrepareInputs(s, h1, osd)

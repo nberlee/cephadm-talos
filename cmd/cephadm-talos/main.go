@@ -49,6 +49,8 @@ Commands:
   upgrade --image IMG [--refresh]          rolling image upgrade: mons, mgrs, osds
   shell [--host H] -- <cmd...>             run a command with the admin keyring on a node
   handoff                                  hand the nodes to their agents and the state to the leader
+  approve [--image REF] [--prepare H:DISK] [--zap H:DISK] [--drop H:SERIAL:ACTION] [--show]
+                                           sign and publish the operator's approval of images and disks
   rm-cluster [--zap] --yes-i-really-mean-it  remove the whole cluster from all hosts
   conf                                     print the generated ceph.conf
   agent                                    run the node agent (inside its container)
@@ -163,7 +165,7 @@ func run() error {
 	// nothing itself (plan 03, step 6): changes go through `ceph orch`
 	if o.Managed() {
 		switch cmd {
-		case "ps", "ls", "conf", "logs", "shell", "handoff":
+		case "ps", "ls", "conf", "logs", "shell", "handoff", "approve":
 		case "host":
 			if len(args) == 0 || args[0] != "ls" {
 				return orch.ErrManaged
@@ -362,6 +364,8 @@ func runCommand(ctx context.Context, o *orch.Orch, cmd string, args []string) er
 		os.Exit(rc)
 	case "handoff":
 		return o.Handoff(ctx)
+	case "approve":
+		return approve(ctx, o, args)
 	case "conf":
 		fmt.Print(o.CephConf())
 
@@ -369,6 +373,42 @@ func runCommand(ctx context.Context, o *orch.Orch, cmd string, args []string) er
 	}
 
 	return fmt.Errorf("unknown command %q, see cephadm-talos -h (%s)", cmd, strings.Join([]string{"bootstrap", "host", "deploy", "ps", "logs", "rm", "upgrade", "shell"}, ", "))
+}
+
+// listFlag collects a repeated flag.
+type listFlag []string
+
+func (l *listFlag) String() string     { return strings.Join(*l, ",") }
+func (l *listFlag) Set(v string) error { *l = append(*l, v); return nil }
+
+func approve(ctx context.Context, o *orch.Orch, args []string) error {
+	fs := flag.NewFlagSet("approve", flag.ExitOnError)
+
+	var c orch.ApprovalChange
+
+	fs.Var((*listFlag)(&c.AddImages), "image", "approve an image by digest (repeatable)")
+	fs.Var((*listFlag)(&c.DropImages), "drop-image", "withdraw an image (repeatable)")
+	fs.Var((*listFlag)(&c.Prepare), "prepare", "approve one OSD preparation on <host>:<serial> or <host>:/dev/<disk> (repeatable)")
+	fs.Var((*listFlag)(&c.Zap), "zap", "approve one zap without the label check on <host>:<serial> or <host>:/dev/<disk> (repeatable)")
+	fs.Var((*listFlag)(&c.Drop), "drop", "withdraw a disk entry <host>:<serial>:<action> (repeatable)")
+	show := fs.Bool("show", false, "print the last approval")
+
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	if *show {
+		return o.ShowApproval()
+	}
+
+	a, err := o.Approve(ctx, c)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("approval %d published: %d images, %d disk entries\n", a.Serial, len(a.Images), len(a.Disks))
+
+	return nil
 }
 
 func rmCluster(ctx context.Context, o *orch.Orch, args []string) error {

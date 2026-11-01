@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/nberlee/cephadm-talos/internal/approval"
 	"io"
 	"sort"
 	"strings"
@@ -36,6 +37,9 @@ import (
 const (
 	ownershipRecord = "ownership"
 	applyRecord     = "apply"
+	// approvalRecord is the highest approval the agent verified, with the disk
+	// entries jobs used (plan 03, step 6c); it is never pruned
+	approvalRecord = "approval"
 )
 
 // ownershipSchema is the version of the ownership and apply records.
@@ -58,6 +62,9 @@ type Ownership struct {
 	Schema   int               `json:"schema"`
 	Revision int64             `json:"revision"`
 	Docs     map[string]string `json:"docs"` // key -> hash
+	// ApprovalSerial is the highest approval the agent recorded: an approval
+	// record missing or older than it blocks admission (plan 03, step 6c)
+	ApprovalSerial int64 `json:"approval_serial,omitempty"`
 }
 
 // applyIntent is written before an apply and removed after its outcome is
@@ -158,7 +165,13 @@ func (n *Node) admit(ctx context.Context, docs []Doc, typed map[string]typedDoc,
 		return err
 	}
 
-	f := facts{containers: map[string]bool{}}
+	appr, err := n.approval()
+	if err != nil {
+		return err
+	}
+
+	uses := []diskUse{}
+	f := facts{containers: map[string]bool{}, appr: appr, uses: &uses}
 
 	for _, d := range disks {
 		f.disks = append(f.disks, Disk{Serial: d.TypedSpec().Serial, Symlinks: d.TypedSpec().Symlinks})
@@ -177,7 +190,173 @@ func (n *Node) admit(ctx context.Context, docs []Doc, typed map[string]typedDoc,
 		}
 	}
 
-	return n.Policy.check(docs, typed, f)
+	if err := n.Policy.check(docs, typed, f); err != nil {
+		return err
+	}
+
+	// the whole revision passed: each job gets a disk entry of its own (one it
+	// reserved before, on a retry, or one no job used), all checked before the
+	// reservations are written, in one record, before anything is applied
+	if len(uses) == 0 {
+		return nil
+	}
+
+	_, rec, err := n.approvalRecord()
+	if err != nil {
+		return err
+	}
+
+	if rec.Uses == nil {
+		rec.Uses = map[string]diskUseRecord{}
+	}
+
+	picked := map[string]bool{}
+
+	for _, u := range uses {
+		var pick string
+
+		for _, e := range u.candidates {
+			k := e.Key()
+			if have, used := rec.Uses[k]; used && have.Job == u.job && have.Inputs == u.inputs && !picked[k] {
+				pick = k // its own reservation
+
+				break
+			}
+		}
+
+		for _, e := range u.candidates {
+			if _, used := rec.Uses[e.Key()]; pick == "" && !used && !picked[e.Key()] {
+				pick = e.Key()
+			}
+		}
+
+		if pick == "" {
+			return fmt.Errorf("no unused approval to %s: every entry was used by another job", u.action)
+		}
+
+		picked[pick] = true
+		rec.Uses[pick] = diskUseRecord{Entry: pick, Job: u.job, Inputs: u.inputs}
+	}
+
+	return n.writeJSON(approvalRecord, rec)
+}
+
+// diskUseRecord is a disk entry of an approval, reserved for the job that used it.
+type diskUseRecord struct {
+	Entry  string `json:"entry"`
+	Job    string `json:"job"`
+	Inputs string `json:"inputs"`
+}
+
+// approvalStore is the recorded highest approval and the disk entries jobs
+// used, one record.
+type approvalStore struct {
+	Signed approval.Signed          `json:"signed"`
+	Uses   map[string]diskUseRecord `json:"uses,omitempty"`
+}
+
+// approvalRecord reads the recorded approval, verified again, and checks it
+// against the ownership's serial: a record missing or older than what the
+// agent recorded before blocks, and never resets what was used.
+func (n *Node) approvalRecord() (*approval.Approval, approvalStore, error) {
+	var rec approvalStore
+
+	if n.Policy == nil {
+		return nil, rec, errors.New("no admission policy")
+	}
+
+	own, owned, err := n.ownership()
+	if err != nil {
+		return nil, rec, err
+	}
+
+	found, err := n.readJSON(approvalRecord, &rec)
+	if err != nil {
+		return nil, rec, err
+	}
+
+	if !found {
+		if owned && own.ApprovalSerial > 0 {
+			return nil, rec, fmt.Errorf("the approval record is missing (the agent recorded approval %d)", own.ApprovalSerial)
+		}
+
+		return nil, rec, nil
+	}
+
+	a, err := approval.Verify(n.Policy.ApprovalKey, rec.Signed, n.FSID)
+	if err != nil {
+		return nil, rec, fmt.Errorf("the recorded approval: %w", err)
+	}
+
+	if owned && a.Serial < own.ApprovalSerial {
+		return nil, rec, fmt.Errorf("the recorded approval %d is older than %d", a.Serial, own.ApprovalSerial)
+	}
+
+	return &a, rec, nil
+}
+
+// approval returns the highest approval the agent verified, nil before any.
+func (n *Node) approval() (*approval.Approval, error) {
+	a, _, err := n.approvalRecord()
+
+	return a, err
+}
+
+// Approval is the highest approval the agent verified, for checks outside a
+// grant (the admin socket queries).
+func (n *Node) Approval(ctx context.Context) (*approval.Approval, error) {
+	if err := n.lock(ctx); err != nil {
+		return nil, err
+	}
+	defer n.unlock()
+
+	return n.approval()
+}
+
+// RecordApproval verifies an approval a grant carries and records it if it is
+// higher than the agent's, keeping the entries jobs used; a lower one is
+// refused: an agent never goes back.
+func (n *Node) RecordApproval(ctx context.Context, s approval.Signed) error {
+	if err := n.lock(ctx); err != nil {
+		return err
+	}
+	defer n.unlock()
+
+	if n.Policy == nil || n.Policy.ApprovalKey == "" {
+		return errors.New("no approval key: the agent admits no approval")
+	}
+
+	a, err := approval.Verify(n.Policy.ApprovalKey, s, n.FSID)
+	if err != nil {
+		return err
+	}
+
+	cur, rec, err := n.approvalRecord()
+	if err != nil {
+		return err
+	}
+
+	if cur != nil && a.Serial < cur.Serial {
+		return fmt.Errorf("approval %d is older than the agent's %d", a.Serial, cur.Serial)
+	}
+
+	if cur == nil || a.Serial > cur.Serial {
+		rec.Signed = s
+		if err := n.writeJSON(approvalRecord, rec); err != nil {
+			return err
+		}
+	}
+
+	// the ownership remembers the serial, so a lost record is noticed; an
+	// equal one repairs a serial the ownership lost
+	own, owned, err := n.ownership()
+	if err != nil || !owned || own.ApprovalSerial >= a.Serial {
+		return err
+	}
+
+	own.ApprovalSerial = a.Serial
+
+	return n.writeJSON(ownershipRecord, own)
 }
 
 // handoff reports whether a document stays the CLI's: the agent's own
@@ -567,6 +746,14 @@ func (n *Node) Reconcile(ctx context.Context) (outcome string, rev, owned int64,
 	}
 
 	next := Ownership{Schema: ownershipSchema, Revision: intent.Revision, Docs: map[string]string{}}
+
+	// what the agent knows of the operator's approvals is not the apply's to lose
+	if prev, found, err := n.ownership(); err != nil {
+		return "", 0, 0, err
+	} else if found {
+		next.ApprovalSerial = prev.ApprovalSerial
+	}
+
 	for k, h := range intent.Before {
 		next.Docs[k] = h
 	}
@@ -679,6 +866,13 @@ func (n *Node) Adopt(ctx context.Context, revision int64) (Ownership, error) {
 	}
 
 	own := Ownership{Schema: ownershipSchema, Revision: revision, Docs: map[string]string{}}
+
+	// an approval the agent recorded before the handoff counts from now on
+	if a, err := n.approval(); err != nil {
+		return Ownership{}, err
+	} else if a != nil {
+		own.ApprovalSerial = a.Serial
+	}
 
 	for k, h := range docs {
 		kind, name, _ := strings.Cut(k, "/")
@@ -801,16 +995,27 @@ func (n *Node) apply(ctx context.Context, until time.Time, revision int64, docs 
 		return Ownership{}, started, err
 	}
 
-	cur, err := parseDocs(cfg)
+	curTyped, err := typedDocs([]byte(cfg))
 	if err != nil {
-		return Ownership{}, started, err
+		return Ownership{}, started, errors.New("machine config: does not decode") // the message may quote a value
+	}
+
+	cur := make(map[string]string, len(curTyped))
+	for k, d := range curTyped {
+		cur[k] = d.hash
 	}
 
 	if d := n.drift(own, cur); len(d) > 0 {
 		return Ownership{}, started, fmt.Errorf("%w: %s", ErrDrift, strings.Join(d, ", "))
 	}
 
-	// every document must pass the admission policy (plan 03, item 13)
+	// the mgr's keys and certificates as the node will hold them
+	if err := mgrPairs(curTyped, typed, sent); err != nil {
+		return Ownership{}, started, err
+	}
+
+	// every document must pass the admission policy (plan 03, item 13); disk
+	// entries are reserved here, before the intent
 	if err := n.admit(ctx, docs, typed, cur, sent); err != nil {
 		return Ownership{}, started, err
 	}
@@ -861,7 +1066,7 @@ func (n *Node) apply(ctx context.Context, until time.Time, revision int64, docs 
 		return Ownership{}, started, err
 	}
 
-	next := Ownership{Schema: ownershipSchema, Revision: revision, Docs: map[string]string{}}
+	next := Ownership{Schema: ownershipSchema, Revision: revision, Docs: map[string]string{}, ApprovalSerial: own.ApprovalSerial}
 	for k, h := range own.Docs {
 		next.Docs[k] = h
 	}
