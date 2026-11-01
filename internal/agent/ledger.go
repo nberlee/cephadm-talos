@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/nberlee/cephadm-talos/internal/daemons"
 	"github.com/nberlee/cephadm-talos/internal/spec"
 	"net/http"
 	"path/filepath"
@@ -39,7 +40,12 @@ const (
 	KindRemoveDaemon = "remove_daemon"
 	KindRemoveHost   = "remove_host"
 	KindCreateOSD    = "create_osd"
+	KindRemoveOSD    = "remove_osd"
 )
+
+// errWait is a step that waits as long as it takes (a drain), which does not
+// count toward stuckAfter.
+var errWait = errors.New("waiting")
 
 // maxAckAttempts bounds the attempts to acknowledge a failed creation's job.
 const maxAckAttempts = 50
@@ -195,7 +201,7 @@ func (l *LeaderLoop) ledgerOp(ctx context.Context, b *Bridge, js store.Backend, 
 	op := e.Op
 	opKey := JournalPrefix(gid) + "op/" + op.ID
 
-	known := map[string]bool{KindRestart: true, KindRedeploy: true, KindAddDaemon: true, KindRemoveDaemon: true, KindRemoveHost: true, KindCreateOSD: true}
+	known := map[string]bool{KindRestart: true, KindRedeploy: true, KindAddDaemon: true, KindRemoveDaemon: true, KindRemoveHost: true, KindCreateOSD: true, KindRemoveOSD: true}
 	noDaemon := op.Kind == KindRemoveHost || op.Kind == KindCreateOSD
 	if !ledgerIDRe.MatchString(op.ID) || pki.ValidName(op.Host) != nil || !known[op.Kind] ||
 		noDaemon != (op.Daemon == "") || (op.Daemon != "" && !ledgerDaemonRe.MatchString(op.Daemon)) ||
@@ -209,10 +215,12 @@ func (l *LeaderLoop) ledgerOp(ctx context.Context, b *Bridge, js store.Backend, 
 	}
 
 	switch op.Kind {
-	case KindAddDaemon, KindRemoveDaemon, KindRemoveHost, KindCreateOSD:
+	case KindAddDaemon, KindRemoveDaemon, KindRemoveHost, KindCreateOSD, KindRemoveOSD:
 		var phase func() error
 
 		switch op.Kind {
+		case KindRemoveOSD:
+			phase = func() error { return l.removeOSD(ctx, b, js, gid, epoch, op) }
 		case KindCreateOSD:
 			phase = func() error { return l.createOSD(ctx, b, js, gid, epoch, op) }
 		case KindAddDaemon:
@@ -276,10 +284,10 @@ func (l *LeaderLoop) ledgerOp(ctx context.Context, b *Bridge, js store.Backend, 
 // phaseKey and phaseKey.*) has an unknown outcome; the time it started failing
 // is kept in memory only.
 func (l *LeaderLoop) unstick(ctx context.Context, js store.Backend, opKey, phaseKey string, op LedgerOp, onFail func() error, err error) error {
-	if err == nil {
+	if err == nil || errors.Is(err, errWait) {
 		delete(l.failing, op.ID)
 
-		return nil
+		return err
 	}
 
 	if l.failing == nil {
@@ -822,12 +830,14 @@ func (l *LeaderLoop) createOSD(ctx context.Context, b *Bridge, js store.Backend,
 			return err
 		}
 
-		serial, link := "", ""
+		serial, link, seen := "", "", false
 
 		for _, disk := range rep.Disks {
 			if disk.DevPath != op.Device && !slices.Contains(disk.Symlinks, op.Device) {
 				continue
 			}
+
+			seen = true
 
 			serial = strings.TrimSpace(disk.Serial)
 
@@ -836,6 +846,10 @@ func (l *LeaderLoop) createOSD(ctx context.Context, b *Bridge, js store.Backend,
 					link = s
 				}
 			}
+		}
+
+		if !seen {
+			return l.failCreate(ctx, b, js, gid, epoch, op, fmt.Errorf("%s has no disk %s", op.Host, op.Device))
 		}
 
 		if serial == "" || link == "" {
@@ -984,37 +998,8 @@ func (l *LeaderLoop) cleanCreate(ctx context.Context, b *Bridge, js store.Backen
 			rc = rec.Result.RC
 		}
 
-		// attempts are numbered: one that ended without applying (a refused
-		// confirmation, among others) is followed by a new one, one unresolved is asked again
-		mode := revisionMode{extra: []string{"ContainerConfig/" + rec.Job.Doc}, ack: &wire.JobAck{Job: rec.Job.ID, Inputs: rec.Job.Inputs, RC: rc}}
-		acked := false
-
-		for n := 1; n <= maxAckAttempts && !acked; n++ {
-			id := fmt.Sprintf("%s.ack.%d", op.ID, n)
-
-			s, err := l.journalState(ctx, b, js, gid, id)
-			if err != nil {
-				return err
-			}
-
-			if terminal(s) && s != wire.OpCompleted && s != JournalNoChange {
-				continue // a new attempt
-			}
-
-			done, ok, err := l.step(ctx, b, js, gid, epoch, id, op.Host, mode)
-			if err != nil {
-				return err
-			}
-
-			if !done {
-				return fmt.Errorf("%w: the acknowledgement of %s is not decided yet", errRetry, op.ID)
-			}
-
-			acked = ok
-		}
-
-		if !acked {
-			return fmt.Errorf("%w: the preparation's outcome of %s is not acknowledged yet", errRetry, op.ID)
+		if err := l.ackJob(ctx, b, js, gid, epoch, op.ID, op.Host, rec, rc); err != nil {
+			return err
 		}
 	}
 
@@ -1034,3 +1019,223 @@ func (l *LeaderLoop) cleanCreate(ctx context.Context, b *Bridge, js store.Backen
 
 	return b.Retire(ctx, "close create", op.ID)
 }
+
+// ackJob acknowledges a job's recorded outcome with its document's removal.
+// Attempts are numbered (<base>.ack.<n>): one that ended without applying (a
+// refused confirmation, among others) is followed by a new one, one
+// unresolved is asked again; an error means not done yet.
+func (l *LeaderLoop) ackJob(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, base, host string, rec JournalOp, rc int) error {
+	mode := revisionMode{extra: []string{"ContainerConfig/" + rec.Job.Doc}, ack: &wire.JobAck{Job: rec.Job.ID, Inputs: rec.Job.Inputs, RC: rc}}
+
+	for n := 1; n <= maxAckAttempts; n++ {
+		id := fmt.Sprintf("%s.ack.%d", base, n)
+
+		s, err := l.journalState(ctx, b, js, gid, id)
+		if err != nil {
+			return err
+		}
+
+		if terminal(s) && s != wire.OpCompleted && s != JournalNoChange {
+			continue // a new attempt
+		}
+
+		done, ok, err := l.step(ctx, b, js, gid, epoch, id, host, mode)
+		if err != nil {
+			return err
+		}
+
+		if !done {
+			return fmt.Errorf("%w: the acknowledgement of %s is not decided yet", errRetry, base)
+		}
+
+		if ok {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("%w: the job outcome of %s is not acknowledged yet", errRetry, base)
+}
+
+// zapOf is the job id of a removal's zap: sixteen hex digits, as tombstones
+// are kept for good.
+func zapOf(op string) string {
+	sum := sha256.Sum256([]byte(op + ":zap"))
+
+	return hex.EncodeToString(sum[:8])
+}
+
+// removeOSD removes an OSD: out and drained by the module (safe to destroy
+// while it runs, unless forced), marked leaving in the state (not rendered,
+// its identity kept) and its document removed, its instance gone, retired by
+// the module (down, purged), with zap its disk zapped (the job checks the
+// label of this cluster and OSD), and only then out of the state.
+func (l *LeaderLoop) removeOSD(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, op LedgerOp) error {
+	st, _, err := l.clusterState(ctx, b)
+	if err != nil {
+		return err
+	}
+
+	h, ok := st.Host(op.Host)
+	if !ok {
+		return finish(ctx, js, gid, op, JournalFailed, fmt.Errorf("no host %s", op.Host))
+	}
+
+	d, found := daemonOf(st, op.Daemon)
+	if !found {
+		// out of the state: the removal ended before its journal record; a zap
+		// it was asked for counts only if its job completed
+		if op.Zap {
+			rec, ok, err := l.journalRecord(ctx, b, js, gid, op.ID+".zap")
+			if err != nil {
+				return err
+			}
+
+			if !ok || rec.State != wire.OpCompleted {
+				return finish(ctx, js, gid, op, JournalFailed, errors.New("purged, not zapped"))
+			}
+		}
+
+		return finish(ctx, js, gid, op, wire.OpCompleted, nil)
+	}
+
+	if d.Host != op.Host || d.OSDUUID != op.UUID {
+		return finish(ctx, js, gid, op, JournalFailed, fmt.Errorf("%s in the state is another OSD", op.Daemon))
+	}
+
+	// out and drained for this removal also when an earlier one marked the OSD
+	// leaving and failed (the module's calls are idempotent per removal)
+	if err := b.Retire(ctx, "osd out", op.ID); err != nil {
+		return err
+	}
+
+	// a drain takes as long as recovery does: waiting for it does not fail
+	if err := b.Retire(ctx, "drain", op.ID); err != nil {
+		return fmt.Errorf("%w: %v", errWait, err)
+	}
+
+	if !d.Leaving {
+		if err := l.changeState(ctx, b, gid, func(st *state.State) error {
+			x, ok := daemonOf(st, op.Daemon)
+			if !ok {
+				return fmt.Errorf("no %s", op.Daemon)
+			}
+
+			x.Leaving = true
+			st.AddDaemon(x)
+
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+
+	doc := st.DocName(d)
+
+	done, ok, err := l.step(ctx, b, js, gid, epoch, op.ID+".rev", op.Host, revisionMode{extra: []string{"ContainerConfig/" + doc}})
+	if err != nil || !done {
+		return err
+	}
+
+	if !ok {
+		return fmt.Errorf("%w: the revision of %s did not apply", errRetry, op.Host)
+	}
+
+	var rep wire.NodeReport
+	if _, err := l.call(ctx, h, http.MethodGet, "/v1/node", nil, &rep); err != nil {
+		return err
+	}
+
+	if slices.Contains(rep.Instances, doc) {
+		return fmt.Errorf("%w: %s has not stopped yet", errRetry, op.Daemon)
+	}
+
+	if err := b.Retire(ctx, "retire", op.ID); err != nil {
+		return fmt.Errorf("%w: %v", errRetry, err)
+	}
+
+	var zapFailed error
+
+	if op.Zap {
+		var zf errZapFailed
+		if err := l.zapOSD(ctx, b, js, gid, epoch, op, st, h, d); errors.As(err, &zf) {
+			zapFailed = zf.error
+		} else if err != nil {
+			return err
+		}
+	}
+
+	// purged: the OSD leaves the state, zapped or not
+	if err := l.changeState(ctx, b, gid, func(st *state.State) error {
+		if x, ok := daemonOf(st, op.Daemon); ok {
+			st.RemoveDaemon(x)
+		}
+
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	if zapFailed != nil {
+		return finish(ctx, js, gid, op, JournalFailed, fmt.Errorf("purged, not zapped: %w", zapFailed))
+	}
+
+	return finish(ctx, js, gid, op, wire.OpCompleted, nil)
+}
+
+// zapOSD zaps a removed OSD's disk with a job that requires a BlueStore label
+// of this cluster and of that OSD, and acknowledges its outcome; a zap that
+// fails ends the removal as failed (the OSD is purged, its disk kept).
+func (l *LeaderLoop) zapOSD(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, op LedgerOp, st *state.State, h state.Host, d state.Daemon) error {
+	if d.DevicePath == "" || d.DiskSerial == "" {
+		return errZapFailed{fmt.Errorf("%s has no stable device and serial to zap", op.Daemon)}
+	}
+
+	id := zapOf(op.ID)
+	job := daemons.Zap(daemons.Params{
+		Name: st.DocName(state.Daemon{Type: "job", ID: id}), Image: st.Image, FSID: st.FSID, ID: "job",
+		Device: d.DevicePath, DiskSerial: d.DiskSerial, OSDUUID: d.OSDUUID,
+	}, id, daemons.ZapInputs(h.Name, d.DevicePath, d.DiskSerial, false, d.OSDUUID))
+
+	y, err := spec.Render(job)
+	if err != nil {
+		return err
+	}
+
+	zap := op.ID + ".zap"
+
+	done, _, err := l.step(ctx, b, js, gid, epoch, zap, op.Host, revisionMode{add: []Doc{{Kind: "ContainerConfig", Name: job.MetaName, YAML: y}}})
+	if err != nil {
+		return err
+	}
+
+	// a sub-step: the removal goes on only once the zap ended
+	if !done {
+		return fmt.Errorf("%w: the zap of %s has not ended yet", errRetry, op.Daemon)
+	}
+
+	rec, _, err := l.journalRecord(ctx, b, js, gid, zap)
+	if err != nil {
+		return err
+	}
+
+	if rec.Job != nil {
+		rc := -1
+		if rec.Result != nil {
+			rc = rec.Result.RC
+		}
+
+		if err := l.ackJob(ctx, b, js, gid, epoch, op.ID+".zap", op.Host, rec, rc); err != nil {
+			return err
+		}
+	}
+
+	if rec.State != wire.OpCompleted {
+		return errZapFailed{fmt.Errorf("the zap of %s ended %s %s", op.Daemon, rec.State, rec.Error)}
+	}
+
+	return nil
+}
+
+// errZapFailed ends a removal as failed: the OSD is purged and leaves the
+// state, its disk keeps its label (zapping it is the operator's, with the CLI).
+type errZapFailed struct{ error }

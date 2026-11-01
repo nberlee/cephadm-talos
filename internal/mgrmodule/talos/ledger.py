@@ -26,10 +26,10 @@ ENTRY_VERSION = 1
 KEY_RE = re.compile(r'\A(\d{20})-(\d{10})-(takeover|op-[0-9a-f]{16}|m-[0-9a-f]{16})\Z')
 OP_RE = re.compile(r'\Aop-[0-9a-f]{16}\Z')
 # kinds an operation entry may have; ADDS and REMOVES change the fold
-KINDS = ('restart', 'redeploy', 'add_daemon', 'remove_daemon', 'remove_host', 'create_osd')
+KINDS = ('restart', 'redeploy', 'add_daemon', 'remove_daemon', 'remove_host', 'create_osd', 'remove_osd')
 # the module's own entries (ids m-<hex>), which carry out a removal: close a
 # daemon's generation, retire the daemon, retire a host
-MODULE_KINDS = ('close', 'retire', 'retire_host', 'bind', 'confirm', 'close_create')
+MODULE_KINDS = ('close', 'retire', 'retire_host', 'bind', 'confirm', 'close_create', 'drained')
 DEVICE_RE = re.compile(r'\A/dev/[A-Za-z0-9][A-Za-z0-9._:/-]{0,200}\Z')
 SERIAL_RE = re.compile(r'\A[A-Za-z0-9._-]{1,64}\Z')
 UUID_RE_OSD = re.compile(r'\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z')
@@ -81,7 +81,7 @@ def check_entry(key: str, raw: str) -> Dict[str, Any]:
     if e['id'].startswith('m-'):
         if kind not in MODULE_KINDS or not isinstance(e.get('of'), str) or not OP_RE.match(e['of']):
             raise LedgerError('module entry %s' % key)
-        if kind in ('close', 'retire') and not ok_daemon:
+        if kind in ('close', 'retire', 'drained') and not ok_daemon:
             raise LedgerError('module entry %s' % key)
         if kind == 'bind' and not (isinstance(e.get('serial'), str) and SERIAL_RE.match(e['serial'])
                                    and isinstance(e.get('link'), str) and e['link'].startswith('/dev/disk/by-id/')
@@ -107,6 +107,11 @@ def check_entry(key: str, raw: str) -> Dict[str, Any]:
     if kind == 'add_daemon' and (t not in ('mon', 'mgr') or i != host):
         raise LedgerError('operation entry %s' % key)
     if kind == 'remove_daemon' and (t != 'mgr' or i != host):
+        raise LedgerError('operation entry %s' % key)
+    if kind == 'remove_osd' and (t != 'osd' or not re.match(r'\A(0|[1-9][0-9]{0,8})\Z', i) or not isinstance(e.get('uuid'), str)
+                                 or not UUID_RE_OSD.match(e['uuid']) or type(e.get('zap')) is not bool or type(e.get('force')) is not bool):
+        raise LedgerError('operation entry %s' % key)
+    if kind in ('restart', 'redeploy', 'add_daemon', 'remove_daemon') and set(e) - {'version', 'id', 'kind', 'daemon', 'host', 'gid', 'epoch', 'seq', 'request'}:
         raise LedgerError('operation entry %s' % key)
     return e
 
@@ -182,6 +187,7 @@ class Fold:
             elif kind == 'retire':
                 self.daemons.pop(e['daemon'], None)
                 self.generations.pop(e['daemon'], None)
+                self.uuids.pop(e['daemon'], None)
             elif kind == 'retire_host' and not any(h == e['host'] for h in self.daemons.values()):
                 self.hosts.pop(e['host'], None)
             elif kind == 'create_osd' and e['host'] in self.hosts:

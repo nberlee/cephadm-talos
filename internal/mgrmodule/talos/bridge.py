@@ -342,7 +342,7 @@ READ_ONLY = {'status', 'health', 'mgr dump', 'config-key keys', 'config-key get'
 # calls that release a credential: checked against the fold, while active
 CREDENTIALS = {'auth get', 'auth get-or-create', 'secret get'}
 # calls the module answers itself, for operations of its ledger (ledger.py)
-LOCAL = {'mgr cert', 'retire', 'retire host', 'bind disk', 'confirm osd', 'close create'}
+LOCAL = {'mgr cert', 'retire', 'retire host', 'bind disk', 'confirm osd', 'close create', 'osd out', 'drain'}
 
 ALLOWLIST: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     'status': _no_args('status'),
@@ -362,6 +362,8 @@ ALLOWLIST: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     'bind disk': _operation_with('serial', 'link', 'job'),
     'confirm osd': _operation_with('osd'),
     'close create': _operation,
+    'osd out': _operation,
+    'drain': _operation,
     'osd dump': _osd_dump,
     'retire': _operation,
     'retire host': _operation,
@@ -784,6 +786,8 @@ class Channel:
             try:
                 if call == 'mgr cert':
                     return self._mgr_cert(fold, op)
+                if call in ('osd out', 'drain') or (call == 'retire' and op is not None and op['kind'] == 'remove_osd'):
+                    return self._removal(call, led, fold, ops, op)
                 if call == 'retire':
                     return self._retire(led, fold, ops, op)
                 if call in ('bind disk', 'confirm osd', 'close create'):
@@ -892,6 +896,77 @@ class Channel:
         if md.get('hostname') != op['host'] or not device_matches(md.get('device_ids', ''), c['bind']['serial']):
             return 409, {'error': 'the metadata of %s does not name the bound host and disk' % name}
         led.append({'id': mid, 'kind': 'confirm', 'of': op['id'], 'host': op['host'], 'daemon': name, 'uuid': entry[0]['uuid']})
+        return 200, done
+
+    def _osd(self, osd: int) -> Tuple[Optional[Dict[str, Any]], Optional[Tuple[int, Dict[str, Any]]]]:
+        """An OSD of the OSD map (None if it has none), or an answer to give."""
+        dump = self._mon({'prefix': 'osd dump', 'format': 'json'}, None, _osds)
+        if dump is None or dump.r != 0 or dump.too_large:
+            return None, (503, {'error': 'cannot read the OSD map; ask again'})
+        entry = [o for o in json.loads(dump.outb) if o['osd'] == osd]
+        return (entry[0] if entry else None), None
+
+    def _safe(self, osd: int) -> Optional[bool]:
+        """Whether `osd safe-to-destroy` lists the OSD (its rc is 0 either way); None without an answer."""
+        job = self._mon({'prefix': 'osd safe-to-destroy', 'ids': [str(osd)], 'format': 'json'})
+        if job is None or job.too_large:
+            return None
+        try:
+            return osd in json.loads(job.outb).get('safe_to_destroy', [])
+        except (ValueError, AttributeError):
+            return False
+
+    def _removal(self, call: str, led: Any, fold: Any, ops: Dict[str, Dict[str, Any]], op: Optional[Dict[str, Any]]) -> Tuple[int, Dict[str, Any]]:
+        """The module's steps of an OSD removal, each checked against the OSD map
+        by id and uuid first: out, drain (safe to destroy unless forced, while it
+        runs), and the retirement (down, safe again unless forced, purge)."""
+        done = {'outcome': 'done', 'r': 0, 'out': '', 'outs': ''}
+        if op is None or op['kind'] != 'remove_osd':
+            return 400, {'error': 'no removal of an OSD'}
+        name, osd = op['daemon'], int(op['daemon'].split('.', 1)[1])
+        if any(e['kind'] == 'retire' and e['of'] == op['id'] for e in ops.values()):
+            return 200, done
+        if fold.uuids.get(name) != op['uuid']:
+            return 400, {'error': '%s is not that OSD of the cluster' % name}
+        # an earlier purge or out still unanswered first: the OSD map read below
+        # must not be older than what this module already sent
+        if self._pending(name):
+            return 409, {'error': 'mutations for %s are not answered yet; ask again' % name}
+        entry, answer = self._osd(osd)
+        if answer is not None:
+            return answer
+        if entry is not None and entry['uuid'] != op['uuid']:
+            return 400, {'error': '%s in the OSD map is another OSD' % name}
+        drained = any(e['kind'] == 'drained' and e['of'] == op['id'] for e in ops.values())
+        mid = 'm-' + secrets.token_hex(8)
+        if call == 'osd out':
+            if entry is None:
+                return 200, done
+            job = self._mon({'prefix': 'osd out', 'ids': [str(osd)]}, name)
+            return (200, done) if job is not None and job.r == 0 else (503, {'error': 'osd out %s: no answer or refused' % name})
+        if call == 'drain':
+            if drained:
+                return 200, done
+            if entry is None:
+                return 400, {'error': '%s is not in the OSD map' % name}
+            # checked while it runs on the first removal; an OSD a failed removal
+            # already stopped is checked as it is
+            if not op['force'] and not self._safe(osd):
+                return 409, {'error': '%s is not safe to destroy yet' % name}
+            led.append({'id': mid, 'kind': 'drained', 'of': op['id'], 'daemon': name, 'host': op['host']})
+            return 200, done
+        # the retirement
+        if not drained:
+            return 400, {'error': '%s was not drained' % name}
+        if entry is not None:
+            if entry['up']:
+                return 409, {'error': '%s is not down yet' % name}
+            if not op['force'] and not self._safe(osd):
+                return 409, {'error': '%s is not safe to destroy' % name}
+            job = self._mon({'prefix': 'osd purge-actual', 'id': osd, 'yes_i_really_mean_it': True}, name)
+            if job is None or job.r != 0:
+                return 503, {'error': 'osd purge-actual %s: no answer or refused; ask again' % name}
+        led.append({'id': mid, 'kind': 'retire', 'of': op['id'], 'daemon': name, 'host': op['host']})
         return 200, done
 
     def _retire_host(self, led: Any, fold: Any, ops: Dict[str, Dict[str, Any]], op: Optional[Dict[str, Any]]) -> Tuple[int, Dict[str, Any]]:

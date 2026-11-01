@@ -1368,3 +1368,97 @@ func TestAFailedPreparationClosesTheCreation(t *testing.T) {
 		t.Fatal("the deployment of a failed preparation stayed")
 	}
 }
+
+func TestLeaderRemovesAnOSDAndZapsItsDisk(t *testing.T) {
+	testRemoval(t, 0)
+}
+
+func TestAFailedZapEndsTheRemovalPurged(t *testing.T) {
+	testRemoval(t, 67)
+}
+
+func testRemoval(t *testing.T, zapRC int) {
+	t.Helper()
+
+	s := newLeaderSetup(t)
+	ctx := context.Background()
+
+	disk := block.NewDisk(block.NamespaceName, "sdb")
+	disk.TypedSpec().Serial, disk.TypedSpec().DevPath = "QM00003", "/dev/sdb"
+	disk.TypedSpec().Symlinks = []string{"/dev/disk/by-id/ata-QEMU_HARDDISK_QM00003"}
+	must(t, s.agent.fake.St.Create(ctx, disk))
+
+	// an OSD on h1, deployed
+	id, uuid := 3, "8f2c0a4e-1d3b-4c5a-9e6f-7a8b9c0d1e2f"
+	s.st.AddDaemon(state.Daemon{Type: state.TypeOSD, ID: "h1-sdb", Host: "h1", OSDID: &id, OSDUUID: uuid, DeployID: "0123456789abcdef",
+		DiskSerial: "QM00003", DevicePath: "/dev/disk/by-id/ata-QEMU_HARDDISK_QM00003"})
+	publish(t, s.leader, s.module, s.st)
+
+	s.request("r1", `{"version":1,"kind":"revision","host":"h1"}`)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	osdDoc := "ContainerConfig/ceph-" + testFSID[:8] + "-osd-h1-sdb"
+	if rep, err := s.agent.Node.Report(ctx); err != nil || rep.Owned[osdDoc] == "" {
+		t.Fatalf("the OSD is not deployed: %v", err)
+	}
+
+	rm := s.accept(KindRemoveOSD, "osd.3", "h1", 1)
+	rm.Op.UUID, rm.Op.Zap = uuid, true
+	s.module.mu.Lock()
+	s.module.ledger[len(s.module.ledger)-1] = rm
+	s.module.mu.Unlock()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	// out, drained, its document off the node, retired; the zap running
+	if rep, err := s.agent.Node.Report(ctx); err != nil || rep.Owned[osdDoc] != "" {
+		t.Fatalf("the OSD's document stayed: %v", err)
+	}
+
+	zap := s.op(t, rm.Op.ID+".zap")
+	if zap.State != JournalGranting {
+		t.Fatalf("zap %+v", zap)
+	}
+
+	// the removal waits for its zap
+	s.module.mu.Lock()
+	_, ended := s.module.kv[JournalPrefix(42)+"op/"+rm.Op.ID]
+	s.module.mu.Unlock()
+
+	if ended {
+		t.Fatal("the removal ended before its zap")
+	}
+
+	finishJob(t, s.agent, rm.Op.ID+".zap", zapRC, "zap output")
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	want := "completed"
+	if zapRC != 0 {
+		want = JournalFailed // purged, not zapped
+	}
+
+	if op := s.op(t, rm.Op.ID); op.State != want {
+		t.Fatalf("removal %+v", op)
+	}
+
+	s.module.mu.Lock()
+	calls := slices.Clone(s.module.retired)
+	s.module.mu.Unlock()
+
+	for _, c := range []string{"osd out ", "drain ", "retire "} {
+		if !slices.Contains(calls, c+rm.Op.ID) {
+			t.Errorf("no %s: %v", c, calls)
+		}
+	}
+
+	st, _, err := s.leader.clusterState(ctx, s.leader.bridge())
+	must(t, err)
+
+	if _, ok := st.Find("osd.h1-sdb"); ok {
+		t.Fatal("the OSD stayed in the state")
+	}
+
+	if op, _, _ := s.agent.readOp(rm.Op.ID + ".zap"); !op.Acked {
+		t.Fatalf("the zap is not acknowledged: %+v", op)
+	}
+}

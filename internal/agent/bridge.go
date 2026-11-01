@@ -418,6 +418,10 @@ type LedgerOp struct {
 	Seq     int64  `json:"seq"`
 	Request string `json:"request,omitempty"`
 	Device  string `json:"device,omitempty"` // create_osd: the disk as the operator named it
+	// remove_osd: the OSD's uuid, and whether to zap and to skip the safety check
+	UUID  string `json:"uuid,omitempty"`
+	Zap   bool   `json:"zap,omitempty"`
+	Force bool   `json:"force,omitempty"`
 }
 
 // Ledger returns the executable operations after a ledger key, in the order

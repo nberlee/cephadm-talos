@@ -863,7 +863,7 @@ func (l *LeaderLoop) renderHost(ctx context.Context, b *Bridge, st *state.State,
 
 	// a daemon stopped without the mons (its cleanup pending) or purged (its
 	// disk still to wipe) is on its way out: it is not rendered again
-	gone := func(d state.Daemon) bool { return d.LocalOnly || d.Purged }
+	gone := func(d state.Daemon) bool { return d.LocalOnly || d.Purged || d.Leaving }
 
 	withMgr := false
 

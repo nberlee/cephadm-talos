@@ -130,6 +130,9 @@ type Daemon struct {
 	DevicePath string `json:"device_path,omitempty"`
 	// Purged is set once the OSD is gone from the cluster, so a retried rm only wipes
 	Purged bool `json:"purged,omitempty"`
+	// Leaving: an OSD the leader is removing: not rendered, its identity kept
+	// until it is purged and, if asked, zapped
+	Leaving bool `json:"leaving,omitempty"`
 	// Joining: a mon the leader deployed that has not joined the quorum yet;
 	// ceph.conf does not name it until it has
 	Joining bool `json:"joining,omitempty"`

@@ -643,3 +643,33 @@ class CreateOSDs(unittest.TestCase):
                    {'osd_id_claims': {'h2': ['3']}}, {'extra_entrypoint_args': ['--x']}):
             self.assertTrue(m.Module.create_osds(mod, self.dg('h2', '/dev/sdd', **kw)).exception_str, kw)
         self.assertEqual(m.Module.create_osds(mod, self.dg('h2', '/dev/sdc')).exception_str, '')
+
+
+class RemoveOSDs(unittest.TestCase):
+    def test_remove_and_status(self):
+        inv = inventory()
+        inv['daemons'][1]['osd_uuid'] = '8f2c0a4e-1d3b-4c5a-9e6f-7a8b9c0d1e2f'  # osd.0 on h1
+        mod, entries = AddAndRemove.module(self, inv)
+        for args, kw in ((['9'], {}), (['0'], {'replace': True}), (['0'], {'no_destroy': True}), (['0', '0'], {})):
+            self.assertTrue(m.Module.remove_osds(mod, args, **kw).exception_str, (args, kw))
+        res = m.Module.remove_osds(mod, ['0'], zap=True)
+        self.assertEqual(res.exception_str, '')
+        [(_, e)] = mod._ledger.executable()
+        self.assertEqual((e['kind'], e['daemon'], e['uuid'], e['zap'], e['force']), ('remove_osd', 'osd.0', '8f2c0a4e-1d3b-4c5a-9e6f-7a8b9c0d1e2f', True, False))
+        [st] = m.Module.remove_osds_status(mod).result
+        self.assertEqual((st['osd_id'], st['hostname'], st['zap'], st['drain_status']), (0, 'h1', True, 'draining'))
+        self.assertTrue(m.Module.remove_osds(mod, ['0']).exception_str)  # in progress
+        entries['talos/inc/20/journal/op/' + e['id']] = json.dumps({'state': 'completed'})
+        self.assertEqual(m.Module.remove_osds_status(mod).result, [])
+
+
+class BatchAfterAnUnknownAppend(unittest.TestCase):
+    def test_settled_before_the_checks(self):
+        inv = inventory()
+        inv['daemons'][1]['osd_uuid'] = '8f2c0a4e-1d3b-4c5a-9e6f-7a8b9c0d1e2f'
+        mod, _ = AddAndRemove.module(self, inv)
+        mod._ledger.mon.silent = 1
+        self.assertTrue(m.Module.remove_osds(mod, ['0']).exception_str)  # outcome unknown
+        # the retry settles the first, then finds it in progress
+        self.assertTrue(m.Module.remove_osds(mod, ['0'], zap=True).exception_str)
+        self.assertEqual(len(mod._ledger.executable()), 1)

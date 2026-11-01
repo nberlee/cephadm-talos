@@ -70,6 +70,8 @@ class Mons:
         self.kv = None      # a config-key store for get, set, rm and ls, if set
         self.auth_rm = []
         self.osds = []      # osd dump's osds
+        self.safe = []      # osd safe-to-destroy's safe ids
+        self.osd_calls = []
         self.metadata = {}  # osd metadata by id
 
     def send(self, res, cmd):
@@ -96,6 +98,11 @@ class Mons:
                 res.complete(0, '', '')
             else:
                 res.complete(0, json.dumps(sorted(self.kv)), '')
+        elif prefix == 'osd safe-to-destroy':
+            res.complete(0, json.dumps({'safe_to_destroy': self.safe, 'active': [], 'missing_stats': [], 'stored_pgs': []}), '')
+        elif prefix in ('osd out', 'osd purge-actual'):
+            self.osd_calls.append(prefix)
+            res.complete(0, '', '')
         elif prefix == 'osd dump':
             res.complete(0, json.dumps({'osds': self.osds}), '')
         elif prefix == 'osd metadata':
@@ -787,6 +794,7 @@ class LedgerCallsTest(unittest.TestCase):
         self.mons.late = False
         self.mons.pending[0].complete(0, '', '')
         self.mons.auth_rm.append('mgr.h2')  # the late answer was that removal
+        self.assertTrue(wait_until(lambda: not self.ch._pending('mgr.h2')))
         self.assertEqual(self.call('retire', operation=rm)[1]['outcome'], 'done')
         self.assertEqual(self.mons.auth_rm, ['mgr.h2', 'mgr.h2'])
         self.assertFalse([k for k in self.mons.kv if k.startswith(b.SECRET_PREFIX + 'issued/')])
@@ -866,3 +874,55 @@ class CreationTest(LedgerCallsTest):
                         ('sda=QEMU_HARDDISK_QM000012', False), ('sda=QEMU_HARDDISK_XQM00001', False), ('', False),
                         ('sdb=OTHER,sda=QEMU_HARDDISK_QM00001', True)):
             self.assertEqual(b.device_matches(ids, 'QM00001'), ok, ids)
+
+
+class RemovalTest(LedgerCallsTest):
+    UUID = '8f2c0a4e-1d3b-4c5a-9e6f-7a8b9c0d1e2f'
+
+    def setUp(self):
+        super().setUp()
+        inv = inventory('mon.h1@h1', 'mgr.h1@h1', 'osd.3@h1')
+        inv['daemons'][-1]['osd_uuid'] = self.UUID
+        self.ch.authority = lambda: (self.led, lg.Fold(inv, self.led.executable()))
+
+    def remove(self, force=False, uuid=None):
+        op = {'id': 'op-%016x' % (300 + self.n), 'kind': 'remove_osd', 'daemon': 'osd.3', 'host': 'h1', 'uuid': uuid or self.UUID, 'zap': True, 'force': force}
+        self.n += 1
+        return self.led.append(op)[1]['id']
+
+    def test_out_drain_and_retire(self):
+        rm = self.remove()
+        self.mons.osds = [{'osd': 3, 'uuid': self.UUID, 'up': 1}]
+        self.assertEqual(self.call('osd out', operation=rm)[1]['outcome'], 'done')
+        # not safe to destroy yet: no drained entry, no retirement
+        self.assertEqual(self.call('drain', operation=rm)[0], 409)
+        self.assertEqual(self.call('retire', operation=rm)[0], 400)
+        self.mons.safe = [3]
+        self.assertEqual(self.call('drain', operation=rm)[1]['outcome'], 'done')
+        # it must be down before the purge
+        self.assertEqual(self.call('retire', operation=rm)[0], 409)
+        self.mons.osds = [{'osd': 3, 'uuid': self.UUID, 'up': 0}]
+        self.assertEqual(self.call('retire', operation=rm)[1]['outcome'], 'done')
+        self.assertEqual(self.mons.osd_calls, ['osd out', 'osd purge-actual'])
+        self.assertNotIn('osd.3', self.ch.authority()[1].daemons)
+        # once
+        self.assertEqual(self.call('retire', operation=rm)[1]['outcome'], 'done')
+        self.assertEqual(self.mons.osd_calls, ['osd out', 'osd purge-actual'])
+
+    def test_force_skips_the_safety_check_and_a_gone_id_finishes(self):
+        rm = self.remove(force=True)
+        self.mons.osds = [{'osd': 3, 'uuid': self.UUID, 'up': 1}]
+        self.assertEqual(self.call('drain', operation=rm)[1]['outcome'], 'done')
+        self.mons.osds = []  # an earlier purge landed
+        self.assertEqual(self.call('retire', operation=rm)[1]['outcome'], 'done')
+        self.assertEqual(self.mons.osd_calls, [])
+
+    def test_another_osd_under_the_id_is_left_alone(self):
+        rm = self.remove()
+        self.mons.osds = [{'osd': 3, 'uuid': '00000000-0000-0000-0000-000000000000', 'up': 0}]
+        for call in ('osd out', 'drain', 'retire'):
+            self.assertEqual(self.call(call, operation=rm)[0], 400, call)
+        self.assertEqual(self.mons.osd_calls, [])
+        # nor a removal naming another uuid than the fold's
+        other = self.remove(uuid='11111111-1111-1111-1111-111111111111')
+        self.assertEqual(self.call('osd out', operation=other)[0], 400)

@@ -533,7 +533,7 @@ func (p *Policy) admitJob(kind string, d Doc, td typedDoc, env map[string]string
 	job := env["JOB"]
 
 	switch {
-	case kind == "osd-prepare" && !deployIDRe.MatchString(job), kind == "job" && !shortIDRe.MatchString(job):
+	case kind == "osd-prepare" && !deployIDRe.MatchString(job), kind == "job" && !shortIDRe.MatchString(job) && !deployIDRe.MatchString(job):
 		return errors.New("JOB: not a job id")
 	case p.docName(kind, job) != d.Name:
 		return errors.New("JOB: not the job id in the document's name")

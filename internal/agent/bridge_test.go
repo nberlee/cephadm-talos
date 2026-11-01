@@ -120,7 +120,7 @@ func (m *fakeBridge) run(req wire.BridgeRequest) map[string]any {
 		b, _ := json.Marshal(out)
 
 		return map[string]any{"outcome": "done", "r": 0, "out": string(b)}
-	case "bind disk", "confirm osd", "close create":
+	case "bind disk", "confirm osd", "close create", "osd out", "drain":
 		m.retired = append(m.retired, req.Call+" "+str("operation"))
 
 		return map[string]any{"outcome": "done", "r": 0, "out": ""}

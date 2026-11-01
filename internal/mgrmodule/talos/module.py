@@ -502,6 +502,14 @@ class Module(orchestrator.Orchestrator, MgrModule):
                 return e['id']
         return None
 
+    def _settle(self) -> None:
+        """An earlier append whose outcome is unknown counts before any check."""
+        led, _ = self._authority()
+        try:
+            led.settle()
+        except ledger.LedgerError as e:
+            raise OrchestratorError('an earlier operation is not settled yet (%s); try again' % e)
+
     def _accept(self, kind: str, daemon: Optional[str], host: str) -> str:
         """Accept an operation: checks, then one ledger entry (ledger.py)."""
         led, fold = self._authority()
@@ -675,6 +683,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
 
     @handle_orch_error
     def remove_daemons(self, names: List[str]) -> List[str]:
+        self._settle()
         _, fold = self._authority()
         mgrs = {n for n in fold.daemons if n.startswith('mgr.')}
         active = 'mgr.' + self.get_mgr_id()
@@ -754,6 +763,67 @@ class Module(orchestrator.Orchestrator, MgrModule):
         except ledger.LedgerError as e:
             raise OrchestratorError('not accepted: %s' % e)
         return op_id
+
+    @handle_orch_error
+    def remove_osds(self, osd_ids: List[str], replace: bool = False, replace_block: bool = False, replace_db: bool = False,
+                    replace_wal: bool = False, force: bool = False, zap: bool = False, no_destroy: bool = False) -> str:
+        if replace or replace_block or replace_db or replace_wal or no_destroy:
+            raise OrchestratorError('--replace and --no-destroy are not supported by this backend')
+        self._settle()
+        led, fold = self._authority()
+        names = []
+        for i in osd_ids:
+            name = 'osd.%s' % i
+            if not re.match(r'\A(0|[1-9][0-9]{0,8})\Z', str(i)) or name not in fold.daemons or name not in fold.uuids:
+                raise OrchestratorError('%s is not an OSD of the cluster' % name)
+            names.append(name)
+        if len(set(names)) != len(names):
+            raise OrchestratorError('an OSD named twice')
+        for n in names:  # every one checked before any is accepted
+            busy = self._unfinished(n, fold.daemons[n])
+            if busy:
+                raise OrchestratorError('%s has operation %s in progress (orch talos operation %s)' % (n, busy, busy))
+        out = []
+        for n in names:
+            op_id = self._accept_osd_removal(n, fold.daemons[n], fold.uuids[n], zap, force)
+            out.append('Scheduled to remove %s from host %s (operation %s)' % (n, fold.daemons[n], op_id))
+        return '\n'.join(out)
+
+    def _accept_osd_removal(self, name: str, host: str, uuid: str, zap: bool, force: bool) -> str:
+        led, _ = self._authority()
+        lead = getattr(self, '_leadership', None)
+        if lead is None or not lead.still_active():
+            raise OrchestratorError('this mgr is not confirmed as the active one; try again')
+        try:
+            led.settle()
+        except ledger.LedgerError as e:
+            raise OrchestratorError('an earlier operation is not settled yet (%s); try again' % e)
+        op_id = 'op-' + os.urandom(8).hex()
+        try:
+            led.append({'id': op_id, 'kind': 'remove_osd', 'daemon': name, 'host': host, 'uuid': uuid, 'zap': bool(zap), 'force': bool(force)})
+        except ledger.OutcomeUnknown:
+            raise OrchestratorError('the mons did not answer: operation %s may have been accepted (orch talos operation %s)' % (op_id, op_id))
+        except ledger.LedgerError as e:
+            raise OrchestratorError('not accepted: %s' % e)
+        return op_id
+
+    @handle_orch_error
+    def remove_osds_status(self) -> List[Dict[str, Any]]:
+        """The OSD removals not finished: from the ledger, with the leader's phase."""
+        led, fold = self._authority()
+        entries = led.executable()
+        out = []
+        for _, e in entries:
+            if e['kind'] != 'remove_osd':
+                continue
+            rec = self._journal(e['id'])
+            if rec is not None and rec.get('state') in TERMINAL:
+                continue
+            drained = any(x['kind'] == 'drained' and x.get('of') == e['id'] for _, x in entries)
+            out.append({'osd_id': int(e['daemon'].split('.', 1)[1]), 'hostname': e['host'],
+                        'drain_status': (rec or {}).get('phase') or ('drained' if drained else 'draining'),
+                        'pg_count': None, 'replace': False, 'force': e['force'], 'zap': e['zap'], 'drain_started_at': None})
+        return out
 
     @handle_orch_error
     def remove_host(self, host: str, force: bool = False, offline: bool = False, rm_crush_entry: bool = False) -> str:
