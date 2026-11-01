@@ -2,14 +2,22 @@ package orch
 
 import (
 	"context"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
+	"maps"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
+	"github.com/nberlee/cephadm-talos/internal/pki"
 	"github.com/nberlee/cephadm-talos/internal/spec"
 	"github.com/nberlee/cephadm-talos/internal/state"
+	"github.com/nberlee/cephadm-talos/internal/store"
 	"github.com/nberlee/cephadm-talos/internal/talos/talostest"
 )
 
@@ -156,6 +164,22 @@ func TestHandoffSealsTheState(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// a key that is not its certificate's stops it: the leader could not render it
+	ca, caKey, err := pki.NewCA("rgw", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cert, _, _ := pki.Issue(ca, caKey, pki.Leaf{CommonName: "s3", Usage: x509.ExtKeyUsageServerAuth, Years: 1})
+	_, other, _ := pki.Issue(ca, caKey, pki.Leaf{CommonName: "s3", Usage: x509.ExtKeyUsageServerAuth, Years: 1})
+	o.St.RGW = &state.RGW{Cert: cert, Key: other, UserCert: true}
+
+	if err := o.Handoff(ctx); err == nil || o.St.HandingOver {
+		t.Fatal("handoff with an RGW key that is not its certificate's")
+	}
+
+	o.St.RGW = nil
+
 	// documents still owed to a node stop it
 	o.St.ConfPending = []string{"h1"}
 	if err := o.Handoff(ctx); err == nil {
@@ -209,5 +233,147 @@ func TestAHalfHandoffBlocksTheCLI(t *testing.T) {
 
 	if !o.St.HandingOver || o.St.Sealed || !o.Managed() || !errors.Is(o.save(), ErrManaged) {
 		t.Fatalf("after a half handoff: handing over %v sealed %v", o.St.HandingOver, o.St.Sealed)
+	}
+
+	before := secretEntries(t, o)
+
+	// the next run finishes it without having read the secrets: they stay
+	st := reload(t, o)
+	st.RemoveHost("h1") // the agent that did not answer
+	st.Hosts = append(st.Hosts, state.Host{Name: "contact"})
+
+	next := &Orch{Talos: o.Talos, St: st, Out: io.Discard, StoreBackend: o.StoreBackend, AuthGet: noAuth}
+	if err := next.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	next.St.RemoveHost("h1")
+
+	if err := next.Handoff(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if after := secretEntries(t, o); !maps.Equal(before, after) || len(after) == 0 {
+		t.Fatalf("the resumed handoff changed the secrets: %v", slices.Collect(maps.Keys(after)))
+	}
+}
+
+func secretEntries(t *testing.T, o *Orch) map[string]string {
+	t.Helper()
+
+	ctx := context.Background()
+
+	keys, err := o.StoreBackend.List(ctx, store.SecretPrefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m := map[string]string{}
+
+	for _, k := range keys {
+		v, err := o.StoreBackend.Get(ctx, k)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		m[k] = string(v)
+	}
+
+	return m
+}
+
+// The published state carries no private key: they are secrets, one entry
+// each below their own prefix, which a reload reads back.
+func TestSecretsStayOutOfThePublishedState(t *testing.T) {
+	o := fakeOrch(t, talostest.New(t, images()))
+	ctx := context.Background()
+
+	if err := o.setupAgent(ctx, "node", "registry/agent:dev", false); err != nil {
+		t.Fatal(err)
+	}
+
+	h := state.Host{Name: "h1", Addr: "node"}
+	if err := o.ensureAgentCert(&h); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := o.ensureMgrCerts(&h, true); err != nil {
+		t.Fatal(err)
+	}
+
+	o.St.AddHost(h)
+
+	if err := o.save(); err != nil {
+		t.Fatal(err)
+	}
+
+	keys, err := o.StoreBackend.List(ctx, store.Prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, k := range keys {
+		v, _ := o.StoreBackend.Get(ctx, k)
+		raw, _ := base64.StdEncoding.DecodeString(string(v))
+
+		if strings.Contains(string(v)+string(raw), "PRIVATE KEY") {
+			t.Errorf("%s carries a private key", k)
+		}
+	}
+
+	sec, err := o.StoreBackend.List(ctx, store.SecretPrefix)
+	if err != nil || len(sec) != 5 { // the agent CA, two agent and two mgr keys
+		t.Fatalf("secrets %v %v", sec, err)
+	}
+
+	back := reload(t, o)
+	bh, _ := back.Host("h1")
+
+	if back.Agent.CAKey != o.St.Agent.CAKey || bh.MgrServerKey != h.MgrServerKey || bh.AgentClientKey != h.AgentClientKey {
+		t.Fatal("secrets lost on reload")
+	}
+
+	// a host gone takes its secrets along
+	o.St.RemoveHost("h1")
+
+	if err := o.save(); err != nil {
+		t.Fatal(err)
+	}
+
+	if sec, _ = o.StoreBackend.List(ctx, store.SecretPrefix); len(sec) != 1 {
+		t.Fatalf("secrets after removing the host: %v", sec)
+	}
+}
+
+// A certificate file that also holds the key publishes only the certificate.
+func TestUserCertKeepsTheKeyOutOfTheCertificate(t *testing.T) {
+	caCert, caKey, err := pki.NewCA("user CA", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cert, key, err := pki.Issue(caCert, caKey, pki.Leaf{CommonName: "s3", Names: []string{"s3"}, Usage: x509.ExtKeyUsageServerAuth, Years: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	certFile, keyFile := filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
+
+	if err := os.WriteFile(certFile, []byte(key+cert+caCert), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(keyFile, []byte(key), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	c, k, err := userCert(certFile, keyFile)
+	if err != nil || k != key {
+		t.Fatal(err)
+	}
+
+	if strings.Contains(c, "PRIVATE KEY") || c != cert+caCert {
+		t.Fatalf("published certificate:\n%s", c)
 	}
 }

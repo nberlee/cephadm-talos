@@ -13,6 +13,7 @@ package render
 
 import (
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -26,6 +27,10 @@ import (
 
 // Key returns an existing entity's secret from mon auth; it never creates one.
 type Key func(entity string) (string, error)
+
+// Secret returns one of the cluster's private keys or passwords by name
+// (state.Secret*); the published state carries none.
+type Secret func(name string) (string, error)
 
 // Ref names a document to remove.
 type Ref struct {
@@ -51,7 +56,7 @@ var mgrTLS = []string{daemons.AgentCAFile, daemons.MgrCertFile, daemons.MgrKeyFi
 // MgrFiles are the mgr module and its TLS identity on a host that runs (or is
 // about to run) a mgr, or their removal from one that does not. A mgr host
 // must have its certificates already: rendering issues none.
-func MgrFiles(s *state.State, h state.Host, withMgr bool) (Documents, error) {
+func MgrFiles(s *state.State, h state.Host, withMgr bool, secret Secret) (Documents, error) {
 	var out Documents
 
 	if !withMgr {
@@ -66,8 +71,25 @@ func MgrFiles(s *state.State, h state.Host, withMgr bool) (Documents, error) {
 		return out, nil
 	}
 
-	if s.Agent == nil || s.Agent.CACert == "" || h.MgrClientCert == "" || h.MgrClientKey == "" || h.MgrServerCert == "" || h.MgrServerKey == "" {
+	if s.Agent == nil || s.Agent.CACert == "" || h.MgrClientCert == "" || h.MgrServerCert == "" {
 		return Documents{}, fmt.Errorf("the mgr of %s has no certificates yet", h.Name)
+	}
+
+	clientKey, err := secret(state.SecretHost(h.Name, state.SecretMgrClient))
+	if err != nil {
+		return Documents{}, err
+	}
+
+	serverKey, err := secret(state.SecretHost(h.Name, state.SecretMgrServer))
+	if err != nil {
+		return Documents{}, err
+	}
+
+	// a key that does not belong to its certificate breaks the agent channel
+	for _, pair := range [][2]string{{h.MgrClientCert, clientKey}, {h.MgrServerCert, serverKey}} {
+		if _, err := tls.X509KeyPair([]byte(pair[0]), []byte(pair[1])); err != nil {
+			return Documents{}, fmt.Errorf("the mgr of %s: a key does not match its certificate", h.Name)
+		}
 	}
 
 	files := mgrmodule.Files()
@@ -78,9 +100,9 @@ func MgrFiles(s *state.State, h state.Host, withMgr bool) (Documents, error) {
 	out.Upsert = append(out.Upsert,
 		spec.EtcFile(daemons.AgentCAFile, 0o644, s.Agent.CACert),
 		spec.EtcFile(daemons.MgrCertFile, 0o644, h.MgrClientCert),
-		spec.EtcFile(daemons.MgrKeyFile, 0o600, h.MgrClientKey),
+		spec.EtcFile(daemons.MgrKeyFile, 0o600, clientKey),
 		spec.EtcFile(daemons.MgrServerCertFile, 0o644, h.MgrServerCert),
-		spec.EtcFile(daemons.MgrServerKeyFile, 0o600, h.MgrServerKey))
+		spec.EtcFile(daemons.MgrServerKeyFile, 0o600, serverKey))
 
 	return out, nil
 }
@@ -90,7 +112,7 @@ func MgrFiles(s *state.State, h state.Host, withMgr bool) (Documents, error) {
 // as a joining mon with the mon. key only; its deploy id is kept, as a new one
 // rebuilds its store. An OSD needs its id, uuid and stable device: prepare it
 // first.
-func Daemon(s *state.State, h state.Host, d state.Daemon, image string, key Key) (*spec.ContainerConfig, error) {
+func Daemon(s *state.State, h state.Host, d state.Daemon, image string, key Key, secret Secret) (*spec.ContainerConfig, error) {
 	p := daemons.Params{Name: s.DocName(d), Image: image, FSID: s.FSID, ID: d.ID, Addr: h.Addr, DeployID: d.DeployID}
 
 	switch d.Type {
@@ -126,8 +148,17 @@ func Daemon(s *state.State, h state.Host, d state.Daemon, image string, key Key)
 
 		return daemons.OSD(p), nil
 	case state.TypeRGW:
-		if s.RGW == nil || s.RGW.Cert == "" || s.RGW.Key == "" {
+		if s.RGW == nil || s.RGW.Cert == "" {
 			return nil, errors.New("rgw: no serving certificate yet")
+		}
+
+		tlsKey, err := secret(state.SecretRGWServer)
+		if err != nil {
+			return nil, err
+		}
+
+		if _, err := tls.X509KeyPair([]byte(s.RGW.Cert), []byte(tlsKey)); err != nil {
+			return nil, errors.New("rgw: the serving key does not match its certificate")
 		}
 
 		k, err := key("client.rgw." + d.ID)
@@ -136,7 +167,7 @@ func Daemon(s *state.State, h state.Host, d state.Daemon, image string, key Key)
 		}
 
 		p.Keyring = daemons.Keyring("client.rgw."+d.ID, k)
-		p.Port, p.TLSPEM = s.RGW.Port, s.RGW.Cert+s.RGW.Key
+		p.Port, p.TLSPEM = s.RGW.Port, s.RGW.Cert+tlsKey
 
 		return daemons.RGW(p), nil
 	case state.TypeVIP:
@@ -144,7 +175,13 @@ func Daemon(s *state.State, h state.Host, d state.Daemon, image string, key Key)
 			return nil, errors.New("vip: no virtual IP or keepalived image")
 		}
 
+		pass, err := secret(state.SecretVRRP)
+		if err != nil {
+			return nil, err
+		}
+
 		vipParams(s, &p, d)
+		p.VRRPPass = pass
 
 		// stopped before its host's RGW, so the VIP moves first (plan 03, item 12)
 		for _, r := range s.DaemonsOf(state.TypeRGW, h.Name) {
@@ -164,7 +201,7 @@ func Daemon(s *state.State, h state.Host, d state.Daemon, image string, key Key)
 // (the first is preferred), the other VIP hosts as unicast peers.
 func vipParams(s *state.State, p *daemons.Params, d state.Daemon) {
 	r := s.RGW
-	p.Port, p.VIP, p.VRID, p.VRRPPass = r.Port, r.VIP, r.VRID, r.VRRPPass
+	p.Port, p.VIP, p.VRID = r.Port, r.VIP, r.VRID
 	p.Priority = 150
 
 	for i, other := range s.DaemonsOf(state.TypeVIP, "") {

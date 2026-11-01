@@ -2,6 +2,7 @@ package orch
 
 import (
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"fmt"
 	"slices"
@@ -82,7 +83,13 @@ func (o *Orch) issueOperatorCert() error {
 
 // certValid reports whether a certificate carries the identity and, for a
 // server certificate, exactly these addresses and names.
-func certValid(certPEM string, id pki.Identity, server bool, ips, names []string) bool {
+func certValid(certPEM, keyPEM string, id pki.Identity, server bool, ips, names []string) bool {
+	// a key that is not the certificate's, e.g. after a save that wrote the
+	// secrets but did not publish, gets a new certificate
+	if _, err := tls.X509KeyPair([]byte(certPEM), []byte(keyPEM)); err != nil {
+		return false
+	}
+
 	c, err := pki.Parse(certPEM)
 	if err != nil {
 		return false
@@ -105,13 +112,13 @@ func (o *Orch) ensureAgentCert(h *state.Host) error {
 	id := o.identity(pki.RoleAgent, h.Name)
 	ips, names := []string{h.Addr}, []string{h.Name}
 
-	if !certValid(h.AgentCert, id, true, ips, names) {
+	if !certValid(h.AgentCert, h.AgentKey, id, true, ips, names) {
 		if err := o.issueAgentServerCert(h); err != nil {
 			return err
 		}
 	}
 
-	if !certValid(h.AgentClientCert, id, false, nil, nil) {
+	if !certValid(h.AgentClientCert, h.AgentClientKey, id, false, nil, nil) {
 		return o.issueAgentClientCert(h)
 	}
 
@@ -141,13 +148,13 @@ func (o *Orch) ensureMgrCerts(h *state.Host, withMgr bool) error {
 
 	id := o.identity(pki.RoleMgr, h.Name)
 
-	if !certValid(h.MgrServerCert, id, true, []string{h.Addr}, []string{h.Name}) {
+	if !certValid(h.MgrServerCert, h.MgrServerKey, id, true, []string{h.Addr}, []string{h.Name}) {
 		if err := o.issueMgrServerCert(h); err != nil {
 			return err
 		}
 	}
 
-	if !certValid(h.MgrClientCert, id, false, nil, nil) {
+	if !certValid(h.MgrClientCert, h.MgrClientKey, id, false, nil, nil) {
 		return o.issueMgrClientCert(h)
 	}
 
@@ -264,7 +271,7 @@ func (o *Orch) RenewAgentCerts(ctx context.Context) error {
 		}
 	}
 
-	if !certValid(o.St.Agent.OperatorCert, o.identity(pki.RoleOperator, "admin"), false, nil, nil) || expiresSoon(o.St.Agent.OperatorCert, now) {
+	if !certValid(o.St.Agent.OperatorCert, o.St.Agent.OperatorKey, o.identity(pki.RoleOperator, "admin"), false, nil, nil) || expiresSoon(o.St.Agent.OperatorCert, now) {
 		if err := o.issueOperatorCert(); err != nil {
 			return err
 		}

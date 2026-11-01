@@ -414,7 +414,36 @@ func TestRenewRepairsAMismatchedOperatorCert(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if o.St.Agent.OperatorCert == wrong || !certValid(o.St.Agent.OperatorCert, o.identity(pki.RoleOperator, "admin"), false, nil, nil) {
+	if o.St.Agent.OperatorCert == wrong || !certValid(o.St.Agent.OperatorCert, o.St.Agent.OperatorKey, o.identity(pki.RoleOperator, "admin"), false, nil, nil) {
 		t.Error("mismatched operator certificate kept")
+	}
+}
+
+// A key that is not its certificate's (the secrets were written, the state not
+// published) gets a new certificate with the next command.
+func TestRenewRepairsAKeyThatIsNotItsCertificates(t *testing.T) {
+	f := talostest.New(t, images())
+	o := fakeOrch(t, f)
+
+	if err := o.setupAgent(context.Background(), "node", "registry/agent:dev", false); err != nil {
+		t.Fatal(err)
+	}
+
+	h := state.Host{Name: "h1", Addr: "10.5.0.2"}
+	if err := o.ensureAgentCert(&h); err != nil {
+		t.Fatal(err)
+	}
+
+	stale := h.AgentCert
+	h.AgentKey = h.AgentClientKey
+	o.St.AddHost(h)
+
+	if err := o.RenewAgentCerts(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	got, _ := o.St.Host("h1")
+	if got.AgentCert == stale || !certValid(got.AgentCert, got.AgentKey, o.identity(pki.RoleAgent, "h1"), true, []string{"10.5.0.2"}, []string{"h1"}) {
+		t.Error("a certificate without its key kept")
 	}
 }

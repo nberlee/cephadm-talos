@@ -19,6 +19,34 @@ import (
 	"github.com/nberlee/cephadm-talos/internal/wire"
 )
 
+// mismatchedKeys are the certificates in the state whose keys are not theirs.
+func (o *Orch) mismatchedKeys() []string {
+	var bad []string
+
+	check := func(what, cert, key string) {
+		if cert == "" {
+			return
+		}
+
+		if _, err := tls.X509KeyPair([]byte(cert), []byte(key)); err != nil {
+			bad = append(bad, what)
+		}
+	}
+
+	if r := o.St.RGW; r != nil {
+		check("rgw", r.Cert, r.Key)
+	}
+
+	for _, h := range o.St.Hosts {
+		check("agent server "+h.Name, h.AgentCert, h.AgentKey)
+		check("agent client "+h.Name, h.AgentClientCert, h.AgentClientKey)
+		check("mgr server "+h.Name, h.MgrServerCert, h.MgrServerKey)
+		check("mgr client "+h.Name, h.MgrClientCert, h.MgrClientKey)
+	}
+
+	return bad
+}
+
 // Handoff hands the cluster to its agents and their leader (plan 03, item
 // 11): every node's agent takes ownership of its node's documents as they
 // are, then the CLI publishes its state one last time, sealed. The leader
@@ -47,6 +75,12 @@ func (o *Orch) Handoff(ctx context.Context) error {
 	// from here the CLI changes nothing but this handoff, also when it stops
 	// half-way: a node handed over must not see the CLI again
 	if !o.St.HandingOver {
+		// the leader renders no key that is not its certificate's, and only the
+		// CLI can repair one (a crash between writing the secrets and publishing)
+		if bad := o.mismatchedKeys(); len(bad) > 0 {
+			return fmt.Errorf("keys that do not match their certificates: %v; `deploy rgw` again (with --cert and --key for your own certificate) first", bad)
+		}
+
 		o.St.HandingOver = true
 
 		if err := o.save(); err != nil {

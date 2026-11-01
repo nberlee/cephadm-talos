@@ -377,6 +377,28 @@ func (b *Bridge) AuthGet(ctx context.Context, entity string) (string, bool, erro
 	return k, err == nil, err
 }
 
+// Secret returns one of the cluster's secrets the leader renders into a
+// document (a mgr host's TLS keys, the RGW serving key, the VRRP password);
+// the module releases no other, never the CA keys or agent keys.
+func (b *Bridge) Secret(ctx context.Context, name string) (string, error) {
+	id, err := NewDispatchID()
+	if err != nil {
+		return "", err
+	}
+
+	res, err := b.Call(ctx, id, "secret get", map[string]any{"name": name}, MaxBridgeDeadline)
+	if err != nil {
+		return "", err
+	}
+
+	if res.R != 0 || res.Out == "" {
+		// never the module's message: it might quote a value
+		return "", fmt.Errorf("bridge: secret %s not available (%d)", name, res.R)
+	}
+
+	return res.Out, nil
+}
+
 // AuthGetOrCreate returns the secret of a mgr or RGW identity, created with
 // the caps the module fixes for its type if mon auth has none.
 func (b *Bridge) AuthGetOrCreate(ctx context.Context, entity string) (string, error) {

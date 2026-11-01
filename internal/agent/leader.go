@@ -829,7 +829,21 @@ func (l *LeaderLoop) renderHost(ctx context.Context, b *Bridge, st *state.State,
 		withMgr = withMgr || !gone(d)
 	}
 
-	mgr, err := render.MgrFiles(st, h, withMgr)
+	// a secret only for the document that carries it, through the bridge
+	secret := func(name string) (string, error) {
+		v, err := b.Secret(ctx, name)
+		if err != nil {
+			transient = err
+		}
+
+		return v, err
+	}
+
+	mgr, err := render.MgrFiles(st, h, withMgr, secret)
+	if transient != nil {
+		return rendered{}, fmt.Errorf("%w: %w", errRetry, transient)
+	}
+
 	if err != nil {
 		return rendered{}, err
 	}
@@ -847,7 +861,7 @@ func (l *LeaderLoop) renderHost(ctx context.Context, b *Bridge, st *state.State,
 			continue
 		}
 
-		c, err := render.Daemon(st, h, d, st.Image, key)
+		c, err := render.Daemon(st, h, d, st.Image, key, secret)
 		if transient != nil {
 			return rendered{}, fmt.Errorf("%w: %w", errRetry, transient)
 		}

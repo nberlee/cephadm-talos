@@ -554,7 +554,15 @@ func Main(ctx context.Context) error {
 		return err
 	}
 
-	recs := &records.Store{Dir: filepath.Join(records.Mount, records.RecordsDir)}
+	// the records of this cluster: the volume outlives rm-cluster, and a new
+	// cluster on the same node must not inherit another one's ownership,
+	// session floor or fence
+	dir := filepath.Join(records.Mount, records.RecordsDir, self.FSID)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("records: %w", err)
+	}
+
+	recs := &records.Store{Dir: dir}
 	// from the agent's own document, which only the CLI writes; no
 	// repositories admit no image
 	repos := strings.Fields(os.Getenv(daemons.EnvImageRepos))

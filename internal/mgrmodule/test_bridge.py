@@ -148,7 +148,7 @@ class ConfirmTest(unittest.TestCase):
         cmds = mons.commands(2)
         self.addCleanup(cmds.stop)
         lead = b.Leadership('h1', activation or mgrmap(42, 'h1'), cmds)
-        return b.Channel('f1', 'h1', lead, mons.commands(2), None, pem, m.require_identity, Log()), lead, key
+        return b.Channel('f1', 'h1', lead, mons.commands(2), None, pem, m.require_identity, Log(), lambda: {'h1'}), lead, key
 
     def test_refused_until_captured(self):
         ch, lead, _ = self.channel([mgrmap(10, 'other')])
@@ -192,7 +192,7 @@ class BridgeTest(unittest.TestCase):
         mons = Mons()
         cmds = mons.commands(n, 'bridge')
         self.addCleanup(cmds.stop)
-        return b.Channel('f1', 'h1', lead, cmds, None, b'', m.require_identity, Log()), mons
+        return b.Channel('f1', 'h1', lead, cmds, None, b'', m.require_identity, Log(), lambda: {'h1'}), mons
 
     def call(self, ch, **kw):
         req = {'version': 1, 'call': 'health', 'args': {}, 'deadline': 5, 'dispatch_id': '12' * 8}
@@ -263,6 +263,30 @@ class BridgeTest(unittest.TestCase):
         b.ALLOWLIST['auth get-or-create']({'entity': 'mgr.h1'})['caps'].append('x')
         self.assertEqual(b.CREATE_CAPS['mgr'][-1], 'allow *')
 
+    def test_secrets(self):
+        ch, mons = self.channel()
+        for i, name in enumerate(('host/h1/mgr-server.key', 'host/h1/mgr-client.key', 'rgw/server.key', 'rgw/vrrp')):
+            self.assertEqual(b.ALLOWLIST['secret get']({'name': name}), {'prefix': 'config-key get', 'key': b.SECRET_PREFIX + name})
+            code, reply = self.call(ch, call='secret get', args={'name': name}, dispatch_id='%016x' % (300 + i))
+            self.assertEqual((code, reply['outcome']), (200, 'done'), name)
+        self.assertEqual(ch.outcome('%016x' % 300)[0], 404)  # a secret is not kept once answered
+        sent = len(mons.sent)
+        # the CA keys and the agents' keys never; a host's mgr keys only where the inventory has a mgr
+        for i, name in enumerate(('agent-ca.key', 'rgw/ca.key', 'host/h1/agent-server.key', 'host/h1/agent-client.key',
+                                  'host/h2/mgr-server.key', 'host/../mgr-server.key', 'host/h1/../agent-ca.key', 7)):
+            code, _ = self.call(ch, call='secret get', args={'name': name}, dispatch_id='%016x' % (400 + i))
+            self.assertEqual(code, 400, name)
+        self.assertEqual(self.call(ch, call='secret get', args={'name': 'rgw/vrrp', 'x': 1}, dispatch_id='%016x' % 410)[0], 400)
+        # nor through the store calls
+        for i, call in enumerate(('config-key get', 'config-key set', 'config-key rm')):
+            args = {'key': b.SECRET_PREFIX + 'agent-ca.key'}
+            if call == 'config-key set':
+                args['value'] = 'x'
+            self.assertEqual(self.call(ch, call=call, args=args, dispatch_id='%016x' % (420 + i))[0], 400, call)
+        code, reply = self.call(ch, call='config-key keys', args={'prefix': b.SECRET_PREFIX, 'after': ''}, dispatch_id='%016x' % 430)
+        self.assertEqual(code, 400)
+        self.assertEqual(len(mons.sent), sent)
+
     def test_keys_below_the_prefix_in_pages(self):
         ch, mons = self.channel()
         base = 'mgr/cephadm/talos/inc/42/'
@@ -313,7 +337,7 @@ class BridgeTest(unittest.TestCase):
         cmds = mons.commands(2)
         self.addCleanup(cmds.stop)
         lead = b.Leadership('h1', mgrmap(10, 'other'), cmds)
-        ch = b.Channel('f1', 'h1', lead, cmds, None, b'', m.require_identity, Log())
+        ch = b.Channel('f1', 'h1', lead, cmds, None, b'', m.require_identity, Log(), lambda: {'h1'})
         self.assertEqual(self.call(ch)[0], 503)
 
     def test_a_dispatch_id_runs_once(self):
@@ -443,7 +467,7 @@ class ServerTest(unittest.TestCase):
         mons = Mons()
         cmds = mons.commands(2)
         self.addCleanup(cmds.stop)
-        self.ch = b.Channel('f1', 'h1', lead, cmds, ctx, b.read(self.files['srv.key']), m.require_identity, Log())
+        self.ch = b.Channel('f1', 'h1', lead, cmds, ctx, b.read(self.files['srv.key']), m.require_identity, Log(), lambda: {'h1'})
         s = socket.socket()
         s.bind(('127.0.0.1', 0))
         self.port = s.getsockname()[1]

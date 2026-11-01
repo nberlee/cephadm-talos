@@ -256,13 +256,28 @@ def _auth_get_or_create(args: Dict[str, Any]) -> Dict[str, Any]:
     return {'prefix': 'auth get-or-create', 'entity': e, 'caps': list(CREATE_CAPS[m.group(1)]), 'format': 'json'}
 
 
+# Secrets the leader renders into documents (internal/state Secrets), below
+# their own prefix: never the CA keys or the agents' keys. A host's mgr keys
+# only for a host the inventory places a mgr on (Channel.bridge).
+SECRET_PREFIX = 'cephadm-talos/secrets/'
+SECRET_RE = re.compile(r'\A(?:host/([A-Za-z0-9][A-Za-z0-9._-]{0,127})/mgr-(?:server|client)\.key|rgw/server\.key|rgw/vrrp)\Z')
+
+
+def _secret_get(args: Dict[str, Any]) -> Dict[str, Any]:
+    _args(args, {'name'})
+    n = args['name']
+    if not isinstance(n, str) or not SECRET_RE.match(n):
+        raise ValueError('secret not allowed')
+    return {'prefix': 'config-key get', 'key': SECRET_PREFIX + n}
+
+
 # calls whose output is reduced in the mgr before it is kept and returned
 REDUCE: Dict[str, Callable[[Dict[str, Any]], Callable[[str], str]]] = {
     'config-key keys': lambda args: _keys_page(args['prefix'], args['after']),
 }
 
 # calls that change nothing: an answered one is not kept
-READ_ONLY = {'status', 'health', 'mgr dump', 'config-key keys', 'config-key get', 'entry limit', 'auth get'}
+READ_ONLY = {'status', 'health', 'mgr dump', 'config-key keys', 'config-key get', 'entry limit', 'auth get', 'secret get'}
 
 ALLOWLIST: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     'status': _no_args('status'),
@@ -275,6 +290,7 @@ ALLOWLIST: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     'entry limit': _entry_limit,
     'auth get': _auth_get,
     'auth get-or-create': _auth_get_or_create,
+    'secret get': _secret_get,
 }
 
 
@@ -450,8 +466,9 @@ class Channel:
 
     def __init__(self, fsid: str, mgr_id: str, leadership: Leadership, bridge_commands: Commands,
                  server_ctx: Optional[ssl.SSLContext], server_key: bytes,
-                 require_identity: Callable[..., str], log: Any) -> None:
+                 require_identity: Callable[..., str], log: Any, mgr_hosts: Callable[[], Set[str]]) -> None:
         self.fsid = fsid
+        self.mgr_hosts = mgr_hosts
         self.mgr_id = mgr_id
         self.leadership = leadership
         self.commands = bridge_commands
@@ -493,6 +510,10 @@ class Channel:
             cmd = ALLOWLIST[call](args)
         except ValueError as e:
             return 400, {'error': str(e)}
+        if call == 'secret get':
+            m = SECRET_RE.match(args['name'])
+            if m and m.group(1) is not None and m.group(1) not in self.mgr_hosts():
+                return 400, {'error': 'secret not allowed'}
         if self.leadership.captured() is None:
             return 503, {'error': 'no captured incarnation'}
         rec = Record()

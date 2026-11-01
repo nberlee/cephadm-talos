@@ -2,6 +2,7 @@ package orch
 
 import (
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
@@ -120,7 +121,7 @@ func (o *Orch) ensureRGWCert() error {
 	ips, names := o.rgwCertSANs()
 
 	// a new certificate restarts every rgw: only reissue when the names changed
-	if r.Cert != "" && certCovers(r.Cert, ips, names) {
+	if _, err := tls.X509KeyPair([]byte(r.Cert), []byte(r.Key)); err == nil && certCovers(r.Cert, ips, names) {
 		return nil
 	}
 

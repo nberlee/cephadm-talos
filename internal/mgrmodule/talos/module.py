@@ -22,7 +22,7 @@ import socket
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import orchestrator
 from ceph.deployment.hostspec import HostSpec
@@ -444,6 +444,10 @@ class Module(orchestrator.Orchestrator, MgrModule):
         entries = self.get_store_prefix(STORE_PREFIX)
         return inventory_from_store(entries, choose_incarnation(entries, getattr(self, '_gid', None)))
 
+    def _mgr_hosts(self) -> Set[str]:
+        """The hosts the inventory places a mgr on."""
+        return {d['host'] for d in self._inventory()['daemons'] if d['daemon_type'] == 'mgr'}
+
     def _send_mon(self, result: Any, cmd: str) -> None:
         self.send_command(result, 'mon', '', cmd, '')
 
@@ -465,7 +469,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
                             inv['fsid'], self.get_mgr_id(), leadership, bridge_cmds,
                             bridge.server_context(os.path.join(TALOS_DIR, 'agent-ca.crt'), os.path.join(TALOS_DIR, 'mgr-server.crt'),
                                                   os.path.join(TALOS_DIR, 'mgr-server.key')),
-                            bridge.read(os.path.join(TALOS_DIR, 'mgr-server.key')), require_identity, self.log)
+                            bridge.read(os.path.join(TALOS_DIR, 'mgr-server.key')), require_identity, self.log, self._mgr_hosts)
                         c.start()
                         channel = c  # only a started channel; a failed start is retried
                     if leadership.capture():

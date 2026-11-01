@@ -699,7 +699,7 @@ func (o *Orch) removeDoc(ctx context.Context, h state.Host, d state.Daemon) erro
 				continue
 			}
 
-			doc, err := render.Daemon(&without, h, v, o.St.Image, o.key)
+			doc, err := render.Daemon(&without, h, v, o.St.Image, o.key, o.secret)
 			if err != nil {
 				return err
 			}
@@ -1060,7 +1060,7 @@ func (o *Orch) Redeploy(ctx context.Context, name string) error {
 
 // redeployDoc re-renders the document of an existing daemon (internal/render).
 func (o *Orch) redeployDoc(d state.Daemon, h state.Host, image string) (*spec.ContainerConfig, error) {
-	return render.Daemon(o.St, h, d, image, o.key)
+	return render.Daemon(o.St, h, d, image, o.key, o.secret)
 }
 
 // Hosts prints the host inventory.

@@ -88,6 +88,13 @@ func (m *fakeBridge) run(req wire.BridgeRequest) map[string]any {
 		delete(m.kv, str("key"))
 
 		return map[string]any{"outcome": "done", "r": 0}
+	case "secret get":
+		v, ok := m.kv[store.SecretPrefix+str("name")]
+		if !ok {
+			return map[string]any{"outcome": "done", "r": -2}
+		}
+
+		return map[string]any{"outcome": "done", "r": 0, "out": v}
 	case "auth get":
 		if str("entity") == "osd.9" {
 			return map[string]any{"outcome": "done", "r": -2, "outs": "failed to find osd.9"}

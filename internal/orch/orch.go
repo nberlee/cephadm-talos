@@ -14,6 +14,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -47,6 +48,8 @@ type Orch struct {
 
 	// st is the cluster's state in the store, once a mon answers (plan 03, item 4)
 	st *store.Store
+	// secrets are the state's private keys and passwords (store.SecretPrefix)
+	secrets store.Backend
 	// opened: the cluster's state was read from its mons
 	opened bool
 	// incarnation is the one the state was read from: "cli", or a leader's
@@ -119,6 +122,17 @@ func (o *Orch) Open(ctx context.Context) error {
 
 		o.opened, o.sealed, o.handingOver = true, o.St.Sealed, o.St.HandingOver
 
+		// the private keys, for a CLI that still writes the state
+		if !o.Managed() {
+			if err := o.openSecrets(ctx, h.Addr); err != nil {
+				return err
+			}
+
+			if err := o.readSecrets(ctx); err != nil {
+				return err
+			}
+		}
+
 		return nil
 	}
 
@@ -161,6 +175,20 @@ func (o *Orch) openStore(ctx context.Context, node string) error {
 	o.st = &store.Store{B: ck, Incarnation: o.storeIncarnation()}
 
 	return nil
+}
+
+// openSecrets opens the secrets, which only the CLI before the handoff reads
+// and writes, through a Ceph container on node.
+func (o *Orch) openSecrets(ctx context.Context, node string) (err error) {
+	if o.StoreBackend != nil {
+		o.secrets = o.StoreBackend
+
+		return nil
+	}
+
+	o.secrets, err = o.configKeys(ctx, node, store.SecretPrefix)
+
+	return err
 }
 
 func (o *Orch) printf(format string, args ...any) { fmt.Fprintf(o.Out, format, args...) }
@@ -621,8 +649,104 @@ func (o *Orch) save() error {
 	ctx, cancel := context.WithTimeout(context.Background(), configKeyTimeout)
 	defer cancel()
 
+	// the keys first: a certificate in the state is never newer than its key.
+	// A handoff changes no secret, and a resumed one has not read them.
+	if !o.Managed() {
+		if err := o.writeSecrets(ctx); err != nil {
+			return fmt.Errorf("writing the cluster's secrets: %w", err)
+		}
+	}
+
 	if _, err := o.st.Publish(ctx, recs); err != nil {
 		return fmt.Errorf("publishing the cluster state: %w", err)
+	}
+
+	return nil
+}
+
+// secret looks a secret up in the state the CLI loaded (render.Secret).
+func (o *Orch) secret(name string) (string, error) {
+	if v := o.St.Secrets()[name]; v != "" {
+		return v, nil
+	}
+
+	return "", fmt.Errorf("the cluster has no secret %s", name)
+}
+
+// readSecrets fills the state's private keys and passwords in from their
+// entries below store.SecretPrefix.
+func (o *Orch) readSecrets(ctx context.Context) error {
+	keys, err := o.secrets.List(ctx, store.SecretPrefix)
+	if err != nil {
+		return err
+	}
+
+	sec := map[string]string{}
+
+	for _, k := range keys {
+		v, err := o.secrets.Get(ctx, k)
+		if err != nil {
+			return err
+		}
+
+		sec[strings.TrimPrefix(k, store.SecretPrefix)] = string(v)
+	}
+
+	o.St.ApplySecrets(sec)
+
+	return nil
+}
+
+// writeSecrets makes the entries below store.SecretPrefix the state's
+// secrets: changed and new ones written, gone ones removed.
+func (o *Orch) writeSecrets(ctx context.Context) error {
+	if o.secrets == nil {
+		return errors.New("the secrets are not open")
+	}
+
+	want := o.St.Secrets()
+
+	keys, err := o.secrets.List(ctx, store.SecretPrefix)
+	if err != nil {
+		return err
+	}
+
+	var (
+		set  []store.KV
+		gone []string
+	)
+
+	have := map[string]bool{}
+
+	for _, k := range keys {
+		name := strings.TrimPrefix(k, store.SecretPrefix)
+		have[name] = true
+
+		if _, ok := want[name]; !ok {
+			gone = append(gone, k)
+		}
+	}
+
+	for name, v := range want {
+		if have[name] {
+			if cur, err := o.secrets.Get(ctx, store.SecretPrefix+name); err == nil && string(cur) == v {
+				continue
+			}
+		}
+
+		set = append(set, store.KV{Key: store.SecretPrefix + name, Value: []byte(v)})
+	}
+
+	sort.Slice(set, func(i, j int) bool { return set[i].Key < set[j].Key })
+
+	if len(set) > 0 {
+		if err := o.secrets.SetMany(ctx, set); err != nil {
+			return err
+		}
+	}
+
+	if len(gone) > 0 {
+		return o.secrets.Remove(ctx, gone)
 	}
 
 	return nil
@@ -744,7 +868,7 @@ func (o *Orch) Bootstrap(ctx context.Context, addr, image, agentImage string, re
 	})
 	// no dependsOn on the mon: Talos rejects configs referencing a removed container,
 	// which would block removing the bootstrap mon later. ceph-mgr retries by itself.
-	mgrDoc, err := render.Daemon(o.St, h, mgr, image, func(string) (string, error) { return mgrKey, nil })
+	mgrDoc, err := render.Daemon(o.St, h, mgr, image, func(string) (string, error) { return mgrKey, nil }, o.secret)
 	if err != nil {
 		return err
 	}
@@ -790,6 +914,10 @@ func (o *Orch) Bootstrap(ctx context.Context, addr, image, agentImage string, re
 	// from here on the cluster's state lives in the mons: the first publication
 	if !o.Talos.DryRun {
 		if err := o.openStore(ctx, h.Addr); err != nil {
+			return err
+		}
+
+		if err := o.openSecrets(ctx, h.Addr); err != nil {
 			return err
 		}
 
@@ -910,7 +1038,7 @@ func (o *Orch) deployMon(ctx context.Context, h state.Host) error {
 	}
 
 	// a joining mon with the mon. key only (plan 03, item 13)
-	doc, err := render.Daemon(o.St, h, d, o.St.Image, func(string) (string, error) { return monKey, nil })
+	doc, err := render.Daemon(o.St, h, d, o.St.Image, func(string) (string, error) { return monKey, nil }, o.secret)
 	if err != nil {
 		return err
 	}
@@ -962,7 +1090,7 @@ func (o *Orch) deployMgr(ctx context.Context, h state.Host) error {
 		return err
 	}
 
-	doc, err := render.Daemon(o.St, h, d, o.St.Image, func(string) (string, error) { return k, nil })
+	doc, err := render.Daemon(o.St, h, d, o.St.Image, func(string) (string, error) { return k, nil }, o.secret)
 	if err != nil {
 		return err
 	}
@@ -1048,7 +1176,7 @@ func (o *Orch) deployOSD(ctx context.Context, h state.Host, device string) error
 		return err
 	}
 
-	doc, err := render.Daemon(o.St, h, d, o.St.Image, o.key)
+	doc, err := render.Daemon(o.St, h, d, o.St.Image, o.key, o.secret)
 	if err != nil {
 		return err
 	}

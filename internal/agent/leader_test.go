@@ -180,6 +180,59 @@ func TestLeaderGrantsAHostRevision(t *testing.T) {
 	}
 }
 
+func TestLeaderRendersMgrKeysFromTheSecrets(t *testing.T) {
+	s := newLeaderSetup(t)
+	ctx := context.Background()
+
+	// a mgr on h1: its certificates are in the published state, its keys only below the secret prefix
+	ca := newTestCA(t)
+	h, _ := s.st.Host("h1")
+	h.MgrServerCert, h.MgrServerKey = ca.pair(pki.RoleMgr, "h1", x509.ExtKeyUsageServerAuth, testFSID)
+	h.MgrClientCert, h.MgrClientKey = ca.pair(pki.RoleMgr, "h1", x509.ExtKeyUsageClientAuth, testFSID)
+	s.st.AddHost(h)
+	s.st.Agent = &state.Agent{CACert: ca.cert}
+	s.agent.Node.Policy.CACert, s.leader.CACert = ca.cert, ca.cert // the agents trust the same CA
+	s.st.AddDaemon(state.Daemon{Type: state.TypeMgr, ID: "h1", Host: "h1"})
+	publish(t, s.leader, s.st)
+
+	s.module.mu.Lock()
+	for k, v := range s.module.kv {
+		if strings.Contains(v, "PRIVATE KEY") {
+			t.Fatalf("%s carries a private key", k)
+		}
+	}
+	s.module.mu.Unlock()
+
+	s.request("r1", `{"version":1,"kind":"revision","host":"h1"}`)
+	_ = s.leader.Tick(ctx, 42, 5)
+
+	// without its keys the host is not rendered: the request waits
+	s.module.mu.Lock()
+	if _, ok := s.module.kv[JournalPrefix(42)+"op/r1"]; ok || s.agent.patches.n != 0 {
+		t.Fatal("rendered without the mgr keys")
+	}
+	s.module.mu.Unlock()
+
+	s.module.mu.Lock()
+	for name, v := range s.st.Secrets() {
+		s.module.kv[store.SecretPrefix+name] = v
+	}
+	s.module.mu.Unlock()
+
+	if err := s.leader.Tick(ctx, 42, 5); err != nil {
+		t.Fatal(err)
+	}
+
+	op := s.op(t, "r1")
+	if op.State != "completed" {
+		t.Fatalf("journal %+v", op)
+	}
+
+	if _, ok := op.Docs["EtcFileConfig/ceph/talos/mgr-server.key"]; !ok {
+		t.Fatalf("the mgr key was not granted: %v", op.Docs)
+	}
+}
+
 func TestLeaderRefusesBadRequests(t *testing.T) {
 	s := newLeaderSetup(t)
 	ctx := context.Background()

@@ -141,7 +141,7 @@ func (o *Orch) publishedContent() string {
 		h.Write([]byte(a.CACert))
 
 		for _, host := range o.St.Hosts {
-			h.Write([]byte(host.Name + "\x00" + host.MgrServerCert + host.MgrServerKey + host.MgrClientCert + host.MgrClientKey + "\x00"))
+			h.Write([]byte(host.Name + "\x00" + host.MgrServerCert + host.MgrClientCert + "\x00"))
 		}
 	}
 
@@ -284,7 +284,7 @@ func (o *Orch) Publish(ctx context.Context) error {
 // mgrFileDocs are the module and its TLS files on a mgr host, or their
 // removal elsewhere (internal/render).
 func (o *Orch) mgrFileDocs(h state.Host, withMgr bool) ([]any, error) {
-	r, err := render.MgrFiles(o.St, h, withMgr)
+	r, err := render.MgrFiles(o.St, h, withMgr, o.secret)
 	if err != nil {
 		return nil, err
 	}

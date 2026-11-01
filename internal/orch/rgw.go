@@ -3,6 +3,7 @@ package orch
 import (
 	"context"
 	"crypto/tls"
+	"encoding/pem"
 	"fmt"
 	"net"
 	"os"
@@ -56,21 +57,12 @@ func (o *Orch) DeployRGW(ctx context.Context, hostName string, opts RGWOptions) 
 	}
 
 	if opts.CertFile != "" {
-		cert, err := os.ReadFile(opts.CertFile)
+		cert, key, err := userCert(opts.CertFile, opts.KeyFile)
 		if err != nil {
 			return err
 		}
 
-		key, err := os.ReadFile(opts.KeyFile)
-		if err != nil {
-			return err
-		}
-
-		if _, err := tls.X509KeyPair(cert, key); err != nil {
-			return fmt.Errorf("certificate and key do not match: %w", err)
-		}
-
-		o.St.RGW.Cert, o.St.RGW.Key, o.St.RGW.UserCert = string(cert), string(key), true
+		o.St.RGW.Cert, o.St.RGW.Key, o.St.RGW.UserCert = cert, key, true
 	}
 
 	// (re)issue the generated certificate so it also covers this host
@@ -103,6 +95,33 @@ func (o *Orch) DeployRGW(ctx context.Context, hostName string, opts RGWOptions) 
 	o.printf("rgw.%s serving https://%s (CA: %s/rgw-ca.crt)\n", h.Name, net.JoinHostPort(h.Addr, fmt.Sprint(o.St.RGW.Port)), o.St.Dir())
 
 	return nil
+}
+
+// userCert reads the user's RGW certificate and key. The certificate comes
+// back as its certificates only: the published state must not carry a key that
+// came in the same file.
+func userCert(certFile, keyFile string) (cert, key string, err error) {
+	c, err := os.ReadFile(certFile)
+	if err != nil {
+		return "", "", err
+	}
+
+	k, err := os.ReadFile(keyFile)
+	if err != nil {
+		return "", "", err
+	}
+
+	pair, err := tls.X509KeyPair(c, k)
+	if err != nil {
+		return "", "", fmt.Errorf("certificate and key do not match: %w", err)
+	}
+
+	var chain []byte
+	for _, der := range pair.Certificate {
+		chain = append(chain, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})...)
+	}
+
+	return string(chain), string(k), nil
 }
 
 // DeployVIP places a keepalived holding the RGW virtual IP on a host. The host

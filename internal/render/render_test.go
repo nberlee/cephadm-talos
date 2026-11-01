@@ -1,12 +1,14 @@
 package render
 
 import (
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
 
 	"github.com/nberlee/cephadm-talos/internal/daemons"
+	"github.com/nberlee/cephadm-talos/internal/pki"
 	"github.com/nberlee/cephadm-talos/internal/state"
 )
 
@@ -16,9 +18,9 @@ func testState() *state.State {
 	s := state.New("eb8dac3e-0ba7-4795-8feb-a80e8593331f")
 	s.Image = image
 	s.Agent = &state.Agent{CACert: "CA"}
-	s.RGW = &state.RGW{Port: 443, Cert: "CERT", Key: "KEY", VIP: "10.5.0.100/24", VRID: 51, VRRPPass: "0a1b2c3d", KeepalivedImage: "quay.io/ceph/keepalived@sha256:cd"}
+	s.RGW = &state.RGW{Port: 443, Cert: rgwServer.cert, Key: rgwServer.key, VIP: "10.5.0.100/24", VRID: 51, VRRPPass: "0a1b2c3d", KeepalivedImage: "quay.io/ceph/keepalived@sha256:cd"}
 
-	s.AddHost(state.Host{Name: "h1", Addr: "10.5.0.2", MgrClientCert: "c", MgrClientKey: "k", MgrServerCert: "sc", MgrServerKey: "sk"})
+	s.AddHost(state.Host{Name: "h1", Addr: "10.5.0.2", MgrClientCert: mgrClient.cert, MgrClientKey: mgrClient.key, MgrServerCert: mgrServer.cert, MgrServerKey: mgrServer.key})
 	s.AddHost(state.Host{Name: "h2", Addr: "10.5.0.3"})
 
 	id := 3
@@ -32,6 +34,35 @@ func testState() *state.State {
 }
 
 func keys(entity string) (string, error) { return "KEY-" + entity, nil }
+
+type pair struct{ cert, key string }
+
+var mgrClient, mgrServer, rgwServer = issuePair(x509.ExtKeyUsageClientAuth), issuePair(x509.ExtKeyUsageServerAuth), issuePair(x509.ExtKeyUsageServerAuth)
+
+func issuePair(usage x509.ExtKeyUsage) pair {
+	caCert, caKey, err := pki.NewCA("test", 1)
+	if err != nil {
+		panic(err)
+	}
+
+	cert, key, err := pki.Issue(caCert, caKey, pki.Leaf{CommonName: "h1", Usage: usage, Years: 1})
+	if err != nil {
+		panic(err)
+	}
+
+	return pair{cert, key}
+}
+
+// secrets looks a secret up in the state, as the CLI and the leader do.
+func secrets(s *state.State) Secret {
+	return func(name string) (string, error) {
+		if v, ok := s.Secrets()[name]; ok {
+			return v, nil
+		}
+
+		return "", errors.New("no secret " + name)
+	}
+}
 
 func env(t *testing.T, list []string, name string) string {
 	t.Helper()
@@ -75,15 +106,15 @@ func TestRenderingChangesNothing(t *testing.T) {
 
 	for _, d := range s.Daemons {
 		dh, _ := s.Host(d.Host)
-		if _, err := Daemon(s, dh, d, image, keys); err != nil {
+		if _, err := Daemon(s, dh, d, image, keys, secrets(s)); err != nil {
 			t.Fatalf("%s.%s: %v", d.Type, d.ID, err)
 		}
 	}
 
 	osd, _ := s.Find("osd.3")
 
-	_, err1 := MgrFiles(s, h1, true)
-	_, err2 := MgrFiles(s, h2, false)
+	_, err1 := MgrFiles(s, h1, true, secrets(s))
+	_, err2 := MgrFiles(s, h2, false, secrets(s))
 	_, err3 := OSDPrepare(s, h1, osd, keys)
 
 	if err := errors.Join(err1, err2, err3); err != nil {
@@ -108,7 +139,7 @@ func TestDaemonRendering(t *testing.T) {
 	mon, _ := s.Find("mon.h1")
 
 	// a candidate image is rendered before the state changes; the mon keeps its deploy id
-	c, err := Daemon(s, h1, mon, "quay.io/ceph/ceph@sha256:ef", keys)
+	c, err := Daemon(s, h1, mon, "quay.io/ceph/ceph@sha256:ef", keys, secrets(s))
 	if err != nil || c.ContainerImage != "quay.io/ceph/ceph@sha256:ef" || env(t, c.ContainerEnvironment, "DEPLOY_ID") != mon.DeployID || env(t, c.ContainerEnvironment, "MODE") != "join" {
 		t.Fatalf("mon: %v", err)
 	}
@@ -117,12 +148,12 @@ func TestDaemonRendering(t *testing.T) {
 	vip1, _ := s.Find("vip.h1")
 	vip2, _ := s.Find("vip.h2")
 
-	c1, err := Daemon(s, h1, vip1, image, keys)
+	c1, err := Daemon(s, h1, vip1, image, keys, secrets(s))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	c2, err := Daemon(s, h2, vip2, image, keys)
+	c2, err := Daemon(s, h2, vip2, image, keys, secrets(s))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,15 +179,31 @@ func TestIncompleteInputsAreRefused(t *testing.T) {
 	mon, _ := s.Find("mon.h1")
 
 	cases := map[string]func() error{
-		"an OSD without its id":           func() error { _, err := Daemon(s, h1, unprepared, image, keys); return err },
-		"an OSD by kernel name":           func() error { _, err := Daemon(s, h1, kernel, image, keys); return err },
+		"an OSD without its id":           func() error { _, err := Daemon(s, h1, unprepared, image, keys, secrets(s)); return err },
+		"an OSD by kernel name":           func() error { _, err := Daemon(s, h1, kernel, image, keys, secrets(s)); return err },
 		"a prepare by kernel name":        func() error { _, err := OSDPrepare(s, h1, kernel, keys); return err },
-		"a mon without its key":           func() error { _, err := Daemon(s, h1, mon, image, noKey); return err },
-		"a mgr host without certificates": func() error { _, err := MgrFiles(s, h2, true); return err },
+		"a mon without its key":           func() error { _, err := Daemon(s, h1, mon, image, noKey, secrets(s)); return err },
+		"a mgr host without certificates": func() error { _, err := MgrFiles(s, h2, true, secrets(s)); return err },
+		"a mgr key that does not match its certificate": func() error {
+			s := testState()
+			s.Hosts[0].MgrClientKey = mgrServer.key
+			_, err := MgrFiles(s, h1, true, secrets(s))
+			return err
+		},
+		"an RGW without its key": func() error {
+			_, err := Daemon(s, h1, state.Daemon{Type: state.TypeRGW, ID: "h1", Host: "h1"}, image, keys, secrets(&state.State{}))
+			return err
+		},
+		"an RGW key that does not match its certificate": func() error {
+			s := testState()
+			s.RGW.Key = mgrServer.key
+			_, err := Daemon(s, h1, state.Daemon{Type: state.TypeRGW, ID: "h1", Host: "h1"}, image, keys, secrets(s))
+			return err
+		},
 		"an RGW without a certificate": func() error {
 			s := testState()
 			s.RGW.Cert = ""
-			_, err := Daemon(s, h1, state.Daemon{Type: state.TypeRGW, ID: "h1", Host: "h1"}, image, keys)
+			_, err := Daemon(s, h1, state.Daemon{Type: state.TypeRGW, ID: "h1", Host: "h1"}, image, keys, secrets(s))
 			return err
 		},
 	}
@@ -172,7 +219,7 @@ func TestMgrFilesRemovalsAreReferences(t *testing.T) {
 	s := testState()
 	h2, _ := s.Host("h2")
 
-	r, err := MgrFiles(s, h2, false)
+	r, err := MgrFiles(s, h2, false, secrets(s))
 	if err != nil || len(r.Upsert) != 0 || len(r.Remove) == 0 {
 		t.Fatalf("%+v %v", r, err)
 	}
@@ -206,7 +253,7 @@ func TestDaemonDocuments(t *testing.T) {
 
 	vip, _ := s.Find("vip.h1")
 
-	c, err := Daemon(s, h1, vip, image, keys)
+	c, err := Daemon(s, h1, vip, image, keys, secrets(s))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +267,7 @@ func TestDaemonDocuments(t *testing.T) {
 	// daemons back off in Talos; the RGW drains
 	rgw, _ := s.Find("rgw.h1")
 
-	r, err := Daemon(s, h1, rgw, image, keys)
+	r, err := Daemon(s, h1, rgw, image, keys, secrets(s))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,7 +280,7 @@ func TestDaemonDocuments(t *testing.T) {
 	rgw.LocalOnly = true
 	s.AddDaemon(rgw)
 
-	if c, _ = Daemon(s, h1, vip, image, keys); len(c.DependsOnConfig.ContainersConfig) != 0 {
+	if c, _ = Daemon(s, h1, vip, image, keys, secrets(s)); len(c.DependsOnConfig.ContainersConfig) != 0 {
 		t.Fatalf("dependency on a leaving rgw: %+v", c.DependsOnConfig.ContainersConfig)
 	}
 }

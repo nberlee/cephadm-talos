@@ -20,7 +20,7 @@ import (
 
 // SchemaVersion is the state.json schema this build reads and writes. Before
 // the first tagged release there are no migrations: any other version is refused.
-const SchemaVersion = 1
+const SchemaVersion = 2
 
 // Daemon types.
 const (
@@ -46,16 +46,17 @@ type Host struct {
 	Context     string `json:"context,omitempty"`
 	// AgentCert and AgentKey are the agent's server certificate, AgentClientCert
 	// and AgentClientKey its client certificate (agent CA, identity agent/<host>)
+	// The private keys are secrets: not in the published state (Secrets)
 	AgentCert       string `json:"agent_cert,omitempty"`
-	AgentKey        string `json:"agent_key,omitempty"`
+	AgentKey        string `json:"-"`
 	AgentClientCert string `json:"agent_client_cert,omitempty"`
-	AgentClientKey  string `json:"agent_client_key,omitempty"`
+	AgentClientKey  string `json:"-"`
 	// MgrServerCert, MgrClientCert and their keys are the certificates of the
 	// mgr on this host (agent CA, identity mgr/<host>), set while it has one
 	MgrServerCert string `json:"mgr_server_cert,omitempty"`
-	MgrServerKey  string `json:"mgr_server_key,omitempty"`
+	MgrServerKey  string `json:"-"`
 	MgrClientCert string `json:"mgr_client_cert,omitempty"`
-	MgrClientKey  string `json:"mgr_client_key,omitempty"`
+	MgrClientKey  string `json:"-"`
 }
 
 // Published is the revision of what the talos mgr module reads from the nodes
@@ -74,7 +75,7 @@ type Published struct {
 type Agent struct {
 	Image        string `json:"image"` // digest reference
 	CACert       string `json:"ca_cert"`
-	CAKey        string `json:"ca_key"`
+	CAKey        string `json:"-"` // a secret (Secrets)
 	OperatorCert string `json:"operator_cert"`
 	OperatorKey  string `json:"operator_key"`
 }
@@ -86,15 +87,15 @@ type RGW struct {
 	// TLS: a cluster CA and a server certificate for the VIP and all hosts,
 	// unless the user supplied their own (UserCert)
 	CACert   string `json:"ca_cert,omitempty"`
-	CAKey    string `json:"ca_key,omitempty"`
+	CAKey    string `json:"-"` // secrets (Secrets)
 	Cert     string `json:"cert"`
-	Key      string `json:"key"`
+	Key      string `json:"-"`
 	UserCert bool   `json:"user_cert,omitempty"`
 
 	// VIP held by keepalived (VRRP, unicast between the vip hosts)
 	VIP             string `json:"vip,omitempty"` // CIDR, e.g. 10.5.0.200/24
 	VRID            int    `json:"vrid,omitempty"`
-	VRRPPass        string `json:"vrrp_pass,omitempty"`
+	VRRPPass        string `json:"-"` // a secret (Secrets)
 	KeepalivedImage string `json:"keepalived_image,omitempty"`
 }
 
@@ -325,6 +326,76 @@ type cluster struct {
 	// HandingOver: a handoff started; Sealed: it finished, the CLI writes no more
 	HandingOver bool `json:"handing_over,omitempty"`
 	Sealed      bool `json:"sealed,omitempty"`
+}
+
+// Secret names: config-key entries below store.SecretPrefix, one per secret.
+const (
+	SecretAgentCA   = "agent-ca.key"
+	SecretRGWCA     = "rgw/ca.key"
+	SecretRGWServer = "rgw/server.key"
+	SecretVRRP      = "rgw/vrrp"
+
+	// a host's keys, below host/<name>/ (SecretHost)
+	SecretAgentServer = "agent-server.key"
+	SecretAgentClient = "agent-client.key"
+	SecretMgrServer   = "mgr-server.key"
+	SecretMgrClient   = "mgr-client.key"
+)
+
+// SecretHost is the secret name of one of a host's keys.
+func SecretHost(host, key string) string { return "host/" + host + "/" + key }
+
+// Secrets are the state's private keys and passwords, by name: kept apart
+// from the published records, in entries the leader cannot read through the
+// bridge (plan 03, step 6b). Empty secrets are left out.
+func (s *State) Secrets() map[string]string {
+	out := map[string]string{}
+
+	put := func(name, v string) {
+		if v != "" {
+			out[name] = v
+		}
+	}
+
+	if s.Agent != nil {
+		put(SecretAgentCA, s.Agent.CAKey)
+	}
+
+	if s.RGW != nil {
+		put(SecretRGWCA, s.RGW.CAKey)
+		put(SecretRGWServer, s.RGW.Key)
+		put(SecretVRRP, s.RGW.VRRPPass)
+	}
+
+	for _, h := range s.AllHosts() {
+		put(SecretHost(h.Name, SecretAgentServer), h.AgentKey)
+		put(SecretHost(h.Name, SecretAgentClient), h.AgentClientKey)
+		put(SecretHost(h.Name, SecretMgrServer), h.MgrServerKey)
+		put(SecretHost(h.Name, SecretMgrClient), h.MgrClientKey)
+	}
+
+	return out
+}
+
+// ApplySecrets fills the state's private keys and passwords in.
+func (s *State) ApplySecrets(sec map[string]string) {
+	if s.Agent != nil {
+		s.Agent.CAKey = sec[SecretAgentCA]
+	}
+
+	if s.RGW != nil {
+		s.RGW.CAKey, s.RGW.Key, s.RGW.VRRPPass = sec[SecretRGWCA], sec[SecretRGWServer], sec[SecretVRRP]
+	}
+
+	for _, list := range [][]Host{s.Hosts, s.Contacts} {
+		for i := range list {
+			h := &list[i]
+			h.AgentKey = sec[SecretHost(h.Name, SecretAgentServer)]
+			h.AgentClientKey = sec[SecretHost(h.Name, SecretAgentClient)]
+			h.MgrServerKey = sec[SecretHost(h.Name, SecretMgrServer)]
+			h.MgrClientKey = sec[SecretHost(h.Name, SecretMgrClient)]
+		}
+	}
 }
 
 // Records returns the cluster's part of the state as store records: what the
