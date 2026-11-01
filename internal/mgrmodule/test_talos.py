@@ -640,6 +640,18 @@ class Maintenance(unittest.TestCase):
         self.assertEqual(m.Module.exit_host_maintenance(mod, 'h1').exception_str, '')
         self.assertEqual([e['kind'] for _, e in mod._ledger.executable()], ['enter_maintenance', 'exit_maintenance'])
 
+    def test_powercycle(self):
+        mod, entries = self.module()
+        for args in (('h1',), ('h3', True), ('h9', True)):
+            self.assertTrue(m.Module.hardware_powercycle(mod, *args).exception_str, args)
+        self.assertEqual(m.Module.hardware_powercycle(mod, 'h1', True).exception_str, '')
+        [(_, pc)] = mod._ledger.executable()
+        self.assertEqual((pc['kind'], pc['host']), ('powercycle_host', 'h1'))
+        self.finish(entries, pc['id'])
+        # in maintenance until its maintained entry: nothing else on h1
+        self.assertTrue(m.Module.enter_host_maintenance(mod, 'h1').exception_str)
+        self.assertTrue(m.Module.daemon_action(mod, 'restart', 'mon.h1').exception_str)
+
     def test_the_active_mgr_needs_a_standby(self):
         mod, _ = self.module()
         mod.get_mgr_id = lambda: 'h2'

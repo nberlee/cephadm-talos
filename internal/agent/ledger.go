@@ -40,6 +40,7 @@ const (
 	KindRemoveDaemon = "remove_daemon"
 	KindEnterMaint   = "enter_maintenance"
 	KindExitMaint    = "exit_maintenance"
+	KindPowercycle   = "powercycle_host"
 	KindRemoveHost   = "remove_host"
 	KindCreateOSD    = "create_osd"
 	KindRemoveOSD    = "remove_osd"
@@ -96,7 +97,7 @@ func (l *LeaderLoop) ledgerOps(ctx context.Context, b *Bridge, js store.Backend,
 			done, err := l.ledgerOp(ctx, b, js, gid, epoch, e)
 			if err != nil || !done {
 				l.holding = ""
-				if e.Op.Kind == KindEnterMaint || e.Op.Kind == KindExitMaint {
+				if e.Op.Kind == KindEnterMaint || e.Op.Kind == KindExitMaint || e.Op.Kind == KindPowercycle {
 					l.holding = e.Op.Host
 				}
 
@@ -216,8 +217,8 @@ func (l *LeaderLoop) ledgerOp(ctx context.Context, b *Bridge, js store.Backend, 
 	opKey := JournalPrefix(gid) + "op/" + op.ID
 
 	known := map[string]bool{KindRestart: true, KindRedeploy: true, KindAddDaemon: true, KindRemoveDaemon: true, KindRemoveHost: true, KindCreateOSD: true, KindRemoveOSD: true,
-		KindEnterMaint: true, KindExitMaint: true}
-	noDaemon := op.Kind == KindRemoveHost || op.Kind == KindCreateOSD || op.Kind == KindEnterMaint || op.Kind == KindExitMaint
+		KindEnterMaint: true, KindExitMaint: true, KindPowercycle: true}
+	noDaemon := op.Kind == KindRemoveHost || op.Kind == KindCreateOSD || op.Kind == KindEnterMaint || op.Kind == KindExitMaint || op.Kind == KindPowercycle
 	if !ledgerIDRe.MatchString(op.ID) || pki.ValidName(op.Host) != nil || !known[op.Kind] ||
 		noDaemon != (op.Daemon == "") || (op.Daemon != "" && !ledgerDaemonRe.MatchString(op.Daemon)) ||
 		(op.Kind == KindCreateOSD) != strings.HasPrefix(op.Device, "/dev/") {
@@ -230,10 +231,12 @@ func (l *LeaderLoop) ledgerOp(ctx context.Context, b *Bridge, js store.Backend, 
 	}
 
 	switch op.Kind {
-	case KindAddDaemon, KindRemoveDaemon, KindRemoveHost, KindCreateOSD, KindRemoveOSD, KindEnterMaint, KindExitMaint:
+	case KindAddDaemon, KindRemoveDaemon, KindRemoveHost, KindCreateOSD, KindRemoveOSD, KindEnterMaint, KindExitMaint, KindPowercycle:
 		var phase func() error
 
 		switch op.Kind {
+		case KindPowercycle:
+			phase = func() error { return l.powercycle(ctx, b, js, gid, epoch, op) }
 		case KindEnterMaint:
 			phase = func() error { return l.enterMaintenance(ctx, b, js, gid, epoch, op) }
 		case KindExitMaint:
@@ -256,7 +259,11 @@ func (l *LeaderLoop) ledgerOp(ctx context.Context, b *Bridge, js store.Backend, 
 		}
 
 		if op.Kind == KindEnterMaint {
-			onFail = func() error { return l.failEnter(ctx, b, js, gid, op) }
+			onFail = func() error { return l.unmark(ctx, b, js, gid, op.Host, op.ID) }
+		}
+
+		if op.Kind == KindPowercycle {
+			onFail = func() error { return l.unmark(ctx, b, js, gid, op.Host, op.ID+".in") }
 		}
 
 		if err := l.unstick(ctx, js, opKey, opKey, op, onFail, phase()); err != nil {
@@ -1291,22 +1298,104 @@ func (l *LeaderLoop) zapOSD(ctx context.Context, b *Bridge, js store.Backend, gi
 // state, its disk keeps its label (zapping it is the operator's, with the CLI).
 type errZapFailed struct{ error }
 
-// enterMaintenance stops a host's daemons, as cephadm's maintenance enter:
-// Ceph's checks that they can stop (force overrides neither, as in Ceph), the
-// active mgr failed over if it runs there, keepalived off first, noout for its
-// OSDs (recorded in the state first, so the exit clears it), the host marked
-// in maintenance (its daemons stay in the state, not rendered), then every
-// document off and every instance gone. The checks and the active mgr are
-// checked again until the stop grant is sent.
+// enterMaintenance puts a host into maintenance (stopHost).
 func (l *LeaderLoop) enterMaintenance(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, op LedgerOp) error {
-	st, _, err := l.clusterState(ctx, b)
+	done, err := l.stopHost(ctx, b, js, gid, epoch, op, op.ID)
+	if err != nil || !done {
+		return ended(err)
+	}
+
+	return finish(ctx, js, gid, op, wire.OpCompleted, nil)
+}
+
+// exitMaintenance takes a host out of maintenance (startHost).
+func (l *LeaderLoop) exitMaintenance(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, op LedgerOp) error {
+	done, err := l.startHost(ctx, b, js, gid, epoch, op, op.ID)
+	if err != nil || !done {
+		return ended(err)
+	}
+
+	if err := b.Retire(ctx, "maintained", op.ID); err != nil {
+		return err
+	}
+
+	return finish(ctx, js, gid, op, wire.OpCompleted, nil)
+}
+
+// powercycle reboots a host as one operation: into maintenance (stopHost),
+// the agent's reboot of its node, out of maintenance (startHost).
+func (l *LeaderLoop) powercycle(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, op LedgerOp) error {
+	// the stop phase ends where the reboot step begins: once that is
+	// journaled, the host's daemons may be starting again
+	bs, err := l.journalState(ctx, b, js, gid, op.ID+".boot")
 	if err != nil {
 		return err
 	}
 
+	if bs == "" {
+		done, err := l.stopHost(ctx, b, js, gid, epoch, op, op.ID+".in")
+		if err != nil || !done {
+			return ended(err)
+		}
+	}
+
+	done, ok, err := l.rebootStep(ctx, b, js, gid, epoch, op.ID+".boot", op.Host)
+	if err != nil || !done {
+		return err
+	}
+
+	if !ok {
+		return finish(ctx, js, gid, op, JournalFailed, fmt.Errorf("%s did not reboot; it stays in maintenance", op.Host))
+	}
+
+	if done, err := l.startHost(ctx, b, js, gid, epoch, op, op.ID+".out"); err != nil || !done {
+		return ended(err)
+	}
+
+	if err := b.Retire(ctx, "maintained", op.ID); err != nil {
+		return err
+	}
+
+	return finish(ctx, js, gid, op, wire.OpCompleted, nil)
+}
+
+// errEnded: a phase function ended the operation in the journal itself.
+var errEnded = errors.New("the operation ended")
+
+// ended is a phase function's error as its operation returns it.
+func ended(err error) error {
+	if errors.Is(err, errEnded) {
+		return nil
+	}
+
+	return err
+}
+
+// end ends an operation as failed and returns errEnded.
+func end(ctx context.Context, js store.Backend, gid int64, op LedgerOp, cause error) error {
+	if err := finish(ctx, js, gid, op, JournalFailed, cause); err != nil {
+		return err
+	}
+
+	return errEnded
+}
+
+// stopHost stops a host's daemons, as cephadm's maintenance enter, in phases
+// below base: Ceph's checks that they can stop (force overrides neither, as
+// in Ceph), the active mgr failed over if it runs there, keepalived off first,
+// noout for its OSDs (recorded in the state first, so the exit clears it), the
+// host marked in maintenance (its daemons stay in the state, not rendered),
+// then every document off and every instance gone. The checks and the active
+// mgr are checked again until the stop grant is sent.
+func (l *LeaderLoop) stopHost(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, op LedgerOp, base string) (bool, error) {
+	st, _, err := l.clusterState(ctx, b)
+	if err != nil {
+		return false, err
+	}
+
 	h, ok := st.Host(op.Host)
 	if !ok {
-		return finish(ctx, js, gid, op, JournalFailed, fmt.Errorf("no host %s", op.Host))
+		return false, end(ctx, js, gid, op, fmt.Errorf("no host %s", op.Host))
 	}
 
 	var docs, vips []string
@@ -1326,16 +1415,16 @@ func (l *LeaderLoop) enterMaintenance(ctx context.Context, b *Bridge, js store.B
 		}
 	}
 
-	rs, err := l.journalState(ctx, b, js, gid, op.ID+".rev")
+	rs, err := l.journalState(ctx, b, js, gid, base+".rev")
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	// right before the stop grant is sent, also on a resumed operation; a
 	// grant already sent is resolved by its step
 	if rs == "" {
 		if err := b.Retire(ctx, "ok to stop", op.ID); err != nil {
-			return err
+			return false, err
 		}
 	}
 
@@ -1343,22 +1432,22 @@ func (l *LeaderLoop) enterMaintenance(ctx context.Context, b *Bridge, js store.B
 	if !terminal(rs) {
 		active, agid, err := b.ActiveMgrGID(ctx)
 		if err != nil {
-			return err
+			return false, err
 		}
 
 		if active == h.Name {
 			// recorded first: the module that answers is the one failed over
-			if err := writeJSONKey(ctx, js, JournalPrefix(gid)+"op/"+op.ID+".fail", JournalOp{Version: journalVersion, Kind: "mgr_fail", Host: h.Name, State: wire.OpStarted, MgrGID: agid}); err != nil {
-				return err
+			if err := writeJSONKey(ctx, js, JournalPrefix(gid)+"op/"+base+".fail", JournalOp{Version: journalVersion, Kind: "mgr_fail", Host: h.Name, State: wire.OpStarted, MgrGID: agid}); err != nil {
+				return false, err
 			}
 
 			// no answer is expected; a refusal (no standby) is retried until the
 			// operation fails, and the successor checks the mgr map again
 			if err := b.MgrFail(ctx, op.ID, agid); err != nil {
-				return fmt.Errorf("%w: failing the active mgr on %s over: %w", errRetry, h.Name, err)
+				return false, fmt.Errorf("%w: failing the active mgr on %s over: %w", errRetry, h.Name, err)
 			}
 
-			return fmt.Errorf("%w: the active mgr on %s is failing over", errRetry, h.Name)
+			return false, fmt.Errorf("%w: the active mgr on %s is failing over", errRetry, h.Name)
 		}
 	}
 
@@ -1368,18 +1457,18 @@ func (l *LeaderLoop) enterMaintenance(ctx context.Context, b *Bridge, js store.B
 			keys = append(keys, "ContainerConfig/"+v)
 		}
 
-		done, ok, err := l.step(ctx, b, js, gid, epoch, op.ID+".vip", h.Name, revisionMode{stop: keys})
+		done, ok, err := l.step(ctx, b, js, gid, epoch, base+".vip", h.Name, revisionMode{stop: keys})
 		if err != nil || !done {
-			return err
+			return false, err
 		}
 
 		if !ok {
-			return finish(ctx, js, gid, op, JournalFailed, fmt.Errorf("keepalived on %s did not stop", h.Name))
+			return false, end(ctx, js, gid, op, fmt.Errorf("keepalived on %s did not stop", h.Name))
 		}
 
 		// the VIP moves once keepalived has exited, not when its document is gone
 		if err := l.gone(ctx, h, vips); err != nil {
-			return err
+			return false, err
 		}
 	}
 
@@ -1395,7 +1484,7 @@ func (l *LeaderLoop) enterMaintenance(ctx context.Context, b *Bridge, js store.B
 
 			return nil
 		}); err != nil {
-			return err
+			return false, err
 		}
 
 		h.NoOut = true
@@ -1404,7 +1493,7 @@ func (l *LeaderLoop) enterMaintenance(ctx context.Context, b *Bridge, js store.B
 	// before the host is marked: from then on any revision stops its OSDs
 	if h.NoOut {
 		if err := b.Retire(ctx, "noout set", op.ID); err != nil {
-			return err
+			return false, err
 		}
 	}
 
@@ -1420,36 +1509,36 @@ func (l *LeaderLoop) enterMaintenance(ctx context.Context, b *Bridge, js store.B
 
 			return nil
 		}); err != nil {
-			return err
+			return false, err
 		}
 	}
 
-	done, ok, err := l.step(ctx, b, js, gid, epoch, op.ID+".rev", h.Name, revisionMode{})
+	done, ok, err := l.step(ctx, b, js, gid, epoch, base+".rev", h.Name, revisionMode{})
 	if err != nil || !done {
-		return err
+		return false, err
 	}
 
 	if !ok {
-		if err := l.failEnter(ctx, b, js, gid, op); err != nil {
-			return err
+		if err := l.unmark(ctx, b, js, gid, op.Host, base); err != nil {
+			return false, err
 		}
 
-		return finish(ctx, js, gid, op, JournalFailed, fmt.Errorf("the revision of %s did not apply", h.Name))
+		return false, end(ctx, js, gid, op, fmt.Errorf("the revision of %s did not apply", h.Name))
 	}
 
 	if err := l.gone(ctx, h, docs); err != nil {
-		return err
+		return false, err
 	}
 
-	return finish(ctx, js, gid, op, wire.OpCompleted, nil)
+	return true, nil
 }
 
-// failEnter undoes the mark of a maintenance whose stop grant was never sent
-// or never applied (its checks kept refusing, or the node refused it):
-// revisions would stop the host's daemons without the checks. noout stays
-// recorded, so the exit clears it.
-func (l *LeaderLoop) failEnter(ctx context.Context, b *Bridge, js store.Backend, gid int64, op LedgerOp) error {
-	rs, err := l.journalState(ctx, b, js, gid, op.ID+".rev")
+// unmark undoes the mark of a maintenance whose stop grant (base.rev) was
+// never sent or never applied (its checks kept refusing, or the node refused
+// it): revisions would stop the host's daemons without the checks. noout
+// stays recorded, so the exit clears it.
+func (l *LeaderLoop) unmark(ctx context.Context, b *Bridge, js store.Backend, gid int64, host, base string) error {
+	rs, err := l.journalState(ctx, b, js, gid, base+".rev")
 	if err != nil {
 		return err
 	}
@@ -1460,7 +1549,7 @@ func (l *LeaderLoop) failEnter(ctx context.Context, b *Bridge, js store.Backend,
 	}
 
 	return l.changeState(ctx, b, gid, func(st *state.State) error {
-		if h, ok := st.Host(op.Host); ok && h.Maintenance {
+		if h, ok := st.Host(host); ok && h.Maintenance {
 			h.Maintenance = false
 			st.AddHost(h)
 		}
@@ -1485,18 +1574,18 @@ func (l *LeaderLoop) gone(ctx context.Context, h state.Host, docs []string) erro
 	return nil
 }
 
-// exitMaintenance starts a host's daemons again: its mon first, in the
-// quorum before the rest is rendered, then its OSDs up in the OSD map, noout
-// cleared, and the module ends the maintenance in the fold.
-func (l *LeaderLoop) exitMaintenance(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, op LedgerOp) error {
+// startHost starts a host's daemons again, in phases below base: its mon
+// first, in the quorum before the rest is rendered (other documents on the
+// node are left as they are), then its OSDs up in the OSD map, noout cleared.
+func (l *LeaderLoop) startHost(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, op LedgerOp, base string) (bool, error) {
 	st, _, err := l.clusterState(ctx, b)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	h, ok := st.Host(op.Host)
 	if !ok {
-		return finish(ctx, js, gid, op, JournalFailed, fmt.Errorf("no host %s", op.Host))
+		return false, end(ctx, js, gid, op, fmt.Errorf("no host %s", op.Host))
 	}
 
 	if h.Maintenance {
@@ -1511,7 +1600,7 @@ func (l *LeaderLoop) exitMaintenance(ctx context.Context, b *Bridge, js store.Ba
 
 			return nil
 		}); err != nil {
-			return err
+			return false, err
 		}
 	}
 
@@ -1532,37 +1621,37 @@ func (l *LeaderLoop) exitMaintenance(ctx context.Context, b *Bridge, js store.Ba
 	}
 
 	if mon {
-		done, ok, err := l.step(ctx, b, js, gid, epoch, op.ID+".mon", h.Name, revisionMode{hold: rest})
+		done, ok, err := l.step(ctx, b, js, gid, epoch, base+".mon", h.Name, revisionMode{hold: rest})
 		if err != nil || !done {
-			return err
+			return false, err
 		}
 
 		if !ok {
-			return finish(ctx, js, gid, op, JournalFailed, fmt.Errorf("the mon of %s did not start", h.Name))
+			return false, end(ctx, js, gid, op, fmt.Errorf("the mon of %s did not start", h.Name))
 		}
 
 		q, err := b.Quorum(ctx)
 		if err != nil {
-			return err
+			return false, err
 		}
 
 		if !slices.Contains(q, h.Name) {
-			return fmt.Errorf("%w: mon.%s is not in the quorum yet", errRetry, h.Name)
+			return false, fmt.Errorf("%w: mon.%s is not in the quorum yet", errRetry, h.Name)
 		}
 	}
 
-	done, ok, err := l.step(ctx, b, js, gid, epoch, op.ID+".rev", h.Name, revisionMode{})
+	done, ok, err := l.step(ctx, b, js, gid, epoch, base+".rev", h.Name, revisionMode{})
 	if err != nil || !done {
-		return err
+		return false, err
 	}
 
 	if !ok {
-		return finish(ctx, js, gid, op, JournalFailed, fmt.Errorf("the revision of %s did not apply", h.Name))
+		return false, end(ctx, js, gid, op, fmt.Errorf("the revision of %s did not apply", h.Name))
 	}
 
 	osds, err := b.OSDs(ctx)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	for _, d := range st.DaemonsOf(state.TypeOSD, h.Name) {
@@ -1577,13 +1666,13 @@ func (l *LeaderLoop) exitMaintenance(ctx context.Context, b *Bridge, js store.Ba
 		}
 
 		if !up {
-			return fmt.Errorf("%w: osd.%d is not up yet", errRetry, *d.OSDID)
+			return false, fmt.Errorf("%w: osd.%d is not up yet", errRetry, *d.OSDID)
 		}
 	}
 
 	if h.NoOut {
 		if err := b.Retire(ctx, "noout unset", op.ID); err != nil {
-			return err
+			return false, err
 		}
 
 		if err := l.changeState(ctx, b, gid, func(st *state.State) error {
@@ -1597,13 +1686,94 @@ func (l *LeaderLoop) exitMaintenance(ctx context.Context, b *Bridge, js store.Ba
 
 			return nil
 		}); err != nil {
-			return err
+			return false, err
 		}
 	}
 
-	if err := b.Retire(ctx, "maintained", op.ID); err != nil {
-		return err
+	return true, nil
+}
+
+// rebootStep has the agent of a host reboot its node, as one grant under its
+// own id (journaled before it is sent): done once the agent decided it, ok
+// once it completed, which it records when the node runs another boot.
+func (l *LeaderLoop) rebootStep(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, id, host string) (done, ok bool, err error) {
+	opKey := JournalPrefix(gid) + "op/" + id
+
+	cur, found, err := readJSONKey[JournalOp](ctx, js, opKey)
+	if err != nil {
+		return false, false, err
 	}
 
-	return finish(ctx, js, gid, op, wire.OpCompleted, nil)
+	if found {
+		if cur.State == JournalGranting || cur.State == wire.OpUncertain {
+			if err := l.resolve(ctx, b, js, gid, epoch, opKey, cur, id); err != nil {
+				return false, false, err
+			}
+
+			if cur, _, err = readJSONKey[JournalOp](ctx, js, opKey); err != nil || !terminal(cur.State) {
+				return false, false, err
+			}
+		}
+
+		return true, cur.State == wire.OpCompleted, nil
+	}
+
+	st, seq, err := l.clusterState(ctx, b)
+	if err != nil {
+		return false, false, err
+	}
+
+	h, ok := st.Host(host)
+	if !ok {
+		return false, false, fmt.Errorf("no host %s in the cluster state", host)
+	}
+
+	if !l.closed[h.Name] {
+		return false, false, fmt.Errorf("%w: %s's earlier sessions are not closed yet", errRetry, h.Name)
+	}
+
+	me, ok := st.Host(l.Self.Name)
+	if !ok {
+		return false, false, fmt.Errorf("the leader's host %s is not in the cluster state", l.Self.Name)
+	}
+
+	var rep wire.NodeReport
+	if _, err := l.call(ctx, h, http.MethodGet, "/v1/node", nil, &rep); err != nil {
+		return false, false, err
+	}
+
+	if rep.State != "owned" {
+		return false, false, fmt.Errorf("%w: %s is %s %v", errRetry, h.Name, rep.State, rep.Drift)
+	}
+
+	op := JournalOp{Version: journalVersion, Kind: "reboot", Host: h.Name, Seq: seq, State: JournalGranting, Revision: max(rep.Revision+1, l.clock().UnixNano())}
+
+	if !l.stillLeader(gid, epoch) {
+		return false, false, nil
+	}
+
+	// the intent is in the journal before anything is sent
+	if err := writeJSONKey(ctx, js, opKey, op); err != nil {
+		return false, false, err
+	}
+
+	if !l.stillLeader(gid, epoch) {
+		return false, false, nil
+	}
+
+	g := wire.Grant{
+		Version: wire.Version, FSID: l.Self.FSID, Host: h.Name, Mgr: l.Self.Name, MgrAddr: me.Addr, GID: gid, Epoch: epoch,
+		Revision: op.Revision, Operation: id, Reboot: true, Approval: l.approval,
+	}
+
+	var res wire.Operation
+	if _, err := l.call(ctx, h, http.MethodPost, "/v1/grant", g, &res); err != nil {
+		return false, false, fmt.Errorf("reboot %s: %w", h.Name, err)
+	}
+
+	if err := l.record(ctx, js, opKey, op, res); err != nil {
+		return false, false, err
+	}
+
+	return false, false, nil // decided on a later tick
 }

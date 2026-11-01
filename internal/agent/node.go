@@ -125,6 +125,7 @@ type Node struct {
 		InstanceOwners(ctx context.Context, node string) ([]string, error)
 		ContainerStatuses(ctx context.Context, node string) (map[string]containers.ContainerStatusSpec, error)
 		RestartInstance(ctx context.Context, node, id string) error
+		RebootNow(ctx context.Context, node string) error
 	}
 	Records *records.Store
 	// JobsDir is where the node's jobs write their claims and results (the
@@ -696,6 +697,10 @@ func (n *Node) Report(ctx context.Context) (wire.NodeReport, error) {
 		}
 	}
 
+	if r.BootID, err = n.Talos.BootID(ctx, ""); err != nil {
+		return r, err
+	}
+
 	disks, err := n.Talos.Disks(ctx, "")
 	if err != nil {
 		return r, err
@@ -1207,6 +1212,101 @@ func (n *Node) RestartBefore(ctx context.Context, until time.Time, revision int6
 	}
 
 	return true, n.Talos.RestartInstance(ctx, "", instance)
+}
+
+// RebootBefore reboots the node for a confirmed grant: only a node handed
+// over that holds no daemon document of the cluster (its host is in
+// maintenance), with the same checks as a restart. The operation is recorded
+// with the boot before Talos is asked, and the revision fenced.
+func (n *Node) RebootBefore(ctx context.Context, until time.Time, revision int64, record func(boot string) error) (started bool, err error) {
+	if err := n.lock(ctx); err != nil {
+		return false, err
+	}
+	defer n.unlock()
+
+	if err := n.Records.Check(); err != nil {
+		return false, err
+	}
+
+	var intent applyIntent
+
+	if pending, err := n.readJSON(applyRecord, &intent); err != nil || pending {
+		if err == nil {
+			err = fmt.Errorf("the apply of revision %d has an uncertain outcome", intent.Revision)
+		}
+
+		return false, err
+	}
+
+	own, found, err := n.ownership()
+	if err != nil {
+		return false, err
+	}
+
+	if !found {
+		return false, errors.New("the node has not been handed over")
+	}
+
+	floor, err := n.fence()
+	if err != nil {
+		return false, err
+	}
+
+	if revision <= max(own.Revision, floor) {
+		return false, fmt.Errorf("revision %d is not newer than %d", revision, max(own.Revision, floor))
+	}
+
+	cfg, err := n.Talos.MachineConfig(ctx, "")
+	if err != nil {
+		return false, err
+	}
+
+	typed, err := typedDocs([]byte(cfg))
+	if err != nil {
+		return false, errors.New("machine config: does not decode") // the message may quote a key
+	}
+
+	cur := make(map[string]string, len(typed))
+	for k, d := range typed {
+		cur[k] = d.hash
+	}
+
+	if d := n.drift(own, cur); len(d) > 0 {
+		return false, fmt.Errorf("%w: %s", ErrDrift, strings.Join(d, ", "))
+	}
+
+	// what the node holds now, owned or not
+	for key := range cur {
+		kind, name, _ := strings.Cut(key, "/")
+		if kind == "ContainerConfig" && n.cluster(kind, name) && !n.handoff(key) {
+			return false, fmt.Errorf("the node still holds %s: only a node without daemons reboots", key)
+		}
+	}
+
+	boot, err := n.Talos.BootID(ctx, "")
+	if err != nil {
+		return false, err
+	}
+
+	if !until.IsZero() && !time.Now().Before(until) {
+		return false, errors.New("the confirmation expired before the reboot")
+	}
+
+	if err := record(boot); err != nil {
+		return false, err
+	}
+
+	if floor < revision {
+		if err := n.writeJSON(fenceRecord, fence{Schema: ownershipSchema, Revision: revision}); err != nil {
+			return false, err
+		}
+	}
+
+	if !until.IsZero() && !time.Now().Before(until) {
+		return false, errors.New("the confirmation expired before the reboot")
+	}
+
+	return true, n.Talos.RebootNow(ctx, "")
 }
 
 // RestartOutcome decides a restart that is started or uncertain: "refused" on

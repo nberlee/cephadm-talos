@@ -828,6 +828,23 @@ func (c *Client) Reboot(ctx context.Context, node string) error {
 	return c.waitBooted(ctx, node, before.TypedSpec().BootID, RebootTimeout, rebootPoll)
 }
 
+// RebootNow asks a node to reboot and returns without waiting: the agent's
+// call on its own node, which goes down with it.
+func (c *Client) RebootNow(ctx context.Context, node string) error {
+	if c.DryRun {
+		fmt.Fprintf(c.Out, "# reboot %s\n", node)
+
+		return nil
+	}
+
+	cl, nctx, err := c.node(ctx, node, "reboot")
+	if err != nil {
+		return err
+	}
+
+	return wrap("reboot "+node, cl.Reboot(nctx))
+}
+
 // waitBooted waits for a boot id other than old and a running, ready machine.
 func (c *Client) waitBooted(ctx context.Context, node, old string, timeout, every time.Duration) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)

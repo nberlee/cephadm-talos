@@ -746,3 +746,55 @@ func TestARestartWithoutOutcomeIsReconciledFromItsInstance(t *testing.T) {
 		t.Fatalf("lost restart: %+v", op)
 	}
 }
+
+func rebootGrant(rev int64, op string) wire.Grant {
+	return wire.Grant{
+		Version: wire.Version, FSID: testFSID, Host: "h1", Mgr: "h0", MgrAddr: "10.5.0.2", GID: 42, Epoch: 5,
+		Revision: rev, Operation: op, Reboot: true,
+	}
+}
+
+func TestARebootNeedsANodeWithoutDaemons(t *testing.T) {
+	g := newTestGranter(t)
+	ctx := context.Background()
+
+	// a probe is a document of the cluster: not while it is there
+	if op, err := g.Grant(ctx, probeGrant(2, "op-1", "aaaaaa")); err != nil || op.State != wire.OpCompleted {
+		t.Fatalf("probe: %+v %v", op, err)
+	}
+
+	if op, err := g.Grant(ctx, rebootGrant(3, "op-2")); err != nil || op.State != wire.OpRefused || g.fake.Reboots != 0 {
+		t.Fatalf("reboot beside a daemon: %+v %v, %d reboots", op, err, g.fake.Reboots)
+	}
+
+	name := "ceph-" + testFSID[:8] + "-probe-aaaaaa"
+	rm := wire.Grant{Version: wire.Version, FSID: testFSID, Host: "h1", Mgr: "h0", MgrAddr: "10.5.0.2", GID: 42, Epoch: 5,
+		Revision: 4, Operation: "op-3", Docs: []wire.GrantDoc{{Kind: "ContainerConfig", Name: name}}}
+	if op, err := g.Grant(ctx, rm); err != nil || op.State != wire.OpCompleted {
+		t.Fatalf("removal: %+v %v", op, err)
+	}
+
+	// recorded with the boot before the call, started until another boot runs
+	op, err := g.Grant(ctx, rebootGrant(5, "op-4"))
+	if err != nil || op.State != wire.OpStarted || !op.Reboot || op.BootID != "boot-1" || g.fake.Reboots != 1 {
+		t.Fatalf("reboot: %+v %v, %d reboots", op, err, g.fake.Reboots)
+	}
+
+	must(t, g.Reconcile(ctx))
+
+	if op, found, err := g.readOp("op-4"); err != nil || !found || op.State != wire.OpCompleted {
+		t.Fatalf("after the boot: %+v %v %v", op, found, err)
+	}
+
+	// the revision is fenced: the same grant does not reboot again
+	if op, err := g.Grant(ctx, rebootGrant(5, "op-5")); err != nil || op.State != wire.OpRefused || g.fake.Reboots != 1 {
+		t.Fatalf("replay: %+v %v, %d reboots", op, err, g.fake.Reboots)
+	}
+
+	// a reboot carries nothing else
+	bad := rebootGrant(9, "op-6")
+	bad.Restart = &wire.GrantRestart{Kind: "ContainerConfig", Name: name, Hash: "x"}
+	if op, err := g.Grant(ctx, bad); err == nil && op.State != wire.OpRefused || g.fake.Reboots != 1 {
+		t.Fatalf("a reboot with a restart: %+v %v", op, err)
+	}
+}

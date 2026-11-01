@@ -1869,3 +1869,70 @@ func TestAFailedEnterUnmarksTheHost(t *testing.T) {
 		t.Fatal("h1 stays marked: a revision would stop its daemons without the checks")
 	}
 }
+
+func TestPowercycleStopsRebootsAndStarts(t *testing.T) {
+	s := newLeaderSetup(t)
+	ctx := context.Background()
+
+	s.module.mu.Lock()
+	s.module.active, s.module.quorum = "h0", []string{"h0", "h1"}
+	s.module.mu.Unlock()
+
+	s.request("r1", `{"version":1,"kind":"revision","host":"h1"}`)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	pc := s.accept(KindPowercycle, "", "h1", 1)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	// stopped, the reboot granted: started until the node runs another boot
+	if s.agent.fake.Reboots != 1 {
+		t.Fatalf("%d reboots", s.agent.fake.Reboots)
+	}
+
+	if rep, err := s.agent.Node.Report(ctx); err != nil || rep.BootID != "boot-2" {
+		t.Fatalf("report after the reboot: %+v %v", rep, err)
+	}
+
+	// the agent starts again on the new boot and decides the reboot; the mon
+	// comes back first and is waited for, its stop not run again meanwhile
+	must(t, s.agent.Reconcile(ctx))
+
+	s.module.mu.Lock()
+	s.module.quorum = []string{"h0"}
+	s.module.mu.Unlock()
+
+	monDoc := "ContainerConfig/ceph-" + testFSID[:8] + "-mon-h1"
+
+	for i := 0; i < 3; i++ {
+		must(t, s.leader.Tick(ctx, 42, 5))
+
+		if rep, err := s.agent.Node.Report(ctx); err != nil || rep.Owned[monDoc] == "" {
+			t.Fatalf("tick %d: the mon is not there while it is waited for: %v", i, err)
+		}
+	}
+
+	s.module.mu.Lock()
+	s.module.quorum = []string{"h0", "h1"}
+	s.module.mu.Unlock()
+
+	for i := 0; i < 2; i++ {
+		must(t, s.leader.Tick(ctx, 42, 5))
+	}
+
+	op := s.op(t, pc.Op.ID)
+	if op.State != "completed" || s.agent.fake.Reboots != 1 {
+		t.Fatalf("powercycle: %+v, %d reboots", op, s.agent.fake.Reboots)
+	}
+
+	s.module.mu.Lock()
+	calls := slices.Clone(s.module.retired)
+	s.module.mu.Unlock()
+
+	if !slices.Equal(calls, []string{"ok to stop " + pc.Op.ID, "maintained " + pc.Op.ID}) {
+		t.Fatalf("calls %v", calls)
+	}
+
+	if rep, err := s.agent.Node.Report(ctx); err != nil || rep.Owned["ContainerConfig/ceph-"+testFSID[:8]+"-mon-h1"] == "" {
+		t.Fatalf("the mon did not come back: %v", err)
+	}
+}

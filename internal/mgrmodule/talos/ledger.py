@@ -26,9 +26,11 @@ ENTRY_VERSION = 1
 KEY_RE = re.compile(r'\A(\d{20})-(\d{10})-(takeover|op-[0-9a-f]{16}|m-[0-9a-f]{16})\Z')
 OP_RE = re.compile(r'\Aop-[0-9a-f]{16}\Z')
 # kinds an operation entry may have; ADDS and REMOVES change the fold
-KINDS = ('restart', 'redeploy', 'add_daemon', 'remove_daemon', 'remove_host', 'create_osd', 'remove_osd', 'enter_maintenance', 'exit_maintenance')
+KINDS = ('restart', 'redeploy', 'add_daemon', 'remove_daemon', 'remove_host', 'create_osd', 'remove_osd', 'enter_maintenance', 'exit_maintenance', 'powercycle_host')
 # kinds that are about a whole host: every other operation on it waits for them
-HOST_KINDS = ('remove_host', 'enter_maintenance', 'exit_maintenance')
+HOST_KINDS = ('remove_host', 'enter_maintenance', 'exit_maintenance', 'powercycle_host')
+# kinds that stop a host's daemons, and that start them again
+STOPS, STARTS = ('enter_maintenance', 'powercycle_host'), ('exit_maintenance', 'powercycle_host')
 # the module's own entries (ids m-<hex>), which carry out a removal: close a
 # daemon's generation, retire the daemon, retire a host; end a host's maintenance
 MODULE_KINDS = ('close', 'retire', 'retire_host', 'bind', 'confirm', 'close_create', 'drained', 'maintained')
@@ -94,8 +96,8 @@ def check_entry(key: str, raw: str) -> Dict[str, Any]:
         return e
     if kind not in KINDS or (e.get('request') is not None and not (isinstance(e['request'], str) and UUID_RE.match(e['request']))):
         raise LedgerError('operation entry %s' % key)
-    if kind in ('remove_host', 'exit_maintenance'):
-        if daemon is not None or (kind == 'exit_maintenance' and set(e) - {'version', 'id', 'kind', 'host', 'gid', 'epoch', 'seq', 'request'}):
+    if kind in ('remove_host', 'exit_maintenance', 'powercycle_host'):
+        if daemon is not None or (kind != 'remove_host' and set(e) - {'version', 'id', 'kind', 'host', 'gid', 'epoch', 'seq', 'request'}):
             raise LedgerError('operation entry %s' % key)
         return e
     if kind == 'enter_maintenance':
@@ -170,7 +172,7 @@ class Fold:
     generation of the daemon (the add's id; "cli" for the CLI's daemons); a
     close entry closes it, a retire entry takes the daemon out, a retire_host
     entry the host. A host is in maintenance from the acceptance of its enter
-    until the maintained entry of an exit."""
+    (or powercycle) until the maintained entry of an exit (or that powercycle)."""
 
     def __init__(self, inventory: Dict[str, Any], entries: List[Tuple[str, Dict[str, Any]]] = ()) -> None:
         self.hosts: Dict[str, str] = {h['name']: h['addr'] for h in inventory['hosts']}
@@ -199,7 +201,7 @@ class Fold:
             elif kind == 'retire_host' and not any(h == e['host'] for h in self.daemons.values()):
                 self.hosts.pop(e['host'], None)
                 self.maintenance.discard(e['host'])
-            elif kind == 'enter_maintenance' and e['host'] in self.hosts:
+            elif kind in STOPS and e['host'] in self.hosts:
                 self.maintenance.add(e['host'])
             elif kind == 'maintained':
                 self.maintenance.discard(e['host'])

@@ -979,6 +979,13 @@ class MaintenanceCallsTest(unittest.TestCase):
         self.assertTrue(wait_until(lambda: not self.ch._pending('host/h1')))
         self.assertEqual(self.call('noout unset', operation=exit_)[1]['outcome'], 'done')
 
+    def test_a_powercycle_has_the_calls_of_both(self):
+        self.fold('mon.h1@h1', 'osd.3@h1')
+        pc = self.maint('powercycle_host')
+        for call in ('ok to stop', 'noout set', 'noout unset', 'maintained'):
+            self.assertEqual(self.call(call, operation=pc)[1]['outcome'], 'done', call)
+        self.assertNotIn('h1', self.ch.authority()[1].maintenance)
+
     def test_mgr_fail_by_gid_with_a_standby(self):
         self.fold('mon.h1@h1', 'mgr.h1@h1', 'mgr.h2@h2')
         enter = self.maint('enter_maintenance')

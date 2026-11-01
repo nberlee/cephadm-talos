@@ -33,6 +33,8 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
+from . import ledger
+
 WIRE_VERSION = 1
 # confirmations, for every agent; the bridge, for the local agent only, on loopback
 CONFIRM_PORT = 4722
@@ -913,9 +915,9 @@ class Channel:
         daemons can stop (as cephadm's _host_ok_to_stop), noout for its CRUSH
         bucket, and the end of the maintenance in the fold."""
         done = {'outcome': 'done', 'r': 0, 'out': '', 'outs': ''}
-        kind = 'exit_maintenance' if call in ('noout unset', 'maintained') else 'enter_maintenance'
-        if op is None or op['kind'] != kind:
-            return 400, {'error': 'no %s operation' % kind}
+        kinds = ledger.STARTS if call in ('noout unset', 'maintained') else ledger.STOPS
+        if op is None or op['kind'] not in kinds:
+            return 400, {'error': 'no %s operation' % ' or '.join(kinds)}
         host = op['host']
         if host not in fold.maintenance:
             return (200, done) if call == 'maintained' else (400, {'error': '%s is not in maintenance' % host})
@@ -952,7 +954,7 @@ class Channel:
         The active mgr respawns, so the answer may never come; done also when
         that gid is no longer the active one."""
         done = {'outcome': 'done', 'r': 0, 'out': '', 'outs': ''}
-        if op is None or op['kind'] != 'enter_maintenance' or op['host'] not in fold.maintenance:
+        if op is None or op['kind'] not in ledger.STOPS or op['host'] not in fold.maintenance:
             return 400, {'error': 'no operation that must stop the active mgr'}
         job = self._mon({'prefix': 'mgr dump', 'format': 'json'})
         if job is None or job.r != 0 or job.too_large:

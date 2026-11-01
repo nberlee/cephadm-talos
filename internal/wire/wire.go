@@ -115,6 +115,9 @@ type Grant struct {
 	// Restart, instead of documents, restarts the current instance of one
 	// daemon document the agent owns with this hash
 	Restart *GrantRestart `json:"restart,omitempty"`
+	// Reboot, instead of documents, reboots the agent's own node, which must
+	// hold no daemon document of the cluster
+	Reboot bool `json:"reboot,omitempty"`
 	// Approval is the newest approval of the operator the leader has; the
 	// agent verifies it and records it if it is higher than its own
 	Approval *approval.Signed `json:"approval,omitempty"`
@@ -168,9 +171,10 @@ func GrantInputs(g Grant) string {
 		Operation string           `json:"operation"`
 		Docs      []GrantDoc       `json:"docs"`
 		Restart   *GrantRestart    `json:"restart,omitempty"`
+		Reboot    bool             `json:"reboot,omitempty"`
 		Approval  *approval.Signed `json:"approval,omitempty"`
 		Ack       *JobAck          `json:"ack,omitempty"`
-	}{g.FSID, g.Host, g.Revision, g.Operation, g.Docs, g.Restart, g.Approval, g.Ack})
+	}{g.FSID, g.Host, g.Revision, g.Operation, g.Docs, g.Restart, g.Reboot, g.Approval, g.Ack})
 
 	sum := sha256.Sum256(b)
 
@@ -213,6 +217,9 @@ type Operation struct {
 	Instance string `json:"instance,omitempty"`
 	BootID   string `json:"boot_id,omitempty"`
 	At       int64  `json:"at,omitempty"`
+	// Reboot: the grant reboots the node; recorded with the boot before the
+	// call, completed once the node runs another boot
+	Reboot bool `json:"reboot,omitempty"`
 	// a job's grant: the job, its result once read, and whether the leader
 	// acknowledged it (until then the record is kept)
 	Job    *JobRef    `json:"job,omitempty"`
@@ -321,6 +328,8 @@ type NodeReport struct {
 	// not cleaned up yet
 	Instances []string `json:"instances,omitempty"`
 	Disks     []Disk   `json:"disks"`
+	// BootID is the node's boot id; it changes with every boot
+	BootID string `json:"boot_id,omitempty"`
 }
 
 // Disk is one of a node's disks as Talos reports it.

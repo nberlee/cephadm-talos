@@ -850,11 +850,8 @@ class Module(orchestrator.Orchestrator, MgrModule):
         op_id = self._accept('remove_host', None, host)
         return 'Scheduled to remove host %s (operation %s)' % (host, op_id)
 
-    @handle_orch_error
-    def enter_host_maintenance(self, hostname: str, force: bool = False, yes_i_really_mean_it: bool = False) -> str:
-        """Stop a host's daemons (their documents removed) and set noout for it."""
-        if yes_i_really_mean_it:
-            raise OrchestratorError('--yes-i-really-mean-it is not supported by this backend')
+    def _may_stop(self, hostname: str) -> None:
+        """What a maintenance or powercycle of a host needs before acceptance."""
         self._settle()
         _, fold = self._authority()
         if hostname not in fold.hosts:
@@ -871,8 +868,24 @@ class Module(orchestrator.Orchestrator, MgrModule):
             standbys = [m for m in (self.get('mgr_map') or {}).get('standbys', []) if m.get('available', True)]
             if not standbys:
                 raise OrchestratorError('%s runs the active mgr and no standby mgr is available' % hostname)
+
+    @handle_orch_error
+    def enter_host_maintenance(self, hostname: str, force: bool = False, yes_i_really_mean_it: bool = False) -> str:
+        """Stop a host's daemons (their documents removed) and set noout for it."""
+        if yes_i_really_mean_it:
+            raise OrchestratorError('--yes-i-really-mean-it is not supported by this backend')
+        self._may_stop(hostname)
         op_id = self._accept('enter_maintenance', None, hostname, force=bool(force))
         return 'Scheduled to put host %s into maintenance (operation %s)' % (hostname, op_id)
+
+    @handle_orch_error
+    def hardware_powercycle(self, hostname: str, yes_i_really_mean_it: bool = False) -> str:
+        """Reboot a host through its agent, its daemons stopped as for maintenance first."""
+        if not yes_i_really_mean_it:
+            raise OrchestratorError('you must pass --yes-i-really-mean-it')
+        self._may_stop(hostname)
+        op_id = self._accept('powercycle_host', None, hostname)
+        return 'Scheduled to powercycle host %s (operation %s)' % (hostname, op_id)
 
     @handle_orch_error
     def exit_host_maintenance(self, hostname: str, force: bool = False, offline: bool = False) -> str:

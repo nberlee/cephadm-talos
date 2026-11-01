@@ -223,7 +223,13 @@ class MaintenanceFoldTest(unittest.TestCase):
         # the exit's acceptance leaves it in maintenance: its documents are still gone
         self.assertEqual(lg.Fold(inv, [enter, exit_]).maintenance, {'h2', 'h3'})
         self.assertEqual(lg.Fold(inv, [enter, exit_, done]).maintenance, {'h3'})
-        for bad in (dict(kind='enter_maintenance', host='h2'), dict(kind='enter_maintenance', host='h2', force=1),
+        # a powercycle is in maintenance from its acceptance until its own maintained entry
+        pc = entry(5, 4, 'op-%016x' % 4, kind='powercycle_host', host='h1')
+        pcdone = entry(5, 5, 'm-%016x' % 5, kind='maintained', of='op-%016x' % 4, host='h1')
+        lg.check_entry(*map(lambda x: x, (pc[0], json.dumps(pc[1]))))
+        self.assertEqual(lg.Fold(inv, [pc]).maintenance, {'h1', 'h3'})
+        self.assertEqual(lg.Fold(inv, [pc, pcdone]).maintenance, {'h3'})
+        for bad in (dict(kind='powercycle_host', host='h1', force=False), dict(kind='enter_maintenance', host='h2'), dict(kind='enter_maintenance', host='h2', force=1),
                     dict(kind='enter_maintenance', host='h2', force=False, daemon='mgr.h2'), dict(kind='exit_maintenance', host='h2', force=False)):
             k, e = entry(5, 9, 'op-%016x' % 9, **bad)
             with self.assertRaises(lg.LedgerError, msg=bad):
