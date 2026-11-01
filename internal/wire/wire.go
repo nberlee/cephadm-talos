@@ -334,8 +334,8 @@ type NodeReport struct {
 	Running map[string]string `json:"running,omitempty"`
 	// VRRP is, for each running keepalived of the cluster, the latest start
 	// its log shows and its VRRP state since (absent if the log was unreadable)
-	VRRP map[string]VRRP `json:"vrrp,omitempty"`
-	Disks   []Disk            `json:"disks"`
+	VRRP  map[string]VRRP `json:"vrrp,omitempty"`
+	Disks []Disk          `json:"disks"`
 	// BootID is the node's boot id; it changes with every boot
 	BootID string `json:"boot_id,omitempty"`
 }
