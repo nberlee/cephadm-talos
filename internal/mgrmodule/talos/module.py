@@ -28,7 +28,7 @@ import orchestrator
 from ceph.deployment.hostspec import HostSpec
 from ceph.deployment.service_spec import ServiceSpec
 from mgr_module import CLICommandBase, CommandResult, HandleCommandResult, MgrModule
-from orchestrator import DaemonDescription, DaemonDescriptionStatus, OrchestratorError, handle_orch_error
+from orchestrator import DaemonDescription, DaemonDescriptionStatus, OrchestratorError, handle_orch_error, UpgradeStatusSpec
 
 from . import bridge, ledger
 
@@ -495,7 +495,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
                 continue
             if daemon is not None and e.get('daemon') != daemon and not (e['kind'] in ledger.HOST_KINDS and e['host'] == host):
                 continue
-            if daemon is None and e['host'] != host:
+            if daemon is None and e.get('host') != host:
                 continue
             rec = self._journal(e['id'])
             if rec is None or rec.get('state') not in TERMINAL:
@@ -758,7 +758,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
         except ledger.LedgerError as e:
             raise OrchestratorError('an earlier operation is not settled yet (%s); try again' % e)
         for _, e in led.executable():
-            if e['id'].startswith('m-') or e['host'] != host or not (e['kind'] in ledger.HOST_KINDS or e.get('device') == device):
+            if e['id'].startswith('m-') or e.get('host') != host or not (e['kind'] in ledger.HOST_KINDS or e.get('device') == device):
                 continue
             rec = self._journal(e['id'])
             if rec is None or rec.get('state') not in TERMINAL:
@@ -858,6 +858,8 @@ class Module(orchestrator.Orchestrator, MgrModule):
             raise OrchestratorError('%s is not a host of the cluster' % hostname)
         if hostname in fold.maintenance:
             raise OrchestratorError('%s is already in maintenance' % hostname)
+        if fold.upgrade is not None:
+            raise OrchestratorError('an upgrade is in progress (operation %s)' % fold.upgrade['op'])
         if len(fold.hosts) < 2:
             raise OrchestratorError('maintenance is not supported on single node clusters')
         # osd set-group resolves numbers (OSD ids), all and any before CRUSH bucket names
@@ -898,6 +900,123 @@ class Module(orchestrator.Orchestrator, MgrModule):
             raise OrchestratorError('%s is not in maintenance' % hostname)
         op_id = self._accept('exit_maintenance', None, hostname)
         return 'Scheduled to take host %s out of maintenance (operation %s)' % (hostname, op_id)
+
+    def _approved_images(self) -> List[str]:
+        """The images of the operator's newest approval in config-key: its payload
+        as written (the agents verify its signature; this is presence only)."""
+        r, out, _ = self.mon_command({'prefix': 'config-key ls', 'format': 'json'})
+        keys = sorted(k for k in json.loads(out) if bridge.APPROVAL_KEY_RE.match(k)) if r == 0 else None
+        if keys is None:
+            raise OrchestratorError('cannot list the approvals; try again')
+        if not keys:
+            return []
+        r, out, _ = self.mon_command({'prefix': 'config-key get', 'key': keys[-1]})
+        if r != 0:
+            raise OrchestratorError('cannot read the approval; try again')
+        try:
+            images = json.loads(base64.b64decode(json.loads(out)['payload']))['images']
+        except (ValueError, KeyError, TypeError):
+            raise OrchestratorError('the newest approval does not decode')
+        return [i for i in images if isinstance(i, str)]
+
+    def _accept_cluster(self, kind: str, **fields: Any) -> str:
+        """Accept an operation about the whole cluster (an upgrade's): no host."""
+        led, _ = self._authority()
+        lead = getattr(self, '_leadership', None)
+        if lead is None or not lead.still_active():
+            raise OrchestratorError('this mgr is not confirmed as the active one; try again')
+        try:
+            led.settle()
+        except ledger.LedgerError as e:
+            raise OrchestratorError('an earlier operation is not settled yet (%s); try again' % e)
+        op_id = 'op-' + os.urandom(8).hex()
+        try:
+            led.append({'id': op_id, 'kind': kind, **fields})
+        except ledger.OutcomeUnknown:
+            raise OrchestratorError('the mons did not answer: operation %s may have been accepted (orch talos operation %s)' % (op_id, op_id))
+        except ledger.LedgerError as e:
+            raise OrchestratorError('not accepted: %s' % e)
+        return op_id
+
+    @handle_orch_error
+    def upgrade_start(self, image: Optional[str], version: Optional[str], daemon_types: Optional[List[str]],
+                      hosts: Optional[str], services: Optional[List[str]], limit: Optional[int]) -> str:
+        """Upgrade the cluster to an image the operator approved, daemon by daemon."""
+        if version or daemon_types or hosts or services or limit is not None:
+            raise OrchestratorError('only --image is supported by this backend')
+        if not isinstance(image, str) or not ledger.IMAGE_RE.match(image):
+            raise OrchestratorError('name the image by its digest: <repository>@sha256:<hex>')
+        self._settle()
+        _, fold = self._authority()
+        if fold.upgrade is not None:
+            raise OrchestratorError('an upgrade is in progress (operation %s)' % fold.upgrade['op'])
+        if fold.maintenance:
+            raise OrchestratorError('hosts in maintenance: %s' % ', '.join(sorted(fold.maintenance)))
+        current = self._inventory().get('image', '')
+        if image.split('@')[0] != current.split('@')[0]:
+            raise OrchestratorError('the image is not from the cluster\'s repository %s' % current.split('@')[0])
+        if image == current:
+            raise OrchestratorError('the cluster runs %s already' % image)
+        if image not in self._approved_images():
+            raise OrchestratorError('the operator has not approved %s (cephadm-talos approve --image)' % image)
+        op_id = self._accept_cluster('upgrade_start', image=image)
+        return 'Scheduled to upgrade to %s (operation %s)' % (image, op_id)
+
+    def _upgrade_paused(self, fold: Any) -> bool:
+        """Paused by the operator (the fold) or by the leader after a failed step
+        (its inventory, for the same upgrade)."""
+        try:
+            u = self._inventory().get('upgrade') or {}
+        except Exception:
+            u = {}
+        return bool(fold.upgrade['paused'] or u.get('op') == fold.upgrade['op'] and u.get('paused'))
+
+    def _upgrade_control(self, kind: str) -> str:
+        self._settle()
+        _, fold = self._authority()
+        if fold.upgrade is None:
+            raise OrchestratorError('no upgrade is in progress')
+        if kind == 'upgrade_pause' and fold.upgrade['paused']:
+            raise OrchestratorError('the upgrade is paused already')
+        if kind == 'upgrade_resume' and not self._upgrade_paused(fold):
+            raise OrchestratorError('the upgrade is not paused')
+        return self._accept_cluster(kind, upgrade=fold.upgrade['op'])
+
+    @handle_orch_error
+    def upgrade_pause(self) -> str:
+        return 'Scheduled to pause the upgrade (operation %s)' % self._upgrade_control('upgrade_pause')
+
+    @handle_orch_error
+    def upgrade_resume(self) -> str:
+        return 'Scheduled to resume the upgrade (operation %s)' % self._upgrade_control('upgrade_resume')
+
+    @handle_orch_error
+    def upgrade_stop(self) -> str:
+        return 'Scheduled to stop the upgrade (operation %s)' % self._upgrade_control('upgrade_stop')
+
+    @handle_orch_error
+    def upgrade_status(self) -> UpgradeStatusSpec:
+        """The upgrade in the fold, with the leader's progress from its inventory."""
+        _, fold = self._authority()
+        spec = UpgradeStatusSpec()
+        if fold.upgrade is None:
+            return spec
+        inv = self._inventory()
+        u = inv.get('upgrade') or {}
+        mine = u.get('op') == fold.upgrade['op']
+        done = set(u.get('done') or []) if mine else set()
+        daemons = [d for d in inv['daemons'] if d['daemon_type'] in ('mgr', 'mon', 'osd', 'rgw')]
+        spec.in_progress, spec.target_image, spec.which = True, fold.upgrade['image'], 'all'
+        spec.is_paused = self._upgrade_paused(fold)
+        spec.progress = '%d/%d daemons upgraded' % (len([d for d in daemons if d['doc_name'] in done]), len(daemons))
+        spec.services_complete = sorted({d['daemon_type'] for d in daemons} - {d['daemon_type'] for d in daemons if d['doc_name'] not in done})
+        if not mine:
+            spec.message = 'starting (operation %s)' % fold.upgrade['op']
+        elif u.get('error'):
+            spec.message = 'paused: %s' % u['error']
+        elif u.get('step'):
+            spec.message = 'upgrading %s' % u['step']
+        return spec
 
     @TalosCLICommand.Read('orch talos operation')
     def _operation(self, id: str) -> HandleCommandResult:

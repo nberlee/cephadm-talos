@@ -422,6 +422,9 @@ type LedgerOp struct {
 	UUID  string `json:"uuid,omitempty"`
 	Zap   bool   `json:"zap,omitempty"`
 	Force bool   `json:"force,omitempty"`
+	// upgrade_start: the target image; the controls: the start they control
+	Image   string `json:"image,omitempty"`
+	Upgrade string `json:"upgrade,omitempty"`
 }
 
 // Ledger returns the executable operations after a ledger key, in the order
@@ -579,21 +582,44 @@ func (b *Bridge) ActiveMgr(ctx context.Context) (string, error) {
 
 // ActiveMgrGID returns the active mgr's name and gid.
 func (b *Bridge) ActiveMgrGID(ctx context.Context) (string, int64, error) {
+	name, gid, _, err := b.MgrMap(ctx)
+
+	return name, gid, err
+}
+
+// MgrMap returns the active mgr's name and gid, and the standbys' names.
+func (b *Bridge) MgrMap(ctx context.Context) (string, int64, []string, error) {
 	out, err := b.do(ctx, "mgr dump", map[string]any{})
 	if err != nil {
-		return "", 0, err
+		return "", 0, nil, err
 	}
 
 	var m struct {
 		ActiveName string `json:"active_name"`
 		ActiveGID  int64  `json:"active_gid"`
+		Standbys   []struct {
+			Name string `json:"name"`
+		} `json:"standbys"`
 	}
 
 	if err := json.Unmarshal([]byte(out), &m); err != nil || m.ActiveName == "" {
-		return "", 0, errors.New("bridge: mgr dump: no active mgr")
+		return "", 0, nil, errors.New("bridge: mgr dump: no active mgr")
 	}
 
-	return m.ActiveName, m.ActiveGID, nil
+	var standbys []string
+	for _, s := range m.Standbys {
+		standbys = append(standbys, s.Name)
+	}
+
+	return m.ActiveName, m.ActiveGID, standbys, nil
+}
+
+// OKToStop asks the module for Ceph's check that one daemon of an upgrade's
+// step can stop (osd and mon ok-to-stop; nothing to check for the others).
+func (b *Bridge) OKToStop(ctx context.Context, op, daemon string) error {
+	_, err := b.do(ctx, "ok to stop daemon", map[string]any{"operation": op, "daemon": daemon})
+
+	return err
 }
 
 // MgrFail asks the module to fail the active mgr over (by its gid) for an

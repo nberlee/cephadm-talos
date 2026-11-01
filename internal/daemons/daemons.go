@@ -334,6 +334,21 @@ func Job(p Params, job, inputs, cmd string) *spec.ContainerConfig {
 	return c
 }
 
+// ProbeCmd is the probe job's command: the image's Ceph version and CPU
+// architecture, as Probe prints them.
+const ProbeCmd = `ceph --version; echo "arch $(uname -m)"`
+
+// ProbeInputs are the inputs of a probe job: the cluster, the host, the image.
+func ProbeInputs(fsid, host, image string) string {
+	return JobInputs("probe", fsid, host, image)
+}
+
+// ProbeJob renders the image probe as a job (plan 03, step 6d): the leader
+// reads its output from the job's result, as it cannot read container logs.
+func ProbeJob(p Params, job, host string) *spec.ContainerConfig {
+	return Job(p, job, ProbeInputs(p.FSID, host, p.Image), ProbeCmd)
+}
+
 // OSDPrepare renders the job that prepares a raw device as a new OSD (plan 03,
 // item 8): privileged, with the device, ceph.conf, the Ceph volume and the
 // bootstrap-osd key only. It ignores SIGTERM for its whole process tree and has

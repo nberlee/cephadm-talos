@@ -659,6 +659,53 @@ class Maintenance(unittest.TestCase):
         self.assertIn('standby', m.Module.enter_host_maintenance(mod, 'h2').exception_str)
 
 
+class Upgrade(unittest.TestCase):
+    IMG = 'quay.io/ceph/ceph@sha256:' + 'cd' * 32
+
+    def module(self, approved=()):
+        import base64
+        mod, entries = AddAndRemove.module(self)
+        key = 'cephadm-talos/approvals/%020d' % 1
+        signed = json.dumps({'payload': base64.b64encode(json.dumps({'images': list(approved)}).encode()).decode(), 'signature': 'x'})
+        mod.mon_command = lambda cmd: (0, json.dumps([key]), '') if cmd['prefix'] == 'config-key ls' else (0, signed, '')
+        mod.get = lambda what: {'standbys': [{'name': 'h1', 'available': True}]}
+        return mod, entries
+
+    def test_start_needs_an_approved_digest_of_the_repository(self):
+        mod, _ = self.module()
+        for args in (('quay.io/ceph/ceph:v20.2.5',), ('docker.io/x/ceph@sha256:' + 'cd' * 32,), (self.IMG,)):
+            self.assertTrue(m.Module.upgrade_start(mod, args[0], None, None, None, None, None).exception_str, args)
+        mod, _ = self.module(approved=[self.IMG])
+        self.assertTrue(m.Module.upgrade_start(mod, self.IMG, '20.2.5', None, None, None, None).exception_str)
+        # h3 is in maintenance in the CLI's state: refused until it is out
+        self.assertIn('maintenance', m.Module.upgrade_start(mod, self.IMG, None, None, None, None, None).exception_str)
+
+    def test_controls_and_status(self):
+        mod, entries = self.module(approved=[self.IMG])
+        inv = inventory()
+        inv['hosts'][2].pop('maintenance')
+        mod, entries = AddAndRemove.module(self, inv)
+        base = self.module(approved=[self.IMG])[0]
+        mod.mon_command, mod.get = base.mon_command, base.get
+        self.assertTrue(m.Module.upgrade_pause(mod).exception_str)  # none in progress
+        res = m.Module.upgrade_start(mod, self.IMG, None, None, None, None, None)
+        self.assertEqual(res.exception_str, '')
+        [(_, start)] = mod._ledger.executable()
+        # a second start, maintenance and powercycle wait for it
+        self.assertTrue(m.Module.upgrade_start(mod, self.IMG, None, None, None, None, None).exception_str)
+        self.assertTrue(m.Module.enter_host_maintenance(mod, 'h1').exception_str)
+        self.assertTrue(m.Module.hardware_powercycle(mod, 'h1', True).exception_str)
+        st = m.Module.upgrade_status(mod).result
+        self.assertTrue(st.in_progress and st.target_image == self.IMG and not st.is_paused)
+        self.assertTrue(m.Module.upgrade_resume(mod).exception_str)  # not paused
+        self.assertEqual(m.Module.upgrade_pause(mod).exception_str, '')
+        self.assertTrue(m.Module.upgrade_status(mod).result.is_paused)
+        self.assertEqual(m.Module.upgrade_stop(mod).exception_str, '')
+        self.assertFalse(m.Module.upgrade_status(mod).result.in_progress)
+        kinds = [(e['kind'], e.get('upgrade')) for _, e in mod._ledger.executable()]
+        self.assertEqual(kinds, [('upgrade_start', None), ('upgrade_pause', start['id']), ('upgrade_stop', start['id'])])
+
+
 class Conflicts(unittest.TestCase):
     def test_a_host_removal_and_daemons_on_that_host_exclude_each_other(self):
         inv = inventory()
@@ -731,3 +778,20 @@ class BatchAfterAnUnknownAppend(unittest.TestCase):
         # the retry settles the first, then finds it in progress
         self.assertTrue(m.Module.remove_osds(mod, ['0'], zap=True).exception_str)
         self.assertEqual(len(mod._ledger.executable()), 1)
+
+
+class UpgradePausedByTheLeader(unittest.TestCase):
+    def test_resume_after_a_failed_step(self):
+        inv = inventory()
+        inv['hosts'][2].pop('maintenance')
+        mod, entries = AddAndRemove.module(self, inv)
+        base = Upgrade.module(self, approved=[Upgrade.IMG])[0]
+        mod.mon_command, mod.get = base.mon_command, base.get
+        self.assertEqual(m.Module.upgrade_start(mod, Upgrade.IMG, None, None, None, None, None).exception_str, '')
+        [(_, start)] = mod._ledger.executable()
+        paused = dict(inv, upgrade={'op': start['id'], 'image': Upgrade.IMG, 'version': '20.2.5', 'paused': True,
+                                    'error': 'mon.h1 not done within 10m0s', 'done': []})
+        mod._inventory = lambda: paused
+        st = m.Module.upgrade_status(mod).result
+        self.assertTrue(st.is_paused and 'not done' in st.message)
+        self.assertEqual(m.Module.upgrade_resume(mod).exception_str, '')

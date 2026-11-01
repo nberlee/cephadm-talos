@@ -41,6 +41,10 @@ const (
 	KindEnterMaint   = "enter_maintenance"
 	KindExitMaint    = "exit_maintenance"
 	KindPowercycle   = "powercycle_host"
+	KindUpgrade      = "upgrade_start"
+	KindUpPause      = "upgrade_pause"
+	KindUpResume     = "upgrade_resume"
+	KindUpStop       = "upgrade_stop"
 	KindRemoveHost   = "remove_host"
 	KindCreateOSD    = "create_osd"
 	KindRemoveOSD    = "remove_osd"
@@ -94,10 +98,33 @@ func (l *LeaderLoop) ledgerOps(ctx context.Context, b *Bridge, js store.Backend,
 				return nil // the next leader carries on
 			}
 
+			// an upgrade step in progress, or an upgrade ending, holds the slot:
+			// only the upgrade's controls, which change its record alone, run
+			// beside it, also those queued behind other operations (their
+			// journal records make them run once)
+			if st.Upgrade != nil && !isControl(e.Op.Kind) {
+				cur, _, err := l.clusterState(ctx, b)
+				if err != nil {
+					return err
+				}
+
+				if u := cur.Upgrade; u != nil && (u.Step != "" || u.Finished || u.Stopped) {
+					if err := l.controlsAhead(ctx, b, js, gid, epoch, after, u.Op); err != nil {
+						return err
+					}
+
+					return l.upgradeStep(ctx, b, js, gid, epoch)
+				}
+			}
+
 			done, err := l.ledgerOp(ctx, b, js, gid, epoch, e)
 			if err != nil || !done {
 				l.holding = ""
-				if e.Op.Kind == KindEnterMaint || e.Op.Kind == KindExitMaint || e.Op.Kind == KindPowercycle {
+
+				switch {
+				case st.Upgrade != nil:
+					l.holding = holdAll // a step may be in progress
+				case e.Op.Kind == KindEnterMaint || e.Op.Kind == KindExitMaint || e.Op.Kind == KindPowercycle:
 					l.holding = e.Op.Host
 				}
 
@@ -112,9 +139,9 @@ func (l *LeaderLoop) ledgerOps(ctx context.Context, b *Bridge, js store.Backend,
 		}
 
 		if !more || len(entries) == 0 {
-			l.holding = ""
-
-			return nil
+			// between ledger operations: the upgrade's next step, which releases
+			// the hold once it read that no step is in progress
+			return l.upgradeStep(ctx, b, js, gid, epoch)
 		}
 	}
 }
@@ -217,9 +244,11 @@ func (l *LeaderLoop) ledgerOp(ctx context.Context, b *Bridge, js store.Backend, 
 	opKey := JournalPrefix(gid) + "op/" + op.ID
 
 	known := map[string]bool{KindRestart: true, KindRedeploy: true, KindAddDaemon: true, KindRemoveDaemon: true, KindRemoveHost: true, KindCreateOSD: true, KindRemoveOSD: true,
-		KindEnterMaint: true, KindExitMaint: true, KindPowercycle: true}
-	noDaemon := op.Kind == KindRemoveHost || op.Kind == KindCreateOSD || op.Kind == KindEnterMaint || op.Kind == KindExitMaint || op.Kind == KindPowercycle
-	if !ledgerIDRe.MatchString(op.ID) || pki.ValidName(op.Host) != nil || !known[op.Kind] ||
+		KindEnterMaint: true, KindExitMaint: true, KindPowercycle: true, KindUpgrade: true, KindUpPause: true, KindUpResume: true, KindUpStop: true}
+	cluster := op.Kind == KindUpgrade || isControl(op.Kind)
+	noDaemon := cluster || op.Kind == KindRemoveHost || op.Kind == KindCreateOSD || op.Kind == KindEnterMaint || op.Kind == KindExitMaint || op.Kind == KindPowercycle
+	if !ledgerIDRe.MatchString(op.ID) || cluster != (op.Host == "") || !cluster && pki.ValidName(op.Host) != nil || !known[op.Kind] ||
+		(op.Kind == KindUpgrade) != (op.Image != "") || isControl(op.Kind) != ledgerIDRe.MatchString(op.Upgrade) ||
 		noDaemon != (op.Daemon == "") || (op.Daemon != "" && !ledgerDaemonRe.MatchString(op.Daemon)) ||
 		(op.Kind == KindCreateOSD) != strings.HasPrefix(op.Device, "/dev/") {
 		return true, writeJSONKey(ctx, js, opKey, JournalOp{Version: journalVersion, Kind: op.Kind, Host: op.Host, State: JournalFailed, Error: "unknown or malformed operation"})
@@ -231,6 +260,32 @@ func (l *LeaderLoop) ledgerOp(ctx context.Context, b *Bridge, js store.Backend, 
 	}
 
 	switch op.Kind {
+	case KindUpgrade, KindUpPause, KindUpResume, KindUpStop:
+		phase := func() error { return l.upgradeControl(ctx, b, js, gid, op) }
+
+		var onFail func() error
+
+		if op.Kind == KindUpgrade {
+			phase = func() error { return l.upgradeStart(ctx, b, js, gid, epoch, op) }
+
+			// a start that never got recorded is closed in the module's fold
+			onFail = func() error {
+				st, _, err := l.clusterState(ctx, b)
+				if err != nil || st.Upgrade != nil && st.Upgrade.Op == op.ID {
+					return err
+				}
+
+				return b.Retire(ctx, "upgrade refused", op.ID)
+			}
+		}
+
+		if err := l.unstick(ctx, js, opKey, opKey, op, onFail, phase()); err != nil {
+			return false, err
+		}
+
+		s, err = l.journalState(ctx, b, js, gid, op.ID)
+
+		return err == nil && terminal(s), err
 	case KindAddDaemon, KindRemoveDaemon, KindRemoveHost, KindCreateOSD, KindRemoveOSD, KindEnterMaint, KindExitMaint, KindPowercycle:
 		var phase func() error
 
@@ -564,7 +619,7 @@ func (l *LeaderLoop) addDaemon(ctx context.Context, b *Bridge, js store.Backend,
 
 			h.MgrServerCert, h.MgrClientCert, h.MgrKeys = certs.ServerCert, certs.ClientCert, op.ID+"/"+certs.Attempt
 			st.AddHost(h)
-			st.AddDaemon(state.Daemon{Type: state.TypeMgr, ID: id, Host: h.Name})
+			st.AddDaemon(st.Created(state.Daemon{Type: state.TypeMgr, ID: id, Host: h.Name}))
 
 			return nil
 		}); err != nil {
@@ -579,7 +634,7 @@ func (l *LeaderLoop) addDaemon(ctx context.Context, b *Bridge, js store.Backend,
 		}
 
 		if err := l.changeState(ctx, b, gid, func(st *state.State) error {
-			st.AddDaemon(state.Daemon{Type: state.TypeMon, ID: id, Host: op.Host, DeployID: hex.EncodeToString(deploy), Joining: true})
+			st.AddDaemon(st.Created(state.Daemon{Type: state.TypeMon, ID: id, Host: op.Host, DeployID: hex.EncodeToString(deploy), Joining: true}))
 
 			return nil
 		}); err != nil {
@@ -925,6 +980,7 @@ func (l *LeaderLoop) createOSD(ctx context.Context, b *Bridge, js store.Backend,
 		}
 
 		if err := l.changeState(ctx, b, gid, func(st *state.State) error {
+			d = st.Created(d) // the target's image during an upgrade, also for the preparation
 			st.AddDaemon(d)
 
 			return nil
@@ -1776,4 +1832,718 @@ func (l *LeaderLoop) rebootStep(ctx context.Context, b *Bridge, js store.Backend
 	}
 
 	return false, false, nil // decided on a later tick
+}
+
+// controlsAhead carries out the controls of the upgrade in progress (op) among
+// the executable operations after a ledger key, ahead of their turn; another
+// upgrade's wait for it.
+func (l *LeaderLoop) controlsAhead(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, after, op string) error {
+	for {
+		entries, more, err := b.Ledger(ctx, after)
+		if err != nil {
+			return err
+		}
+
+		for _, e := range entries {
+			if isControl(e.Op.Kind) && e.Op.Upgrade == op {
+				if _, err := l.ledgerOp(ctx, b, js, gid, epoch, e); err != nil {
+					return err
+				}
+			}
+
+			after = e.Key
+		}
+
+		if !more || len(entries) == 0 {
+			return nil
+		}
+	}
+}
+
+// isControl reports whether a kind is one of an upgrade's controls.
+func isControl(kind string) bool {
+	return kind == KindUpPause || kind == KindUpResume || kind == KindUpStop
+}
+
+// probeOf is the job id of an upgrade's image probe.
+func probeOf(op string) string {
+	sum := sha256.Sum256([]byte(op + ":probe"))
+
+	return hex.EncodeToString(sum[:8])
+}
+
+var (
+	cephVersionRe = regexp.MustCompile(`ceph version (\d+)\.(\d+)\.(\d+)`)
+	probeArchRe   = regexp.MustCompile(`(?m)^arch (\S+)$`)
+)
+
+// versionOf reads "20.2.4" into its numbers.
+func versionOf(v string) ([3]int, bool) {
+	var n [3]int
+
+	parts := strings.Split(v, ".")
+	if len(parts) != 3 {
+		return n, false
+	}
+
+	for i, p := range parts {
+		x, err := strconv.Atoi(p)
+		if err != nil {
+			return n, false
+		}
+
+		n[i] = x
+	}
+
+	return n, true
+}
+
+// upgradeStart validates an upgrade and records it in the state (plan 03,
+// step 6d): the image in the operator's approval, its Ceph version and
+// architecture from a probe job, no downgrade, at most two majors up, the
+// cluster's architecture. The steps follow between ledger operations. A
+// refused upgrade is closed in the module's fold.
+func (l *LeaderLoop) upgradeStart(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, op LedgerOp) error {
+	st, _, err := l.clusterState(ctx, b)
+	if err != nil {
+		return err
+	}
+
+	refuse := func(cause error) error {
+		if err := b.Retire(ctx, "upgrade refused", op.ID); err != nil {
+			return err
+		}
+
+		return finish(ctx, js, gid, op, JournalFailed, cause)
+	}
+
+	if u := st.Upgrade; u != nil {
+		switch {
+		case u.Op == op.ID:
+			return finish(ctx, js, gid, op, wire.OpCompleted, nil)
+		case u.Finished || u.Stopped:
+			// the module accepted this start once that one was closed: it ends first
+			return fmt.Errorf("%w: upgrade %s is ending", errRetry, u.Op)
+		default:
+			return refuse(fmt.Errorf("upgrade %s is in progress", u.Op))
+		}
+	}
+
+	if l.appr == nil || !l.appr.Image(op.Image) {
+		return refuse(fmt.Errorf("the operator has not approved %s", op.Image))
+	}
+
+	// the probe runs on the host of the first mon by name: the same for every leader
+	var host string
+
+	for _, d := range st.DaemonsOf(state.TypeMon, "") {
+		if h, ok := st.Host(d.Host); ok && !h.Maintenance && !d.Joining && (host == "" || d.Host < host) {
+			host = d.Host
+		}
+	}
+
+	if host == "" {
+		return refuse(errors.New("no host to probe the image on"))
+	}
+
+	id := probeOf(op.ID)
+	job := daemons.ProbeJob(daemons.Params{Name: st.DocName(state.Daemon{Type: "job", ID: id}), Image: op.Image, FSID: st.FSID, ID: "job"}, id, host)
+
+	y, err := spec.Render(job)
+	if err != nil {
+		return err
+	}
+
+	done, _, err := l.step(ctx, b, js, gid, epoch, op.ID+".probe", host, revisionMode{add: []Doc{{Kind: "ContainerConfig", Name: job.MetaName, YAML: y}}})
+	if err != nil {
+		return err
+	}
+
+	if !done {
+		return fmt.Errorf("%w: the probe of %s has not ended yet", errRetry, op.Image)
+	}
+
+	rec, _, err := l.journalRecord(ctx, b, js, gid, op.ID+".probe")
+	if err != nil {
+		return err
+	}
+
+	var out string
+
+	rc := -1
+	if rec.Result != nil {
+		rc, out = rec.Result.RC, rec.Result.Output
+	}
+
+	if rec.Job != nil {
+		if err := l.ackJob(ctx, b, js, gid, epoch, op.ID+".probe", host, rec, rc); err != nil {
+			return err
+		}
+	}
+
+	m, a := cephVersionRe.FindStringSubmatch(out), probeArchRe.FindStringSubmatch(out)
+	if rec.State != wire.OpCompleted || rc != 0 || m == nil || a == nil {
+		return refuse(fmt.Errorf("the probe of %s ended %s (rc %d) without a version and architecture", op.Image, rec.State, rc))
+	}
+
+	version := m[1] + "." + m[2] + "." + m[3]
+	to, _ := versionOf(version)
+
+	if from, ok := versionOf(st.CephVersion); ok {
+		switch {
+		case to[0] < from[0] || to[0] == from[0] && (to[1] < from[1] || to[1] == from[1] && to[2] < from[2]):
+			return refuse(fmt.Errorf("%s is Ceph %s, older than the cluster's %s", op.Image, version, st.CephVersion))
+		case to[0]-from[0] > 2:
+			return refuse(fmt.Errorf("Ceph %s is more than two majors after the cluster's %s", version, st.CephVersion))
+		}
+	}
+
+	if st.Arch != "" && a[1] != st.Arch {
+		return refuse(fmt.Errorf("%s is for %s, the cluster runs %s", op.Image, a[1], st.Arch))
+	}
+
+	if err := l.changeState(ctx, b, gid, func(st *state.State) error {
+		if st.Upgrade == nil {
+			st.Upgrade = &state.Upgrade{Op: op.ID, Image: op.Image, Version: version, Done: []string{}}
+		}
+
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	return finish(ctx, js, gid, op, wire.OpCompleted, nil)
+}
+
+// upgradeControl carries out pause, resume or stop of the upgrade it names:
+// they change its record alone. A stop leaves the images already changed (no
+// rollback) and the cluster's image as it was; with a step in progress the
+// upgrade ends with that step.
+func (l *LeaderLoop) upgradeControl(ctx context.Context, b *Bridge, js store.Backend, gid int64, op LedgerOp) error {
+	if err := l.changeState(ctx, b, gid, func(st *state.State) error {
+		u := st.Upgrade
+		if u == nil || u.Op != op.Upgrade {
+			return nil // ended already
+		}
+
+		switch {
+		case op.Kind == KindUpPause:
+			u.Paused = true
+		case op.Kind == KindUpResume:
+			// a step that is failing keeps its cause until it ended (paused again)
+			u.Paused = false
+			if u.Step == "" {
+				u.Error = ""
+			}
+		case u.Step != "":
+			u.Paused, u.Stopped = true, true // it ends with its step
+		default:
+			st.Upgrade = nil
+		}
+
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	return finish(ctx, js, gid, op, wire.OpCompleted, nil)
+}
+
+// upgradeOrder is the order of an upgrade's steps, as Ceph's: the standby
+// mgrs, the active one, the mons, the OSDs, the RGWs (keepalived keeps its
+// own image).
+func upgradeOrder(st *state.State, active string) []state.Daemon {
+	var out []state.Daemon
+
+	rank := func(d state.Daemon) int {
+		switch {
+		case d.Type == state.TypeMgr && d.ID != active:
+			return 0
+		case d.Type == state.TypeMgr:
+			return 1
+		case d.Type == state.TypeMon:
+			return 2
+		case d.Type == state.TypeOSD:
+			return 3
+		default:
+			return 4
+		}
+	}
+
+	for _, d := range st.Daemons {
+		switch {
+		case d.LocalOnly || d.Purged || d.Leaving || d.Joining:
+		case d.Type == state.TypeOSD && (d.OSDID == nil || d.OSDUUID == ""):
+		case d.Type == state.TypeMgr, d.Type == state.TypeMon, d.Type == state.TypeOSD, d.Type == state.TypeRGW:
+			out = append(out, d)
+		}
+	}
+
+	slices.SortStableFunc(out, func(a, b state.Daemon) int { return rank(a) - rank(b) })
+
+	return out
+}
+
+// upgradeStep carries out the upgrade's next step, one daemon (plan 03, step
+// 6d): chosen and recorded in the state, Ceph's check that it can stop (mon
+// only with more than two mons), the active mgr failed over first, an RGW's
+// keepalived moved off first, its image set and its host's revision granted,
+// then the daemon running the target with a newer instance and back in Ceph.
+// While a step is unfinished, no revision request starts. A step not done
+// within 10 minutes (of its start before the grant, of the grant's end after
+// it) pauses the upgrade with an error and ends; a grant whose outcome is
+// unknown keeps it. A stopped upgrade ends with its step; one not granted yet
+// is dropped. Without a daemon left, the target becomes the cluster's image,
+// recorded as finished before the module closes the upgrade.
+func (l *LeaderLoop) upgradeStep(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64) error {
+	st, _, err := l.clusterState(ctx, b)
+	if err != nil {
+		return err // the hold stays
+	}
+
+	if st.Upgrade == nil {
+		l.holding = ""
+
+		return nil
+	}
+
+	u := *st.Upgrade
+
+	// before any read that can fail: no revision request beside a step
+	l.holding = ""
+	if u.Step != "" {
+		l.holding = holdAll
+	}
+
+	if u.Finished {
+		// closed in the fold, then cleared: a retry finds it closed already
+		if err := b.Retire(ctx, "upgrade done", u.Op); err != nil {
+			return err
+		}
+
+		return l.changeState(ctx, b, gid, func(st *state.State) error {
+			if st.Upgrade != nil && st.Upgrade.Op == u.Op && st.Upgrade.Finished {
+				st.Upgrade = nil
+			}
+
+			return nil
+		})
+	}
+
+	active, agid, standbys, err := b.MgrMap(ctx)
+	if err != nil {
+		return err
+	}
+
+	if u.Step == "" {
+		if u.Stopped {
+			return l.changeState(ctx, b, gid, func(st *state.State) error {
+				if st.Upgrade != nil && st.Upgrade.Op == u.Op && st.Upgrade.Step == "" {
+					st.Upgrade = nil
+				}
+
+				return nil
+			})
+		}
+
+		var next *state.Daemon
+
+		for _, d := range upgradeOrder(st, active) {
+			if !slices.Contains(u.Done, st.DocName(d)) {
+				next = &d
+
+				break
+			}
+		}
+
+		if next == nil {
+			return l.changeState(ctx, b, gid, func(st *state.State) error {
+				if st.Upgrade == nil || st.Upgrade.Op != u.Op || st.Upgrade.Step != "" {
+					return nil
+				}
+
+				st.Image, st.CephVersion, st.Upgrade.Finished = st.Upgrade.Image, st.Upgrade.Version, true
+
+				for _, d := range st.Daemons {
+					if d.Image != "" {
+						d.Image = ""
+						st.AddDaemon(d)
+					}
+				}
+
+				return nil
+			})
+		}
+
+		if u.Paused {
+			return nil
+		}
+
+		l.holding = holdAll
+		name := st.DocName(*next)
+
+		if err := l.changeState(ctx, b, gid, func(st *state.State) error {
+			if cur := st.Upgrade; cur != nil && cur.Op == u.Op && cur.Step == "" && !cur.Paused {
+				cur.Step, cur.Attempt, cur.StepAt, cur.GrantedAt, cur.Before = name, cur.Attempt+1, l.clock().UTC(), time.Time{}, ""
+			}
+
+			return nil
+		}); err != nil {
+			return err
+		}
+
+		return fmt.Errorf("%w: upgrading %s", errRetry, name)
+	}
+
+	// a step in progress holds the slot for every host
+	l.holding = holdAll
+
+	var d state.Daemon
+
+	found := false
+
+	for _, x := range st.Daemons {
+		if st.DocName(x) == u.Step {
+			d, found = x, true
+		}
+	}
+
+	h, ok := st.Host(d.Host)
+	if !found || !ok {
+		return l.endStep(ctx, b, gid, u, "", false) // gone meanwhile (removed)
+	}
+
+	since := u.StepAt
+	if !u.GrantedAt.IsZero() {
+		since = u.GrantedAt
+	}
+
+	sid := fmt.Sprintf("%s.u%d", u.Op, u.Attempt)
+
+	var vips []string
+
+	if d.Type == state.TypeRGW {
+		for _, x := range st.DaemonsOf(state.TypeVIP, h.Name) {
+			vips = append(vips, st.DocName(x))
+		}
+	}
+
+	stop := make([]string, 0, len(vips))
+	for _, v := range vips {
+		stop = append(stop, "ContainerConfig/"+v)
+	}
+
+	phase := map[string]string{}
+
+	// the states of the step's grants, read again before any decision to give up
+	unresolved := func() (bool, error) {
+		open := false
+
+		for _, p := range []string{"vip", "rev", "back"} {
+			s, err := l.journalState(ctx, b, js, gid, sid+"."+p)
+			if err != nil {
+				return true, err
+			}
+
+			phase[p], open = s, open || s == JournalGranting || s == wire.OpUncertain
+		}
+
+		return open, nil
+	}
+
+	if _, err := unresolved(); err != nil {
+		return err
+	}
+
+	// keepalived back beside its RGW, before the step ends either way
+	restore := func() (bool, error) {
+		if len(vips) == 0 || phase["vip"] == "" {
+			return true, nil
+		}
+
+		done, ok, err := l.step(ctx, b, js, gid, epoch, sid+".back", h.Name, revisionMode{})
+		if err != nil {
+			// a host that cannot be reached past the step's time, every grant's
+			// outcome known: paused, the daemon not done (resume retries it)
+			if open, uerr := unresolved(); uerr == nil && !open && l.clock().Sub(since) > stuckAfter {
+				cause := strings.TrimPrefix(u.Error+"; ", "; ") + "keepalived on " + h.Name + " not restored: " + err.Error()
+
+				return false, l.endStep(ctx, b, gid, u, cause, false)
+			}
+
+			return false, err
+		}
+
+		if !done {
+			return false, nil
+		}
+
+		if !ok {
+			return false, l.endStep(ctx, b, gid, u, "keepalived on "+h.Name+" did not come back", false)
+		}
+
+		return true, nil
+	}
+
+	// a step that fails records why before it restores keepalived: from then
+	// on it only finishes (restore, then pause), whatever the next tick finds
+	fail := func(cause string) error {
+		if u.Error == "" {
+			if err := l.changeState(ctx, b, gid, func(st *state.State) error {
+				if st.Upgrade != nil && st.Upgrade.Op == u.Op && st.Upgrade.Step == u.Step {
+					st.Upgrade.Error = cause
+				}
+
+				return nil
+			}); err != nil {
+				return err
+			}
+
+			u.Error = cause
+		}
+
+		if done, err := restore(); err != nil || !done {
+			return err
+		}
+
+		return l.endStep(ctx, b, gid, u, u.Error, false)
+	}
+
+	if u.Error != "" {
+		return fail(u.Error)
+	}
+
+	// keepalived's restoration began after the daemon was back: it only finishes
+	if phase["back"] != "" {
+		if done, err := restore(); err != nil || !done {
+			return err
+		}
+
+		return l.endStep(ctx, b, gid, u, "", true)
+	}
+
+	// waiting counts against the step's 10 minutes, then it pauses the upgrade;
+	// never while a grant of the step has an unknown outcome
+	wait := func(why string) error {
+		if l.clock().Sub(since) <= stuckAfter {
+			return fmt.Errorf("%w: %s", errRetry, why)
+		}
+
+		if open, err := unresolved(); err != nil || open {
+			return fmt.Errorf("%w: %s", errRetry, why)
+		}
+
+		return fail(fmt.Sprintf("%s not done within %s: %s", u.Step, stuckAfter, why))
+	}
+
+	if phase["rev"] == "" {
+		if u.Stopped && phase["vip"] == "" {
+			return l.endStep(ctx, b, gid, u, "", false) // nothing granted: dropped
+		}
+
+		// a mgr that is the active one fails over first, by its gid
+		if d.Type == state.TypeMgr && d.ID == active {
+			if len(standbys) == 0 {
+				return wait(fmt.Sprintf("mgr.%s is the active mgr and there is no standby", d.ID))
+			}
+
+			if err := writeJSONKey(ctx, js, JournalPrefix(gid)+"op/"+sid+".fail", JournalOp{Version: journalVersion, Kind: "mgr_fail", Host: h.Name, State: wire.OpStarted, MgrGID: agid}); err != nil {
+				return err
+			}
+
+			if err := b.MgrFail(ctx, u.Op, agid); err != nil {
+				return wait(fmt.Sprintf("failing the active mgr over: %v", err))
+			}
+
+			return fmt.Errorf("%w: the active mgr is failing over", errRetry)
+		}
+
+		check := d.Type == state.TypeOSD
+		if d.Type == state.TypeMon {
+			check = len(st.DaemonsOf(state.TypeMon, "")) > 2
+		}
+
+		if check && phase["vip"] == "" {
+			if err := b.OKToStop(ctx, u.Op, ledgerName(d)); err != nil {
+				return wait(fmt.Sprintf("%s: %v", ledgerName(d), err))
+			}
+		}
+
+		// an RGW's VIP moves to a peer before the RGW restarts
+		if len(vips) > 0 {
+			done, ok, err := l.step(ctx, b, js, gid, epoch, sid+".vip", h.Name, revisionMode{stop: stop})
+			if err != nil {
+				return wait(err.Error())
+			}
+
+			if !done {
+				return nil
+			}
+
+			if !ok {
+				return l.endStep(ctx, b, gid, u, "keepalived on "+h.Name+" did not stop", false)
+			}
+
+			phase["vip"] = wire.OpCompleted
+
+			if err := l.gone(ctx, h, vips); err != nil {
+				return wait(err.Error())
+			}
+		}
+
+		var rep wire.NodeReport
+		if _, err := l.call(ctx, h, http.MethodGet, "/v1/node", nil, &rep); err != nil {
+			return wait(err.Error())
+		}
+
+		if err := l.changeState(ctx, b, gid, func(st *state.State) error {
+			x, ok := st.Find(ledgerName(d))
+			if !ok || st.DocName(x) != u.Step || st.Upgrade == nil || st.Upgrade.Op != u.Op {
+				return nil
+			}
+
+			x.Image, st.Upgrade.Before = u.Image, rep.Current[u.Step]
+			st.AddDaemon(x)
+
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+
+	done, ok, err := l.step(ctx, b, js, gid, epoch, sid+".rev", h.Name, revisionMode{stop: stop})
+	if err != nil {
+		return wait(err.Error())
+	}
+
+	if !done {
+		return nil // a grant whose outcome is unknown is never given up
+	}
+
+	if !ok {
+		return fail(fmt.Sprintf("the revision of %s for %s did not apply", h.Name, u.Step))
+	}
+
+	// readiness is timed from the grant's end
+	if u.GrantedAt.IsZero() {
+		if err := l.changeState(ctx, b, gid, func(st *state.State) error {
+			if st.Upgrade != nil && st.Upgrade.Op == u.Op && st.Upgrade.Step == u.Step {
+				st.Upgrade.GrantedAt = l.clock().UTC()
+			}
+
+			return nil
+		}); err != nil {
+			return err
+		}
+
+		return fmt.Errorf("%w: %s granted", errRetry, u.Step)
+	}
+
+	// a revision that changed nothing (the document had the target already)
+	// starts no new instance: running the target is enough
+	before := u.Before
+	if s, err := l.journalState(ctx, b, js, gid, sid+".rev"); err != nil {
+		return err
+	} else if s == JournalNoChange {
+		before = ""
+	}
+
+	back, why, err := l.backInCeph(ctx, b, d, h, u.Image, before, active, standbys)
+	if err != nil {
+		why = err.Error()
+	}
+
+	if !back {
+		return wait(why)
+	}
+
+	if done, err := restore(); err != nil || !done {
+		return err
+	}
+
+	return l.endStep(ctx, b, gid, u, "", true)
+}
+
+// ledgerName is a daemon's name as the ledger has it ("<type>.<id>").
+func ledgerName(d state.Daemon) string {
+	if d.Type == state.TypeOSD && d.OSDID != nil {
+		return fmt.Sprintf("osd.%d", *d.OSDID)
+	}
+
+	return d.Type + "." + d.ID
+}
+
+// backInCeph reports whether a daemon runs again after its step: running
+// the target's digest, with a newer instance on its node than before (unless
+// before is empty), and the mon in the quorum, the mgr in the mgr map, the OSD
+// up.
+func (l *LeaderLoop) backInCeph(ctx context.Context, b *Bridge, d state.Daemon, h state.Host, target, before, active string, standbys []string) (bool, string, error) {
+	st, _, err := l.clusterState(ctx, b)
+	if err != nil {
+		return false, "", err
+	}
+
+	var rep wire.NodeReport
+	if _, err := l.call(ctx, h, http.MethodGet, "/v1/node", nil, &rep); err != nil {
+		return false, "", err
+	}
+
+	name := st.DocName(d)
+
+	if cur := rep.Current[name]; cur == "" || before != "" && cur == before {
+		return false, name + " has no new instance yet", nil
+	}
+
+	if _, digest, _ := strings.Cut(target, "@"); rep.Running[name] != digest {
+		return false, name + " does not run " + digest + " yet", nil
+	}
+
+	switch d.Type {
+	case state.TypeMon:
+		q, err := b.Quorum(ctx)
+		if err != nil {
+			return false, "", err
+		}
+
+		return slices.Contains(q, d.ID), "mon." + d.ID + " is not in the quorum yet", nil
+	case state.TypeMgr:
+		return d.ID == active || slices.Contains(standbys, d.ID), "mgr." + d.ID + " is not in the mgr map yet", nil
+	case state.TypeOSD:
+		osds, err := b.OSDs(ctx)
+		if err != nil {
+			return false, "", err
+		}
+
+		for _, o := range osds {
+			if d.OSDID != nil && o.ID == *d.OSDID && o.UUID == d.OSDUUID && o.Up {
+				return true, "", nil
+			}
+		}
+
+		return false, ledgerName(d) + " is not up yet", nil
+	}
+
+	return true, "", nil
+}
+
+// endStep ends the upgrade's step: done, or the upgrade paused with an error.
+func (l *LeaderLoop) endStep(ctx context.Context, b *Bridge, gid int64, u state.Upgrade, cause string, done bool) error {
+	return l.changeState(ctx, b, gid, func(st *state.State) error {
+		cur := st.Upgrade
+		if cur == nil || cur.Op != u.Op || cur.Step != u.Step {
+			return nil
+		}
+
+		if done && !slices.Contains(cur.Done, cur.Step) {
+			cur.Done = append(cur.Done, cur.Step)
+		}
+
+		if cause != "" {
+			cur.Paused, cur.Error = true, cause
+		}
+
+		cur.Step, cur.StepAt, cur.GrantedAt = "", time.Time{}, time.Time{}
+
+		return nil
+	})
 }

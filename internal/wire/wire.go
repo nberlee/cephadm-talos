@@ -327,7 +327,12 @@ type NodeReport struct {
 	// Instances are the cluster's containers that have an instance, running or
 	// not cleaned up yet
 	Instances []string `json:"instances,omitempty"`
-	Disks     []Disk   `json:"disks"`
+	// Current is the newest instance of each of them ("<name>-<generation>")
+	Current map[string]string `json:"current,omitempty"`
+	// Running is, for each of the cluster's containers that runs, the image
+	// it runs (the resolved digest, "sha256:<hex>")
+	Running map[string]string `json:"running,omitempty"`
+	Disks   []Disk            `json:"disks"`
 	// BootID is the node's boot id; it changes with every boot
 	BootID string `json:"boot_id,omitempty"`
 }

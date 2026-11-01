@@ -913,7 +913,7 @@ func (l *LeaderLoop) renderHost(ctx context.Context, b *Bridge, st *state.State,
 			continue
 		}
 
-		c, err := render.Daemon(st, h, d, st.Image, key, secret)
+		c, err := render.Daemon(st, h, d, st.ImageOf(d), key, secret)
 		if transient != nil {
 			return rendered{}, fmt.Errorf("%w: %w", errRetry, transient)
 		}

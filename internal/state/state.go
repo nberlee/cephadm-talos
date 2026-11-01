@@ -139,6 +139,65 @@ type Daemon struct {
 	// LocalOnly: stopped by a forced `rm` while no mon was reachable; its
 	// cluster-side cleanup (mon remove, osd purge, auth rm) is still pending
 	LocalOnly bool `json:"local_only,omitempty"`
+	// Image is the daemon's own image during or after an upgrade (plan 03,
+	// step 6d); empty: the cluster's
+	Image string `json:"image,omitempty"`
+}
+
+// Upgrade is an upgrade in progress (plan 03, step 6d): its start operation,
+// the target image and its Ceph version, whether it is paused (and why) or
+// stopped (it ends with its step), the daemon of the step in progress with
+// its attempt, when the step began and its grant ended, and its instance
+// before; the daemons done (upgraded, or added during the upgrade with the
+// target); Finished once the target is the cluster's image.
+type Upgrade struct {
+	Op        string    `json:"op"`
+	Image     string    `json:"image"`
+	Version   string    `json:"version"`
+	Paused    bool      `json:"paused,omitempty"`
+	Error     string    `json:"error,omitempty"`
+	Stopped   bool      `json:"stopped,omitempty"`
+	Finished  bool      `json:"finished,omitempty"`
+	Step      string    `json:"step,omitempty"`
+	Attempt   int       `json:"attempt,omitempty"`
+	StepAt    time.Time `json:"step_at,omitzero"`
+	GrantedAt time.Time `json:"granted_at,omitzero"`
+	// Before is the step daemon's instance before its grant: it is back with
+	// a newer one
+	Before string   `json:"before,omitempty"`
+	Done   []string `json:"done,omitempty"`
+}
+
+// ImageOf is the image a daemon runs: its own, else the cluster's.
+func (s *State) ImageOf(d Daemon) string {
+	if d.Image != "" {
+		return d.Image
+	}
+
+	return s.Image
+}
+
+// NewImage is the image a daemon gets that is created now: an upgrade's
+// target while one is in progress, else the cluster's.
+func (s *State) NewImage() string {
+	if s.Upgrade != nil {
+		return s.Upgrade.Image
+	}
+
+	return s.Image
+}
+
+// Created prepares a daemon the leader creates: during an upgrade it gets the
+// target image and counts as done.
+func (s *State) Created(d Daemon) Daemon {
+	if s.Upgrade != nil {
+		d.Image = s.Upgrade.Image
+		if name := s.DocName(d); !slices.Contains(s.Upgrade.Done, name) {
+			s.Upgrade.Done = append(s.Upgrade.Done, name)
+		}
+	}
+
+	return d
 }
 
 // OSDDevice is the path an OSD's device is used by: its by-id link, or the
@@ -182,6 +241,8 @@ type State struct {
 	// LedgerApplied: the last operation of the mgr module's ledger the leader
 	// carried out; the next ones come after it
 	LedgerApplied string `json:"-"`
+	// Upgrade is the upgrade in progress, nil without one
+	Upgrade *Upgrade `json:"-"`
 	// Inventory is the revision of the mgr module's inventory record: bumped,
 	// with its time, only when its content changes
 	Inventory InventoryRevision `json:"-"`
@@ -467,6 +528,8 @@ type cluster struct {
 	Sealed      bool `json:"sealed,omitempty"`
 	// LedgerApplied is the last ledger operation the leader carried out
 	LedgerApplied string `json:"ledger_applied,omitempty"`
+	// Upgrade is the upgrade in progress
+	Upgrade *Upgrade `json:"upgrade,omitempty"`
 }
 
 // Secret names: config-key entries below store.SecretPrefix, one per secret.
@@ -559,7 +622,7 @@ func (s *State) Records() (map[string][]byte, error) {
 	c := cluster{
 		Schema: SchemaVersion, FSID: s.FSID, Image: s.Image, CephVersion: s.CephVersion, Arch: s.Arch,
 		RGW: s.RGW, Published: s.Published, ConfPending: s.ConfPending, RGWPending: s.RGWPending, Inventory: s.Inventory,
-		HandingOver: s.HandingOver, Sealed: s.Sealed, LedgerApplied: s.LedgerApplied,
+		HandingOver: s.HandingOver, Sealed: s.Sealed, LedgerApplied: s.LedgerApplied, Upgrade: s.Upgrade,
 	}
 
 	if s.Agent != nil {
@@ -645,7 +708,7 @@ func (s *State) ApplyRecords(recs map[string][]byte) error {
 
 	s.Image, s.CephVersion, s.Arch, s.RGW, s.Published = c.Image, c.CephVersion, c.Arch, c.RGW, c.Published
 	s.ConfPending, s.RGWPending, s.Hosts, s.Daemons = c.ConfPending, c.RGWPending, hosts, daemons
-	s.Inventory, s.HandingOver, s.Sealed, s.LedgerApplied = c.Inventory, c.HandingOver, c.Sealed, c.LedgerApplied
+	s.Inventory, s.HandingOver, s.Sealed, s.LedgerApplied, s.Upgrade = c.Inventory, c.HandingOver, c.Sealed, c.LedgerApplied, c.Upgrade
 	s.Agent = c.Agent
 
 	if s.Agent != nil && operator != nil {

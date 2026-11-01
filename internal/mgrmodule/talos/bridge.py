@@ -316,6 +316,8 @@ def _operation_with(*more: str) -> Callable[[Dict[str, Any]], Dict[str, Any]]:
             raise ValueError('not an OSD id')
         if 'gid' in more and not (type(args['gid']) is int and 0 < args['gid'] < 1 << 63):
             raise ValueError('not a mgr gid')
+        if 'daemon' in more and not (isinstance(args['daemon'], str) and ledger.DAEMON_RE.match(args['daemon'])):
+            raise ValueError('not a daemon name')
         return {}  # answered by the module (Channel.local)
     return build
 
@@ -347,7 +349,7 @@ READ_ONLY = {'status', 'health', 'mgr dump', 'config-key keys', 'config-key get'
 CREDENTIALS = {'auth get', 'auth get-or-create', 'secret get'}
 # calls the module answers itself, for operations of its ledger (ledger.py)
 LOCAL = {'mgr cert', 'retire', 'retire host', 'bind disk', 'confirm osd', 'close create', 'osd out', 'drain', 'mon rm',
-         'ok to stop', 'noout set', 'noout unset', 'maintained', 'mgr fail'}
+         'ok to stop', 'noout set', 'noout unset', 'maintained', 'mgr fail', 'ok to stop daemon', 'upgrade done', 'upgrade refused'}
 
 ALLOWLIST: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     'status': _no_args('status'),
@@ -378,6 +380,9 @@ ALLOWLIST: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     'noout unset': _operation,
     'maintained': _operation,
     'mgr fail': _operation_with('gid'),
+    'ok to stop daemon': _operation_with('daemon'),
+    'upgrade done': _operation,
+    'upgrade refused': _operation,
 }
 
 
@@ -807,6 +812,8 @@ class Channel:
                     return self._maintenance(call, led, fold, op)
                 if call == 'mgr fail':
                     return self._mgr_fail(fold, op, (args or {}).get('gid'))
+                if call in ('ok to stop daemon', 'upgrade done', 'upgrade refused'):
+                    return self._upgrade(call, led, fold, op, (args or {}).get('daemon'))
                 if call in ('bind disk', 'confirm osd', 'close create'):
                     return self._creation(call, led, fold, op, args or {})
                 return self._retire_host(led, fold, ops, op)
@@ -954,7 +961,8 @@ class Channel:
         The active mgr respawns, so the answer may never come; done also when
         that gid is no longer the active one."""
         done = {'outcome': 'done', 'r': 0, 'out': '', 'outs': ''}
-        if op is None or op['kind'] not in ledger.STOPS or op['host'] not in fold.maintenance:
+        upgrading = op is not None and op['kind'] == 'upgrade_start' and (fold.upgrade or {}).get('op') == op['id']
+        if not upgrading and (op is None or op['kind'] not in ledger.STOPS or op['host'] not in fold.maintenance):
             return 400, {'error': 'no operation that must stop the active mgr'}
         job = self._mon({'prefix': 'mgr dump', 'format': 'json'})
         if job is None or job.r != 0 or job.too_large:
@@ -967,11 +975,35 @@ class Channel:
             return 503, {'error': 'cannot read the mgr map; ask again'}
         if active_gid != gid:
             return 200, done
-        if active != op['host'] or 'mgr.' + op['host'] not in fold.daemons:
+        if not upgrading and (active != op['host'] or 'mgr.' + op['host'] not in fold.daemons):
             return 400, {'error': 'the active mgr is not on %s' % op['host']}
         if not standbys:
             return 409, {'error': 'no standby mgr is available'}
-        self._mon({'prefix': 'mgr fail', 'who': str(gid)}, 'mgr.' + op['host'])
+        self._mon({'prefix': 'mgr fail', 'who': str(gid)}, 'mgr.%s' % active)
+        return 200, done
+
+    def _upgrade(self, call: str, led: Any, fold: Any, op: Optional[Dict[str, Any]], daemon: Optional[str]) -> Tuple[int, Dict[str, Any]]:
+        """The module's steps of the upgrade in progress: Ceph's check that one
+        daemon of a step can stop, and the end of the upgrade in the fold."""
+        done = {'outcome': 'done', 'r': 0, 'out': '', 'outs': ''}
+        if op is None or op['kind'] != 'upgrade_start':
+            return 400, {'error': 'no upgrade'}
+        if (fold.upgrade or {}).get('op') != op['id']:
+            return (200, done) if call != 'ok to stop daemon' else (400, {'error': 'the upgrade is not in progress'})
+        if call != 'ok to stop daemon':
+            led.append({'id': 'm-' + secrets.token_hex(8), 'kind': call.replace(' ', '_'), 'of': op['id']})
+            return 200, done
+        if daemon not in fold.daemons:
+            return 400, {'error': '%s is not a daemon of the cluster' % daemon}
+        t, i = daemon.split('.', 1)
+        if t not in ('osd', 'mon'):
+            return 200, done
+        cmd = {'prefix': 'osd ok-to-stop', 'ids': [i], 'max': 16, 'format': 'json'} if t == 'osd' else {'prefix': 'mon ok-to-stop', 'ids': [i]}
+        job = self._mon(cmd)
+        if job is None:
+            return 503, {'error': '%s: no answer; ask again' % cmd['prefix']}
+        if job.r != 0:
+            return 409, {'error': '%s: %s' % (cmd['prefix'], job.outs.strip()[:500])}
         return 200, done
 
     def _creation(self, call: str, led: Any, fold: Any, op: Optional[Dict[str, Any]], args: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:

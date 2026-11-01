@@ -234,3 +234,33 @@ class MaintenanceFoldTest(unittest.TestCase):
             k, e = entry(5, 9, 'op-%016x' % 9, **bad)
             with self.assertRaises(lg.LedgerError, msg=bad):
                 lg.check_entry(k, json.dumps(e))
+
+
+class UpgradeFoldTest(unittest.TestCase):
+    IMG = 'quay.io/ceph/ceph@sha256:' + 'cd' * 32
+
+    def test_from_start_until_done_or_stop(self):
+        inv = GenerationTest.INV
+        start = entry(5, 1, 'op-%016x' % 1, kind='upgrade_start', image=self.IMG)
+        pause = entry(5, 2, 'op-%016x' % 2, kind='upgrade_pause', upgrade='op-%016x' % 1)
+        resume = entry(5, 3, 'op-%016x' % 3, kind='upgrade_resume', upgrade='op-%016x' % 1)
+        done = entry(5, 4, 'm-%016x' % 4, kind='upgrade_done', of='op-%016x' % 1)
+        stop = entry(5, 4, 'op-%016x' % 4, kind='upgrade_stop', upgrade='op-%016x' % 1)
+        for k, e in (start, pause, resume, done, stop):
+            lg.check_entry(k, json.dumps(e))
+        self.assertEqual(lg.Fold(inv, [start]).upgrade, {'op': 'op-%016x' % 1, 'image': self.IMG, 'paused': False})
+        self.assertTrue(lg.Fold(inv, [start, pause]).upgrade['paused'])
+        self.assertFalse(lg.Fold(inv, [start, pause, resume]).upgrade['paused'])
+        self.assertIsNone(lg.Fold(inv, [start, done]).upgrade)
+        self.assertIsNone(lg.Fold(inv, [start, stop]).upgrade)
+        # a second start beside the first does not replace it
+        second = entry(5, 5, 'op-%016x' % 5, kind='upgrade_start', image=self.IMG)
+        self.assertEqual(lg.Fold(inv, [start, second]).upgrade['op'], 'op-%016x' % 1)
+        for bad in (dict(kind='upgrade_start', image='quay.io/ceph/ceph:v20'), dict(kind='upgrade_start', image=self.IMG, host='h1'),
+                    dict(kind='upgrade_pause'), dict(kind='upgrade_stop', upgrade='op-1')):
+            k, e = entry(5, 9, 'op-%016x' % 9, **bad)
+            with self.assertRaises(lg.LedgerError, msg=bad):
+                lg.check_entry(k, json.dumps(e))
+        k, e = entry(5, 9, 'm-%016x' % 9, kind='upgrade_done', of='op-%016x' % 1, host='h1')
+        with self.assertRaises(lg.LedgerError):
+            lg.check_entry(k, json.dumps(e))

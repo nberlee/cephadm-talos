@@ -239,7 +239,7 @@ func OSDPrepare(s *state.State, h state.Host, d state.Daemon, key Key) (*spec.Co
 	}
 
 	return daemons.OSDPrepare(daemons.Params{
-		Name: OSDPrepareName(s, d), Image: s.Image, FSID: s.FSID, ID: "job",
+		Name: OSDPrepareName(s, d), Image: s.ImageOf(d), FSID: s.FSID, ID: "job",
 		Keyring: daemons.Keyring("client.bootstrap-osd", k), Device: d.DevicePath, DiskSerial: d.DiskSerial,
 	}, d.DeployID, OSDPrepareInputs(s, h, d)), nil
 }

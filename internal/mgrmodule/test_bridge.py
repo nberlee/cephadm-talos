@@ -1003,6 +1003,34 @@ class MaintenanceCallsTest(unittest.TestCase):
         self.assertEqual(self.call('mgr fail', operation=enter, gid='42')[0], 400)
 
 
+class UpgradeCallsTest(unittest.TestCase):
+    setUp, call = LedgerCallsTest.setUp, LedgerCallsTest.call
+    IMG = 'quay.io/ceph/ceph@sha256:' + 'cd' * 32
+
+    def test_checks_mgr_fail_and_the_end(self):
+        inv = inventory('mon.h1@h1', 'mgr.h1@h1', 'mgr.h2@h2', 'osd.3@h1', 'rgw.h1@h1')
+        self.ch.authority = lambda: (self.led, lg.Fold(inv, self.led.executable()))
+        start = self.led.append({'id': 'op-%016x' % 700, 'kind': 'upgrade_start', 'image': self.IMG})[1]['id']
+        self.mons.not_ok = {'osd ok-to-stop'}
+        self.assertEqual(self.call('ok to stop daemon', operation=start, daemon='osd.3')[0], 409)
+        self.mons.not_ok = set()
+        for d in ('osd.3', 'mon.h1', 'rgw.h1'):
+            self.assertEqual(self.call('ok to stop daemon', operation=start, daemon=d)[1]['outcome'], 'done', d)
+        self.assertEqual(self.mons.maint_calls, [('osd ok-to-stop', ['3']), ('osd ok-to-stop', ['3']), ('mon ok-to-stop', ['h1'])])
+        self.assertEqual(self.call('ok to stop daemon', operation=start, daemon='osd.9')[0], 400)
+        # mgr fail of the active one, by its gid, with a standby, for the upgrade in progress
+        self.mons.maps = [dict(mgrmap(42, 'h1'), standbys=[{'gid': 50, 'name': 'h2', 'available': True}])]
+        self.assertEqual(self.call('mgr fail', operation=start, gid=42)[1]['outcome'], 'done')
+        self.assertEqual(self.mons.maint_calls[-1], ('mgr fail', '42'))
+        self.assertEqual(self.call('upgrade done', operation=start)[1]['outcome'], 'done')
+        self.assertIsNone(self.ch.authority()[1].upgrade)
+        # once ended, nothing more for it
+        self.assertEqual(self.call('upgrade refused', operation=start)[1]['outcome'], 'done')
+        self.assertEqual(self.call('ok to stop daemon', operation=start, daemon='osd.3')[0], 400)
+        self.assertEqual(self.call('mgr fail', operation=start, gid=42)[0], 400)
+        self.assertEqual(len([e for _, e in self.led.executable() if e['kind'] in ('upgrade_done', 'upgrade_refused')]), 1)
+
+
 class RemovalTest(LedgerCallsTest):
     UUID = '8f2c0a4e-1d3b-4c5a-9e6f-7a8b9c0d1e2f'
 

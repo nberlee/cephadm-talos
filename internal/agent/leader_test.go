@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"github.com/nberlee/cephadm-talos/internal/approval"
 	"github.com/siderolabs/talos/pkg/machinery/resources/block"
+	"github.com/siderolabs/talos/pkg/machinery/resources/containers"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -1934,5 +1935,175 @@ func TestPowercycleStopsRebootsAndStarts(t *testing.T) {
 
 	if rep, err := s.agent.Node.Report(ctx); err != nil || rep.Owned["ContainerConfig/ceph-"+testFSID[:8]+"-mon-h1"] == "" {
 		t.Fatalf("the mon did not come back: %v", err)
+	}
+}
+
+func TestAnUpgradeProbesAndStepsDaemonByDaemon(t *testing.T) {
+	s := newLeaderSetup(t)
+	ctx := context.Background()
+
+	target := "quay.io/ceph/ceph@sha256:" + strings.Repeat("cd", 32)
+
+	appr, err := approval.Sign(testApprovalPriv, approval.Approval{Version: approval.Version, FSID: testFSID, Serial: 2, Images: []string{testImage, target}})
+	must(t, err)
+
+	b, _ := json.Marshal(appr)
+
+	s.module.mu.Lock()
+	s.module.approval, s.module.active, s.module.quorum = string(b), "h0", []string{"h1"}
+	s.module.mu.Unlock()
+
+	s.st.CephVersion, s.st.Arch = "20.2.4", "x86_64"
+	publish(t, s.leader, s.module, s.st)
+
+	s.request("r1", `{"version":1,"kind":"revision","host":"h1"}`)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	monName := "ceph-" + testFSID[:8] + "-mon-h1"
+	addInstance(t, s.agent.fake, monName, 1)
+
+	before, err := s.agent.Node.Report(ctx)
+	must(t, err)
+
+	up := s.accept(KindUpgrade, "", "", 1)
+	up.Op.Image = target
+	s.module.mu.Lock()
+	s.module.ledger[len(s.module.ledger)-1] = up
+	s.module.mu.Unlock()
+
+	// the probe on the mon's host; its result gives the version and architecture
+	must(t, s.leader.Tick(ctx, 42, 5))
+	finishJob(t, s.agent, up.Op.ID+".probe", 0, "ceph version 20.2.5 (0123) tentacle (stable)\narch x86_64")
+
+	for i := 0; i < 3; i++ {
+		must(t, s.leader.Tick(ctx, 42, 5))
+	}
+
+	if op := s.op(t, up.Op.ID); op.State != "completed" {
+		t.Fatalf("start: %+v", op)
+	}
+
+	monDoc := "ContainerConfig/ceph-" + testFSID[:8] + "-mon-h1"
+
+	// the mon's step: its image set, its host's revision granted; it waits for
+	// a newer instance, then for the mon in the quorum
+	for i := 0; i < 3; i++ {
+		must(t, s.leader.Tick(ctx, 42, 5))
+	}
+
+	if st, _, err := s.leader.clusterState(ctx, s.leader.bridge()); err != nil || st.Upgrade == nil || st.Upgrade.Step != monName {
+		t.Fatalf("the step ended without a new instance: %+v %v", st.Upgrade, err)
+	}
+
+	addInstance(t, s.agent.fake, monName, 2)
+
+	// running the target: its status has the target's digest
+	cs := containers.NewContainerStatus(containers.NamespaceName, monName)
+	cs.TypedSpec().State, cs.TypedSpec().Image = containers.ContainerStateRunning, "sha256:"+strings.Repeat("cd", 32)
+	must(t, s.agent.fake.St.Create(ctx, cs))
+
+	for i := 0; i < 4; i++ {
+		must(t, s.leader.Tick(ctx, 42, 5))
+	}
+
+	after, err := s.agent.Node.Report(ctx)
+	must(t, err)
+
+	if before.Owned[monDoc] == after.Owned[monDoc] {
+		t.Fatal("the mon's document did not change")
+	}
+
+	st, _, err := s.leader.clusterState(ctx, s.leader.bridge())
+	must(t, err)
+
+	if st.Upgrade != nil || st.Image != target || st.CephVersion != "20.2.5" {
+		t.Fatalf("after the upgrade: %+v %s %s", st.Upgrade, st.Image, st.CephVersion)
+	}
+
+	if d, _ := st.Find("mon.h1"); d.Image != "" {
+		t.Fatalf("the mon keeps its own image: %+v", d)
+	}
+
+	s.module.mu.Lock()
+	calls := slices.Clone(s.module.retired)
+	s.module.mu.Unlock()
+
+	if !slices.Contains(calls, "upgrade done "+up.Op.ID) {
+		t.Fatalf("calls %v", calls)
+	}
+}
+
+func TestAnUnapprovedUpgradeIsRefusedAndControlsChangeTheRecord(t *testing.T) {
+	s := newLeaderSetup(t)
+	ctx := context.Background()
+
+	target := "quay.io/ceph/ceph@sha256:" + strings.Repeat("ef", 32)
+
+	s.module.mu.Lock()
+	s.module.active = "h0"
+	s.module.mu.Unlock()
+
+	up := s.accept(KindUpgrade, "", "", 1)
+	up.Op.Image = target
+	s.module.mu.Lock()
+	s.module.ledger[len(s.module.ledger)-1] = up
+	s.module.mu.Unlock()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if op := s.op(t, up.Op.ID); op.State != JournalFailed || !strings.Contains(op.Error, "approved") {
+		t.Fatalf("unapproved: %+v", op)
+	}
+
+	s.module.mu.Lock()
+	calls := slices.Clone(s.module.retired)
+	s.module.mu.Unlock()
+
+	if !slices.Equal(calls, []string{"upgrade refused " + up.Op.ID}) {
+		t.Fatalf("calls %v", calls)
+	}
+
+	// the controls of an upgrade in progress change its record alone
+	must(t, s.leader.changeState(ctx, s.leader.bridge(), 42, func(st *state.State) error {
+		st.Upgrade = &state.Upgrade{Op: "op-00000000000000aa", Image: target, Version: "20.2.5", Done: []string{}}
+
+		return nil
+	}))
+
+	control := func(kind string, seq int64) {
+		e := s.accept(kind, "", "", seq)
+		e.Op.Upgrade = "op-00000000000000aa"
+		s.module.mu.Lock()
+		s.module.ledger[len(s.module.ledger)-1] = e
+		s.module.mu.Unlock()
+		must(t, s.leader.Tick(ctx, 42, 5))
+	}
+
+	upgrade := func() *state.Upgrade {
+		st, _, err := s.leader.clusterState(ctx, s.leader.bridge())
+		must(t, err)
+
+		return st.Upgrade
+	}
+
+	control(KindUpPause, 2)
+
+	if u := upgrade(); u == nil || !u.Paused || u.Step != "" {
+		t.Fatalf("paused: %+v", u)
+	}
+
+	control(KindUpResume, 3)
+
+	if u := upgrade(); u == nil || u.Paused {
+		t.Fatalf("resumed: %+v", u)
+	}
+
+	// a stop with a step in progress ends with that step (one not granted is dropped)
+	control(KindUpStop, 4)
+	must(t, s.leader.Tick(ctx, 42, 5))
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if u := upgrade(); u != nil {
+		t.Fatalf("stopped: %+v", u)
 	}
 }

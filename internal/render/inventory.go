@@ -46,6 +46,20 @@ type Inventory struct {
 	CertExpiry  *time.Time        `json:"cert_expiry,omitempty"`
 	Hosts       []InventoryHost   `json:"hosts"`
 	Daemons     []InventoryDaemon `json:"daemons"`
+	// Upgrade is the upgrade in progress, as the module reports it
+	Upgrade *InventoryUpgrade `json:"upgrade,omitempty"`
+}
+
+// InventoryUpgrade is an upgrade in progress: the module accepts its controls
+// from its ledger and reports this progress in `orch upgrade status`.
+type InventoryUpgrade struct {
+	Op      string   `json:"op"`
+	Image   string   `json:"image"`
+	Version string   `json:"version"`
+	Paused  bool     `json:"paused,omitempty"`
+	Error   string   `json:"error,omitempty"`
+	Step    string   `json:"step,omitempty"`
+	Done    []string `json:"done"`
 }
 
 // InventoryOf derives the mgr module's view of the cluster from the state,
@@ -61,7 +75,7 @@ func InventoryOf(s *state.State) Inventory {
 	}
 
 	for _, d := range s.Daemons {
-		id, typ, svc, img := d.ID, d.Type, d.Type, s.Image
+		id, typ, svc, img := d.ID, d.Type, d.Type, s.ImageOf(d)
 
 		switch d.Type {
 		case state.TypeOSD:
@@ -82,6 +96,10 @@ func InventoryOf(s *state.State) Inventory {
 			DocName: s.DocName(d), Host: d.Host, DaemonType: typ, DaemonID: id, ServiceName: svc,
 			DesiredImage: img, LocalOnly: d.LocalOnly, OSDUUID: d.OSDUUID,
 		})
+	}
+
+	if u := s.Upgrade; u != nil {
+		inv.Upgrade = &InventoryUpgrade{Op: u.Op, Image: u.Image, Version: u.Version, Paused: u.Paused, Error: u.Error, Step: u.Step, Done: append([]string{}, u.Done...)}
 	}
 
 	if t, ok := earliestCertExpiry(s); ok {

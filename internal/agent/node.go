@@ -123,6 +123,7 @@ type Node struct {
 		BootID(ctx context.Context, node string) (string, error)
 		Instance(ctx context.Context, node, name string) (string, error)
 		InstanceOwners(ctx context.Context, node string) ([]string, error)
+		CurrentInstances(ctx context.Context, node string) (map[string]string, error)
 		ContainerStatuses(ctx context.Context, node string) (map[string]containers.ContainerStatusSpec, error)
 		RestartInstance(ctx context.Context, node, id string) error
 		RebootNow(ctx context.Context, node string) error
@@ -686,14 +687,31 @@ func (n *Node) Report(ctx context.Context) (wire.NodeReport, error) {
 
 	// the cluster's containers that still have an instance: a removed daemon
 	// is gone once its name is not here
-	owners, err := n.Talos.InstanceOwners(ctx, "")
+	cur, err := n.Talos.CurrentInstances(ctx, "")
 	if err != nil {
 		return r, err
 	}
 
-	for _, name := range owners {
+	r.Current = map[string]string{}
+
+	for name, id := range cur {
 		if strings.HasPrefix(name, n.prefix()) {
-			r.Instances = append(r.Instances, name)
+			r.Instances, r.Current[name] = append(r.Instances, name), id
+		}
+	}
+
+	sort.Strings(r.Instances)
+
+	statuses, err := n.Talos.ContainerStatuses(ctx, "")
+	if err != nil {
+		return r, err
+	}
+
+	r.Running = map[string]string{}
+
+	for name, s := range statuses {
+		if strings.HasPrefix(name, n.prefix()) && s.State == containers.ContainerStateRunning {
+			r.Running[name] = s.Image
 		}
 	}
 

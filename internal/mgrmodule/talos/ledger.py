@@ -26,14 +26,19 @@ ENTRY_VERSION = 1
 KEY_RE = re.compile(r'\A(\d{20})-(\d{10})-(takeover|op-[0-9a-f]{16}|m-[0-9a-f]{16})\Z')
 OP_RE = re.compile(r'\Aop-[0-9a-f]{16}\Z')
 # kinds an operation entry may have; ADDS and REMOVES change the fold
-KINDS = ('restart', 'redeploy', 'add_daemon', 'remove_daemon', 'remove_host', 'create_osd', 'remove_osd', 'enter_maintenance', 'exit_maintenance', 'powercycle_host')
+KINDS = ('restart', 'redeploy', 'add_daemon', 'remove_daemon', 'remove_host', 'create_osd', 'remove_osd', 'enter_maintenance', 'exit_maintenance', 'powercycle_host',
+         'upgrade_start', 'upgrade_pause', 'upgrade_resume', 'upgrade_stop')
+# the upgrade's kinds, operations and module entries: about the cluster, without a host
+UPGRADE_CONTROLS = ('upgrade_pause', 'upgrade_resume', 'upgrade_stop')
+UPGRADE_KINDS = ('upgrade_start',) + UPGRADE_CONTROLS + ('upgrade_done', 'upgrade_refused')
+IMAGE_RE = re.compile(r'\A[a-z0-9][a-z0-9._/:-]{0,254}@sha256:[0-9a-f]{64}\Z')
 # kinds that are about a whole host: every other operation on it waits for them
 HOST_KINDS = ('remove_host', 'enter_maintenance', 'exit_maintenance', 'powercycle_host')
 # kinds that stop a host's daemons, and that start them again
 STOPS, STARTS = ('enter_maintenance', 'powercycle_host'), ('exit_maintenance', 'powercycle_host')
 # the module's own entries (ids m-<hex>), which carry out a removal: close a
 # daemon's generation, retire the daemon, retire a host; end a host's maintenance
-MODULE_KINDS = ('close', 'retire', 'retire_host', 'bind', 'confirm', 'close_create', 'drained', 'maintained')
+MODULE_KINDS = ('close', 'retire', 'retire_host', 'bind', 'confirm', 'close_create', 'drained', 'maintained', 'upgrade_done', 'upgrade_refused')
 DEVICE_RE = re.compile(r'\A/dev/[A-Za-z0-9][A-Za-z0-9._:/-]{0,200}\Z')
 SERIAL_RE = re.compile(r'\A[A-Za-z0-9._-]{1,64}\Z')
 UUID_RE_OSD = re.compile(r'\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z')
@@ -80,12 +85,14 @@ def check_entry(key: str, raw: str) -> Dict[str, Any]:
     kind, daemon, host = e.get('kind'), e.get('daemon'), e.get('host')
     ok_daemon = isinstance(daemon, str) and DAEMON_RE.match(daemon) is not None
     ok_host = isinstance(host, str) and HOST_RE.match(host) is not None
-    if e['seq'] < 1 or not ok_host:
+    if e['seq'] < 1 or not (ok_host or kind in UPGRADE_KINDS and 'host' not in e):
         raise LedgerError('entry %s' % key)
     if e['id'].startswith('m-'):
         if kind not in MODULE_KINDS or not isinstance(e.get('of'), str) or not OP_RE.match(e['of']):
             raise LedgerError('module entry %s' % key)
         if kind in ('close', 'retire', 'drained') and not ok_daemon:
+            raise LedgerError('module entry %s' % key)
+        if (kind in UPGRADE_KINDS) != ('host' not in e) or kind in UPGRADE_KINDS and daemon is not None:
             raise LedgerError('module entry %s' % key)
         if kind == 'bind' and not (isinstance(e.get('serial'), str) and SERIAL_RE.match(e['serial'])
                                    and isinstance(e.get('link'), str) and e['link'].startswith('/dev/disk/by-id/')
@@ -96,6 +103,18 @@ def check_entry(key: str, raw: str) -> Dict[str, Any]:
         return e
     if kind not in KINDS or (e.get('request') is not None and not (isinstance(e['request'], str) and UUID_RE.match(e['request']))):
         raise LedgerError('operation entry %s' % key)
+    if (kind in UPGRADE_KINDS) != ('host' not in e):
+        raise LedgerError('operation entry %s' % key)
+    if kind == 'upgrade_start':
+        if not isinstance(e.get('image'), str) or not IMAGE_RE.match(e['image']) \
+                or set(e) - {'version', 'id', 'kind', 'image', 'gid', 'epoch', 'seq', 'request'}:
+            raise LedgerError('operation entry %s' % key)
+        return e
+    if kind in UPGRADE_CONTROLS:
+        if not isinstance(e.get('upgrade'), str) or not OP_RE.match(e['upgrade']) \
+                or set(e) - {'version', 'id', 'kind', 'upgrade', 'gid', 'epoch', 'seq', 'request'}:
+            raise LedgerError('operation entry %s' % key)
+        return e
     if kind in ('remove_host', 'exit_maintenance', 'powercycle_host'):
         if daemon is not None or (kind != 'remove_host' and set(e) - {'version', 'id', 'kind', 'host', 'gid', 'epoch', 'seq', 'request'}):
             raise LedgerError('operation entry %s' % key)
@@ -182,6 +201,9 @@ class Fold:
         # creations of OSDs: op id -> {'host', 'bind': entry or None, 'confirmed', 'closed'}
         self.creations: Dict[str, Dict[str, Any]] = {}
         self.maintenance = {h['name'] for h in inventory['hosts'] if h.get('maintenance')}
+        # the upgrade in progress: {'op', 'image', 'paused'} from its start's
+        # acceptance until done, refused, or a stop's acceptance
+        self.upgrade: Optional[Dict[str, Any]] = None
         for d in inventory['daemons']:
             if d.get('daemon_id'):
                 name = '%s.%s' % (d['daemon_type'], d['daemon_id'])
@@ -205,6 +227,13 @@ class Fold:
                 self.maintenance.add(e['host'])
             elif kind == 'maintained':
                 self.maintenance.discard(e['host'])
+            elif kind == 'upgrade_start' and self.upgrade is None:
+                self.upgrade = {'op': e['id'], 'image': e['image'], 'paused': False}
+            elif self.upgrade is not None and e.get('upgrade', e.get('of')) == self.upgrade['op'] and kind in UPGRADE_KINDS:
+                if kind in ('upgrade_pause', 'upgrade_resume'):
+                    self.upgrade['paused'] = kind == 'upgrade_pause'
+                else:
+                    self.upgrade = None
             elif kind == 'create_osd' and e['host'] in self.hosts:
                 self.creations[e['id']] = {'host': e['host'], 'bind': None, 'confirmed': False, 'closed': False}
             elif kind == 'bind' and e['of'] in self.creations and self.creations[e['of']]['bind'] is None:

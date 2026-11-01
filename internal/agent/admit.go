@@ -541,6 +541,19 @@ func (p *Policy) admitJob(kind string, d Doc, td typedDoc, env map[string]string
 		return errors.New("ID, ADDR, DEPLOY_ID: not a job's")
 	}
 
+	// a job without a disk is the image probe, exactly (plan 03, step 6d)
+	if kind == "job" && env["DEVICE"] == "" {
+		if env["CMD"] != daemons.ProbeCmd {
+			return errors.New("CMD: a job without a disk is the image probe")
+		}
+
+		if _, err := keyring(env["CEPHADM_TALOS_KEYRING"], ""); err != nil {
+			return err
+		}
+
+		return same(td, daemons.ProbeJob(params, job, p.Host))
+	}
+
 	serial, err := device(env["DEVICE"], f)
 	if err != nil {
 		return err

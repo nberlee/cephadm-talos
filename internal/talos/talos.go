@@ -716,6 +716,24 @@ func (c *Client) Instance(ctx context.Context, node, name string) (string, error
 // InstanceOwners returns the ContainerConfig containers that have an instance
 // on node, running or not yet cleaned up.
 func (c *Client) InstanceOwners(ctx context.Context, node string) ([]string, error) {
+	cur, err := c.CurrentInstances(ctx, node)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]string, 0, len(cur))
+	for id := range cur {
+		out = append(out, id)
+	}
+
+	sort.Strings(out)
+
+	return out, nil
+}
+
+// CurrentInstances returns, for every ContainerConfig container with an
+// instance on node, its newest instance (Instance).
+func (c *Client) CurrentInstances(ctx context.Context, node string) (map[string]string, error) {
 	cl, nctx, err := c.node(ctx, node, "list instances")
 	if err != nil {
 		return nil, err
@@ -726,18 +744,14 @@ func (c *Client) InstanceOwners(ctx context.Context, node string) ([]string, err
 		return nil, wrap("list containerinstancespec on "+node, err)
 	}
 
-	seen := map[string]bool{}
-
-	var out []string
+	out, gens := map[string]string{}, map[string]uint64{}
 
 	for r := range list.All() {
-		if id := r.TypedSpec().ContainerID; !seen[id] {
-			seen[id] = true
-			out = append(out, id)
+		s := r.TypedSpec()
+		if _, ok := out[s.ContainerID]; !ok || s.Generation > gens[s.ContainerID] {
+			out[s.ContainerID], gens[s.ContainerID] = r.Metadata().ID(), s.Generation
 		}
 	}
-
-	sort.Strings(out)
 
 	return out, nil
 }

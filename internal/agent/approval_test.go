@@ -577,3 +577,26 @@ func TestAcknowledgementsAreIdempotentAndFenced(t *testing.T) {
 		t.Fatalf("an acknowledgement below the fence: %+v", res)
 	}
 }
+
+func TestAJobWithoutADiskIsTheProbe(t *testing.T) {
+	g := newTestGranter(t)
+	ctx := context.Background()
+
+	id := "0123456789abcdef"
+	p := daemons.Params{Name: "ceph-" + testFSID[:8] + "-job-" + id, Image: testImage, FSID: testFSID, ID: "job"}
+
+	// any other command, or other inputs, is refused
+	other := daemons.Job(p, id, daemons.ProbeInputs(testFSID, "h1", testImage), "rm -rf /var/lib/ceph")
+	if op, err := g.Grant(ctx, grantOf(t, 2, "op-q1", other)); err != nil || op.State != wire.OpRefused || !strings.Contains(op.Error, "probe") {
+		t.Fatalf("another command: %+v %v", op, err)
+	}
+
+	foreign := daemons.Job(p, id, daemons.ProbeInputs(testFSID, "h9", testImage), daemons.ProbeCmd)
+	if op, err := g.Grant(ctx, grantOf(t, 3, "op-q2", foreign)); err != nil || op.State != wire.OpRefused {
+		t.Fatalf("inputs of another host: %+v %v", op, err)
+	}
+
+	if op, err := g.Grant(ctx, grantOf(t, 4, "op-q3", daemons.ProbeJob(p, id, "h1"))); err != nil || op.State != wire.OpStarted {
+		t.Fatalf("the probe: %+v %v", op, err)
+	}
+}
