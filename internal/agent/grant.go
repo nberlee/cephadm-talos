@@ -121,8 +121,12 @@ func (g *Granter) checkGrant(gr wire.Grant, leader string) error {
 		return errors.New("the grant's mgr is not the sender's host")
 	case pki.ValidName(gr.Mgr) != nil || gr.GID <= 0 || gr.Epoch <= 0 || gr.Revision <= 0 || !operationRe.MatchString(gr.Operation):
 		return errors.New("malformed grant")
-	case len(gr.Docs) == 0:
+	case len(gr.Docs) == 0 && gr.Restart == nil:
 		return errors.New("a grant without documents")
+	case len(gr.Docs) > 0 && gr.Restart != nil:
+		return errors.New("a grant with documents and a restart")
+	case gr.Restart != nil && (gr.Restart.Kind != "ContainerConfig" || gr.Restart.Name == "" || gr.Restart.Hash == ""):
+		return errors.New("a restart without a ContainerConfig, name or hash")
 	}
 
 	if _, err := netip.ParseAddr(gr.MgrAddr); err != nil {
@@ -291,6 +295,21 @@ func (g *Granter) reconcile(ctx context.Context) error {
 			continue
 		}
 
+		// a restart changed no document: its instance tells
+		if op.Instance != "" {
+			out, err := g.Node.RestartOutcome(ctx, op.Instance, op.BootID, time.Unix(0, op.At))
+			if err != nil || out == "" {
+				continue // not known yet: it stays unresolved
+			}
+
+			op.State, op.Error = out, "reconciled from the daemon's instance"
+			if err := g.writeOp(op); err != nil {
+				return err
+			}
+
+			continue
+		}
+
 		switch {
 		case outcome == "uncertain" && op.Revision == rev:
 			continue // the node cannot tell
@@ -394,6 +413,10 @@ func (g *Granter) grant(ctx context.Context, gr wire.Grant) (wire.Operation, err
 		return unconfirmed(errors.New("the confirmation expired before the apply"))
 	}
 
+	if gr.Restart != nil {
+		return g.restart(ctx, gr, op, until)
+	}
+
 	op.State = wire.OpStarted
 	if err := g.writeOp(op); err != nil {
 		return wire.Operation{}, err
@@ -415,6 +438,34 @@ func (g *Granter) grant(ctx context.Context, gr wire.Grant) (wire.Operation, err
 	case err == nil:
 		op.State, op.Error = wire.OpCompleted, ""
 	case errors.Is(err, ErrNotApplied):
+		op.State, op.Error = wire.OpRefused, err.Error()
+	default:
+		op.State, op.Error = wire.OpUncertain, err.Error()
+	}
+
+	if err := g.writeOp(op); err != nil {
+		return op, err
+	}
+
+	return op, g.prune()
+}
+
+// restart runs a confirmed restart grant: the operation is recorded as started
+// with its instance before Talos is asked. Talos answers once it signalled the
+// daemon, before the daemon stopped, so the operation stays started, and an
+// error leaves it uncertain: reconcile decides both from the instance, and
+// until then the agent runs no other grant.
+func (g *Granter) restart(ctx context.Context, gr wire.Grant, op wire.Operation, until time.Time) (wire.Operation, error) {
+	started, err := g.Node.RestartBefore(ctx, until, gr.Revision, *gr.Restart, func(instance, boot string) error {
+		op.State, op.Instance, op.BootID, op.At = wire.OpStarted, instance, boot, time.Now().UnixNano()
+
+		return g.writeOp(op)
+	})
+
+	switch {
+	case err == nil:
+		op.State, op.Error = wire.OpStarted, "" // until a newer instance exists
+	case !started:
 		op.State, op.Error = wire.OpRefused, err.Error()
 	default:
 		op.State, op.Error = wire.OpUncertain, err.Error()

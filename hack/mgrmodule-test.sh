@@ -10,4 +10,4 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 PY=python3
 [ -x "$ROOT/.venv-mgrmodule/bin/python3" ] && PY=$ROOT/.venv-mgrmodule/bin/python3
 cd "$ROOT/internal/mgrmodule"
-PYTHONPATH="$PWD:$CEPH/src/pybind/mgr:$CEPH/src/pybind:$CEPH/src/python-common" exec "$PY" -m unittest -v test_talos test_bridge
+PYTHONPATH="$PWD:$CEPH/src/pybind/mgr:$CEPH/src/pybind:$CEPH/src/python-common" exec "$PY" -m unittest -v test_talos test_bridge test_ledger

@@ -673,16 +673,26 @@ func (c *Client) Restart(ctx context.Context, node, name string) error {
 		return nil
 	}
 
-	cl, nctx, err := c.node(ctx, node, "restart "+name)
+	id, err := c.Instance(ctx, node, name)
 	if err != nil {
 		return err
 	}
 
-	// containerd knows the container by its instance (ContainerInstanceSpec
-	// ID, e.g. <name>-3), not by the ContainerConfig name
+	return c.RestartInstance(ctx, node, id)
+}
+
+// Instance returns the current instance of a ContainerConfig container: the
+// ContainerInstanceSpec ID with the highest generation (e.g. <name>-3), by
+// which containerd knows it.
+func (c *Client) Instance(ctx context.Context, node, name string) (string, error) {
+	cl, nctx, err := c.node(ctx, node, "get instances of "+name)
+	if err != nil {
+		return "", err
+	}
+
 	list, err := safe.StateListAll[*containers.ContainerInstanceSpec](nctx, cl.COSI)
 	if err != nil {
-		return wrap("list containerinstancespec on "+node, err)
+		return "", wrap("list containerinstancespec on "+node, err)
 	}
 
 	var (
@@ -697,10 +707,27 @@ func (c *Client) Restart(ctx context.Context, node, name string) error {
 	}
 
 	if id == "" {
-		return fmt.Errorf("restart %s on %s: %w: no running instance", name, node, ErrNotFound)
+		return "", fmt.Errorf("%s on %s: %w: no running instance", name, node, ErrNotFound)
 	}
 
-	return wrap("restart "+name+" on "+node, cl.Restart(nctx, Namespace, common.ContainerDriver_CONTAINERD, id))
+	return id, nil
+}
+
+// RestartInstance restarts one instance (Instance) of a ContainerConfig
+// container: Talos stops it within its stop timeout and starts the next one.
+func (c *Client) RestartInstance(ctx context.Context, node, id string) error {
+	if c.DryRun {
+		fmt.Fprintf(c.Out, "# restart %s on %s\n", id, node)
+
+		return nil
+	}
+
+	cl, nctx, err := c.node(ctx, node, "restart "+id)
+	if err != nil {
+		return err
+	}
+
+	return wrap("restart "+id+" on "+node, cl.Restart(nctx, Namespace, common.ContainerDriver_CONTAINERD, id))
 }
 
 // EtcFileWritten reports whether a file below /etc (EtcFileConfig name, e.g.

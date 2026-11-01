@@ -399,6 +399,60 @@ func (b *Bridge) Secret(ctx context.Context, name string) (string, error) {
 	return res.Out, nil
 }
 
+// LedgerEntry is one operation the module accepted (internal/mgrmodule ledger.py).
+type LedgerEntry struct {
+	Key string
+	Op  LedgerOp
+}
+
+// LedgerOp is an operation entry of the ledger.
+type LedgerOp struct {
+	Version int    `json:"version"`
+	ID      string `json:"id"`
+	Kind    string `json:"kind"`
+	Daemon  string `json:"daemon"`
+	Host    string `json:"host"`
+	GID     int64  `json:"gid"`
+	Epoch   int64  `json:"epoch"`
+	Seq     int64  `json:"seq"`
+	Request string `json:"request,omitempty"`
+}
+
+// Ledger returns the executable operations after a ledger key, in the order
+// they run, a page at a time; more reports whether a later page exists.
+func (b *Bridge) Ledger(ctx context.Context, after string) (entries []LedgerEntry, more bool, err error) {
+	out, err := b.do(ctx, "ledger", map[string]any{"after": after})
+	if err != nil {
+		return nil, false, err
+	}
+
+	var page struct {
+		Entries [][2]json.RawMessage `json:"entries"`
+		More    bool                 `json:"more"`
+	}
+
+	if err := json.Unmarshal([]byte(out), &page); err != nil {
+		return nil, false, fmt.Errorf("bridge: ledger: %w", err)
+	}
+
+	prev := after
+
+	for _, raw := range page.Entries {
+		var e LedgerEntry
+		if err := json.Unmarshal(raw[0], &e.Key); err != nil || e.Key <= prev {
+			return nil, false, fmt.Errorf("bridge: ledger: keys out of order")
+		}
+
+		if err := json.Unmarshal(raw[1], &e.Op); err != nil {
+			return nil, false, fmt.Errorf("bridge: ledger entry %s: %w", e.Key, err)
+		}
+
+		entries, prev = append(entries, e), e.Key
+	}
+
+	return entries, page.More, nil
+}
+
 // AuthGetOrCreate returns the secret of a mgr or RGW identity, created with
 // the caps the module fixes for its type if mon auth has none.
 func (b *Bridge) AuthGetOrCreate(ctx context.Context, entity string) (string, error) {

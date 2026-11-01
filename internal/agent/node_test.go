@@ -31,13 +31,22 @@ func (failingPatch) Patch(context.Context, string, ...[]byte) error {
 func testNode(t *testing.T) (*Node, *talos.Client) {
 	t.Helper()
 
+	n, tc, _ := testNodeFake(t)
+
+	return n, tc
+}
+
+// testNodeFake is testNode with the fake Talos node behind it.
+func testNodeFake(t *testing.T) (*Node, *talos.Client, *talostest.Node) {
+	t.Helper()
+
 	f := talostest.New(t)
 	tc := &talos.Client{Dial: func(ctx context.Context, _ talos.Conn) (*client.Client, error) { return f.Dial(ctx) }}
 	t.Cleanup(func() { tc.Close() }) //nolint:errcheck
 
 	pol := &Policy{FSID: testFSID, Host: "h1", Repos: []string{"quay.io/ceph/ceph"}}
 
-	return &Node{Talos: tc, Records: &records.Store{Dir: t.TempDir()}, FSID: testFSID, Host: "h1", Policy: pol}, tc
+	return &Node{Talos: tc, Records: &records.Store{Dir: t.TempDir()}, FSID: testFSID, Host: "h1", Policy: pol}, tc, f
 }
 
 func yamlOf(t *testing.T, d any) []byte {

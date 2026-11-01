@@ -108,6 +108,8 @@ type Node struct {
 		Patch(ctx context.Context, node string, patches ...[]byte) error
 		Disks(ctx context.Context, node string) ([]*block.Disk, error)
 		BootID(ctx context.Context, node string) (string, error)
+		Instance(ctx context.Context, node, name string) (string, error)
+		RestartInstance(ctx context.Context, node, id string) error
 	}
 	Records *records.Store
 	// Policy admits the documents Apply applies; nil admits nothing
@@ -869,4 +871,148 @@ func (n *Node) apply(ctx context.Context, until time.Time, revision int64, docs 
 	}
 
 	return next, started, n.Records.Remove(applyRecord)
+}
+
+// RestartBefore restarts the current instance of one daemon document the node
+// owns with the given hash, under the same checks as an apply: handed over,
+// no uncertain apply, the revision above the fence, no drift, the confirmation
+// still counting. record is called with the instance and the boot before
+// Talos is asked; started reports whether it was, after which an error leaves
+// the outcome uncertain.
+func (n *Node) RestartBefore(ctx context.Context, until time.Time, revision int64, r wire.GrantRestart, record func(instance, boot string) error) (started bool, err error) {
+	if err := n.lock(ctx); err != nil {
+		return false, err
+	}
+	defer n.unlock()
+
+	if err := n.Records.Check(); err != nil {
+		return false, err
+	}
+
+	var intent applyIntent
+
+	if pending, err := n.readJSON(applyRecord, &intent); err != nil || pending {
+		if err == nil {
+			err = fmt.Errorf("the apply of revision %d has an uncertain outcome", intent.Revision)
+		}
+
+		return false, err
+	}
+
+	own, found, err := n.ownership()
+	if err != nil {
+		return false, err
+	}
+
+	if !found {
+		return false, errors.New("the node has not been handed over")
+	}
+
+	floor, err := n.fence()
+	if err != nil {
+		return false, err
+	}
+
+	if revision <= max(own.Revision, floor) {
+		return false, fmt.Errorf("revision %d is not newer than %d", revision, max(own.Revision, floor))
+	}
+
+	key := r.Kind + "/" + r.Name
+	if r.Kind != "ContainerConfig" || !n.cluster(r.Kind, r.Name) || n.handoff(key) || own.Docs[key] == "" || own.Docs[key] != r.Hash {
+		return false, fmt.Errorf("%s is not a document the agent owns with this content", key)
+	}
+
+	cfg, err := n.Talos.MachineConfig(ctx, "")
+	if err != nil {
+		return false, err
+	}
+
+	typed, err := typedDocs([]byte(cfg))
+	if err != nil {
+		return false, errors.New("machine config: does not decode") // the message may quote a key
+	}
+
+	cur := make(map[string]string, len(typed))
+	for k, d := range typed {
+		cur[k] = d.hash
+	}
+
+	if d := n.drift(own, cur); len(d) > 0 {
+		return false, fmt.Errorf("%w: %s", ErrDrift, strings.Join(d, ", "))
+	}
+
+	if n.Policy == nil || !n.Policy.daemon(r.Name, typed[key]) {
+		return false, fmt.Errorf("%s is not a daemon of the cluster", key)
+	}
+
+	instance, err := n.Talos.Instance(ctx, "", r.Name)
+	if err != nil {
+		return false, err
+	}
+
+	boot, err := n.Talos.BootID(ctx, "")
+	if err != nil {
+		return false, err
+	}
+
+	// the mutation boundary: the confirmation must still count
+	if !until.IsZero() && !time.Now().Before(until) {
+		return false, errors.New("the confirmation expired before the restart")
+	}
+
+	if err := record(instance, boot); err != nil {
+		return false, err
+	}
+
+	// the revision is fenced like an applied one: the grant cannot run again
+	// once its operation record is pruned
+	if floor < revision {
+		if err := n.writeJSON(fenceRecord, fence{Schema: ownershipSchema, Revision: revision}); err != nil {
+			return false, err
+		}
+	}
+
+	// and the confirmation must still count when the restart is sent
+	if !until.IsZero() && !time.Now().Before(until) {
+		return false, errors.New("the confirmation expired before the restart")
+	}
+
+	return true, n.Talos.RestartInstance(ctx, "", instance)
+}
+
+// RestartOutcome decides a restart that is started or uncertain: "refused" on
+// another boot (the call can no longer run), "completed" once a newer instance
+// than the recorded one exists (Talos stopped the old one, within its stop
+// timeout, and started the next), "refused" if the recorded one is still the
+// current one after ApplySettle, else "" (not known yet).
+func (n *Node) RestartOutcome(ctx context.Context, instance, boot string, at time.Time) (string, error) {
+	// a call of another boot can no longer run, whatever instances there are
+	now, err := n.Talos.BootID(ctx, "")
+	if err != nil {
+		return "", err
+	}
+
+	if now != boot {
+		return wire.OpRefused, nil
+	}
+
+	i := strings.LastIndex(instance, "-")
+	if i <= 0 {
+		return "", fmt.Errorf("instance %q has no generation", instance)
+	}
+
+	cur, err := n.Talos.Instance(ctx, "", instance[:i])
+	if err != nil {
+		return "", err
+	}
+
+	if cur != instance {
+		return wire.OpCompleted, nil
+	}
+
+	if time.Since(at) > ApplySettle {
+		return wire.OpRefused, nil
+	}
+
+	return "", nil
 }

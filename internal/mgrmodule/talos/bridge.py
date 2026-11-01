@@ -274,13 +274,26 @@ def _secret_get(args: Dict[str, Any]) -> Dict[str, Any]:
     return {'prefix': 'config-key get', 'key': SECRET_PREFIX + n}
 
 
+# the leader's view of the module's ledger (ledger.py): read in pages after a key
+LEDGER_PAGE = 128 << 10
+
+
+def _ledger(args: Dict[str, Any]) -> Dict[str, Any]:
+    _args(args, {'after'})
+    if not isinstance(args['after'], str) or len(args['after']) > MAX_KEY:
+        raise ValueError('after must be a ledger key or empty')
+    return {}  # answered by the module, not the mons
+
+
 # calls whose output is reduced in the mgr before it is kept and returned
 REDUCE: Dict[str, Callable[[Dict[str, Any]], Callable[[str], str]]] = {
     'config-key keys': lambda args: _keys_page(args['prefix'], args['after']),
 }
 
 # calls that change nothing: an answered one is not kept
-READ_ONLY = {'status', 'health', 'mgr dump', 'config-key keys', 'config-key get', 'entry limit', 'auth get', 'secret get'}
+READ_ONLY = {'status', 'health', 'mgr dump', 'config-key keys', 'config-key get', 'entry limit', 'auth get', 'secret get', 'ledger'}
+# calls that release a credential: checked against the fold, while active
+CREDENTIALS = {'auth get', 'auth get-or-create', 'secret get'}
 
 ALLOWLIST: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     'status': _no_args('status'),
@@ -294,6 +307,7 @@ ALLOWLIST: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     'auth get': _auth_get,
     'auth get-or-create': _auth_get_or_create,
     'secret get': _secret_get,
+    'ledger': _ledger,
 }
 
 
@@ -471,9 +485,10 @@ class Channel:
 
     def __init__(self, fsid: str, mgr_id: str, leadership: Leadership, bridge_commands: Commands,
                  server_ctx: Optional[ssl.SSLContext], server_key: bytes,
-                 require_identity: Callable[..., str], log: Any, mgr_hosts: Callable[[], Set[str]]) -> None:
+                 require_identity: Callable[..., str], log: Any, authority: Callable[[], Any]) -> None:
         self.fsid = fsid
-        self.mgr_hosts = mgr_hosts
+        # authority returns (ledger.Ledger, ledger.Fold); it raises while there is none
+        self.authority = authority
         self.mgr_id = mgr_id
         self.leadership = leadership
         self.commands = bridge_commands
@@ -516,19 +531,29 @@ class Channel:
             cmd = ALLOWLIST[call](args)
         except ValueError as e:
             return 400, {'error': str(e)}
-        if call == 'secret get':
-            m = SECRET_RE.match(args['name'])
-            if m and m.group(1) is not None and m.group(1) not in self.mgr_hosts():
-                return 400, {'error': 'secret not allowed'}
         cap = self.leadership.captured()
         if cap is None:
             return 503, {'error': 'no captured incarnation'}
+        if call == 'ledger' or call in CREDENTIALS:
+            try:
+                led, fold = self.authority()
+            except Exception as e:
+                return 503, {'error': 'no ledger yet: %s' % e}
+            if call == 'ledger':
+                return 200, self._ledger_page(led, args['after'])
+            allowed = fold.entity_allowed(args['entity']) if call != 'secret get' else \
+                fold.secret_allowed(args['name'], SECRET_RE.match(args['name']).group(1))
+            if not allowed:
+                return 400, {'error': '%s not allowed: not in the accepted cluster' % call}
+            # a credential goes out only while the mons show this incarnation active
+            if not self.leadership.still_active(self.commands):
+                return 409, {'error': 'not confirmed as the active mgr'}
         # writes go to this incarnation's own namespace only; reads are cluster-wide
         if call in ('config-key set', 'config-key rm') and not cmd['key'].startswith('%sinc/%d/' % (STORE_PREFIX_FULL, cap[0])):
             return 400, {'error': 'writes only below this incarnation'}
         # a change is made only while the mons still show this incarnation active
         # (checked before, not atomically with, the change)
-        if call not in READ_ONLY and not self.leadership.still_active(self.commands):
+        if call not in READ_ONLY and call not in CREDENTIALS and not self.leadership.still_active(self.commands):
             return 409, {'error': 'not confirmed as the active mgr'}
         rec = Record()
         with self.lock:
@@ -552,12 +577,28 @@ class Channel:
         if job.ev.wait(float(deadline)):
             out = self._outcome(dispatch, rec)
             with self.lock:
-                if call in READ_ONLY:
+                if call in READ_ONLY or call in CREDENTIALS:
                     self.records.pop(dispatch, None)
                 else:
                     rec.answered = True
             return 200, out
+        if call in CREDENTIALS:
+            # a credential is never kept for a later fetch, which would skip the
+            # leadership check: the caller asks again with a new dispatch id
+            with self.lock:
+                self.records.pop(dispatch, None)
         return 200, {'outcome': 'unknown'}
+
+    def _ledger_page(self, led: Any, after: str) -> Dict[str, Any]:
+        """The executable entries after a key, in order, a page at a time."""
+        rest = [(k, e) for k, e in led.executable() if k > after]
+        page, size = [], 0
+        for k, e in rest:
+            size += len(k) + len(json.dumps(e)) + 8
+            if size > LEDGER_PAGE:
+                break
+            page.append([k, e])
+        return {'outcome': 'done', 'r': 0, 'out': json.dumps({'entries': page, 'more': len(page) < len(rest)}), 'outs': ''}
 
     def _outcome(self, dispatch: str, rec: Record) -> Dict[str, Any]:
         job = rec.job

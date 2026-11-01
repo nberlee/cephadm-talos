@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -929,5 +930,118 @@ func TestTheLeaderWaitsForTheHandoff(t *testing.T) {
 
 	if published || n != 1 || s.agent.patches.n != 0 {
 		t.Fatalf("the leader acted before the handoff: %d keys of its own, %d patches", n, s.agent.patches.n)
+	}
+}
+
+func (s *leaderSetup) accept(kind, daemon, host string, seq int64) LedgerEntry {
+	id := fmt.Sprintf("op-%016x", seq)
+	e := LedgerEntry{
+		Key: fmt.Sprintf("cephadm-talos/ledger/%020d-%010d-%s", 5, seq, id),
+		Op:  LedgerOp{Version: 1, ID: id, Kind: kind, Daemon: daemon, Host: host, GID: 42, Epoch: 5, Seq: seq},
+	}
+
+	s.module.mu.Lock()
+	s.module.ledger = append(s.module.ledger, e)
+	s.module.mu.Unlock()
+
+	return e
+}
+
+func (s *leaderSetup) applied(t *testing.T) string {
+	t.Helper()
+
+	st, _, err := s.leader.clusterState(context.Background(), s.leader.bridge())
+	must(t, err)
+
+	return st.LedgerApplied
+}
+
+func TestLeaderRunsTheLedgerInOrder(t *testing.T) {
+	s := newLeaderSetup(t)
+	ctx := context.Background()
+
+	// the mon is on h1 first
+	s.request("r1", `{"version":1,"kind":"revision","host":"h1"}`)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if op := s.op(t, "r1"); op.State != "completed" {
+		t.Fatalf("revision %+v", op)
+	}
+
+	monDoc := "ceph-" + testFSID[:8] + "-mon-h1"
+	addInstance(t, s.agent.fake, monDoc, 1)
+
+	bad := s.accept("rm", "mgr.h1", "h1", 1)
+	restart := s.accept(KindRestart, "mon.h1", "h1", 2)
+	redeploy := s.accept(KindRedeploy, "mon.h1", "h1", 3)
+
+	for range 4 {
+		must(t, s.leader.Tick(ctx, 42, 5))
+	}
+
+	if op := s.op(t, bad.Op.ID); op.State != JournalFailed {
+		t.Errorf("unknown kind: %+v", op)
+	}
+
+	if op := s.op(t, restart.Op.ID); op.State != "completed" {
+		t.Fatalf("restart: %+v", op)
+	}
+
+	// the redeploy's revision changed nothing, then the restart ran
+	if op := s.op(t, redeploy.Op.ID+".rev"); op.State != JournalNoChange {
+		t.Errorf("redeploy's revision: %+v", op)
+	}
+
+	if op := s.op(t, redeploy.Op.ID); op.State != "completed" {
+		t.Fatalf("redeploy: %+v", op)
+	}
+
+	if got := s.agent.fake.Restarted; len(got) != 2 || got[0] != monDoc+"-1" {
+		t.Fatalf("restarted %v", got)
+	}
+
+	if got := s.applied(t); got != redeploy.Key {
+		t.Fatalf("checkpoint %q", got)
+	}
+
+	// done is done: nothing runs again
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if got := s.agent.fake.Restarted; len(got) != 2 {
+		t.Fatalf("restarted again: %v", got)
+	}
+}
+
+func TestLedgerOperationsThatCannotRunEnd(t *testing.T) {
+	s := newLeaderSetup(t)
+	ctx := context.Background()
+
+	must(t, s.leader.Tick(ctx, 42, 5)) // the takeover closes the earlier sessions
+
+	// no such document on the node, no such daemon, a refused confirmation:
+	// each ends, and the next one runs in the same tick
+	first := s.accept(KindRestart, "mon.h1", "h1", 1)
+	second := s.accept(KindRestart, "mon.h0", "h0", 2)
+	third := s.accept(KindRedeploy, "mon.h1", "h1", 3)
+
+	s.agent.refuse = errors.New("no mgr")
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	for _, c := range []struct {
+		e     LedgerEntry
+		state string
+	}{{first, JournalFailed}, {second, JournalFailed}, {third, JournalFailed}} {
+		if op := s.op(t, c.e.Op.ID); op.State != c.state {
+			t.Errorf("%s: %+v", c.e.Op.ID, op)
+		}
+	}
+
+	if op := s.op(t, third.Op.ID+".rev"); op.State != wire.OpRefused {
+		t.Errorf("redeploy's revision: %+v", op)
+	}
+
+	if got := s.applied(t); got != third.Key {
+		t.Fatalf("checkpoint %q", got)
 	}
 }

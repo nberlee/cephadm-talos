@@ -48,6 +48,8 @@ type fakeBridge struct {
 	fsid string
 	// own is the module's incarnation: writes only below it; "" allows all
 	own string
+	// ledger is the module's executable ledger, in order
+	ledger []LedgerEntry
 }
 
 func (m *fakeBridge) run(req wire.BridgeRequest) map[string]any {
@@ -90,6 +92,18 @@ func (m *fakeBridge) run(req wire.BridgeRequest) map[string]any {
 		delete(m.kv, str("key"))
 
 		return map[string]any{"outcome": "done", "r": 0}
+	case "ledger":
+		page := [][2]any{}
+
+		for _, e := range m.ledger {
+			if e.Key > str("after") {
+				page = append(page, [2]any{e.Key, e.Op})
+			}
+		}
+
+		b, _ := json.Marshal(map[string]any{"entries": page, "more": false})
+
+		return map[string]any{"outcome": "done", "r": 0, "out": string(b)}
 	case "secret get":
 		v, ok := m.kv[store.SecretPrefix+str("name")]
 		if !ok {

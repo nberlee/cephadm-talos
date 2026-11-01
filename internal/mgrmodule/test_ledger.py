@@ -1,0 +1,163 @@
+"""Tests of ledger.py, the module's record of accepted operations (plan 03,
+step 6b, part 3). Run with hack/mgrmodule-test.sh."""
+import json
+import unittest
+
+import test_talos  # noqa: F401  (stubs ceph_module before the talos package is imported)
+
+from talos import ledger as lg
+
+
+def op(epoch, gid, seq, n=0):
+    ident = 'op-%016x' % (epoch * 1000 + seq + n)
+    e = {'version': 1, 'id': ident, 'kind': 'restart', 'daemon': 'mgr.h1', 'host': 'h1', 'gid': gid, 'epoch': epoch, 'seq': seq}
+    return lg.entry_key(epoch, seq, ident), e
+
+
+def takeover(epoch, gid, cutoffs):
+    e = {'version': 1, 'id': 'takeover', 'kind': 'takeover', 'gid': gid, 'epoch': epoch, 'seq': 0, 'cutoffs': {str(k): v for k, v in cutoffs.items()}}
+    return lg.entry_key(epoch, 0, 'takeover'), e
+
+
+def ids(entries):
+    return [(e['gid'], e['seq']) for _, e in lg.executable(dict(entries))]
+
+
+class ExecutableTest(unittest.TestCase):
+    def test_order_and_cutoffs(self):
+        a1, a2, a3 = op(5, 10, 1), op(5, 10, 2), op(5, 10, 3)
+        b0, b1 = takeover(7, 20, {10: 2}), op(7, 20, 1)
+        # A's third append landed after B's takeover entry: void for every reader
+        self.assertEqual(ids([a1, a2, a3, b0, b1]), [(10, 1), (10, 2), (20, 1)])
+        # without a later takeover entry, everything of A counts
+        self.assertEqual(ids([a1, a2, a3]), [(10, 1), (10, 2), (10, 3)])
+
+    def test_a_delayed_takeover_entry_changes_nothing(self):
+        # B saw A up to 1, but its takeover entry is late; C saw A up to 2 and ran it
+        a1, a2 = op(5, 10, 1), op(5, 10, 2)
+        c0, c1 = takeover(9, 30, {10: 2}), op(9, 30, 1)
+        before = ids([a1, a2, c0, c1])
+        b0 = takeover(7, 20, {10: 1})  # lands after C's takeover entry: C does not name B
+        self.assertEqual(ids([a1, a2, b0, c0, c1]), before)
+        self.assertEqual(before, [(10, 1), (10, 2), (30, 1)])
+
+    def test_a_valid_takeover_governs_the_incarnations_before_it(self):
+        a1, a2 = op(5, 10, 1), op(5, 10, 2)
+        b0, b1, b2 = takeover(7, 20, {10: 1}), op(7, 20, 1), op(7, 20, 2)
+        c0 = takeover(9, 30, {20: 1})
+        # A is cut by B (the first later valid takeover), B by C
+        self.assertEqual(ids([a1, a2, b0, b1, b2, c0]), [(10, 1), (20, 1)])
+
+    def test_takeover_cutoffs(self):
+        a1, a2 = op(5, 10, 1), op(5, 10, 2)
+        b0, b1 = takeover(7, 20, {10: 2}), op(7, 20, 1)
+        entries = {k: e for k, e in (a1, a2, b0, b1)}
+        # since B's takeover entry: B itself, not A (B governs A)
+        self.assertEqual(lg.takeover_cutoffs(entries, 9), {'20': 1})
+        self.assertEqual(lg.takeover_cutoffs({k: e for k, e in (a1, a2)}, 9), {'10': 2})
+        self.assertEqual(lg.takeover_cutoffs({}, 9), {})
+
+    def test_entries_must_match_their_keys(self):
+        k, e = op(5, 10, 1)
+        lg.check_entry(k, json.dumps(e))
+        for bad in (dict(e, seq=2), dict(e, kind='rm'), dict(e, daemon='client.admin'), dict(e, host='../x'), dict(e, version=2),
+                    dict(e, id='op-1'), dict(e, request='nope')):
+            with self.assertRaises(lg.LedgerError, msg=bad):
+                lg.check_entry(k, json.dumps(bad))
+        with self.assertRaises(lg.LedgerError):
+            lg.check_entry('cephadm-talos/ledger/x', json.dumps(e))
+        tk, te = takeover(7, 20, {10: 1})
+        lg.check_entry(tk, json.dumps(te))
+        with self.assertRaises(lg.LedgerError):
+            lg.check_entry(tk, json.dumps(dict(te, cutoffs={'x': 1})))
+
+
+class Mons:
+    """config-key dump and set over a dict; `silent` writes are stored but not answered."""
+
+    def __init__(self, kv=None):
+        self.kv = dict(kv or {})
+        self.silent = 0
+        self.sets = []
+
+    def __call__(self, cmd, deadline):
+        if cmd['prefix'] == 'config-key dump':
+            return 0, json.dumps({k: v for k, v in self.kv.items() if k.startswith(cmd['key'])}), ''
+        if cmd['prefix'] == 'config-key set':
+            self.sets.append(cmd['key'])
+            self.kv[cmd['key']] = cmd['val']
+            if self.silent:
+                self.silent -= 1
+                return None
+            return 0, '', ''
+        raise AssertionError(cmd)
+
+
+class LedgerTest(unittest.TestCase):
+    def test_open_writes_the_takeover_entry_first(self):
+        k, e = op(5, 10, 1)
+        mons = Mons({k: json.dumps(e), 'cephadm-talos/ledger/garbage': 'x'})
+        led = lg.Ledger(mons, 20, 7)
+        with self.assertRaises(lg.LedgerError):
+            led.append({'id': 'op-%016x' % 1, 'kind': 'restart', 'daemon': 'mgr.h1', 'host': 'h1'})
+        led.open()
+        self.assertEqual(mons.sets, [lg.entry_key(7, 0, 'takeover')])
+        self.assertEqual(json.loads(mons.kv[mons.sets[0]])['cutoffs'], {'10': 1})
+        key, entry = led.append({'id': 'op-%016x' % 1, 'kind': 'restart', 'daemon': 'mgr.h1', 'host': 'h1'})
+        self.assertEqual((entry['gid'], entry['epoch'], entry['seq']), (20, 7, 1))
+        self.assertEqual([x['id'] for _, x in led.executable()], [e['id'], 'op-%016x' % 1])
+
+    def test_an_unknown_append_is_settled_before_the_next(self):
+        led = lg.Ledger(Mons(), 20, 7)
+        led.open()
+        led.mon.silent = 1
+        with self.assertRaises(lg.OutcomeUnknown):
+            led.append({'id': 'op-%016x' % 1, 'kind': 'restart', 'daemon': 'mgr.h1', 'host': 'h1'})
+        # the same key with the same content first, then the next with the next sequence
+        _, entry = led.append({'id': 'op-%016x' % 2, 'kind': 'redeploy', 'daemon': 'mgr.h1', 'host': 'h1'})
+        k1 = lg.entry_key(7, 1, 'op-%016x' % 1)
+        self.assertEqual(led.mon.sets, [lg.entry_key(7, 0, 'takeover'), k1, k1, lg.entry_key(7, 2, 'op-%016x' % 2)])
+        self.assertEqual(entry['seq'], 2)
+
+    def test_settle_writes_a_pending_append_without_a_new_one(self):
+        led = lg.Ledger(Mons(), 20, 7)
+        led.open()
+        led.mon.silent = 2
+        with self.assertRaises(lg.OutcomeUnknown):
+            led.append({'id': 'op-%016x' % 1, 'kind': 'restart', 'daemon': 'mgr.h1', 'host': 'h1'})
+        with self.assertRaises(lg.OutcomeUnknown):
+            led.settle()
+        led.settle()
+        self.assertEqual([e['id'] for _, e in led.executable()], ['op-%016x' % 1])
+
+    def test_a_refused_append_is_not_accepted(self):
+        class Refusing(Mons):
+            def __call__(self, cmd, deadline):
+                if cmd['prefix'] == 'config-key set' and 'takeover' not in cmd['key']:
+                    return -27, '', 'too big'
+                return super().__call__(cmd, deadline)
+        led = lg.Ledger(Refusing(), 20, 7)
+        led.open()
+        with self.assertRaises(lg.LedgerError):
+            led.append({'id': 'op-%016x' % 1, 'kind': 'restart', 'daemon': 'mgr.h1', 'host': 'h1'})
+        self.assertEqual(led.executable(), [])
+        led.settle()  # nothing pending: a refusal is not written again
+        self.assertEqual(led.executable(), [])
+
+
+class FoldTest(unittest.TestCase):
+    def test_rules(self):
+        inv = {'hosts': [{'name': 'h1', 'addr': '10.0.0.1'}],
+               'daemons': [{'daemon_type': 'mon', 'daemon_id': 'h1', 'host': 'h1'}, {'daemon_type': 'mgr', 'daemon_id': 'h1', 'host': 'h1'},
+                           {'daemon_type': 'osd', 'daemon_id': '0', 'host': 'h1'}, {'daemon_type': 'osd', 'daemon_id': '', 'host': 'h1'}]}
+        f = lg.Fold(inv)
+        self.assertTrue(f.entity_allowed('mon.') and f.entity_allowed('mgr.h1'))
+        for e in ('mgr.h2', 'osd.0', 'client.bootstrap-osd', 'client.rgw.h1', 'client.admin'):
+            self.assertFalse(f.entity_allowed(e), e)
+        self.assertTrue(f.secret_allowed('host/h1/mgr-server.key', 'h1'))
+        for name, host in (('host/h2/mgr-server.key', 'h2'), ('rgw/server.key', None), ('rgw/vrrp', None)):
+            self.assertFalse(f.secret_allowed(name, host), name)
+
+
+if __name__ == '__main__':
+    unittest.main()

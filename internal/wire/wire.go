@@ -111,6 +111,16 @@ type Grant struct {
 	Operation string `json:"operation"`
 	// Docs replace documents of the same kind and name, or remove them
 	Docs []GrantDoc `json:"docs"`
+	// Restart, instead of documents, restarts the current instance of one
+	// daemon document the agent owns with this hash
+	Restart *GrantRestart `json:"restart,omitempty"`
+}
+
+// GrantRestart names the daemon document a grant restarts.
+type GrantRestart struct {
+	Kind string `json:"kind"`
+	Name string `json:"name"`
+	Hash string `json:"hash"`
 }
 
 // GrantDoc is one document of a grant: its YAML, or a removal when YAML is nil.
@@ -128,8 +138,9 @@ func GrantInputs(g Grant) string {
 		Host      string     `json:"host"`
 		Revision  int64      `json:"revision"`
 		Operation string     `json:"operation"`
-		Docs      []GrantDoc `json:"docs"`
-	}{g.FSID, g.Host, g.Revision, g.Operation, g.Docs})
+		Docs      []GrantDoc    `json:"docs"`
+		Restart   *GrantRestart `json:"restart,omitempty"`
+	}{g.FSID, g.Host, g.Revision, g.Operation, g.Docs, g.Restart})
 
 	sum := sha256.Sum256(b)
 
@@ -165,6 +176,11 @@ type Operation struct {
 	GID        int64  `json:"gid"`
 	State      string `json:"state"`
 	Error      string `json:"error,omitempty"`
+	// a restart records the instance it restarts, the boot and the time
+	// (Unix nanoseconds) before it calls Talos, to decide a lost outcome
+	Instance string `json:"instance,omitempty"`
+	BootID   string `json:"boot_id,omitempty"`
+	At       int64  `json:"at,omitempty"`
 }
 
 // Abandon is the leader giving up a grant whose outcome it does not know and

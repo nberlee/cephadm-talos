@@ -7,6 +7,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"github.com/cosi-project/runtime/pkg/safe"
+	"github.com/siderolabs/talos/pkg/machinery/resources/containers"
 	"net"
 	"path/filepath"
 	"sync"
@@ -46,6 +49,9 @@ type Node struct {
 	Images  machine.ImageServiceServer
 	// Restarted lists the containers Restart was called for
 	Restarted []string
+	// HoldRestarts keeps restarted instances from being replaced (a daemon
+	// still stopping)
+	HoldRestarts bool
 	// VersionTag is what Version reports (default v1.15.0-alpha.2)
 	VersionTag string
 	// FailBeforeApply makes the next ApplyConfiguration fail without storing
@@ -264,13 +270,29 @@ func (f *Node) Version(context.Context, *emptypb.Empty) (*machine.VersionRespons
 	return &machine.VersionResponse{Messages: []*machine.Version{{Version: &machine.VersionInfo{Tag: tag}}}}, nil
 }
 
-func (f *Node) Restart(_ context.Context, req *machine.RestartRequest) (*machine.RestartResponse, error) {
+// Restart records the instance and, like Talos once the instance stopped,
+// starts the next one (unless HoldRestarts): a ContainerInstanceSpec with the
+// next generation.
+func (f *Node) Restart(ctx context.Context, req *machine.RestartRequest) (*machine.RestartResponse, error) {
 	f.Mu.Lock()
-	defer f.Mu.Unlock()
-
 	f.Restarted = append(f.Restarted, req.Id)
+	hold := f.HoldRestarts
+	f.Mu.Unlock()
 
-	return &machine.RestartResponse{}, nil
+	if hold {
+		return &machine.RestartResponse{}, nil
+	}
+
+	cur, err := safe.StateGetByID[*containers.ContainerInstanceSpec](ctx, f.St, req.Id)
+	if err != nil {
+		return &machine.RestartResponse{}, nil //nolint:nilerr // not an instance this fake knows
+	}
+
+	gen := cur.TypedSpec().Generation + 1
+	next := containers.NewContainerInstanceSpec(containers.NamespaceName, fmt.Sprintf("%s-%d", cur.TypedSpec().ContainerID, gen))
+	next.TypedSpec().ContainerID, next.TypedSpec().Generation = cur.TypedSpec().ContainerID, gen
+
+	return &machine.RestartResponse{}, f.St.Create(ctx, next)
 }
 
 func (f *Node) Logs(req *machine.LogsRequest, srv machine.MachineService_LogsServer) error {

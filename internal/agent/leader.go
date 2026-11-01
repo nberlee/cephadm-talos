@@ -114,6 +114,8 @@ type LeaderLoop struct {
 
 	// bridgeAddr is where the module listens: this host's loopback
 	bridgeAddr string
+	// failing: since when a ledger operation keeps failing (ledger.go)
+	failing map[string]time.Time
 	// closed are the hosts whose earlier sessions this incarnation closed
 	closed map[string]bool
 	// stateInc is the incarnation the cluster state is read from: the
@@ -244,6 +246,11 @@ func (l *LeaderLoop) Tick(ctx context.Context, gid, epoch int64) error {
 	}
 
 	sort.Strings(ids)
+
+	// the module's accepted operations first, in their own order
+	if err := l.ledgerOps(ctx, b, js, gid, epoch); err != nil {
+		l.log("ledger: %v", err)
+	}
 
 	for _, id := range ids {
 		if !l.stillLeader(gid, epoch) {
@@ -591,6 +598,27 @@ func (l *LeaderLoop) request(ctx context.Context, b *Bridge, js store.Backend, g
 	}
 
 	return l.revision(ctx, b, js, gid, epoch, id, req.Host)
+}
+
+// runRevision carries out a revision of a host under id, or resolves its
+// grant if its outcome was not recorded.
+func (l *LeaderLoop) runRevision(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, id, host string) error {
+	opKey := JournalPrefix(gid) + "op/" + id
+
+	op, found, err := readJSONKey[JournalOp](ctx, js, opKey)
+	if err != nil {
+		return err
+	}
+
+	if found {
+		if op.State != JournalGranting && op.State != wire.OpUncertain {
+			return nil
+		}
+
+		return l.resolve(ctx, b, js, gid, epoch, opKey, op, id)
+	}
+
+	return l.revision(ctx, b, js, gid, epoch, id, host)
 }
 
 // stateSource is where a new incarnation takes its baseline from: the

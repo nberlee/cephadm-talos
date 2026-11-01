@@ -161,6 +161,9 @@ type State struct {
 	// In both the CLI changes nothing but the handoff itself
 	HandingOver bool `json:"-"`
 	Sealed      bool `json:"-"`
+	// LedgerApplied: the last operation of the mgr module's ledger the leader
+	// carried out; the next ones come after it
+	LedgerApplied string `json:"-"`
 	// Inventory is the revision of the mgr module's inventory record: bumped,
 	// with its time, only when its content changes
 	Inventory InventoryRevision `json:"-"`
@@ -326,6 +329,8 @@ type cluster struct {
 	// HandingOver: a handoff started; Sealed: it finished, the CLI writes no more
 	HandingOver bool `json:"handing_over,omitempty"`
 	Sealed      bool `json:"sealed,omitempty"`
+	// LedgerApplied is the last ledger operation the leader carried out
+	LedgerApplied string `json:"ledger_applied,omitempty"`
 }
 
 // Secret names: config-key entries below store.SecretPrefix, one per secret.
@@ -405,7 +410,7 @@ func (s *State) Records() (map[string][]byte, error) {
 	c := cluster{
 		Schema: SchemaVersion, FSID: s.FSID, Image: s.Image, CephVersion: s.CephVersion, Arch: s.Arch,
 		RGW: s.RGW, Published: s.Published, ConfPending: s.ConfPending, RGWPending: s.RGWPending, Inventory: s.Inventory,
-		HandingOver: s.HandingOver, Sealed: s.Sealed,
+		HandingOver: s.HandingOver, Sealed: s.Sealed, LedgerApplied: s.LedgerApplied,
 	}
 
 	if s.Agent != nil {
@@ -491,7 +496,7 @@ func (s *State) ApplyRecords(recs map[string][]byte) error {
 
 	s.Image, s.CephVersion, s.Arch, s.RGW, s.Published = c.Image, c.CephVersion, c.Arch, c.RGW, c.Published
 	s.ConfPending, s.RGWPending, s.Hosts, s.Daemons = c.ConfPending, c.RGWPending, hosts, daemons
-	s.Inventory, s.HandingOver, s.Sealed = c.Inventory, c.HandingOver, c.Sealed
+	s.Inventory, s.HandingOver, s.Sealed, s.LedgerApplied = c.Inventory, c.HandingOver, c.Sealed, c.LedgerApplied
 	s.Agent = c.Agent
 
 	if s.Agent != nil && operator != nil {

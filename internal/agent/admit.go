@@ -277,6 +277,54 @@ func intIn(v, what string, lo, hi int) (int, error) {
 	return n, nil
 }
 
+// containerKind is the kind whose id renders exactly this name (rest is the
+// name without the cluster's prefix), or "": a host named "prepare" has OSDs
+// whose names begin like an OSD preparation's.
+func (p *Policy) containerKind(name, rest string, env map[string]string) string {
+	for _, k := range containerKinds {
+		if !strings.HasPrefix(rest, k+"-") {
+			continue
+		}
+
+		id := env["ID"]
+
+		switch k {
+		case "probe":
+			id = strings.TrimPrefix(rest, "probe-")
+		case "osd-prepare", "job":
+			id = env["JOB"]
+		}
+
+		if id != "" && p.docName(k, id) == name {
+			return k
+		}
+	}
+
+	return ""
+}
+
+// daemonKinds are the container kinds a restart may target: daemons, not jobs
+// or the probe.
+var daemonKinds = map[string]bool{"mon": true, "mgr": true, "osd": true, "rgw": true, "vip": true}
+
+// Daemon reports whether a ContainerConfig is a daemon of the cluster, which a
+// grant may restart.
+func (p *Policy) daemon(name string, td typedDoc) bool {
+	c, ok := td.doc.(*spec.ContainerConfig)
+	if !ok {
+		return false
+	}
+
+	rest, ok := strings.CutPrefix(name, p.prefix())
+	if !ok {
+		return false
+	}
+
+	env, err := envMap(c.ContainerEnvironment)
+
+	return err == nil && daemonKinds[p.containerKind(name, rest, env)]
+}
+
 func (p *Policy) admitContainer(d Doc, td typedDoc, f facts) error {
 	c, ok := td.doc.(*spec.ContainerConfig)
 	if !ok {
@@ -293,31 +341,7 @@ func (p *Policy) admitContainer(d Doc, td typedDoc, f facts) error {
 		return err
 	}
 
-	// the kind whose id renders exactly this name: a host named "prepare" has
-	// OSDs whose names begin like an OSD preparation's
-	var kind string
-
-	for _, k := range containerKinds {
-		if !strings.HasPrefix(rest, k+"-") {
-			continue
-		}
-
-		id := env["ID"]
-
-		switch k {
-		case "probe":
-			id = strings.TrimPrefix(rest, "probe-")
-		case "osd-prepare", "job":
-			id = env["JOB"]
-		}
-
-		if id != "" && p.docName(k, id) == d.Name {
-			kind = k
-
-			break
-		}
-	}
-
+	kind := p.containerKind(d.Name, rest, env)
 	if kind == "" {
 		return errors.New("not a kind a grant can carry, or its id is not the one in its name")
 	}

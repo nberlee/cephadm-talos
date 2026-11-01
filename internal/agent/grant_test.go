@@ -8,6 +8,10 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
+	"github.com/nberlee/cephadm-talos/internal/render"
+	"github.com/nberlee/cephadm-talos/internal/state"
+	"github.com/siderolabs/talos/pkg/machinery/resources/containers"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -18,6 +22,7 @@ import (
 	"github.com/nberlee/cephadm-talos/internal/pki"
 	"github.com/nberlee/cephadm-talos/internal/spec"
 	"github.com/nberlee/cephadm-talos/internal/talos"
+	"github.com/nberlee/cephadm-talos/internal/talos/talostest"
 	"github.com/nberlee/cephadm-talos/internal/wire"
 )
 
@@ -26,6 +31,7 @@ import (
 type testGranter struct {
 	*Granter
 	patches *countingPatch
+	fake    *talostest.Node
 	gid     int64
 	epoch   int64
 	refuse  error
@@ -36,7 +42,7 @@ type testGranter struct {
 func newTestGranter(t *testing.T) *testGranter {
 	t.Helper()
 
-	n, tc := testNode(t)
+	n, tc, f := testNodeFake(t)
 
 	_, err := n.Adopt(context.Background(), 1)
 	must(t, err)
@@ -47,7 +53,7 @@ func newTestGranter(t *testing.T) *testGranter {
 	ch, err := NewChannel(pki.Identity{FSID: testFSID, Role: pki.RoleAgent, Name: "h1"})
 	must(t, err)
 
-	tg := &testGranter{Granter: NewGranter(n, ch, nil, n.Records), patches: cp, gid: 42, epoch: 5}
+	tg := &testGranter{Granter: NewGranter(n, ch, nil, n.Records), patches: cp, fake: f, gid: 42, epoch: 5}
 	tg.confirm = func(_ context.Context, target ConfirmTarget, revision int64, operation, hash string) (wire.Confirmation, time.Time, error) {
 		tg.calls++
 
@@ -588,5 +594,155 @@ func TestReconcileWaitsForAnApplyInProgress(t *testing.T) {
 
 	if op, _, _ := g.readOp("op-r"); op.State != wire.OpRefused {
 		t.Fatalf("left reservation: %+v", op)
+	}
+}
+
+// monGrant grants h1 a joining mon, a daemon the agent may restart.
+func monGrant(t *testing.T, rev int64, op string) (wire.Grant, string, string) {
+	t.Helper()
+
+	st := state.New(testFSID)
+	st.Image = testImage
+	st.AddHost(state.Host{Name: "h1", Addr: "10.5.0.3"})
+	st.AddDaemon(state.Daemon{Type: state.TypeMon, ID: "h1", Host: "h1", DeployID: "0123456789abcdef"})
+	h, _ := st.Host("h1")
+	d, _ := st.Find("mon.h1")
+
+	c, err := render.Daemon(st, h, d, testImage, func(string) (string, error) { return fakeKey, nil }, func(string) (string, error) { return "", errors.New("no secret") })
+	must(t, err)
+
+	y := string(mustRender(c))
+	g := probeGrant(rev, op, "aaaaaa")
+	g.Docs = []wire.GrantDoc{{Kind: "ContainerConfig", Name: c.MetaName, YAML: &y}}
+
+	td, err := checkDoc(Doc{Kind: "ContainerConfig", Name: c.MetaName, YAML: []byte(y)})
+	must(t, err)
+
+	return g, c.MetaName, td.hash
+}
+
+func addInstance(t *testing.T, f *talostest.Node, name string, gen uint64) {
+	t.Helper()
+
+	inst := containers.NewContainerInstanceSpec(containers.NamespaceName, fmt.Sprintf("%s-%d", name, gen))
+	inst.TypedSpec().ContainerID, inst.TypedSpec().Generation = name, gen
+	must(t, f.St.Create(context.Background(), inst))
+}
+
+func TestGrantRestartsADaemon(t *testing.T) {
+	g := newTestGranter(t)
+	ctx := context.Background()
+
+	gr, name, hash := monGrant(t, 2, "op-m1")
+	if op, err := g.Grant(ctx, gr); err != nil || op.State != wire.OpCompleted {
+		t.Fatalf("mon: %+v %v", op, err)
+	}
+
+	addInstance(t, g.fake, name, 1)
+	addInstance(t, g.fake, name, 2)
+
+	restart := func(rev int64, id string, r wire.GrantRestart) wire.Grant {
+		gr := probeGrant(rev, id, "aaaaaa")
+		gr.Docs, gr.Restart = nil, &r
+
+		return gr
+	}
+
+	// the current instance is restarted, after the record names it; it is
+	// started until the next instance exists
+	g.fake.HoldRestarts = true
+
+	op, err := g.Grant(ctx, restart(3, "op-r1", wire.GrantRestart{Kind: "ContainerConfig", Name: name, Hash: hash}))
+	if err != nil || op.State != wire.OpStarted || op.Instance != name+"-2" || op.BootID == "" || len(g.fake.Restarted) != 1 || g.fake.Restarted[0] != name+"-2" {
+		t.Fatalf("restart: %+v %v %v", op, err, g.fake.Restarted)
+	}
+
+	// still stopping: a retry returns the record and restarts nothing, and no
+	// other grant runs beside it
+	if op, err = g.Grant(ctx, restart(3, "op-r1", wire.GrantRestart{Kind: "ContainerConfig", Name: name, Hash: hash})); err != nil || op.State != wire.OpStarted || len(g.fake.Restarted) != 1 {
+		t.Fatalf("retry: %+v %v", op, err)
+	}
+
+	if _, err := g.Grant(ctx, probeGrant(4, "op-p0", "eeeeee")); err == nil || !strings.Contains(err.Error(), "op-r1") {
+		t.Fatalf("a grant beside a restart in progress: %v", err)
+	}
+
+	// the next instance runs: completed
+	addInstance(t, g.fake, name, 3)
+	must(t, g.Reconcile(ctx))
+
+	if op, _, _ := g.readOp("op-r1"); op.State != wire.OpCompleted {
+		t.Fatalf("after the next instance: %+v", op)
+	}
+
+	// the revision is fenced: the same grant under a new id cannot run again
+	if op, err := g.Grant(ctx, restart(3, "op-r2", wire.GrantRestart{Kind: "ContainerConfig", Name: name, Hash: hash})); err != nil || op.State != wire.OpRefused || len(g.fake.Restarted) != 1 {
+		t.Fatalf("a restart at a fenced revision: %+v %v", op, err)
+	}
+
+	g.fake.HoldRestarts = false
+
+	// not with another hash, not a document it does not own, not a job or probe
+	pg := probeGrant(4, "op-p1", "bbbbbb")
+	if op, err := g.Grant(ctx, pg); err != nil || op.State != wire.OpCompleted {
+		t.Fatalf("probe: %+v %v", op, err)
+	}
+
+	probeDoc := pg.Docs[0]
+	probeTD, err := checkDoc(Doc{Kind: probeDoc.Kind, Name: probeDoc.Name, YAML: []byte(*probeDoc.YAML)})
+	must(t, err)
+
+	for i, r := range []wire.GrantRestart{
+		{Kind: "ContainerConfig", Name: name, Hash: "00"},
+		{Kind: "ContainerConfig", Name: "ceph-" + testFSID[:8] + "-mon-h2", Hash: hash},
+		{Kind: "ContainerConfig", Name: probeDoc.Name, Hash: probeTD.hash},
+		{Kind: "ContainerConfig", Name: n2(g).docName("agent"), Hash: hash},
+	} {
+		op, err := g.Grant(ctx, restart(int64(10+i), fmt.Sprintf("op-x%d", i), r))
+		if err != nil || op.State != wire.OpRefused || len(g.fake.Restarted) != 1 {
+			t.Errorf("%d: %+v %v %v", i, op, err, g.fake.Restarted)
+		}
+	}
+}
+
+func n2(g *testGranter) *Node { return g.Node }
+
+func TestARestartWithoutOutcomeIsReconciledFromItsInstance(t *testing.T) {
+	g := newTestGranter(t)
+	ctx := context.Background()
+
+	gr, name, _ := monGrant(t, 2, "op-m1")
+	if op, err := g.Grant(ctx, gr); err != nil || op.State != wire.OpCompleted {
+		t.Fatalf("mon: %+v %v", op, err)
+	}
+
+	addInstance(t, g.fake, name, 1)
+
+	boot, err := g.Node.Talos.BootID(ctx, "")
+	must(t, err)
+
+	// a restart that stopped after its record: the same instance still runs
+	must(t, g.writeOp(wire.Operation{Version: wire.Version, Operation: "op-lost", Revision: 3, InputsHash: "00", GID: 42, State: wire.OpStarted, Instance: name + "-1", BootID: boot, At: time.Now().UnixNano()}))
+
+	// one sent longer ago than ApplySettle, its instance still current: it did not happen
+	must(t, g.writeOp(wire.Operation{Version: wire.Version, Operation: "op-old", Revision: 3, InputsHash: "00", GID: 42, State: wire.OpUncertain, Instance: name + "-1", BootID: boot, At: time.Now().Add(-ApplySettle - time.Minute).UnixNano()}))
+
+	if _, err := g.Grant(ctx, probeGrant(4, "op-p2", "cccccc")); err == nil || !strings.Contains(err.Error(), "op-lost") {
+		t.Fatalf("a grant beside an undecided restart: %v", err)
+	}
+
+	if op, _, _ := g.readOp("op-old"); op.State != wire.OpRefused {
+		t.Fatalf("old restart: %+v", op)
+	}
+
+	// a newer instance runs: it happened
+	addInstance(t, g.fake, name, 2)
+
+	if op, err := g.Grant(ctx, probeGrant(4, "op-p2", "cccccc")); err != nil || op.State != wire.OpCompleted {
+		t.Fatalf("after the new instance: %+v %v", op, err)
+	}
+
+	if op, _, _ := g.readOp("op-lost"); op.State != wire.OpCompleted {
+		t.Fatalf("lost restart: %+v", op)
 	}
 }

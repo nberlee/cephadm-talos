@@ -26,14 +26,16 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import orchestrator
 from ceph.deployment.hostspec import HostSpec
-from mgr_module import CLICommandBase, CommandResult, MgrModule
-from orchestrator import DaemonDescription, DaemonDescriptionStatus, handle_orch_error
+from mgr_module import CLICommandBase, CommandResult, HandleCommandResult, MgrModule
+from orchestrator import DaemonDescription, DaemonDescriptionStatus, OrchestratorError, handle_orch_error
 
-from . import bridge
+from . import bridge, ledger
 
 TalosCLICommand = CLICommandBase.make_registry_subtype("TalosCLICommand")
 
 TALOS_DIR = '/etc/ceph/talos'
+# journal states after which the leader does nothing more for an operation
+TERMINAL = ('completed', 'nochange', 'failed', 'refused', 'abandoned')
 INVENTORY_SCHEMA = 1
 RECORD_SCHEMA = 2
 AGENT_PORT = 4721
@@ -108,6 +110,21 @@ def choose_incarnation(entries: Dict[str, str], own: Optional[int]) -> str:
 def inventory_from_store(entries: Dict[str, str], incarnation: str = INCARNATION) -> Dict[str, Any]:
     """Read the inventory record of an incarnation's latest manifest from a snapshot
     of the module's store (get_store_prefix); every problem is an InventoryError."""
+    inv, key = record_from_store(entries, incarnation, 'inventory')
+    return check_inventory(inv, key)
+
+
+def cli_baseline(entries: Dict[str, str]) -> Dict[str, Any]:
+    """The inventory of the CLI's sealed state, the root of what the module
+    authorizes (ledger.Fold): no incarnation can write it through the bridge."""
+    cluster, key = record_from_store(entries, INCARNATION, 'cluster')
+    if not isinstance(cluster, dict) or cluster.get('sealed') is not True:
+        raise InventoryError('the CLI has not handed the cluster over (%s is not sealed)' % key)
+    return inventory_from_store(entries, INCARNATION)
+
+
+def record_from_store(entries: Dict[str, str], incarnation: str, name: str) -> Tuple[Any, str]:
+    """Read one record of an incarnation's latest manifest, and the manifest's key."""
     base = STORE_PREFIX + incarnation + '/'
     seqs = {}
     for k in entries:
@@ -127,10 +144,10 @@ def inventory_from_store(entries: Dict[str, str], incarnation: str = INCARNATION
                 or type(m.get('seq')) is not int or m['seq'] != max(seqs):
             raise ValueError('unexpected manifest %r' % {k: m.get(k) for k in ('schema', 'incarnation', 'seq')})
         recs = m.get('records')
-        e = recs.get('inventory') if isinstance(recs, dict) else None
+        e = recs.get(name) if isinstance(recs, dict) else None
         if not isinstance(e, dict) or not isinstance(e.get('chunks'), list) or not e['chunks'] \
                 or not _str(e.get('sha256')) or type(e.get('size')) is not int:
-            raise ValueError('invalid inventory entry %r' % e)
+            raise ValueError('invalid %s entry %r' % (name, e))
         enc = ''
         for c in e['chunks']:
             if not _str(c) or not c.startswith(MODULE_PREFIX + base + 'rec/'):
@@ -141,11 +158,11 @@ def inventory_from_store(entries: Dict[str, str], incarnation: str = INCARNATION
             enc += part
         data = base64.b64decode(enc, validate=True)
         if hashlib.sha256(data).hexdigest() != e['sha256'] or len(data) != e['size']:
-            raise ValueError('inventory does not match its manifest')
-        inv = json.loads(data)
+            raise ValueError('%s does not match its manifest' % name)
+        rec = json.loads(data)
     except (KeyError, TypeError, ValueError, AttributeError) as e:
-        raise InventoryError('cannot read the inventory from %s: %s' % (key, e))
-    return check_inventory(inv, key)
+        raise InventoryError('cannot read the %s from %s: %s' % (name, key, e))
+    return rec, key
 
 
 def check_inventory(inv: Any, path: str) -> Dict[str, Any]:
@@ -444,9 +461,62 @@ class Module(orchestrator.Orchestrator, MgrModule):
         entries = self.get_store_prefix(STORE_PREFIX)
         return inventory_from_store(entries, choose_incarnation(entries, getattr(self, '_gid', None)))
 
-    def _mgr_hosts(self) -> Set[str]:
-        """The hosts the inventory places a mgr on."""
-        return {d['host'] for d in self._inventory()['daemons'] if d['daemon_type'] == 'mgr'}
+    def _authority(self) -> Tuple[ledger.Ledger, ledger.Fold]:
+        """This incarnation's ledger and the fold it authorizes; raises without them."""
+        led = getattr(self, '_ledger', None)
+        if led is None or not led.ready:
+            raise OrchestratorError('this mgr has not opened the ledger: it is not the leader yet')
+        return led, ledger.Fold(cli_baseline(self.get_store_prefix(STORE_PREFIX)))
+
+    def _journal(self, op_id: str) -> Optional[Dict[str, Any]]:
+        """The leader's journal record of an operation, from any incarnation (shown
+        to the operator; it authorizes nothing)."""
+        best: Optional[Dict[str, Any]] = None
+        for k, v in self.get_store_prefix(STORE_PREFIX).items():
+            if k.endswith('/journal/op/' + op_id):
+                try:
+                    rec = json.loads(v)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict) and (best is None or rec.get('state') in TERMINAL):
+                    best = rec
+        return best
+
+    def _accept(self, kind: str, daemon: str, host: str) -> str:
+        """Accept an operation: checks, then one ledger entry (ledger.py)."""
+        led, fold = self._authority()
+        lead = getattr(self, '_leadership', None)
+        if lead is None or not lead.still_active():
+            raise OrchestratorError('this mgr is not confirmed as the active one; try again')
+        # an earlier append whose outcome is unknown counts before any check
+        try:
+            led.settle()
+        except ledger.LedgerError as e:
+            raise OrchestratorError('an earlier operation is not settled yet (%s); try again' % e)
+        # one operation at a time per daemon: a lying journal can only refuse commands
+        for _, e in led.executable():
+            if e['daemon'] == daemon:
+                rec = self._journal(e['id'])
+                if rec is None or rec.get('state') not in TERMINAL:
+                    raise OrchestratorError('%s has operation %s in progress (orch talos operation %s)' % (daemon, e['id'], e['id']))
+        op_id = 'op-' + os.urandom(8).hex()
+        try:
+            led.append({'id': op_id, 'kind': kind, 'daemon': daemon, 'host': host})
+        except ledger.OutcomeUnknown:
+            raise OrchestratorError('the mons did not answer: operation %s may have been accepted (orch talos operation %s)' % (op_id, op_id))
+        except ledger.LedgerError as e:
+            raise OrchestratorError('not accepted: %s' % e)
+        return op_id
+
+    def _ledger_mon(self, cmds: bridge.Commands) -> Callable[[Dict[str, Any], float], Optional[Tuple[int, str, str]]]:
+        def mon(cmd: Dict[str, Any], deadline: float) -> Optional[Tuple[int, str, str]]:
+            job = cmds.submit(cmd)
+            if job is None or not job.ev.wait(deadline):
+                return None
+            if job.too_large:
+                return -27, '', 'output too large'  # EFBIG
+            return job.r, job.outb, job.outs
+        return mon
 
     def _send_mon(self, result: Any, cmd: str) -> None:
         self.send_command(result, 'mon', '', cmd, '')
@@ -469,12 +539,22 @@ class Module(orchestrator.Orchestrator, MgrModule):
                             inv['fsid'], self.get_mgr_id(), leadership, bridge_cmds,
                             bridge.server_context(os.path.join(TALOS_DIR, 'agent-ca.crt'), os.path.join(TALOS_DIR, 'mgr-server.crt'),
                                                   os.path.join(TALOS_DIR, 'mgr-server.key')),
-                            bridge.read(os.path.join(TALOS_DIR, 'mgr-server.key')), require_identity, self.log, self._mgr_hosts)
+                            bridge.read(os.path.join(TALOS_DIR, 'mgr-server.key')), require_identity, self.log, self._authority)
                         c.start()
                         channel = c  # only a started channel; a failed start is retried
                     if leadership.capture():
                         gid, epoch = leadership.captured() or (0, 0)
                         self._gid = gid  # this incarnation's state, once its leader published it
+                        self._leadership = leadership
+                        if getattr(self, '_ledger', None) is None:
+                            self._ledger = ledger.Ledger(self._ledger_mon(bridge_cmds), gid, epoch)
+                        try:
+                            if not self._ledger.ready:
+                                self._ledger.open()  # its takeover entry, before anything is accepted
+                            else:
+                                self._ledger.settle()  # an append the mons did not answer
+                        except ledger.LedgerError as e:
+                            self.log.warning('the ledger: %s', e)
                         nonce = self._heartbeat(inv, gid, epoch, nonce)
                 except InventoryError as e:
                     self.log.warning('%s', e)
@@ -534,6 +614,33 @@ class Module(orchestrator.Orchestrator, MgrModule):
         if inv.get('cert_expiry'):
             details['agent_cert_expiry'] = inv['cert_expiry']
         return True, '', details
+
+    @handle_orch_error
+    def daemon_action(self, action: str, daemon_name: str, image: Optional[str] = None, force: bool = False) -> str:
+        if action not in ('restart', 'redeploy'):
+            raise OrchestratorError('daemon %s is not supported by this backend: only restart and redeploy' % action)
+        if image is not None or force:
+            raise OrchestratorError('an image or --force is not supported by this backend')
+        _, fold = self._authority()
+        host = fold.daemons.get(daemon_name)
+        if host is None:
+            raise OrchestratorError('%s is not a daemon of the cluster' % daemon_name)
+        op_id = self._accept(action, daemon_name, host)
+        return 'Scheduled to %s %s on host %s (operation %s)' % (action, daemon_name, host, op_id)
+
+    @TalosCLICommand.Read('orch talos operation')
+    def _operation(self, id: str) -> HandleCommandResult:
+        """Show an operation this backend accepted: its ledger entry and the leader's journal record"""
+        if not re.match(r'\Aop-[0-9a-f]{16}\Z', id):
+            return HandleCommandResult(retval=-22, stderr='not an operation id')
+        try:
+            led, _ = self._authority()
+        except Exception as e:
+            return HandleCommandResult(retval=-11, stderr=str(e))  # EAGAIN
+        entry = [e for _, e in led.executable() if e['id'] == id]
+        if not entry:
+            return HandleCommandResult(retval=-2, stderr='no accepted operation %s' % id)  # ENOENT
+        return HandleCommandResult(stdout=json.dumps({'accepted': entry[0], 'journal': self._journal(id)}, indent=2, sort_keys=True))
 
     @handle_orch_error
     def get_hosts(self) -> List[HostSpec]:

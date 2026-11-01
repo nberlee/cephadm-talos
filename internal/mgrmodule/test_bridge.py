@@ -19,7 +19,34 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from talos import bridge as b
+from talos import ledger as lg
 from talos import module as m
+
+
+def inventory(*daemons):
+    """An inventory of hosts h1 and h2 with daemons "<type>.<id>@<host>"."""
+    ds = []
+    for d in daemons:
+        name, host = d.split('@')
+        t, i = name.split('.', 1)
+        ds.append({'doc_name': 'x', 'host': host, 'daemon_type': t, 'daemon_id': i, 'service_name': t})
+    return {'hosts': [{'name': 'h1', 'addr': '10.0.0.1'}, {'name': 'h2', 'addr': '10.0.0.2'}], 'daemons': ds}
+
+
+class FakeLedger:
+    ready = True
+
+    def __init__(self, entries=()):
+        self.entries = list(entries)
+
+    def executable(self):
+        return list(self.entries)
+
+
+def authority(*daemons):
+    """What the module authorizes: a mon, mgr, rgw and keepalived on h1 unless named."""
+    inv = inventory(*(daemons or ('mon.h1@h1', 'mgr.h1@h1', 'rgw.h1@h1', 'keepalived.h1@h1')))
+    return lambda: (FakeLedger(), lg.Fold(inv))
 
 
 class Log:
@@ -148,7 +175,7 @@ class ConfirmTest(unittest.TestCase):
         cmds = mons.commands(2)
         self.addCleanup(cmds.stop)
         lead = b.Leadership('h1', activation or mgrmap(42, 'h1'), cmds)
-        return b.Channel('f1', 'h1', lead, mons.commands(2), None, pem, m.require_identity, Log(), lambda: {'h1'}), lead, key
+        return b.Channel('f1', 'h1', lead, mons.commands(2), None, pem, m.require_identity, Log(), authority()), lead, key
 
     def test_refused_until_captured(self):
         ch, lead, _ = self.channel([mgrmap(10, 'other')])
@@ -192,7 +219,7 @@ class BridgeTest(unittest.TestCase):
         mons = Mons([mgrmap(42, 'h1')])  # the bridge's own fresh check before a change
         cmds = mons.commands(n, 'bridge')
         self.addCleanup(cmds.stop)
-        return b.Channel('f1', 'h1', lead, cmds, None, b'', m.require_identity, Log(), lambda: {'h1'}), mons
+        return b.Channel('f1', 'h1', lead, cmds, None, b'', m.require_identity, Log(), authority()), mons
 
     def call(self, ch, **kw):
         req = {'version': 1, 'call': 'health', 'args': {}, 'deadline': 5, 'dispatch_id': '12' * 8}
@@ -271,7 +298,7 @@ class BridgeTest(unittest.TestCase):
             self.assertEqual((code, reply['outcome']), (200, 'done'), name)
         self.assertEqual(ch.outcome('%016x' % 300)[0], 404)  # a secret is not kept once answered
         sent = len(mons.sent)
-        # the CA keys and the agents' keys never; a host's mgr keys only where the inventory has a mgr
+        # the CA keys and the agents' keys never; a host's mgr keys only where the fold has a mgr
         for i, name in enumerate(('agent-ca.key', 'rgw/ca.key', 'host/h1/agent-server.key', 'host/h1/agent-client.key',
                                   'host/h2/mgr-server.key', 'host/../mgr-server.key', 'host/h1/../agent-ca.key', 7)):
             code, _ = self.call(ch, call='secret get', args={'name': name}, dispatch_id='%016x' % (400 + i))
@@ -286,6 +313,55 @@ class BridgeTest(unittest.TestCase):
         code, reply = self.call(ch, call='config-key keys', args={'prefix': b.SECRET_PREFIX, 'after': ''}, dispatch_id='%016x' % 430)
         self.assertEqual(code, 400)
         self.assertEqual(len(mons.sent), sent)
+
+    def test_credentials_follow_the_fold(self):
+        ch, mons = self.channel()
+        ch.authority = authority('mgr.h1@h1')  # no mon, rgw or keepalived
+        for i, (call, args) in enumerate((('secret get', {'name': 'rgw/server.key'}), ('secret get', {'name': 'rgw/vrrp'}),
+                                          ('auth get', {'entity': 'mon.'}), ('auth get', {'entity': 'client.rgw.h1'}),
+                                          ('auth get', {'entity': 'mgr.h2'}), ('auth get', {'entity': 'osd.0'}),
+                                          ('auth get', {'entity': 'client.bootstrap-osd'}),
+                                          ('auth get-or-create', {'entity': 'mgr.h2'}))):
+            self.assertEqual(self.call(ch, call=call, args=args, dispatch_id='%016x' % (700 + i))[0], 400, (call, args))
+        for i, (call, args) in enumerate((('auth get', {'entity': 'mgr.h1'}), ('secret get', {'name': 'host/h1/mgr-server.key'}))):
+            self.assertEqual(self.call(ch, call=call, args=args, dispatch_id='%016x' % (720 + i))[1]['outcome'], 'done', call)
+        # a credential goes out only while this incarnation is active
+        mons.maps = [mgrmap(43, 'h2')]
+        self.assertEqual(self.call(ch, call='auth get', args={'entity': 'mgr.h1'}, dispatch_id='%016x' % 730)[0], 409)
+        # without a ledger, nothing
+        def none():
+            raise ValueError('not open')
+        ch.authority = none
+        self.assertEqual(self.call(ch, call='auth get', args={'entity': 'mgr.h1'}, dispatch_id='%016x' % 731)[0], 503)
+
+    def test_a_credential_is_never_kept(self):
+        ch, mons = self.channel()
+        mons.late = True
+        code, reply = self.call(ch, call='auth get', args={'entity': 'mgr.h1'}, deadline=0.05, dispatch_id='%016x' % 740)
+        self.assertEqual(reply, {'outcome': 'unknown'})
+        self.assertTrue(wait_until(lambda: mons.pending))
+        mons.pending[0].complete(0, '[{"key": "secret"}]', '')
+        time.sleep(0.05)
+        self.assertEqual(ch.outcome('%016x' % 740)[0], 404)  # a late completion is not fetched past the check
+        mons.late = False
+        self.assertEqual(self.call(ch, call='auth get-or-create', args={'entity': 'mgr.h1'}, dispatch_id='%016x' % 741)[1]['outcome'], 'done')
+        self.assertEqual(ch.outcome('%016x' % 741)[0], 404)  # nor an answered get-or-create
+
+    def test_the_ledger_in_pages(self):
+        ch, mons = self.channel()
+        entries = [('cephadm-talos/ledger/%020d-%010d-op-%016x' % (5, i, i), {'id': 'op-%016x' % i, 'pad': 'x' * 1000}) for i in range(1, 400)]
+        ch.authority = lambda: (FakeLedger(entries), lg.Fold(inventory()))
+        got, after = [], ''
+        while True:
+            code, reply = self.call(ch, call='ledger', args={'after': after}, dispatch_id='%016x' % (800 + len(got)))
+            self.assertEqual((code, reply['outcome']), (200, 'done'))
+            page = json.loads(reply['out'])
+            got += [k for k, _ in page['entries']]
+            if not page['more']:
+                break
+            after = got[-1]
+        self.assertEqual(got, [k for k, _ in entries])
+        self.assertEqual([p for _, p in mons.sent if p != 'mgr dump'], [])  # answered by the module
 
     def test_keys_below_the_prefix_in_pages(self):
         ch, mons = self.channel()
@@ -337,7 +413,7 @@ class BridgeTest(unittest.TestCase):
         cmds = mons.commands(2)
         self.addCleanup(cmds.stop)
         lead = b.Leadership('h1', mgrmap(10, 'other'), cmds)
-        ch = b.Channel('f1', 'h1', lead, cmds, None, b'', m.require_identity, Log(), lambda: {'h1'})
+        ch = b.Channel('f1', 'h1', lead, cmds, None, b'', m.require_identity, Log(), authority())
         self.assertEqual(self.call(ch)[0], 503)
 
     def test_a_dispatch_id_runs_once(self):
@@ -434,7 +510,7 @@ class BridgeTest(unittest.TestCase):
         cmds = b.Commands(mons.send, lambda: b.Job({}), 1, 'big')
         self.addCleanup(cmds.stop)
         ch.commands = cmds
-        reply = self.call(ch, dispatch_id='ee' * 8, call='auth get-or-create', args={'entity': 'mgr.h1'})[1]
+        reply = self.call(ch, dispatch_id='ee' * 8, call='config-key rm', args={'key': 'mgr/cephadm/talos/inc/42/x'})[1]
         self.assertEqual((reply['outcome'], reply['r']), ('done', 0))
         self.assertNotIn('out', reply)
         kept = ch.records['ee' * 8].job
@@ -501,7 +577,7 @@ class ServerTest(unittest.TestCase):
         mons = Mons([mgrmap(42, 'h1')])
         cmds = mons.commands(2)
         self.addCleanup(cmds.stop)
-        self.ch = b.Channel('f1', 'h1', lead, cmds, ctx, b.read(self.files['srv.key']), m.require_identity, Log(), lambda: {'h1'})
+        self.ch = b.Channel('f1', 'h1', lead, cmds, ctx, b.read(self.files['srv.key']), m.require_identity, Log(), authority())
         self.port, self.bridge_port = free_port(), free_port()
         self.ch.start(self.port, self.bridge_port)
         self.addCleanup(self.ch.stop)

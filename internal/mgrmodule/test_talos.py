@@ -484,3 +484,75 @@ class IdentityTest(unittest.TestCase):
                     self.cert('cephadm-talos://f1/agent/_node')):
             with self.assertRaises(ValueError):
                 m.cert_identity(bad)
+
+
+def state_entries(inv, cluster, incarnation='cli', seq=1):
+    """The store entries of a published state with an inventory and a cluster record."""
+    import base64
+    import hashlib
+    base = 'talos/inc/%s/' % incarnation
+    entries, recs = {}, {}
+    for name, obj in (('inventory', inv), ('cluster', cluster)):
+        data = json.dumps(obj).encode()
+        key = '%srec/%d/%s.0' % (base, seq, name)
+        entries[key] = base64.b64encode(data).decode()
+        recs[name] = {'chunks': ['mgr/cephadm/' + key], 'sha256': hashlib.sha256(data).hexdigest(), 'size': len(data)}
+    entries['%smanifest/%020d' % (base, seq)] = json.dumps({'schema': 1, 'incarnation': incarnation, 'seq': seq, 'records': recs})
+    return entries
+
+
+class Acceptance(unittest.TestCase):
+    def module(self, sealed=True, active=True):
+        from talos import ledger as lg
+        import test_ledger
+        entries = state_entries(inventory(), {'fsid': 'f', 'sealed': sealed})
+        mod = object.__new__(m.Module)
+        mod.get_store_prefix = lambda prefix: {k: v for k, v in entries.items() if k.startswith(prefix)}
+        mod._ledger = lg.Ledger(test_ledger.Mons(), 20, 7)
+        mod._ledger.open()
+
+        class Lead:
+            def still_active(self):
+                return active
+        mod._leadership = Lead()
+        return mod, entries
+
+    def test_restart_and_redeploy_are_accepted_once_at_a_time(self):
+        mod, entries = self.module()
+        res = m.Module.daemon_action(mod, 'restart', 'mgr.h3')
+        self.assertEqual(res.exception_str, '')
+        op_id = res.result.split('operation ')[1].rstrip(')')
+        [(_, e)] = mod._ledger.executable()
+        self.assertEqual((e['id'], e['kind'], e['daemon'], e['host']), (op_id, 'restart', 'mgr.h3', 'h3'))
+        # another operation on the same daemon waits until the leader finished this one
+        self.assertTrue(m.Module.daemon_action(mod, 'redeploy', 'mgr.h3').exception_str)
+        entries['talos/inc/20/journal/op/' + op_id] = json.dumps({'state': 'completed'})
+        self.assertFalse(m.Module.daemon_action(mod, 'redeploy', 'mgr.h3').exception_str)
+        out = m.Module._operation(mod, op_id)
+        self.assertEqual(out.retval, 0)
+        self.assertEqual(json.loads(out.stdout)['journal']['state'], 'completed')
+        self.assertEqual(m.Module._operation(mod, 'op-%016x' % 1).retval, -2)
+
+    def test_an_unsettled_append_blocks_acceptance(self):
+        mod, entries = self.module()
+        mod._ledger.mon.silent = 2
+        self.assertTrue(m.Module.daemon_action(mod, 'restart', 'mgr.h3').exception_str)  # outcome unknown
+        # still unknown: no second operation on the same daemon goes in beside it
+        self.assertTrue(m.Module.daemon_action(mod, 'restart', 'mgr.h3').exception_str)
+        self.assertEqual(len(mod._ledger.executable()), 0)
+        # settled: the first one counts, and blocks the next on that daemon
+        mod._ledger.settle()
+        self.assertEqual(len(mod._ledger.executable()), 1)
+        self.assertTrue(m.Module.daemon_action(mod, 'restart', 'mgr.h3').exception_str)
+
+    def test_refused_before_acceptance(self):
+        mod, _ = self.module()
+        for args in (('stop', 'mgr.h3'), ('reconfig', 'mgr.h3'), ('restart', 'mgr.h9'), ('restart', 'client.admin')):
+            self.assertTrue(m.Module.daemon_action(mod, *args).exception_str, args)
+        self.assertTrue(m.Module.daemon_action(mod, 'redeploy', 'mgr.h3', image='quay.io/ceph/ceph:v20').exception_str)
+        self.assertTrue(m.Module.daemon_action(mod, 'restart', 'mgr.h3', force=True).exception_str)
+        self.assertEqual(mod._ledger.executable(), [])
+        # not sealed, or no longer active: nothing is accepted
+        for mod in (self.module(sealed=False)[0], self.module(active=False)[0]):
+            self.assertTrue(m.Module.daemon_action(mod, 'restart', 'mgr.h3').exception_str)
+            self.assertEqual(mod._ledger.executable(), [])
