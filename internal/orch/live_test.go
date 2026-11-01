@@ -268,5 +268,10 @@ func liveOrch(t *testing.T) *Orch {
 		t.Fatal(err)
 	}
 
+	// the tests act as a mgr or an agent: they need its keys
+	if err := o.LoadSecrets(ctx); err != nil {
+		t.Fatal(err)
+	}
+
 	return o
 }

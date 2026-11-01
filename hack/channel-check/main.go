@@ -49,8 +49,14 @@ func run(mgrHost, agentHost string) error {
 	tc := &talos.Client{Default: talos.Conn{Talosconfig: st.Talosconfig, Context: st.Context}}
 	defer tc.Close() //nolint:errcheck
 
-	// the certificates are in the cluster's state, in its mons
-	if err := (&orch.Orch{Talos: tc, St: st, Out: os.Stderr}).Open(context.Background()); err != nil {
+	// the certificates are in the cluster's state, in its mons, their keys
+	// in its secrets
+	o := &orch.Orch{Talos: tc, St: st, Out: os.Stderr}
+	if err := o.Open(context.Background()); err != nil {
+		return err
+	}
+
+	if err := o.LoadSecrets(context.Background()); err != nil {
 		return err
 	}
 
@@ -184,6 +190,44 @@ func storeCheck(st *state.State, mgr state.Host) error {
 	}
 
 	fmt.Println("auth get client.admin through the bridge: refused")
+
+	return secretCheck(ctx, st, b, mgr)
+}
+
+// secretCheck reads the mgr host's mgr key through the bridge and checks that
+// the bridge refuses every secret the leader does not render.
+func secretCheck(ctx context.Context, st *state.State, b *agent.Bridge, mgr state.Host) error {
+	v, err := b.Secret(ctx, state.SecretHost(mgr.Name, state.SecretMgrServer))
+	if err != nil || v != mgr.MgrServerKey {
+		return fmt.Errorf("secret get of the mgr server key: matches=%v: %w", v == mgr.MgrServerKey, err)
+	}
+
+	fmt.Println("secret get of the mgr host's mgr server key: the key")
+
+	refused := []string{state.SecretAgentCA, state.SecretRGWCA, state.SecretHost(mgr.Name, state.SecretAgentClient), state.SecretHost(mgr.Name, state.SecretAgentServer)}
+
+	for _, h := range st.Hosts {
+		if h.MgrServerCert == "" {
+			refused = append(refused, state.SecretHost(h.Name, state.SecretMgrServer))
+		}
+	}
+
+	for _, name := range refused {
+		if _, err := b.Secret(ctx, name); err == nil || !strings.Contains(err.Error(), "refused: 400") {
+			return fmt.Errorf("secret get %s was not refused: %w", name, err)
+		}
+	}
+
+	id, err := agent.NewDispatchID()
+	if err != nil {
+		return err
+	}
+
+	if _, err := b.Call(ctx, id, "config-key get", map[string]any{"key": store.SecretPrefix + state.SecretAgentCA}, agent.MaxBridgeDeadline); err == nil || !strings.Contains(err.Error(), "refused: 400") {
+		return fmt.Errorf("config-key get of the agent CA key was not refused: %w", err)
+	}
+
+	fmt.Printf("secret get refused for %v; config-key get of %s refused\n", refused, store.SecretPrefix+state.SecretAgentCA)
 
 	return nil
 }

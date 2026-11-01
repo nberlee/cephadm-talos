@@ -177,6 +177,20 @@ func (o *Orch) openStore(ctx context.Context, node string) error {
 	return nil
 }
 
+// LoadSecrets reads the secrets into the state also when the cluster is
+// managed, for test tools that act as an agent; the state stays read-only.
+func (o *Orch) LoadSecrets(ctx context.Context) error {
+	if len(o.St.Hosts) == 0 {
+		return errors.New("no host to read the secrets through")
+	}
+
+	if err := o.openSecrets(ctx, o.St.Hosts[0].Addr); err != nil {
+		return err
+	}
+
+	return o.readSecrets(ctx)
+}
+
 // openSecrets opens the secrets, which only the CLI before the handoff reads
 // and writes, through a Ceph container on node.
 func (o *Orch) openSecrets(ctx context.Context, node string) (err error) {
