@@ -207,6 +207,14 @@ const maxJobResult = 1 << 20
 // the document again. The result file stays on the node as the job's replay
 // record; the agent removes it once the outcome is acknowledged (plan 03, item 8).
 func (o *Orch) runJob(ctx context.Context, node string, doc *spec.ContainerConfig, id string, timeout time.Duration) (res JobResult, err error) {
+	return o.runJobKeep(ctx, node, doc, id, timeout, false)
+}
+
+// runJobKeep is runJob; with keep a job that has not ended (cancelled, timed
+// out, or an apply whose outcome is unknown) is left running, for a retry
+// under the same journaled id to wait for it again (plan 03, step 7 slice D):
+// removing it would leave a job that started and can never finish.
+func (o *Orch) runJobKeep(ctx context.Context, node string, doc *spec.ContainerConfig, id string, timeout time.Duration, keep bool) (res JobResult, err error) {
 	name, cmd := doc.MetaName, jobEnv(doc, "CMD")
 
 	// a script is named by its job, a one-line command by itself
@@ -222,7 +230,13 @@ func (o *Orch) runJob(ctx context.Context, node string, doc *spec.ContainerConfi
 	// fail after Talos accepted the config). A `never` job left behind runs again
 	// on the next boot, where its claim keeps it from repeating its work; a
 	// document left behind is still an error of its own.
+	ended := false
+
 	defer func() {
+		if keep && !ended {
+			return
+		}
+
 		// cleanup outlives a cancelled or timed out job, but is bounded itself
 		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 6*time.Minute)
 		defer cancel()
@@ -266,6 +280,8 @@ func (o *Orch) runJob(ctx context.Context, node string, doc *spec.ContainerConfi
 		return JobResult{}, err
 	}
 
+	ended = true
+
 	if !usesRecords(doc) {
 		out, err := o.Talos.Logs(jctx, node, name)
 		if err != nil {
@@ -283,7 +299,7 @@ func (o *Orch) runJob(ctx context.Context, node string, doc *spec.ContainerConfi
 	b, rerr := o.Talos.ReadFile(jctx, node, jobsHostDir+"/"+o.St.FSID+"."+id+".result", maxJobResult)
 	if rerr != nil {
 		// no result: refused (other inputs, uncertain) or failed before running
-		return JobResult{RC: int(st.ExitCode)}, fmt.Errorf("job %s (%q) left no result (%s, exit %d): %s", name, cmd, st.State, st.ExitCode, st.Error)
+		return JobResult{RC: int(st.ExitCode)}, fmt.Errorf("job %s (%q) %w (%s, exit %d): %s", name, cmd, errNoJobResult, st.State, st.ExitCode, st.Error)
 	}
 
 	res, inputs, err := parseJobResult(b)
@@ -666,7 +682,7 @@ func (o *Orch) Remove(ctx context.Context, name string, force, zap bool) error {
 
 		// ceph-volume zap, not `talosctl wipe disk`: bluestore keeps label copies
 		// at 1G/10G/100G/1000G that a FAST wipe of the disk start leaves behind
-		if err := o.zap(ctx, h, d.OSDDevice(), d.DiskSerial); err != nil {
+		if err := o.zap(ctx, h, d.OSDDevice(), d.DiskSerial, randHex(3)); err != nil {
 			return fmt.Errorf("osd removed, but wiping %s failed; re-run `cephadm-talos rm --zap %s`: %w", d.Device, name, err)
 		}
 	}
@@ -726,20 +742,213 @@ func (o *Orch) removeDoc(ctx context.Context, h state.Host, d state.Daemon) erro
 	return o.apply(ctx, h.Addr, append(vips, spec.Delete("ContainerConfig", o.St.DocName(d)))...)
 }
 
-// RemoveCluster removes every document of this cluster from every host, like
-// `cephadm rm-cluster`: daemons, leftover jobs and ceph.conf. With zap, OSD
-// devices are zapped and the cluster's data directories deleted as well.
-// The local state is removed last, so a failed run can be repeated.
-func (o *Orch) RemoveCluster(ctx context.Context, zap bool) error {
-	prefix := "ceph-" + o.St.Short() + "-"
+// RemoveCluster removes the whole cluster from every host (plan 03, step 7
+// slice D, item 6). A cluster its agents own is suspended first, so no grant,
+// job or leader tick races the removal; the zap targets are fixed after that,
+// from the state read again and the nodes' preparation jobs, and journaled
+// with the ids of the jobs that zap them. An interrupted removal continues
+// from the journal.
+func (o *Orch) RemoveCluster(ctx context.Context, zap bool, opts SuspendOptions) error {
+	// one removal (or suspension) at a time, from the journal as it is on disk
+	unlock, err := state.Lock(o.St.FSID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 
-	// zap first refuses, before anything is removed
-	if zap && !o.opened {
+	rec, err := state.LoadRecovery(o.St.FSID)
+	if err != nil {
+		return err
+	}
+
+	removing := rec != nil && rec.Phase == state.PhaseRemoving && rec.Removal != nil
+
+	switch {
+	case removing && rec.Removal.Zap != zap:
+		return fmt.Errorf("the interrupted removal was started %s --zap: run it again the same way", map[bool]string{true: "with", false: "without"}[rec.Removal.Zap])
+	case zap && !o.opened && !removing:
+		// zap first refuses, before anything is suspended or removed
 		return errors.New("--zap needs the cluster's state, which names the OSD devices, and it cannot be read; remove the cluster without --zap and wipe the disks with talosctl")
 	}
 
+	// before the handoff the CLI is the writer and the agents own nothing
+	owned := rec != nil || o.St.Agent != nil && !(o.opened && !o.Managed())
+
+	// a dry run of a removal its agents own would suspend them, or record a
+	// step of the journal it only simulated
+	if owned && o.Talos.DryRun {
+		return errors.New("rm-cluster of a cluster its agents own has no dry run: it suspends them and journals its steps")
+	}
+
+	if owned && (rec == nil || rec.Phase == state.PhaseSuspending || rec.Phase == state.PhaseSuspended) {
+		if rec, err = o.suspendLocked(ctx, opts); err != nil {
+			return err
+		}
+	}
+
+	if rec != nil && rec.Phase != state.PhaseSuspended && rec.Phase != state.PhaseRecovering && rec.Phase != state.PhaseRemoving {
+		return fmt.Errorf("recovery session %s is %s", rec.Session, rec.Phase)
+	}
+
+	removal := &state.Removal{Zap: zap, Image: o.St.Image}
+
+	switch {
+	case removing:
+		removal = rec.Removal // as it was started
+	case zap:
+		if removal.Targets, err = o.zapTargets(ctx, rec); err != nil {
+			return err
+		}
+	}
+
+	if rec != nil && !removing {
+		rec.Phase, rec.Removal = state.PhaseRemoving, removal
+		if err := rec.Save(); err != nil {
+			return err
+		}
+	}
+
+	if !removal.DocsRemoved {
+		if err := o.removeDocuments(ctx, o.removalHosts(rec)); err != nil {
+			return err
+		}
+
+		if rec != nil {
+			removal.DocsRemoved = true
+			if err := rec.Save(); err != nil {
+				return err
+			}
+		}
+	}
+
+	for _, t := range removal.Targets {
+		if err := o.zapTarget(ctx, rec, removal, t); err != nil {
+			return err
+		}
+	}
+
+	if removal.Zap {
+		for _, h := range o.removalHosts(rec) {
+			o.printf("deleting /var/mnt/ceph/%s on %s\n", o.St.FSID, h.Name)
+
+			id, err := o.removalJob(rec, "rm-data/"+h.Name)
+			if err != nil {
+				return err
+			}
+
+			dir := "/var/lib/ceph/" + o.St.FSID
+			doc := daemons.HostJob(daemons.Params{
+				Name: fmt.Sprintf("ceph-%s-job-%s", o.St.Short(), id), Image: removal.Image, FSID: o.St.FSID, ID: "job",
+			}, id, jobInputs("rm-data", h.Name, dir), "rm -rf "+shellQuote(dir))
+
+			if _, err := o.runJobKeep(ctx, h.Addr, doc, id, 10*time.Minute, rec != nil); err != nil {
+				return err
+			}
+		}
+	}
+
+	if o.Talos.DryRun {
+		return nil
+	}
+
+	// the journal goes with the rest of the workstation's state
+	if err := os.RemoveAll(o.St.Dir()); err != nil {
+		return err
+	}
+
+	cur := filepath.Join(state.Root(), "current")
+	if b, err := os.ReadFile(cur); err == nil && strings.TrimSpace(string(b)) == o.St.FSID {
+		_ = os.Remove(cur)
+	}
+
+	o.printf("cluster %s removed\n", o.St.FSID)
+
+	return nil
+}
+
+// zapTarget zaps one disk of a removal under its journaled job id. A disk
+// known only from a preparation is zapped only with this cluster's BlueStore
+// label; one without it is left as it is.
+func (o *Orch) zapTarget(ctx context.Context, rec *state.Recovery, removal *state.Removal, t state.ZapTarget) error {
+	id, err := o.removalJob(rec, "zap/"+t.Host+"/"+t.Serial)
+	if err != nil {
+		return err
+	}
+
+	o.printf("zapping %s on %s\n", t.Device, t.Host)
+
+	st := *o.St
+	st.Image = removal.Image
+	doc := render.Zap(&st, state.Host{Name: t.Host, Addr: t.Addr}, id, t.Device, t.Serial, !t.Labelled)
+
+	res, err := o.runJobKeep(ctx, t.Addr, doc, id, 10*time.Minute, rec != nil)
+
+	// only the command's verified refusal: a cleanup that failed is an error
+	var cleanup *JobCleanupError
+	if err != nil && t.Labelled && res.RC == zapNoLabel && !errors.As(err, &cleanup) && !errors.Is(err, errNoJobResult) {
+		o.printf("%s on %s carries no BlueStore label of this cluster: left as it is\n", t.Device, t.Host)
+
+		return nil
+	}
+
+	return err
+}
+
+// errNoJobResult marks a job that left no result file: its exit code is
+// not the command's verified result.
+var errNoJobResult = errors.New("left no result")
+
+// zapNoLabel is zap.sh's exit code for a disk without a BlueStore label of
+// the cluster.
+const zapNoLabel = 67
+
+// removalHosts are the hosts a removal goes through: the state's and the
+// contacts, and every host a recovery session found.
+func (o *Orch) removalHosts(rec *state.Recovery) []state.Host {
+	hosts := o.St.AllHosts()
+
+	if rec != nil {
+		names := make([]string, 0, len(rec.Hosts))
+		for n := range rec.Hosts {
+			names = append(names, n)
+		}
+
+		sort.Strings(names)
+
+		for _, n := range names {
+			if !slices.ContainsFunc(hosts, func(h state.Host) bool { return h.Name == n }) && rec.Hosts[n].Addr != "" {
+				hosts = append(hosts, state.Host{Name: n, Addr: rec.Hosts[n].Addr})
+			}
+		}
+	}
+
+	return hosts
+}
+
+// removalJob is the id of a removal's job for its purpose: journaled before
+// its document is applied when a session runs the removal, fresh otherwise.
+func (o *Orch) removalJob(rec *state.Recovery, purpose string) (string, error) {
+	if rec == nil {
+		return randHex(3), nil
+	}
+
+	if j, ok := rec.Jobs[purpose]; ok {
+		return j.ID, nil
+	}
+
+	j := &state.RecoveryJob{ID: randHex(3), Inputs: purpose}
+	rec.Jobs[purpose] = j
+
+	return j.ID, rec.Save()
+}
+
+// removeDocuments removes every cluster document, the agents included, from
+// each host and waits until every instance is gone.
+func (o *Orch) removeDocuments(ctx context.Context, hosts []state.Host) error {
+	prefix := "ceph-" + o.St.Short() + "-"
+
 	// members and contacts: a node enrolled without a successful publication too
-	for _, h := range o.St.AllHosts() {
+	for _, h := range hosts {
 		names := map[string]bool{}
 
 		for _, d := range o.St.Daemons {
@@ -800,60 +1009,169 @@ func (o *Orch) RemoveCluster(ctx context.Context, zap bool) error {
 		}
 	}
 
-	if zap {
-		for _, d := range o.St.DaemonsOf(state.TypeOSD, "") {
-			h, ok := o.St.Host(d.Host)
-			if !ok {
-				continue
-			}
-
-			o.printf("zapping %s on %s\n", d.Device, h.Name)
-
-			if err := o.zap(ctx, h, d.OSDDevice(), d.DiskSerial); err != nil {
-				return err
-			}
-		}
-
-		for _, h := range o.St.AllHosts() {
-			o.printf("deleting /var/mnt/ceph/%s on %s\n", o.St.FSID, h.Name)
-
-			id := randHex(3)
-			dir := "/var/lib/ceph/" + o.St.FSID
-			doc := daemons.HostJob(daemons.Params{
-				Name: fmt.Sprintf("ceph-%s-job-%s", o.St.Short(), id), Image: o.St.Image, FSID: o.St.FSID, ID: "job",
-			}, id, jobInputs("rm-data", h.Name, dir), "rm -rf "+shellQuote(dir))
-
-			if _, err := o.runJob(ctx, h.Addr, doc, id, 10*time.Minute); err != nil {
-				return err
-			}
-		}
-	}
-
-	if o.Talos.DryRun {
-		return nil
-	}
-
-	if err := os.RemoveAll(o.St.Dir()); err != nil {
-		return err
-	}
-
-	cur := filepath.Join(state.Root(), "current")
-	if b, err := os.ReadFile(cur); err == nil && strings.TrimSpace(string(b)) == o.St.FSID {
-		_ = os.Remove(cur)
-	}
-
-	o.printf("cluster %s removed\n", o.St.FSID)
-
 	return nil
 }
 
-// zap destroys all Ceph signatures on a device, from a privileged job on its host.
-func (o *Orch) zap(ctx context.Context, h state.Host, device, serial string) error {
+// zapTargets are the disks a removal zaps, fixed after the suspension: the
+// OSDs of the state read again (an accepted creation may have published one
+// meanwhile), the disks of the preparation and zap jobs configured on the
+// nodes, and, zapped only with this cluster's label, every disk a
+// preparation used on a host (the receipts, from the agents' approval
+// records). A disk of the state or a job without a known serial refuses the
+// zap before anything goes.
+func (o *Orch) zapTargets(ctx context.Context, rec *state.Recovery) ([]state.ZapTarget, error) {
+	seen := map[string]bool{}
+	targets := []state.ZapTarget{}
+
+	add := func(h state.Host, device, serial string, labelled bool) error {
+		if serial == "" {
+			return fmt.Errorf("--zap: the serial of %s on %s is unknown: remove the cluster without --zap and wipe that disk with talosctl", device, h.Name)
+		}
+
+		if !seen[h.Name+"/"+serial] {
+			seen[h.Name+"/"+serial] = true
+			targets = append(targets, state.ZapTarget{Host: h.Name, Addr: h.Addr, Device: device, Serial: serial, Labelled: labelled})
+		}
+
+		return nil
+	}
+
+	for _, d := range o.St.DaemonsOf(state.TypeOSD, "") {
+		h, ok := o.St.Host(d.Host)
+		if !ok {
+			continue
+		}
+
+		if err := add(h, d.OSDDevice(), d.DiskSerial, false); err != nil {
+			return nil, err
+		}
+	}
+
+	for _, h := range o.removalHosts(rec) {
+		envs, err := o.configuredEnv(ctx, h.Addr, "ceph-"+o.St.Short()+"-")
+		if err != nil {
+			return nil, err
+		}
+
+		names := make([]string, 0, len(envs))
+		for n := range envs {
+			names = append(names, n)
+		}
+
+		sort.Strings(names)
+
+		for _, n := range names {
+			if env := envs[n]; env["DEVICE"] != "" && env["OSD_ID"] == "" {
+				if err := add(h, env["DEVICE"], env["DISK_SERIAL"], false); err != nil {
+					return nil, err
+				}
+			}
+		}
+
+		if rec == nil || rec.Hosts[h.Name] == nil || rec.Hosts[h.Name].Receipt == nil {
+			continue
+		}
+
+		for _, serial := range rec.Hosts[h.Name].Receipt.Prepared {
+			if seen[h.Name+"/"+serial] {
+				continue
+			}
+
+			link, err := o.diskBySerial(ctx, h.Addr, serial)
+			if err != nil {
+				return nil, err
+			}
+
+			if link == "" {
+				o.printf("%s: the disk %s a preparation used is gone\n", h.Name, serial)
+
+				continue
+			}
+
+			if err := add(h, link, serial, true); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	return targets, nil
+}
+
+// diskBySerial returns the /dev/disk/by-id link of the node's disk with a
+// serial, "" if the node has no such disk.
+func (o *Orch) diskBySerial(ctx context.Context, node, serial string) (string, error) {
+	disks, err := o.Talos.Disks(ctx, node)
+	if err != nil {
+		return "", err
+	}
+
+	for _, disk := range disks {
+		ds := disk.TypedSpec()
+		if strings.TrimSpace(ds.Serial) != serial {
+			continue
+		}
+
+		for _, l := range ds.Symlinks {
+			if strings.HasPrefix(l, "/dev/disk/by-id/") && strings.Contains(l, serial) {
+				return l, nil
+			}
+		}
+
+		return "", fmt.Errorf("the disk %s on %s has no /dev/disk/by-id link with its serial", serial, node)
+	}
+
+	return "", nil
+}
+
+// configuredEnv returns the environment of each cluster container configured
+// on a node.
+func (o *Orch) configuredEnv(ctx context.Context, node, prefix string) (map[string]map[string]string, error) {
+	defer o.reading()()
+
+	cfg, err := o.Talos.MachineConfig(ctx, node)
+	if err != nil {
+		return nil, err
+	}
+
+	out := map[string]map[string]string{}
+	dec := yaml.NewDecoder(strings.NewReader(cfg))
+
+	for {
+		var m struct {
+			Kind        string   `yaml:"kind"`
+			Name        string   `yaml:"name"`
+			Environment []string `yaml:"environment"`
+		}
+
+		if err := dec.Decode(&m); errors.Is(err, io.EOF) {
+			return out, nil
+		} else if err != nil {
+			return nil, fmt.Errorf("%s: machine config: %w", node, err)
+		}
+
+		if m.Kind != "ContainerConfig" || !strings.HasPrefix(m.Name, prefix) {
+			continue
+		}
+
+		env := map[string]string{}
+
+		for _, e := range m.Environment {
+			if k, v, ok := strings.Cut(e, "="); ok {
+				env[k] = v
+			}
+		}
+
+		out[m.Name] = env
+	}
+}
+
+// zap destroys all Ceph signatures on a device, from a privileged job on its
+// host, under the job id the caller chose.
+func (o *Orch) zap(ctx context.Context, h state.Host, device, serial, id string) error {
 	if serial == "" {
 		return fmt.Errorf("the serial of %s is unknown: zap is bound to the disk's serial", device)
 	}
 
-	id := randHex(3)
 	// zapping needs no cluster access: jobs mount neither ceph.conf nor a key
 	_, err := o.runJob(ctx, h.Addr, o.zapDoc(h, id, device, serial), id, 10*time.Minute)
 

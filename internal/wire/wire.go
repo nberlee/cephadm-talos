@@ -334,9 +334,12 @@ type SuspendReceipt struct {
 	Floor    int64  `json:"floor"` // the session floor
 	// Unresolved are the operations whose outcome is uncertain, Intents the
 	// bridge calls whose outcome the module did not give
-	Unresolved []Operation       `json:"unresolved"`
-	Intents    []BridgeIntent    `json:"intents"`
-	Owned      map[string]string `json:"owned"` // "<kind>/<name>" -> hash
+	Unresolved []Operation `json:"unresolved"`
+	// Prepared are the serials of the disks preparation jobs used on the host
+	// (the approval's disk entries the agent recorded), for rm-cluster --zap
+	Prepared []string          `json:"prepared,omitempty"`
+	Intents  []BridgeIntent    `json:"intents"`
+	Owned    map[string]string `json:"owned"` // "<kind>/<name>" -> hash
 }
 
 // SuspendState is the answer while an agent drains: Waiting says for what.

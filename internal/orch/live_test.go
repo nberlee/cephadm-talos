@@ -44,7 +44,7 @@ func TestLiveJobs(t *testing.T) {
 	}
 
 	start := time.Now()
-	if err := o.zap(ctx, h, link, serial); err != nil {
+	if err := o.zap(ctx, h, link, serial, randHex(3)); err != nil {
 		t.Fatalf("zap: %v", err)
 	}
 

@@ -90,6 +90,11 @@ func (o *Orch) Suspend(ctx context.Context, opts SuspendOptions) (*state.Recover
 	}
 	defer unlock()
 
+	return o.suspendLocked(ctx, opts)
+}
+
+// suspendLocked is Suspend for a caller that holds the cluster's Lock.
+func (o *Orch) suspendLocked(ctx context.Context, opts SuspendOptions) (*state.Recovery, error) {
 	// what an offline suspension or recovery needs from the state (the agent
 	// CA, the agent image, the hosts) is kept locally while it can be read
 	if o.opened {
@@ -514,7 +519,7 @@ func (o *Orch) suspendNode(ctx context.Context, h state.Host, rec *state.Recover
 
 	return &wire.SuspendReceipt{
 		Version: wire.Version, Session: rec.Session, Host: h.Name, Revision: rep.Revision, Fence: rep.Fence, Floor: rep.Floor,
-		Unresolved: rep.Open, Intents: rep.Intents, Owned: rep.Owned,
+		Unresolved: rep.Open, Intents: rep.Intents, Owned: rep.Owned, Prepared: rep.Prepared,
 	}, nil
 }
 

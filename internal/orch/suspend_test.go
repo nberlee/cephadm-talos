@@ -9,13 +9,17 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/siderolabs/talos/pkg/machinery/resources/block"
 	"github.com/siderolabs/talos/pkg/machinery/resources/containers"
 
+	"github.com/nberlee/cephadm-talos/internal/render"
+	"github.com/nberlee/cephadm-talos/internal/spec"
 	"github.com/nberlee/cephadm-talos/internal/state"
 	"github.com/nberlee/cephadm-talos/internal/store"
 	"github.com/nberlee/cephadm-talos/internal/talos/talostest"
@@ -32,6 +36,8 @@ type fakeAgent struct {
 	gets     int
 	srv      *httptest.Server
 	revision int64
+	// node is the fake Talos node of the setup
+	node *talostest.Node
 }
 
 func (a *fakeAgent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -110,7 +116,7 @@ func suspendSetup(t *testing.T) (*Orch, state.Host, *fakeAgent) {
 	pool := x509.NewCertPool()
 	pool.AppendCertsFromPEM([]byte(o.St.Agent.CACert))
 
-	a := &fakeAgent{revision: 7}
+	a := &fakeAgent{revision: 7, node: f}
 	a.srv = httptest.NewUnstartedServer(a)
 	a.srv.TLS = &tls.Config{Certificates: []tls.Certificate{pair}, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: pool, MinVersion: tls.VersionTLS13}
 	a.srv.StartTLS()
@@ -274,5 +280,146 @@ func TestAnOfflineRetryKeepsTheHostsItFound(t *testing.T) {
 	got, err := o.Suspend(ctx, SuspendOptions{})
 	if err == nil || !strings.Contains(err.Error(), "h2") || got.Phase != state.PhaseSuspending {
 		t.Fatalf("a journaled host was skipped: %v, %+v", err, got)
+	}
+}
+
+func TestRemovingAHandedOverClusterSuspendsItFirst(t *testing.T) {
+	o, h, a := suspendSetup(t)
+	ctx := context.Background()
+
+	// no mon answers: the agents may own the cluster, so it is suspended; the
+	// fake node has no controllers to remove the mon's status
+	mon := o.St.DocName(state.Daemon{Type: state.TypeMon, ID: "h1", Host: "h1"})
+	o.opened = false
+
+	if err := a.node.St.Destroy(ctx, containers.NewContainerStatus(containers.NamespaceName, mon).Metadata()); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := o.apply(ctx, h.Addr, mustDocs(t)(o.hostDocs(h))...); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := o.RemoveCluster(ctx, false, SuspendOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	if a.posts != 1 {
+		t.Fatalf("removed without suspending: %d suspensions", a.posts)
+	}
+
+	cfg, err := o.Talos.MachineConfig(ctx, h.Addr)
+	if err != nil || strings.Contains(cfg, o.agentDocName(h)) {
+		t.Fatalf("the agent is left: %v", err)
+	}
+
+	if rec, err := state.LoadRecovery(o.St.FSID); err != nil || rec != nil {
+		t.Fatalf("the journal outlived the removal: %+v %v", rec, err)
+	}
+}
+
+func TestZapTargetsComeFromTheStateAndThePreparations(t *testing.T) {
+	o, h, _ := suspendSetup(t)
+	ctx := context.Background()
+
+	o.St.AddDaemon(state.Daemon{Type: state.TypeOSD, ID: "0", Host: h.Name, Device: "/dev/sda", DiskSerial: "S0"})
+
+	// a preparation the state does not show yet
+	prep := spec.Container("ceph-"+o.St.Short()+"-osd-prepare-abc", o.St.Image)
+	prep.ContainerEnvironment = []string{"DEVICE=/dev/disk/by-id/ata-X_S1", "DISK_SERIAL=S1"}
+
+	if err := o.apply(ctx, h.Addr, prep); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := o.zapTargets(ctx, nil)
+	if err != nil || len(got) != 2 || got[0].Serial != "S0" || got[1].Serial != "S1" {
+		t.Fatalf("targets %+v %v", got, err)
+	}
+
+	// a disk without a serial refuses the zap
+	o.St.AddDaemon(state.Daemon{Type: state.TypeOSD, ID: "1", Host: h.Name, Device: "/dev/sdb"})
+
+	if _, err := o.zapTargets(ctx, nil); err == nil {
+		t.Fatal("a disk without a serial")
+	}
+}
+
+func TestAPreparedDiskIsZappedOnlyWithTheClustersLabel(t *testing.T) {
+	o, h, a := suspendSetup(t)
+	ctx := context.Background()
+
+	disk := block.NewDisk(block.NamespaceName, "sdc")
+	disk.TypedSpec().Serial, disk.TypedSpec().DevPath = "S9", "/dev/sdc"
+	disk.TypedSpec().Symlinks = []string{"/dev/disk/by-id/ata-QEMU_HARDDISK_S9"}
+
+	if err := a.node.St.Create(ctx, disk); err != nil {
+		t.Fatal(err)
+	}
+
+	// the receipt names S9 (a preparation used it) and a disk that is gone
+	rec := &state.Recovery{Schema: state.RecoverySchema, FSID: o.St.FSID, Session: "0b8f3a52-7c1e-4d3a-9f6e-2a4b5c6d7e8f", Phase: state.PhaseSuspended,
+		Hosts: map[string]*state.RecoveryHost{h.Name: {Addr: h.Addr, Receipt: &wire.SuspendReceipt{Prepared: []string{"S9", "GONE"}}}}}
+
+	got, err := o.zapTargets(ctx, rec)
+	if err != nil || len(got) != 1 || got[0].Serial != "S9" || !got[0].Labelled || got[0].Device != "/dev/disk/by-id/ata-QEMU_HARDDISK_S9" {
+		t.Fatalf("targets %+v %v", got, err)
+	}
+}
+
+func TestAnInterruptedRemovalContinuesAsItWasStarted(t *testing.T) {
+	o, _, _ := suspendSetup(t)
+
+	rec := &state.Recovery{Schema: state.RecoverySchema, FSID: o.St.FSID, Session: "0b8f3a52-7c1e-4d3a-9f6e-2a4b5c6d7e8f", Phase: state.PhaseRemoving,
+		Hosts: map[string]*state.RecoveryHost{}, Removal: &state.Removal{Zap: true, Image: o.St.Image}}
+	if err := rec.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := o.RemoveCluster(context.Background(), false, SuspendOptions{}); err == nil || !strings.Contains(err.Error(), "with --zap") {
+		t.Fatalf("a removal started with --zap continued without: %v", err)
+	}
+}
+
+func TestAJournaledJobThatHasNotEndedIsLeftRunning(t *testing.T) {
+	o, h, _ := suspendSetup(t)
+
+	for _, keep := range []bool{true, false} {
+		id := randHex(3)
+		doc := render.Zap(o.St, h, id, "/dev/disk/by-id/ata-X_S1", "S1", false)
+
+		// the fake node never ends the job: the wait is cut short
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		_, err := o.runJobKeep(ctx, h.Addr, doc, id, time.Minute, keep)
+		cancel()
+
+		if err == nil {
+			t.Fatal("a job that did not end")
+		}
+
+		docs, err := o.configuredContainers(context.Background(), h.Addr, doc.MetaName)
+		if err != nil || slices.Contains(docs, doc.MetaName) != keep {
+			t.Fatalf("keep %v: configured %v %v", keep, docs, err)
+		}
+	}
+}
+
+func TestADryRunLeavesAnInterruptedRemovalAlone(t *testing.T) {
+	o, _, _ := suspendSetup(t)
+
+	rec := &state.Recovery{Schema: state.RecoverySchema, FSID: o.St.FSID, Session: "0b8f3a52-7c1e-4d3a-9f6e-2a4b5c6d7e8f", Phase: state.PhaseRemoving,
+		Hosts: map[string]*state.RecoveryHost{}, Removal: &state.Removal{}}
+	if err := rec.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	o.Talos.DryRun = true
+
+	if err := o.RemoveCluster(context.Background(), false, SuspendOptions{}); err == nil {
+		t.Fatal("a dry run of an interrupted removal")
+	}
+
+	if got, err := state.LoadRecovery(o.St.FSID); err != nil || got.Removal.DocsRemoved {
+		t.Fatalf("the dry run journaled a step: %+v %v", got, err)
 	}
 }

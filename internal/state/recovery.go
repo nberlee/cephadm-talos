@@ -38,6 +38,32 @@ type Recovery struct {
 	// Jobs are the jobs the session allocated, by purpose: an id is recorded
 	// before its document is applied, and a retry reuses it
 	Jobs map[string]*RecoveryJob `json:"jobs"`
+	// Removal is the rm-cluster in progress, fixed before anything is removed
+	Removal *Removal `json:"removal,omitempty"`
+}
+
+// Removal is what an rm-cluster removes: a retry continues it as it was
+// started.
+type Removal struct {
+	// Zap: the disks and the data directories go too; Image is the Ceph image
+	// the zap and data jobs run, Targets the disks
+	Zap     bool        `json:"zap"`
+	Image   string      `json:"image,omitempty"`
+	Targets []ZapTarget `json:"targets,omitempty"`
+	// DocsRemoved is set once every document and instance is gone: a retry
+	// does not remove its own zap or data jobs again
+	DocsRemoved bool `json:"docs_removed,omitempty"`
+}
+
+// ZapTarget is a disk a removal zaps, by its serial. Labelled: only if it
+// carries a BlueStore label of the cluster (a disk known only because a
+// preparation used it).
+type ZapTarget struct {
+	Host     string `json:"host"`
+	Addr     string `json:"addr"`
+	Device   string `json:"device"`
+	Serial   string `json:"serial"`
+	Labelled bool   `json:"labelled,omitempty"`
 }
 
 // RecoveryHost is one host's part of a session.

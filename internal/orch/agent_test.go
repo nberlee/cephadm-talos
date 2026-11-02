@@ -268,7 +268,9 @@ func TestRemoveClusterRemovesAgentsWithoutStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := o.RemoveCluster(ctx, false); err != nil {
+	o.opened = true // the CLI still writes the state: nothing to suspend
+
+	if err := o.RemoveCluster(ctx, false, SuspendOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -308,7 +310,7 @@ func TestRemoveClusterWithoutItsState(t *testing.T) {
 	gone := &Orch{Talos: o.Talos, St: state.New(o.St.FSID), Out: io.Discard}
 	gone.St.AddHost(state.Host{Name: "h1", Addr: "node"})
 
-	if err := gone.RemoveCluster(ctx, true); err == nil {
+	if err := gone.RemoveCluster(ctx, true, SuspendOptions{}); err == nil {
 		t.Fatal("zap without the OSD devices")
 	}
 
@@ -321,7 +323,7 @@ func TestRemoveClusterWithoutItsState(t *testing.T) {
 		t.Fatal("a refused zap removed documents")
 	}
 
-	if err := gone.RemoveCluster(ctx, false); err != nil {
+	if err := gone.RemoveCluster(ctx, false, SuspendOptions{}); err != nil {
 		t.Fatal(err)
 	}
 

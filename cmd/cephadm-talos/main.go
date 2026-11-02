@@ -55,7 +55,8 @@ Commands:
   suspend [--reboot] [--force]             suspend the agents and the leader for a recovery session
   approve [--image REF] [--prepare H:DISK] [--zap H:DISK] [--drop H:SERIAL:ACTION] [--show]
                                            sign and publish the operator's approval of images and disks
-  rm-cluster [--zap] --yes-i-really-mean-it  remove the whole cluster from all hosts
+  rm-cluster [--zap] [--reboot] [--force] --yes-i-really-mean-it
+                                           remove the whole cluster from all hosts (suspends a handed-over one first)
   conf                                     print the generated ceph.conf
   agent                                    run the node agent (inside its container)
 
@@ -511,13 +512,15 @@ func rmCluster(ctx context.Context, o *orch.Orch, args []string) error {
 	fs := flag.NewFlagSet("rm-cluster", flag.ExitOnError)
 	zap := fs.Bool("zap", false, "also zap OSD devices and delete /var/mnt/ceph/<fsid> on every host")
 	yes := fs.Bool("yes-i-really-mean-it", false, "confirm")
+	reboot := fs.Bool("reboot", false, "suspending: reboot a node whose unanswering agent's last apply may still land, instead of waiting")
+	force := fs.Bool("force", false, "suspending: remove a job an unanswering agent started that still runs, instead of waiting for it")
 	_ = fs.Parse(args)
 
 	if !*yes {
 		return fmt.Errorf("this destroys cluster %s; pass --yes-i-really-mean-it", o.St.FSID)
 	}
 
-	return o.RemoveCluster(ctx, *zap)
+	return o.RemoveCluster(ctx, *zap, orch.SuspendOptions{Reboot: *reboot, Force: *force})
 }
 
 // recordsJob is the recovery job's command: it reads the agent's records,

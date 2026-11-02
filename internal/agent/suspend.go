@@ -186,10 +186,15 @@ func (g *Granter) SuspendState(ctx context.Context) (wire.SuspendState, error) {
 		return wire.SuspendState{}, err
 	}
 
+	prepared, err := g.Node.preparedSerials()
+	if err != nil {
+		return wire.SuspendState{}, err
+	}
+
 	st.Receipt = &wire.SuspendReceipt{
 		Version: wire.Version, Session: s.Session, Host: g.Channel.Self.Name,
 		Revision: snap.Own.Revision, Fence: snap.Fence, Floor: floor,
-		Unresolved: unresolved, Intents: intents, Owned: snap.Own.Docs,
+		Unresolved: unresolved, Intents: intents, Owned: snap.Own.Docs, Prepared: prepared,
 	}
 
 	return st, nil

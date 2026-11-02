@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
+	"github.com/nberlee/cephadm-talos/internal/approval"
 	"github.com/nberlee/cephadm-talos/internal/records"
 	"github.com/nberlee/cephadm-talos/internal/wire"
 )
@@ -26,6 +28,8 @@ type RecordsReport struct {
 	// Open are the operations started or uncertain
 	Open    []wire.Operation    `json:"open"`
 	Intents []wire.BridgeIntent `json:"intents"`
+	// Prepared are the serials of the disks preparation jobs used
+	Prepared []string `json:"prepared,omitempty"`
 	// ApplyBoot and ApplyAt are the apply intent's boot id and time
 	// (UnixNano), empty without one
 	ApplyBoot string `json:"apply_boot,omitempty"`
@@ -100,7 +104,37 @@ func InspectRecords(recs *records.Store, session string) (RecordsReport, error) 
 		return RecordsReport{}, err
 	}
 
+	if rep.Prepared, err = n.preparedSerials(); err != nil {
+		return RecordsReport{}, err
+	}
+
 	return rep, nil
+}
+
+// preparedSerials are the serials of the disks preparation jobs used on the
+// node, from the approval record's used disk entries (approval.Disk.Key:
+// "<host>/<serial>/<action>/<since>"); read as recorded, not verified again.
+func (n *Node) preparedSerials() ([]string, error) {
+	var rec approvalStore
+
+	if _, err := n.readJSON(approvalRecord, &rec); err != nil {
+		return nil, err
+	}
+
+	seen := map[string]bool{}
+	out := []string{}
+
+	for key := range rec.Uses {
+		parts := strings.Split(key, "/")
+		if len(parts) == 4 && parts[2] == approval.Prepare && !seen[parts[1]] {
+			seen[parts[1]] = true
+			out = append(out, parts[1])
+		}
+	}
+
+	sort.Strings(out)
+
+	return out, nil
 }
 
 // WriteJobResult writes a job's result file in the jobs directory as job.sh
