@@ -856,6 +856,58 @@ class HostAdd(unittest.TestCase):
         self.assertIn('already', m.Module.apply(mod, [HostSpec('h4', '10.5.0.5')]).exception_str)
 
 
+class Requests(unittest.TestCase):
+    UUID = '0f8fad5b-d9cb-469f-a165-70867728950e'
+
+    def body(self, cmd, sub=None):
+        import hashlib
+        b = {'cmd': cmd, 'inbuf': sub}
+        return json.dumps(b), hashlib.sha256(json.dumps(b, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+    def test_once_per_request(self):
+        mod, _ = Acceptance.module(self)
+        calls = []
+
+        def remote(module, method, sub, cmd):
+            calls.append(cmd['prefix'])
+            r = m.Module.daemon_action(mod, 'restart', cmd['name'])
+            return 0 if not r.exception_str else -22, r.result or '', r.exception_str
+        mod.remote = remote
+        cmd = {'prefix': 'orch daemon', 'action': 'restart', 'name': 'mon.h1'}
+        inbuf, h = self.body(cmd)
+        res = m.Module._request(mod, self.UUID, h, inbuf)
+        self.assertEqual(res.retval, 0, res.stderr)
+        [(_, e)] = mod._ledger.executable()
+        self.assertEqual((e['request'], e['inputs']), (self.UUID, h))
+        # again, through any mgr: the same operation, the command not run again
+        res = m.Module._request(mod, self.UUID, h, inbuf)
+        self.assertIn(e['id'], res.stdout)
+        self.assertEqual(calls, ['orch daemon'])
+        # the same uuid for another command, a wrong hash, several daemons
+        other, oh = self.body(dict(cmd, name='mgr.h3'))
+        self.assertEqual(m.Module._request(mod, self.UUID, oh, other).retval, -17)
+        self.assertEqual(m.Module._request(mod, self.UUID, 'ab' * 32, inbuf).retval, -22)
+        many, mh = self.body({'prefix': 'orch daemon rm', 'names': ['mgr.h1', 'mgr.h2']})
+        self.assertEqual(m.Module._request(mod, '1f8fad5b-d9cb-469f-a165-70867728950e', mh, many).retval, -22)
+        self.assertEqual(len(mod._ledger.executable()), 1)
+
+    def test_a_daemon_spec_goes_to_the_backend_directly(self):
+        mod, _ = RGWs.module(self)
+        mod.remote = lambda *a: self.fail('through the orchestrator module, which logs whole specs')
+        pem = RGWs.operator_pem(self)
+        spec = 'service_type: rgw\nservice_id: default\nplacement:\n  hosts: [h2]\nspec:\n  rgw_frontend_ssl_certificate: |\n' + \
+            ''.join('    %s\n' % line for line in pem.strip().splitlines())
+        inbuf, h = self.body({'prefix': 'orch daemon add'}, spec)
+        res = m.Module._request(mod, self.UUID, h, inbuf)
+        self.assertEqual(res.retval, 0, res.stderr)
+        [(_, e)] = mod._ledger.executable()
+        self.assertEqual((e['daemon'], e['request']), ('rgw.h2', self.UUID))
+        self.assertIn('BEGIN CERTIFICATE', e['cert'])
+        # two specs in one request
+        two, th = self.body({'prefix': 'orch apply'}, 'service_type: mon\n---\nservice_type: mgr\n')
+        self.assertEqual(m.Module._request(mod, '2f8fad5b-d9cb-469f-a165-70867728950e', th, two).retval, -22)
+
+
 class Conflicts(unittest.TestCase):
     def test_a_host_removal_and_daemons_on_that_host_exclude_each_other(self):
         inv = inventory()

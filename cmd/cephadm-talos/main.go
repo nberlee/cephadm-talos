@@ -49,6 +49,7 @@ Commands:
   rm [--force] [--zap] <daemon>            remove a daemon (osd: out, safe-to-destroy, purge)
   upgrade --image IMG [--refresh]          rolling image upgrade: mons, mgrs, osds
   shell [--host H] [--stdin] -- <cmd...>   run a command with the admin keyring on a node (--stdin: pass stdin on)
+  orch [--request U] [-i F|-] -- <words>   run a ceph orch command once per request uuid (retry with --request)
   handoff                                  hand the nodes to their agents and the state to the leader
   approve [--image REF] [--prepare H:DISK] [--zap H:DISK] [--drop H:SERIAL:ACTION] [--show]
                                            sign and publish the operator's approval of images and disks
@@ -166,7 +167,7 @@ func run() error {
 	// nothing itself (plan 03, step 6): changes go through `ceph orch`
 	if o.Managed() {
 		switch cmd {
-		case "ps", "ls", "conf", "logs", "shell", "handoff", "approve":
+		case "ps", "ls", "conf", "logs", "shell", "handoff", "approve", "orch":
 		case "host":
 			// enrollment, then `ceph orch host add` (plan 03, step 7)
 			if len(args) == 0 || args[0] != "ls" && args[0] != "add" {
@@ -352,6 +353,50 @@ func runCommand(ctx context.Context, o *orch.Orch, cmd string, args []string) er
 		}
 
 		return o.Upgrade(ctx, *image, *refresh)
+	case "orch":
+		fs := flag.NewFlagSet("orch", flag.ExitOnError)
+		request := fs.String("request", "", "the request uuid of an earlier invocation to retry (default: a new one)")
+		in := fs.String("i", "", "input file for the command (- for stdin), never on a command line")
+		_ = fs.Parse(args)
+
+		if fs.NArg() == 0 {
+			return errors.New("orch [--request <uuid>] [-i <file>|-] -- <ceph orch words...>")
+		}
+
+		var input []byte
+
+		switch *in {
+		case "":
+		case "-":
+			b, err := io.ReadAll(io.LimitReader(os.Stdin, 1<<20+1))
+			if err != nil {
+				return err
+			}
+
+			input = b
+		default:
+			b, err := os.ReadFile(*in)
+			if err != nil {
+				return err
+			}
+
+			input = b
+		}
+
+		if len(input) > 1<<20 {
+			return errors.New("orch -i: more than 1 MiB of input")
+		}
+
+		rc, err := o.Orch(ctx, *request, fs.Args(), input)
+		if err != nil {
+			return err
+		}
+
+		if rc != 0 {
+			os.Exit(rc)
+		}
+
+		return nil
 	case "shell":
 		fs := flag.NewFlagSet("shell", flag.ExitOnError)
 		host := fs.String("host", "", "host to run on (default: first mon host)")

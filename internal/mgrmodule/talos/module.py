@@ -83,6 +83,23 @@ STORE_SCHEMA = 1
 # the CLI publishes until the leader takes over (plan 03, step 6)
 INCARNATION = 'cli'
 MODULE_PREFIX = 'mgr/cephadm/'
+# acceptances one at a time: an `orch talos request` holds it while its command
+# runs, and its nested call back into this module (a fresh Python thread state
+# on the same OS thread, so a thread-local would be lost) re-enters it
+_ACCEPT_LOCK = threading.RLock()
+
+
+def _accepting(f: Any) -> Any:
+    import functools
+
+    @functools.wraps(f)
+    def w(self: Any, *args: Any, **kwargs: Any) -> Any:
+        with _ACCEPT_LOCK:
+            return f(self, *args, **kwargs)
+    return w
+
+UUID_RE = re.compile(r'\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z')
+
 # the CLI's enrollment records (cephadm-talos host add after the handoff)
 ENROLL_PREFIX = 'cephadm-talos/enroll/'
 
@@ -608,6 +625,13 @@ class Module(orchestrator.Orchestrator, MgrModule):
         op_id = self._accept('add_daemon', name, host, op_id=op_id, **extra)
         return ['Scheduled to deploy %s on host %s (operation %s)' % (name, host, op_id)]
 
+    def _request_fields(self) -> Dict[str, Any]:
+        """The request uuid and inputs hash for the entry being accepted, if a
+        request is in progress on this thread (orch talos request)."""
+        r = self.__dict__.get('_request_active')
+        return {'request': r[0], 'inputs': r[1]} if r else {}
+
+    @_accepting
     def _accept(self, kind: str, daemon: Optional[str], host: str, op_id: Optional[str] = None, **extra: Any) -> str:
         """Accept an operation: checks, then one ledger entry (ledger.py)."""
         led, fold = self._authority()
@@ -627,7 +651,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
         if kind != 'exit_maintenance':
             self._not_in_maintenance(host)
         op_id = op_id or 'op-' + os.urandom(8).hex()
-        entry = {'id': op_id, 'kind': kind, 'host': host, **extra}
+        entry = {'id': op_id, 'kind': kind, 'host': host, **extra, **self._request_fields()}
         if daemon:
             entry['daemon'] = daemon
         try:
@@ -844,6 +868,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
         op_id = self._accept_create(host, dev)
         return 'Scheduled to create an OSD on %s:%s (operation %s)' % (host, dev, op_id)
 
+    @_accepting
     def _accept_create(self, host: str, device: str) -> str:
         """Accept an OSD creation: not beside an unfinished one on the same disk
         name or a host removal."""
@@ -864,7 +889,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
         self._not_in_maintenance(host)
         op_id = 'op-' + os.urandom(8).hex()
         try:
-            led.append({'id': op_id, 'kind': 'create_osd', 'host': host, 'device': device})
+            led.append({'id': op_id, 'kind': 'create_osd', 'host': host, 'device': device, **self._request_fields()})
         except ledger.OutcomeUnknown:
             raise OrchestratorError('the mons did not answer: operation %s may have been accepted (orch talos operation %s)' % (op_id, op_id))
         except ledger.LedgerError as e:
@@ -897,6 +922,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
             out.append('Scheduled to remove %s from host %s (operation %s)' % (n, fold.daemons[n], op_id))
         return '\n'.join(out)
 
+    @_accepting
     def _accept_osd_removal(self, name: str, host: str, uuid: str, zap: bool, force: bool) -> str:
         led, _ = self._authority()
         lead = getattr(self, '_leadership', None)
@@ -908,7 +934,8 @@ class Module(orchestrator.Orchestrator, MgrModule):
             raise OrchestratorError('an earlier operation is not settled yet (%s); try again' % e)
         op_id = 'op-' + os.urandom(8).hex()
         try:
-            led.append({'id': op_id, 'kind': 'remove_osd', 'daemon': name, 'host': host, 'uuid': uuid, 'zap': bool(zap), 'force': bool(force)})
+            led.append({'id': op_id, 'kind': 'remove_osd', 'daemon': name, 'host': host, 'uuid': uuid, 'zap': bool(zap), 'force': bool(force),
+                        **self._request_fields()})
         except ledger.OutcomeUnknown:
             raise OrchestratorError('the mons did not answer: operation %s may have been accepted (orch talos operation %s)' % (op_id, op_id))
         except ledger.LedgerError as e:
@@ -1050,6 +1077,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
             raise OrchestratorError('the newest approval does not decode')
         return [i for i in images if isinstance(i, str)]
 
+    @_accepting
     def _accept_cluster(self, kind: str, op_id: Optional[str] = None, **fields: Any) -> str:
         """Accept an operation about the whole cluster (an upgrade's): no host."""
         led, _ = self._authority()
@@ -1062,7 +1090,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
             raise OrchestratorError('an earlier operation is not settled yet (%s); try again' % e)
         op_id = op_id or 'op-' + os.urandom(8).hex()
         try:
-            led.append({'id': op_id, 'kind': kind, **fields})
+            led.append({'id': op_id, 'kind': kind, **fields, **self._request_fields()})
         except ledger.OutcomeUnknown:
             raise OrchestratorError('the mons did not answer: operation %s may have been accepted (orch talos operation %s)' % (op_id, op_id))
         except ledger.LedgerError as e:
@@ -1226,6 +1254,67 @@ class Module(orchestrator.Orchestrator, MgrModule):
                 raise OrchestratorError('the VRRP password was not written: %s' % outs)
         op_id = self._accept_cluster('apply_ingress', op_id=op_id, vip=str(vip), vrid=vrid, hosts=hosts, image=image, new_password=new_password)
         return 'Scheduled the ingress on %s (operation %s)' % (', '.join(hosts), op_id)
+
+    @TalosCLICommand.Write('orch talos request')
+    def _request(self, request: str, inputs: str, inbuf: Optional[str] = None) -> HandleCommandResult:
+        """Run a ceph orch command once per request uuid (cephadm-talos orch): -i gives {"cmd": {...}, "inbuf": ...}"""
+        if not UUID_RE.match(request) or not re.match(r'\A[0-9a-f]{64}\Z', inputs):
+            return HandleCommandResult(retval=-22, stderr='a request uuid and a SHA-256 inputs hash')
+        try:
+            req = json.loads(inbuf or '')
+            cmd, sub = req['cmd'], req.get('inbuf')
+        except (ValueError, KeyError, TypeError):
+            return HandleCommandResult(retval=-22, stderr='-i: {"cmd": {...}, "inbuf": ...}')
+        if not isinstance(cmd, dict) or not isinstance(cmd.get('prefix'), str) or not cmd['prefix'].startswith('orch ') \
+                or cmd['prefix'].startswith('orch talos') or sub is not None and not isinstance(sub, str):
+            return HandleCommandResult(retval=-22, stderr='a ceph orch command')
+        canonical = json.dumps({'cmd': cmd, 'inbuf': sub}, sort_keys=True, separators=(',', ':'))
+        if hashlib.sha256(canonical.encode()).hexdigest() != inputs:
+            return HandleCommandResult(retval=-22, stderr='the inputs hash is not the command\'s')
+        # one operation per request: several daemons, OSDs or specs at once are refused
+        for arg in ('names', 'osd_id'):
+            if isinstance(cmd.get(arg), list) and len(cmd[arg]) > 1:
+                return HandleCommandResult(retval=-22, stderr='one daemon or OSD per request')
+        if sub:
+            import yaml
+            try:
+                docs = [d for d in yaml.safe_load_all(sub) if d]
+            except yaml.YAMLError:
+                return HandleCommandResult(retval=-22, stderr='the input is not YAML')
+            if len(docs) > 1:
+                return HandleCommandResult(retval=-22, stderr='one spec per request')
+        with _ACCEPT_LOCK:
+            try:
+                self._settle()
+                led, _ = self._authority()
+            except OrchestratorError as e:
+                return HandleCommandResult(retval=-11, stderr=str(e))  # EAGAIN
+            done = [e for _, e in led.executable() if e.get('request') == request]
+            if done:
+                if done[0].get('inputs') != inputs:
+                    return HandleCommandResult(retval=-17, stderr='request %s was another command' % request)  # EEXIST
+                return HandleCommandResult(stdout='Accepted before as operation %s (orch talos operation %s)' % (done[0]['id'], done[0]['id']))
+            self._request_active = (request, inputs)
+            try:
+                # a daemon spec (an RGW's with the operator's key) goes to this
+                # backend directly: Ceph's orchestrator module logs whole specs
+                if cmd['prefix'] == 'orch daemon add' and sub:
+                    from ceph.deployment.service_spec import ServiceSpec
+                    import yaml
+                    try:
+                        spec = ServiceSpec.from_json(yaml.safe_load(sub))
+                    except Exception as e:
+                        return HandleCommandResult(retval=-22, stderr='the spec: %s' % e.__class__.__name__)
+                    out = self.add_daemon(spec)
+                    err = out.exception_str
+                    res = (-22 if err else 0, '\n'.join(out.result or []), err)
+                else:
+                    res = self.remote('orchestrator', '_handle_command', sub, cmd)
+            finally:
+                self._request_active = None
+        if isinstance(res, tuple):
+            return HandleCommandResult(*res)
+        return res
 
     @TalosCLICommand.Read('orch talos operation')
     def _operation(self, id: str) -> HandleCommandResult:

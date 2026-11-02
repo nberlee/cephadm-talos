@@ -115,11 +115,14 @@ def check_entry(key: str, raw: str) -> Dict[str, Any]:
         return e
     if kind not in KINDS or (e.get('request') is not None and not (isinstance(e['request'], str) and UUID_RE.match(e['request']))):
         raise LedgerError('operation entry %s' % key)
+    # a request's inputs hash only with its request uuid
+    if ('inputs' in e) != ('request' in e) or 'inputs' in e and not (isinstance(e['inputs'], str) and re.match(r'\A[0-9a-f]{64}\Z', e['inputs'])):
+        raise LedgerError('operation entry %s' % key)
     if (kind in HOSTLESS) != ('host' not in e):
         raise LedgerError('operation entry %s' % key)
     if kind == 'upgrade_start':
         if not isinstance(e.get('image'), str) or not IMAGE_RE.match(e['image']) \
-                or set(e) - {'version', 'id', 'kind', 'image', 'gid', 'epoch', 'seq', 'request'}:
+                or set(e) - {'version', 'id', 'kind', 'image', 'gid', 'epoch', 'seq', 'request', 'inputs'}:
             raise LedgerError('operation entry %s' % key)
         return e
     if kind == 'apply_ingress':
@@ -128,12 +131,12 @@ def check_entry(key: str, raw: str) -> Dict[str, Any]:
                 and isinstance(hosts, list) and 0 < len(hosts) <= 15 and len(set(hosts)) == len(hosts)
                 and all(isinstance(h, str) and HOST_RE.match(h) for h in hosts)
                 and isinstance(e.get('image'), str) and IMAGE_RE.match(e['image']) and type(e.get('new_password')) is bool) \
-                or set(e) - {'version', 'id', 'kind', 'vip', 'vrid', 'hosts', 'image', 'new_password', 'gid', 'epoch', 'seq', 'request'}:
+                or set(e) - {'version', 'id', 'kind', 'vip', 'vrid', 'hosts', 'image', 'new_password', 'gid', 'epoch', 'seq', 'request', 'inputs'}:
             raise LedgerError('operation entry %s' % key)
         return e
     if kind in UPGRADE_CONTROLS:
         if not isinstance(e.get('upgrade'), str) or not OP_RE.match(e['upgrade']) \
-                or set(e) - {'version', 'id', 'kind', 'upgrade', 'gid', 'epoch', 'seq', 'request'}:
+                or set(e) - {'version', 'id', 'kind', 'upgrade', 'gid', 'epoch', 'seq', 'request', 'inputs'}:
             raise LedgerError('operation entry %s' % key)
         return e
     if kind == 'add_host':
@@ -142,15 +145,15 @@ def check_entry(key: str, raw: str) -> Dict[str, Any]:
                                       and all(isinstance(e.get(c), str) and 0 < len(e[c]) <= 8192 and e[c].startswith('-----BEGIN CERTIFICATE-----')
                                               for c in ('agent_cert', 'agent_client_cert'))
                                       and isinstance(labels, list) and len(labels) <= 32 and all(isinstance(x, str) and LABEL_RE.match(x) for x in labels)) \
-                or set(e) - {'version', 'id', 'kind', 'host', 'addr', 'agent_cert', 'agent_client_cert', 'labels', 'gid', 'epoch', 'seq', 'request'}:
+                or set(e) - {'version', 'id', 'kind', 'host', 'addr', 'agent_cert', 'agent_client_cert', 'labels', 'gid', 'epoch', 'seq', 'request', 'inputs'}:
             raise LedgerError('operation entry %s' % key)
         return e
     if kind in ('remove_host', 'exit_maintenance', 'powercycle_host'):
-        if daemon is not None or (kind != 'remove_host' and set(e) - {'version', 'id', 'kind', 'host', 'gid', 'epoch', 'seq', 'request'}):
+        if daemon is not None or (kind != 'remove_host' and set(e) - {'version', 'id', 'kind', 'host', 'gid', 'epoch', 'seq', 'request', 'inputs'}):
             raise LedgerError('operation entry %s' % key)
         return e
     if kind == 'enter_maintenance':
-        if daemon is not None or type(e.get('force')) is not bool or set(e) - {'version', 'id', 'kind', 'host', 'force', 'gid', 'epoch', 'seq', 'request'}:
+        if daemon is not None or type(e.get('force')) is not bool or set(e) - {'version', 'id', 'kind', 'host', 'force', 'gid', 'epoch', 'seq', 'request', 'inputs'}:
             raise LedgerError('operation entry %s' % key)
         return e
     if kind == 'create_osd':
@@ -174,7 +177,7 @@ def check_entry(key: str, raw: str) -> Dict[str, Any]:
     if kind == 'remove_osd' and (t != 'osd' or not re.match(r'\A(0|[1-9][0-9]{0,8})\Z', i) or not isinstance(e.get('uuid'), str)
                                  or not UUID_RE_OSD.match(e['uuid']) or type(e.get('zap')) is not bool or type(e.get('force')) is not bool):
         raise LedgerError('operation entry %s' % key)
-    if kind in ('restart', 'redeploy', 'add_daemon', 'remove_daemon') and set(e) - {'version', 'id', 'kind', 'daemon', 'host', 'gid', 'epoch', 'seq', 'request', 'port', 'cert'}:
+    if kind in ('restart', 'redeploy', 'add_daemon', 'remove_daemon') and set(e) - {'version', 'id', 'kind', 'daemon', 'host', 'gid', 'epoch', 'seq', 'request', 'inputs', 'port', 'cert'}:
         raise LedgerError('operation entry %s' % key)
     return e
 
