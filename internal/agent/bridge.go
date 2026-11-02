@@ -430,10 +430,15 @@ type LedgerOp struct {
 	Cert string `json:"cert,omitempty"`
 	// apply_ingress: the VIP, router id, hosts in order, whether it set a new
 	// password (the secret ingress/<op>/vrrp); its image in Image
-	VIP         string   `json:"vip,omitempty"`
-	VRID        int      `json:"vrid,omitempty"`
-	Hosts       []string `json:"hosts,omitempty"`
-	NewPassword bool     `json:"new_password,omitempty"`
+	// add_host: the enrolled node's address, agent certificates and labels
+	Addr            string   `json:"addr,omitempty"`
+	AgentCert       string   `json:"agent_cert,omitempty"`
+	AgentClientCert string   `json:"agent_client_cert,omitempty"`
+	Labels          []string `json:"labels,omitempty"`
+	VIP             string   `json:"vip,omitempty"`
+	VRID            int      `json:"vrid,omitempty"`
+	Hosts           []string `json:"hosts,omitempty"`
+	NewPassword     bool     `json:"new_password,omitempty"`
 }
 
 // Ledger returns the executable operations after a ledger key, in the order

@@ -46,6 +46,7 @@ const (
 	KindUpResume     = "upgrade_resume"
 	KindUpStop       = "upgrade_stop"
 	KindIngress      = "apply_ingress"
+	KindAddHost      = "add_host"
 	KindRemoveHost   = "remove_host"
 	KindCreateOSD    = "create_osd"
 	KindRemoveOSD    = "remove_osd"
@@ -246,9 +247,9 @@ func (l *LeaderLoop) ledgerOp(ctx context.Context, b *Bridge, js store.Backend, 
 
 	known := map[string]bool{KindRestart: true, KindRedeploy: true, KindAddDaemon: true, KindRemoveDaemon: true, KindRemoveHost: true, KindCreateOSD: true, KindRemoveOSD: true,
 		KindEnterMaint: true, KindExitMaint: true, KindPowercycle: true, KindUpgrade: true, KindUpPause: true, KindUpResume: true, KindUpStop: true,
-		KindIngress: true}
+		KindIngress: true, KindAddHost: true}
 	cluster := op.Kind == KindUpgrade || isControl(op.Kind) || op.Kind == KindIngress
-	noDaemon := cluster || op.Kind == KindRemoveHost || op.Kind == KindCreateOSD || op.Kind == KindEnterMaint || op.Kind == KindExitMaint || op.Kind == KindPowercycle
+	noDaemon := cluster || op.Kind == KindRemoveHost || op.Kind == KindAddHost || op.Kind == KindCreateOSD || op.Kind == KindEnterMaint || op.Kind == KindExitMaint || op.Kind == KindPowercycle
 	if !ledgerIDRe.MatchString(op.ID) || cluster != (op.Host == "") || !cluster && pki.ValidName(op.Host) != nil || !known[op.Kind] ||
 		(op.Kind == KindUpgrade || op.Kind == KindIngress) != (op.Image != "") || (op.Kind == KindIngress) != (op.VIP != "") || isControl(op.Kind) != ledgerIDRe.MatchString(op.Upgrade) ||
 		noDaemon != (op.Daemon == "") || (op.Daemon != "" && !ledgerDaemonRe.MatchString(op.Daemon)) ||
@@ -312,10 +313,12 @@ func (l *LeaderLoop) ledgerOp(ctx context.Context, b *Bridge, js store.Backend, 
 		s, err = l.journalState(ctx, b, js, gid, op.ID)
 
 		return err == nil && terminal(s), err
-	case KindAddDaemon, KindRemoveDaemon, KindRemoveHost, KindCreateOSD, KindRemoveOSD, KindEnterMaint, KindExitMaint, KindPowercycle:
+	case KindAddDaemon, KindRemoveDaemon, KindRemoveHost, KindCreateOSD, KindRemoveOSD, KindEnterMaint, KindExitMaint, KindPowercycle, KindAddHost:
 		var phase func() error
 
 		switch op.Kind {
+		case KindAddHost:
+			phase = func() error { return l.addHost(ctx, b, js, gid, epoch, op) }
 		case KindPowercycle:
 			phase = func() error { return l.powercycle(ctx, b, js, gid, epoch, op) }
 		case KindEnterMaint:
@@ -2619,4 +2622,105 @@ func (l *LeaderLoop) endStep(ctx context.Context, b *Bridge, gid int64, u state.
 
 		return nil
 	})
+}
+
+// addHost adds a node the CLI enrolled (plan 03, step 7): the host with its
+// agent certificates in the state, earlier sessions on it closed (a removed
+// host's agent may have some) and recorded with the takeover's, then its first
+// revision (ceph.conf).
+func (l *LeaderLoop) addHost(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, op LedgerOp) error {
+	if pki.ValidName(op.Host) != nil || op.Addr == "" || op.AgentCert == "" || op.AgentClientCert == "" {
+		return finish(ctx, js, gid, op, JournalFailed, fmt.Errorf("add_host %s: malformed", op.Host))
+	}
+
+	closedKey := rollKey(gid, op.ID+".closed")
+	takeoverKey := JournalPrefix(gid) + "takeover"
+
+	closed, _, err := readJSONKey[rollRecord](ctx, js, closedKey)
+	if err != nil {
+		return err
+	}
+
+	// an earlier host of that name counts as closed no longer, before this one
+	// is published: the name may be another node's now
+	if !closed.Done {
+		to, _, err := readJSONKey[Takeover](ctx, js, takeoverKey)
+		if err != nil {
+			return err
+		}
+
+		if i := slices.Index(to.Closed, op.Host); i >= 0 {
+			to.Closed = slices.Delete(to.Closed, i, i+1)
+			if err := writeJSONKey(ctx, js, takeoverKey, to); err != nil {
+				return err
+			}
+		}
+
+		delete(l.closed, op.Host)
+	}
+
+	st, _, err := l.clusterState(ctx, b)
+	if err != nil {
+		return err
+	}
+
+	if _, ok := st.Host(op.Host); !ok {
+		if err := l.changeState(ctx, b, gid, func(st *state.State) error {
+			st.AddHost(state.Host{Name: op.Host, Addr: op.Addr, AgentCert: op.AgentCert, AgentClientCert: op.AgentClientCert, Labels: op.Labels})
+
+			return nil
+		}); err != nil {
+			return err
+		}
+
+		if st, _, err = l.clusterState(ctx, b); err != nil {
+			return err
+		}
+	}
+
+	h, _ := st.Host(op.Host)
+
+	// once per add
+	if !closed.Done {
+		me, ok := st.Host(l.Self.Name)
+		if !ok {
+			return fmt.Errorf("the leader's host %s is not in the cluster state", l.Self.Name)
+		}
+
+		c := wire.Close{Version: wire.Version, FSID: l.Self.FSID, Host: h.Name, Mgr: l.Self.Name, MgrAddr: me.Addr, GID: gid, Epoch: epoch}
+
+		var res wire.CloseReply
+		if _, err := l.call(ctx, h, http.MethodPost, "/v1/close", c, &res); err != nil {
+			return fmt.Errorf("%w: closing earlier sessions on %s: %w", errRetry, h.Name, err)
+		}
+
+		to, _, err := readJSONKey[Takeover](ctx, js, takeoverKey)
+		if err != nil {
+			return err
+		}
+
+		if !slices.Contains(to.Closed, h.Name) {
+			to.Closed = append(to.Closed, h.Name)
+			if err := writeJSONKey(ctx, js, takeoverKey, to); err != nil {
+				return err
+			}
+		}
+
+		if err := writeJSONKey(ctx, js, closedKey, rollRecord{Done: true}); err != nil {
+			return err
+		}
+
+		l.closed[h.Name] = true
+	}
+
+	done, ok, err := l.step(ctx, b, js, gid, epoch, op.ID+".rev", h.Name, revisionMode{})
+	if err != nil || !done {
+		return err
+	}
+
+	if !ok {
+		return finish(ctx, js, gid, op, JournalFailed, fmt.Errorf("the first revision of %s did not apply", h.Name))
+	}
+
+	return finish(ctx, js, gid, op, wire.OpCompleted, nil)
 }

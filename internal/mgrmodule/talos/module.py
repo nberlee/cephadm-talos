@@ -83,6 +83,8 @@ STORE_SCHEMA = 1
 # the CLI publishes until the leader takes over (plan 03, step 6)
 INCARNATION = 'cli'
 MODULE_PREFIX = 'mgr/cephadm/'
+# the CLI's enrollment records (cephadm-talos host add after the handoff)
+ENROLL_PREFIX = 'cephadm-talos/enroll/'
 
 
 def choose_incarnation(entries: Dict[str, str], own: Optional[int]) -> str:
@@ -972,6 +974,33 @@ class Module(orchestrator.Orchestrator, MgrModule):
             standbys = [m for m in (self.get('mgr_map') or {}).get('standbys', []) if m.get('available', True)]
             if not standbys:
                 raise OrchestratorError('%s runs the active mgr and no standby mgr is available' % hostname)
+
+    @handle_orch_error
+    def add_host(self, spec: HostSpec) -> str:
+        """A node the CLI enrolled (cephadm-talos host add): its enrollment record
+        gives its address and agent certificates."""
+        host, addr = spec.hostname, spec.addr or spec.hostname
+        if getattr(spec, 'status', None) or getattr(spec, 'location', None) or getattr(spec, 'oob', None):
+            raise OrchestratorError('maintenance status, location and oob are not supported by this backend')
+        labels = list(spec.labels or [])
+        if len(labels) > 32 or any(not ledger.LABEL_RE.match(x) for x in labels):
+            raise OrchestratorError('labels: at most 32, letters, digits, dots, dashes and underscores')
+        self._settle()
+        _, fold = self._authority()
+        if host in fold.hosts:
+            raise OrchestratorError('%s is a host of the cluster already' % host)
+        r, out, _ = self.mon_command({'prefix': 'config-key get', 'key': ENROLL_PREFIX + host})
+        if r != 0:
+            raise OrchestratorError('%s is not enrolled: add it with cephadm-talos host add <addr>' % host)
+        try:
+            rec = json.loads(out)
+        except ValueError:
+            raise OrchestratorError('the enrollment record of %s does not decode' % host)
+        if rec.get('name') != host or rec.get('addr') != addr:
+            raise OrchestratorError('%s was enrolled with the address %s' % (host, rec.get('addr')))
+        op_id = self._accept('add_host', None, host, addr=addr, agent_cert=rec.get('agent_cert'),
+                             agent_client_cert=rec.get('agent_client_cert'), labels=labels)
+        return 'Scheduled to add host %s with addr %s (operation %s)' % (host, addr, op_id)
 
     @handle_orch_error
     def enter_host_maintenance(self, hostname: str, force: bool = False, yes_i_really_mean_it: bool = False) -> str:

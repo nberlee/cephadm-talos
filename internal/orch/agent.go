@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"reflect"
 	"slices"
 	"time"
 
@@ -253,7 +254,7 @@ func (o *Orch) RenewAgentCerts(ctx context.Context) error {
 			return err
 		}
 
-		if *h != before {
+		if !reflect.DeepEqual(*h, before) {
 			renewed = append(renewed, "missing or changed "+h.Name)
 		}
 

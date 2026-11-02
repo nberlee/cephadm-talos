@@ -168,7 +168,8 @@ func run() error {
 		switch cmd {
 		case "ps", "ls", "conf", "logs", "shell", "handoff", "approve":
 		case "host":
-			if len(args) == 0 || args[0] != "ls" {
+			// enrollment, then `ceph orch host add` (plan 03, step 7)
+			if len(args) == 0 || args[0] != "ls" && args[0] != "add" {
 				return orch.ErrManaged
 			}
 		default:
@@ -225,6 +226,10 @@ func runCommand(ctx context.Context, o *orch.Orch, cmd string, args []string) er
 		case "add":
 			if len(args) != 2 {
 				return errors.New("host add <ip>")
+			}
+
+			if o.Managed() {
+				return o.Enroll(ctx, args[1])
 			}
 
 			_, err := o.AddHost(ctx, args[1])

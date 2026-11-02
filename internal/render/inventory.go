@@ -71,7 +71,7 @@ func InventoryOf(s *state.State) Inventory {
 	}
 
 	for _, h := range s.Hosts {
-		inv.Hosts = append(inv.Hosts, InventoryHost{Name: h.Name, Addr: h.Addr, Labels: []string{}, Maintenance: h.Maintenance})
+		inv.Hosts = append(inv.Hosts, InventoryHost{Name: h.Name, Addr: h.Addr, Labels: append([]string{}, h.Labels...), Maintenance: h.Maintenance})
 	}
 
 	for _, d := range s.Daemons {

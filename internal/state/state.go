@@ -42,6 +42,8 @@ type Host struct {
 	Maintenance bool `json:"maintenance,omitempty"`
 	// NoOut: maintenance enter set `osd set-group noout` on this host's CRUSH bucket
 	NoOut bool `json:"noout,omitempty"`
+	// Labels are the host's labels from `ceph orch host add` (stored only)
+	Labels []string `json:"labels,omitempty"`
 	// Talosconfig and Context override the cluster defaults for this node, so
 	// nodes need not share one talosconfig
 	Talosconfig string `json:"talosconfig,omitempty"`

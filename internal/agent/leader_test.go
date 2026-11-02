@@ -2107,3 +2107,47 @@ func TestAnUnapprovedUpgradeIsRefusedAndControlsChangeTheRecord(t *testing.T) {
 		t.Fatalf("stopped: %+v", u)
 	}
 }
+
+func TestLeaderAddsAnEnrolledHost(t *testing.T) {
+	s := newLeaderSetup(t)
+	ctx := context.Background()
+
+	// h1 is enrolled and owned by its agent, not a host of the state yet
+	h, _ := s.st.Host("h1")
+	for _, d := range s.st.DaemonsOf("", "h1") {
+		s.st.RemoveDaemon(d)
+	}
+
+	s.st.RemoveHost("h1")
+	publish(t, s.leader, s.module, s.st)
+
+	s.module.mu.Lock()
+	s.module.active = "h0"
+	s.module.mu.Unlock()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	add := s.accept(KindAddHost, "", "h1", 1)
+	add.Op.Addr, add.Op.AgentCert, add.Op.AgentClientCert, add.Op.Labels = h.Addr, "-----BEGIN CERTIFICATE-----a", "-----BEGIN CERTIFICATE-----b", []string{"rgw"}
+	s.module.mu.Lock()
+	s.module.ledger[len(s.module.ledger)-1] = add
+	s.module.mu.Unlock()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if op := s.op(t, add.Op.ID); op.State != "completed" {
+		t.Fatalf("add host: %+v", op)
+	}
+
+	st, _, err := s.leader.clusterState(ctx, s.leader.bridge())
+	must(t, err)
+
+	if got, ok := st.Host("h1"); !ok || got.AgentCert != add.Op.AgentCert || !slices.Equal(got.Labels, []string{"rgw"}) {
+		t.Fatalf("host: %+v", got)
+	}
+
+	// its first revision: ceph.conf
+	if rep, err := s.agent.Node.Report(ctx); err != nil || rep.Owned["EtcFileConfig/ceph/ceph.conf"] == "" {
+		t.Fatalf("no ceph.conf on the new host: %v", err)
+	}
+}

@@ -27,7 +27,7 @@ KEY_RE = re.compile(r'\A(\d{20})-(\d{10})-(takeover|op-[0-9a-f]{16}|m-[0-9a-f]{1
 OP_RE = re.compile(r'\Aop-[0-9a-f]{16}\Z')
 # kinds an operation entry may have; ADDS and REMOVES change the fold
 KINDS = ('restart', 'redeploy', 'add_daemon', 'remove_daemon', 'remove_host', 'create_osd', 'remove_osd', 'enter_maintenance', 'exit_maintenance', 'powercycle_host',
-         'upgrade_start', 'upgrade_pause', 'upgrade_resume', 'upgrade_stop', 'apply_ingress')
+         'upgrade_start', 'upgrade_pause', 'upgrade_resume', 'upgrade_stop', 'apply_ingress', 'add_host')
 # the upgrade's kinds, operations and module entries: about the cluster, without a host
 UPGRADE_CONTROLS = ('upgrade_pause', 'upgrade_resume', 'upgrade_stop')
 UPGRADE_KINDS = ('upgrade_start',) + UPGRADE_CONTROLS + ('upgrade_done', 'upgrade_refused')
@@ -36,7 +36,9 @@ HOSTLESS = UPGRADE_KINDS + ('rgw_cert', 'rgw_cert_done', 'apply_ingress')
 VIP_RE = re.compile(r'\A(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}/(?:3[0-2]|[12]?\d)\Z')
 IMAGE_RE = re.compile(r'\A[a-z0-9][a-z0-9._/:-]{0,254}@sha256:[0-9a-f]{64}\Z')
 # kinds that are about a whole host: every other operation on it waits for them
-HOST_KINDS = ('remove_host', 'enter_maintenance', 'exit_maintenance', 'powercycle_host')
+HOST_KINDS = ('remove_host', 'enter_maintenance', 'exit_maintenance', 'powercycle_host', 'add_host')
+LABEL_RE = re.compile(r'\A[A-Za-z0-9._-]{1,64}\Z')
+ADDR_RE = re.compile(r'\A[0-9A-Fa-f:.]{2,45}\Z')
 # kinds that stop a host's daemons, and that start them again
 STOPS, STARTS = ('enter_maintenance', 'powercycle_host'), ('exit_maintenance', 'powercycle_host')
 # the module's own entries (ids m-<hex>), which carry out a removal: close a
@@ -132,6 +134,15 @@ def check_entry(key: str, raw: str) -> Dict[str, Any]:
     if kind in UPGRADE_CONTROLS:
         if not isinstance(e.get('upgrade'), str) or not OP_RE.match(e['upgrade']) \
                 or set(e) - {'version', 'id', 'kind', 'upgrade', 'gid', 'epoch', 'seq', 'request'}:
+            raise LedgerError('operation entry %s' % key)
+        return e
+    if kind == 'add_host':
+        labels = e.get('labels')
+        if daemon is not None or not (isinstance(e.get('addr'), str) and ADDR_RE.match(e['addr'])
+                                      and all(isinstance(e.get(c), str) and 0 < len(e[c]) <= 8192 and e[c].startswith('-----BEGIN CERTIFICATE-----')
+                                              for c in ('agent_cert', 'agent_client_cert'))
+                                      and isinstance(labels, list) and len(labels) <= 32 and all(isinstance(x, str) and LABEL_RE.match(x) for x in labels)) \
+                or set(e) - {'version', 'id', 'kind', 'host', 'addr', 'agent_cert', 'agent_client_cert', 'labels', 'gid', 'epoch', 'seq', 'request'}:
             raise LedgerError('operation entry %s' % key)
         return e
     if kind in ('remove_host', 'exit_maintenance', 'powercycle_host'):
@@ -271,6 +282,8 @@ class Fold:
             elif kind == 'retire_host' and not any(h == e['host'] for h in self.daemons.values()):
                 self.hosts.pop(e['host'], None)
                 self.maintenance.discard(e['host'])
+            elif kind == 'add_host' and e['host'] not in self.hosts:
+                self.hosts[e['host']] = e['addr']
             elif kind in STOPS and e['host'] in self.hosts:
                 self.maintenance.add(e['host'])
             elif kind == 'maintained':

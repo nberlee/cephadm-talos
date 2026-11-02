@@ -827,6 +827,35 @@ class Ingress(unittest.TestCase):
         self.assertIn('approved', m.Module.apply(mod, [self.spec()]).exception_str)
 
 
+class HostAdd(unittest.TestCase):
+    CERT = '-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----\n'
+
+    def module(self, records):
+        mod, entries = AddAndRemove.module(self)
+
+        def mon(cmd):
+            k = cmd['key'][len('cephadm-talos/enroll/'):]
+            return (0, json.dumps(records[k]), '') if k in records else (-2, '', 'not found')
+        mod.mon_command = mon
+        return mod, entries
+
+    def test_an_enrolled_node(self):
+        from ceph.deployment.hostspec import HostSpec
+        rec = {'version': 1, 'name': 'h4', 'addr': '10.5.0.5', 'agent_cert': self.CERT, 'agent_client_cert': self.CERT}
+        mod, _ = self.module({'h4': rec})
+        for spec in (HostSpec('h5', '10.5.0.6'), HostSpec('h4', '10.5.0.9'), HostSpec('h1', '10.5.0.2'),
+                     HostSpec('h4', '10.5.0.5', labels=['bad label']), HostSpec('h4', '10.5.0.5', status='maintenance')):
+            self.assertTrue(m.Module.add_host(mod, spec).exception_str, spec)
+        res = m.Module.add_host(mod, HostSpec('h4', '10.5.0.5', labels=['rgw']))
+        self.assertEqual(res.exception_str, '')
+        [(_, e)] = mod._ledger.executable()
+        self.assertEqual((e['kind'], e['host'], e['addr'], e['labels'], e['agent_cert']), ('add_host', 'h4', '10.5.0.5', ['rgw'], self.CERT))
+        _, fold = mod._authority()
+        self.assertEqual(fold.hosts['h4'], '10.5.0.5')
+        # Ceph's own routing of `orch host add` reaches it (h4 is a host now)
+        self.assertIn('already', m.Module.apply(mod, [HostSpec('h4', '10.5.0.5')]).exception_str)
+
+
 class Conflicts(unittest.TestCase):
     def test_a_host_removal_and_daemons_on_that_host_exclude_each_other(self):
         inv = inventory()
