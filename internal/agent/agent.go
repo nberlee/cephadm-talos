@@ -400,6 +400,8 @@ func (a *Agent) Handler() http.Handler {
 		mux.HandleFunc("POST /v1/handoff", a.Granter.HandleHandoff)
 		mux.HandleFunc("POST /v1/suspend", a.Granter.HandleSuspend)
 		mux.HandleFunc("GET /v1/suspend", a.Granter.HandleSuspendState)
+		mux.HandleFunc("POST /v1/readopt", a.Granter.HandleReadopt)
+		mux.HandleFunc("POST /v1/activate", a.Granter.HandleActivate)
 		mux.HandleFunc("GET /v1/node", a.Granter.HandleNode)
 		mux.HandleFunc("POST /v1/abandon", a.Granter.HandleAbandon)
 		mux.HandleFunc("POST /v1/close", a.Granter.HandleClose)

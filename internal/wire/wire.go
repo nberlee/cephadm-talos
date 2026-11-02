@@ -350,6 +350,40 @@ type SuspendState struct {
 	Receipt *SuspendReceipt `json:"receipt,omitempty"`
 }
 
+// Readopt is the CLI's request that a suspended agent take ownership of its
+// node again at the resumption (plan 03, step 7 slice D, item 9): its
+// ownership with the recovery's changes ("<kind>/<name>" -> hash, "" for a
+// removal) must be exactly the node's cluster documents.
+type Readopt struct {
+	Version int               `json:"version"`
+	FSID    string            `json:"fsid"`
+	Host    string            `json:"host"`
+	Session string            `json:"session"`
+	Changes map[string]string `json:"changes"`
+}
+
+// ReadoptReceipt is the ownership a re-adoption took; the same request again
+// gives the same receipt.
+type ReadoptReceipt struct {
+	Version  int               `json:"version"`
+	Session  string            `json:"session"`
+	Host     string            `json:"host"`
+	Revision int64             `json:"revision"`
+	Docs     map[string]string `json:"docs"`
+}
+
+// Activate ends a re-adopted agent's suspension. Epoch is the mgr map epoch
+// the resumption recorded before it restarted every mgr: an open bridge
+// intent of a later epoch refuses it, the others are released.
+type Activate struct {
+	Version  int    `json:"version"`
+	FSID     string `json:"fsid"`
+	Host     string `json:"host"`
+	Session  string `json:"session"`
+	Revision int64  `json:"revision"`
+	Epoch    int64  `json:"epoch"`
+}
+
 // BridgeIntent is the leader's agent's record of a mutating bridge call made
 // before the call (plan 03, step 7 slice D): until its outcome is known, it
 // reserves the operation's daemon and host for the CLI's recovery.

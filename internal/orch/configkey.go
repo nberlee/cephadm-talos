@@ -36,7 +36,7 @@ func (o *Orch) configKeys(ctx context.Context, node, prefix string) (*store.Snap
 // object, from one librados session.
 const readScript = `
 import json, sys, rados
-r = rados.Rados(conffile='/etc/ceph/ceph.conf')
+r = rados.Rados(conffile='/etc/ceph/ceph.conf', conf={'client_mount_timeout': '15'})
 r.conf_parse_env()
 r.connect()
 try:
@@ -114,7 +114,7 @@ func (c *execKeys) exec(ctx context.Context, argv []string, input []byte, stdout
 // mutate runs set and rm operations in order in one librados process.
 const mutateScript = `
 import json, sys, rados
-r = rados.Rados(conffile='/etc/ceph/ceph.conf')
+r = rados.Rados(conffile='/etc/ceph/ceph.conf', conf={'client_mount_timeout': '15'})
 r.conf_parse_env()
 r.connect()
 try:
@@ -168,7 +168,7 @@ func (c *execKeys) Mutate(ctx context.Context, ops []store.Op) error {
 // librados session: config-key ls lists keys only.
 const incarnationsScript = `
 import json, sys, rados
-r = rados.Rados(conffile='/etc/ceph/ceph.conf')
+r = rados.Rados(conffile='/etc/ceph/ceph.conf', conf={'client_mount_timeout': '15'})
 r.conf_parse_env()
 r.connect()
 try:

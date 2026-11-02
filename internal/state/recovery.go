@@ -40,6 +40,24 @@ type Recovery struct {
 	Jobs map[string]*RecoveryJob `json:"jobs"`
 	// Removal is the rm-cluster in progress, fixed before anything is removed
 	Removal *Removal `json:"removal,omitempty"`
+	// Boundary is the resumption's process boundary (item 10 (d))
+	Boundary *Boundary `json:"boundary,omitempty"`
+}
+
+// Boundary is what the resumption's restart of every mgr started from, and
+// the active mgr it ended with: journaled before the restarts, and once done.
+type Boundary struct {
+	// Epoch is the mgr map's epoch before the restarts, GIDs every mgr gid
+	// in it
+	Epoch int64   `json:"epoch"`
+	GIDs  []int64 `json:"gids"`
+	// Instances are the mgr containers' instances before the restarts
+	// ("<host>/<container>" -> instance)
+	Instances map[string]string `json:"instances"`
+	// GID and ActiveEpoch: the active mgr after, not one of GIDs; set once
+	// the boundary is drawn
+	GID         int64 `json:"gid,omitempty"`
+	ActiveEpoch int64 `json:"active_epoch,omitempty"`
 }
 
 // Removal is what an rm-cluster removes: a retry continues it as it was
@@ -84,6 +102,13 @@ type RecoveryHost struct {
 	// Applying are the documents the recovery is applying, before their hash
 	// is read back: what each must be
 	Applying map[string]Applying `json:"applying,omitempty"`
+	// AgentRestored: the resumption applied the removed agent again and it
+	// answered suspended
+	AgentRestored bool `json:"agent_restored,omitempty"`
+	// Readopt is the agent's re-adoption receipt, Activated once its
+	// suspension ended
+	Readopt   *wire.ReadoptReceipt `json:"readopt,omitempty"`
+	Activated bool                 `json:"activated,omitempty"`
 }
 
 // Applying is what a document the recovery applies must be: its hash as the

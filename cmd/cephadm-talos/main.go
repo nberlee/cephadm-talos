@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -54,6 +55,7 @@ Commands:
   handoff                                  hand the nodes to their agents and the state to the leader
   suspend [--reboot] [--force]             suspend the agents and the leader for a recovery session
   recover mons [--image REF]               bring the mons of a suspended cluster back on their stores
+  resume                                   end the recovery session: agents re-adopt their nodes, a new leader takes over
   approve [--image REF] [--prepare H:DISK] [--zap H:DISK] [--drop H:SERIAL:ACTION] [--show]
                                            sign and publish the operator's approval of images and disks
   rm-cluster [--zap] [--reboot] [--force] --yes-i-really-mean-it
@@ -221,6 +223,10 @@ func run() error {
 		_, err := o.Suspend(ctx, orch.SuspendOptions{Reboot: *reboot, Force: *force})
 
 		return err
+	}
+
+	if cmd == "resume" {
+		return o.Resume(ctx)
 	}
 
 	// once a leader owns the cluster state the CLI reads it and changes
@@ -553,6 +559,9 @@ func rmCluster(ctx context.Context, o *orch.Orch, args []string) error {
 	return o.RemoveCluster(ctx, *zap, orch.SuspendOptions{Reboot: *reboot, Force: *force})
 }
 
+// uuidRe is an fsid.
+var uuidRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
 // recordsJob is the recovery job's command: it reads the agent's records,
 // records the suspension with --session, and writes the report as its result.
 func recordsJob(args []string) error {
@@ -565,7 +574,21 @@ func recordsJob(args []string) error {
 
 	jobs := filepath.Join(records.Mount, records.JobsDir)
 
-	rep, err := agent.InspectRecords(&records.Store{Dir: filepath.Join(records.Mount, records.RecordsDir)}, *session)
+	// this cluster's records, where its agent keeps them (another cluster's
+	// on the same node are beside them)
+	if !uuidRe.MatchString(*fsid) {
+		return fmt.Errorf("malformed fsid %q", *fsid)
+	}
+
+	dir := filepath.Join(records.Mount, records.RecordsDir, *fsid)
+
+	rep, err := agent.RecordsReport{}, error(nil)
+	if _, err = os.Stat(dir); err != nil {
+		err = fmt.Errorf("no records of cluster %s on the node: %w", *fsid, err)
+	} else {
+		rep, err = agent.InspectRecords(&records.Store{Dir: dir}, *session)
+	}
+
 	if err != nil {
 		if werr := agent.WriteJobResult(jobs, *fsid, *job, *inputs, 1, []byte(err.Error())); werr != nil {
 			return errors.Join(err, werr)

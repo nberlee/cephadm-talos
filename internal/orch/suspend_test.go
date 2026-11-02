@@ -38,11 +38,41 @@ type fakeAgent struct {
 	revision int64
 	// node is the fake Talos node of the setup
 	node *talostest.Node
+	// the resumption's calls: the re-adoptions' changes, the activations,
+	// and how many activations are refused first
+	readopts    []map[string]string
+	activations []wire.Activate
+	refuseAct   int
 }
 
 func (a *fakeAgent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	switch r.URL.Path {
+	case "/v1/readopt":
+		var ro wire.Readopt
+		_ = json.NewDecoder(r.Body).Decode(&ro)
+		a.readopts = append(a.readopts, ro.Changes)
+		_ = json.NewEncoder(w).Encode(wire.ReadoptReceipt{Version: wire.Version, Session: ro.Session, Host: ro.Host, Revision: a.revision + 1, Docs: map[string]string{}})
+
+		return
+	case "/v1/activate":
+		var ac wire.Activate
+		_ = json.NewDecoder(r.Body).Decode(&ac)
+
+		if a.refuseAct > 0 {
+			a.refuseAct--
+			http.Error(w, "busy", http.StatusConflict)
+
+			return
+		}
+
+		a.activations = append(a.activations, ac)
+		w.WriteHeader(http.StatusNoContent)
+
+		return
+	}
 
 	if r.URL.Path != "/v1/suspend" || len(r.TLS.PeerCertificates) == 0 {
 		w.WriteHeader(http.StatusNotFound)

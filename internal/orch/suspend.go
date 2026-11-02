@@ -283,12 +283,7 @@ func (o *Orch) setControl(ctx context.Context, rec *state.Recovery) error {
 		return errors.New("the cluster state cannot be read")
 	}
 
-	adm, err := o.confirmedAdminHost()
-	if err != nil {
-		return err
-	}
-
-	keys, err := o.configKeys(ctx, adm.Addr, SuspensionKey)
+	keys, err := o.controlStore(ctx)
 	if err != nil {
 		return err
 	}
@@ -491,7 +486,7 @@ func (o *Orch) suspendNode(ctx context.Context, h state.Host, rec *state.Recover
 			return nil, err
 		}
 
-		if err := o.awaitStarted(ctx, h, rep, opts); err != nil {
+		if err := o.awaitStarted(ctx, h, rec, rep, opts); err != nil {
 			return nil, err
 		}
 
@@ -583,11 +578,24 @@ func (o *Orch) settleApply(ctx context.Context, h state.Host, rep agent.RecordsR
 // awaitStarted waits until what the agent started has ended: a job's
 // container (or, with Force, removes it), a reboot (another boot) and a
 // restart (a newer instance), each within the agent's own limits.
-func (o *Orch) awaitStarted(ctx context.Context, h state.Host, rep agent.RecordsReport, opts SuspendOptions) error {
+func (o *Orch) awaitStarted(ctx context.Context, h state.Host, rec *state.Recovery, rep agent.RecordsReport, opts SuspendOptions) error {
 	for _, op := range rep.Open {
 		switch {
 		case op.Job != nil:
 			if opts.Force {
+				// a removal the re-adoption expects, journaled before it
+				hr := rec.Host(h.Name)
+				if v, ok := hr.Changes["ContainerConfig/"+op.Job.Doc]; !ok || v != "" {
+					if hr.Changes == nil {
+						hr.Changes = map[string]string{}
+					}
+
+					hr.Changes["ContainerConfig/"+op.Job.Doc] = ""
+					if err := rec.Save(); err != nil {
+						return err
+					}
+				}
+
 				if err := o.remove(ctx, h.Addr, op.Job.Doc); err != nil {
 					return err
 				}
