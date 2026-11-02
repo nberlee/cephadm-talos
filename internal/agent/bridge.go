@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"github.com/nberlee/cephadm-talos/internal/approval"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"strconv"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/nberlee/cephadm-talos/internal/pki"
+	"github.com/nberlee/cephadm-talos/internal/records"
 	"github.com/nberlee/cephadm-talos/internal/store"
 	"github.com/nberlee/cephadm-talos/internal/wire"
 )
@@ -43,6 +45,14 @@ var ErrOutcomeUnknown = errors.New("bridge: outcome unknown")
 // received, expired, or lost with a restart of the mgr.
 var ErrDispatchUnknown = errors.New("bridge: dispatch id unknown to the module")
 
+// errOutcomePending marks an unknown outcome the module itself reported: the
+// call is still running there.
+var errOutcomePending = errors.New("still running")
+
+// errBridgeRan marks a call that ran (its commands were sent) but has no
+// output to give: an outcome all the same.
+var errBridgeRan = errors.New("bridge")
+
 // BridgeResult is a mon command's result through the bridge.
 type BridgeResult struct {
 	R    int
@@ -58,6 +68,103 @@ type Bridge struct {
 	Addr string      // the mgr host's address: the agent's own host, or 127.0.0.1
 	Mgr  string      // the mgr's name, its certificate's identity
 	FSID string
+
+	// Intents keeps a record of every mutating call before it is made, until
+	// its outcome is known (plan 03, step 7 slice D); nil keeps none (tests).
+	// GID and Epoch are the leader's incarnation, which the records name.
+	Intents    *records.Store
+	GID, Epoch int64
+	// ops are the daemon and host of each executable operation the ledger
+	// returned, for the intents
+	ops map[string][2]string
+}
+
+// intentRecord prefixes the bridge intents in the agent's records.
+const intentRecord = "bridge-"
+
+// intentCalls are the calls that change the cluster outside the leader's own
+// journal: each gets an intent. The journal writes (config-key set and rm
+// below the incarnation) do not: a takeover freezes that namespace.
+var intentCalls = map[string]bool{
+	"auth get-or-create": true, "mgr cert": true, "retire": true, "retire host": true, "bind disk": true,
+	"confirm osd": true, "close create": true, "osd out": true, "drain": true, "mon rm": true,
+	"noout set": true, "noout unset": true, "maintained": true, "mgr fail": true, "upgrade done": true,
+	"upgrade refused": true, "rgw cert": true, "rgw cert done": true, "retire keepalived": true,
+}
+
+// intend records a call's intent before it is made.
+func (b *Bridge) intend(dispatch, call string, args map[string]any) error {
+	if b.Intents == nil || !intentCalls[call] {
+		return nil
+	}
+
+	in := wire.BridgeIntent{Version: wire.Version, Dispatch: dispatch, Call: call, GID: b.GID, Epoch: b.Epoch, At: time.Now().UnixNano()}
+	if op, ok := args["operation"].(string); ok {
+		in.Operation = op
+		in.Daemon, in.Host = b.ops[op][0], b.ops[op][1]
+	}
+
+	if d, ok := args["daemon"].(string); ok && d != "" {
+		in.Daemon = d
+	}
+
+	raw, err := json.Marshal(in)
+	if err != nil {
+		return err
+	}
+
+	return b.Intents.Write(intentRecord+dispatch, raw)
+}
+
+// reserve names what the next calls of an operation change, for their intents.
+func (b *Bridge) reserve(op, daemon, host string) {
+	if b.ops == nil {
+		b.ops = map[string][2]string{}
+	}
+
+	b.ops[op] = [2]string{daemon, host}
+}
+
+// settled removes a call's intent once its outcome is known: an answer, or a
+// refusal before anything was sent. An unknown outcome keeps it.
+func (b *Bridge) settled(dispatch string, err error) {
+	if b.Intents == nil || errors.Is(err, ErrOutcomeUnknown) || errors.Is(err, ErrDispatchUnknown) {
+		return
+	}
+
+	if rmErr := b.Intents.Remove(intentRecord + dispatch); rmErr != nil && !errors.Is(rmErr, records.ErrNotFound) {
+		log.Printf("bridge: intent %s: %v", dispatch, rmErr)
+	}
+}
+
+// OpenIntents returns the intents whose outcome is not known yet.
+func OpenIntents(recs *records.Store) ([]wire.BridgeIntent, error) {
+	names, err := recs.List(intentRecord)
+	if err != nil {
+		return nil, err
+	}
+
+	out := []wire.BridgeIntent{}
+
+	for _, n := range names {
+		raw, err := recs.Read(n)
+		if errors.Is(err, records.ErrNotFound) {
+			continue
+		}
+
+		if err != nil {
+			return nil, err
+		}
+
+		var in wire.BridgeIntent
+		if err := json.Unmarshal(raw, &in); err != nil || in.Dispatch != strings.TrimPrefix(n, intentRecord) {
+			return nil, fmt.Errorf("record %s: damaged", n)
+		}
+
+		out = append(out, in)
+	}
+
+	return out, nil
 }
 
 // NewDispatchID returns a fresh dispatch id for a bridge call.
@@ -109,6 +216,10 @@ func (b *Bridge) Call(ctx context.Context, dispatch, call string, args map[strin
 		return BridgeResult{}, err
 	}
 
+	if err := b.intend(dispatch, call, args); err != nil {
+		return BridgeResult{}, fmt.Errorf("bridge: %s: recording its intent: %w", call, err)
+	}
+
 	// the module answers within its deadline; the connection gets a margin for the handshake
 	ctx, cancel := context.WithTimeout(ctx, deadline+5*time.Second)
 	defer cancel()
@@ -126,7 +237,10 @@ func (b *Bridge) Call(ctx context.Context, dispatch, call string, args map[strin
 		return BridgeResult{}, fmt.Errorf("%w: %s %s: %w", ErrOutcomeUnknown, call, dispatch, err)
 	}
 
-	return b.reply(resp, call, dispatch)
+	res, err := b.reply(resp, call, dispatch)
+	b.settled(dispatch, err)
+
+	return res, err
 }
 
 // Outcome fetches the outcome of an earlier call by its dispatch id.
@@ -144,7 +258,13 @@ func (b *Bridge) Outcome(ctx context.Context, dispatch string) (BridgeResult, er
 		return BridgeResult{}, fmt.Errorf("%w: %s: %w", ErrOutcomeUnknown, dispatch, err)
 	}
 
-	return b.reply(resp, "outcome", dispatch)
+	res, err := b.reply(resp, "outcome", dispatch)
+	// only an outcome settles: another refusal of the fetch says nothing about the call
+	if err == nil || errors.Is(err, errBridgeRan) {
+		b.settled(dispatch, nil)
+	}
+
+	return res, err
 }
 
 func (b *Bridge) reply(resp *http.Response, call, dispatch string) (BridgeResult, error) {
@@ -181,13 +301,13 @@ func (b *Bridge) reply(resp *http.Response, call, dispatch string) (BridgeResult
 
 	switch r.Outcome {
 	case "done":
-		if r.Error != "" { // ran, but its output was not kept
-			return BridgeResult{R: r.R}, fmt.Errorf("bridge: %s: %s", call, r.Error)
+		if r.Error != "" { // ran, but its output was not kept, or failed after sending
+			return BridgeResult{R: r.R}, fmt.Errorf("%w: %s: %s", errBridgeRan, call, r.Error)
 		}
 
 		return BridgeResult{R: r.R, Out: r.Out, Outs: r.Outs}, nil
 	case "unknown":
-		return BridgeResult{}, fmt.Errorf("%w: %s %s", ErrOutcomeUnknown, call, dispatch)
+		return BridgeResult{}, fmt.Errorf("%w: %w: %s %s", ErrOutcomeUnknown, errOutcomePending, call, dispatch)
 	default:
 		return BridgeResult{}, fmt.Errorf("%w: %s %s: outcome %q", ErrOutcomeUnknown, call, dispatch, r.Outcome)
 	}
@@ -471,6 +591,12 @@ func (b *Bridge) Ledger(ctx context.Context, after string) (entries []LedgerEntr
 		}
 
 		entries, prev = append(entries, e), e.Key
+
+		if b.ops == nil {
+			b.ops = map[string][2]string{}
+		}
+
+		b.ops[e.Op.ID] = [2]string{e.Op.Daemon, e.Op.Host}
 	}
 
 	return entries, page.More, nil
@@ -678,7 +804,11 @@ func (b *Bridge) OKToStop(ctx context.Context, op, daemon string) error {
 // MgrFail asks the module to fail the active mgr over (by its gid) for an
 // operation that must stop it; the active mgr respawns, so the answer may
 // never come.
-func (b *Bridge) MgrFail(ctx context.Context, op string, gid int64) error {
+func (b *Bridge) MgrFail(ctx context.Context, op string, gid int64, mgr, host string) error {
+	// the intent names the mgr it fails over: the operation (an upgrade's
+	// start, a maintenance) may name another daemon or none
+	b.reserve(op, "mgr."+mgr, host)
+
 	_, err := b.do(ctx, "mgr fail", map[string]any{"operation": op, "gid": gid})
 
 	return err

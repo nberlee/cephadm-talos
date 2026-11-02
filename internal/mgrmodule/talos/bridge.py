@@ -351,6 +351,9 @@ REDUCE: Dict[str, Callable[[Dict[str, Any]], Callable[[str], str]]] = {
 READ_ONLY = {'status', 'health', 'mgr dump', 'config-key keys', 'config-key get', 'entry limit', 'auth get', 'secret get', 'ledger', 'approval', 'osd dump'}
 # calls that release a credential: checked against the fold, while active
 CREDENTIALS = {'auth get', 'auth get-or-create', 'secret get'}
+# mon commands the handlers send that change nothing (any other one is a mutation)
+READ_PREFIXES = {'auth get', 'config get', 'config-key get', 'config-key ls', 'mgr dump', 'mon ok-to-stop', 'osd dump',
+                 'osd metadata', 'osd ok-to-stop', 'osd safe-to-destroy', 'quorum_status', 'status', 'health'}
 # calls the module answers itself, for operations of its ledger (ledger.py)
 LOCAL = {'mgr cert', 'retire', 'retire host', 'bind disk', 'confirm osd', 'close create', 'osd out', 'drain', 'mon rm',
          'ok to stop', 'noout set', 'noout unset', 'maintained', 'mgr fail', 'ok to stop daemon', 'upgrade done', 'upgrade refused',
@@ -548,10 +551,27 @@ def check_confirm_request(req: Any, fsid: str, peer_name: str) -> Dict[str, Any]
 class Record:
     """A bridge call's outcome, kept by dispatch id."""
 
-    def __init__(self) -> None:
+    def __init__(self, local: bool = False) -> None:
         self.job: Optional[Job] = None
         self.done_at: Optional[float] = None
         self.answered = False  # the call itself returned "done"
+        # a local handler's (and auth get-or-create's): the mutations it sent,
+        # and its answer once it returned, as kept (never a credential)
+        self.local = local
+        self.returned = False
+        self.sent: List[Job] = []
+        self.result: Optional[Dict[str, Any]] = None
+        # a ledger entry the handler appended whose write the mons did not
+        # answer: (ledger, key), settled once the ledger no longer has it pending
+        self.ledger: Optional[Tuple[Any, str]] = None
+
+    def finished(self) -> bool:
+        if self.local:
+            led = self.ledger
+            pending = None if led is None else getattr(led[0], 'pending', None)
+            settled = pending is None or pending[0] != led[1]
+            return self.returned and settled and all(j.ev.is_set() for j in self.sent)
+        return self.job is not None and self.job.ev.is_set()
 
 
 class Server(ThreadingHTTPServer):
@@ -683,6 +703,9 @@ class Channel:
         self.ctx = server_ctx
         self.lock = threading.Lock()
         self.records: Dict[str, Record] = {}
+        # the record of the local handler running on this thread, which _mon
+        # adds the mutations it sends to
+        self._tl = threading.local()
         self.server: Optional[Server] = None
         self.bridge_server: Optional[Server] = None
 
@@ -750,22 +773,12 @@ class Channel:
         # (checked before, not atomically with, the change)
         if call not in READ_ONLY and call not in CREDENTIALS and not self.leadership.still_active(self.commands):
             return 409, {'error': 'not confirmed as the active mgr'}
-        if call in LOCAL:
-            return self.local(call, args['operation'], args)
-        if call == 'auth get-or-create':
-            return self.create(args, cmd, float(deadline))
+        if call in LOCAL or call == 'auth get-or-create':
+            return self._local_call(dispatch, call, args, cmd, float(deadline))
         rec = Record()
-        with self.lock:
-            self._expire()
-            if dispatch in self.records:
-                return 409, {'error': 'dispatch id already used; fetch its outcome'}
-            if len(self.records) >= MAX_RECORDS:
-                # an answered call's outcome is a courtesy: the oldest one makes room
-                answered = [(r.done_at, k) for k, r in self.records.items() if r.answered and r.done_at is not None]
-                if not answered:
-                    return 429, {'error': 'too many kept outcomes'}
-                del self.records[min(answered)[1]]
-            self.records[dispatch] = rec  # registered before anything is sent
+        refused = self._register(dispatch, rec)
+        if refused is not None:
+            return refused
         job = self.commands.submit(cmd, REDUCE[call](args) if call in REDUCE else None)
         if job is None:
             with self.lock:
@@ -790,6 +803,76 @@ class Channel:
                 self.records.pop(dispatch, None)
         return 200, {'outcome': 'unknown'}
 
+    def _register(self, dispatch: str, rec: Record) -> Optional[Tuple[int, Dict[str, Any]]]:
+        """Keep a call's record under its dispatch id before anything is sent;
+        a refusal if the id is used or there is no room."""
+        with self.lock:
+            self._expire()
+            if dispatch in self.records:
+                return 409, {'error': 'dispatch id already used; fetch its outcome'}
+            if len(self.records) >= MAX_RECORDS:
+                # an answered call's outcome is a courtesy: the oldest one makes room
+                answered = [(r.done_at, k) for k, r in self.records.items() if r.answered and r.done_at is not None]
+                if not answered:
+                    return 429, {'error': 'too many kept outcomes'}
+                del self.records[min(answered)[1]]
+            self.records[dispatch] = rec  # registered before anything is sent
+        return None
+
+    def _local_call(self, dispatch: str, call: str, args: Dict[str, Any], cmd: Dict[str, Any],
+                    deadline: float) -> Tuple[int, Dict[str, Any]]:
+        """A local handler or auth get-or-create under its dispatch id (plan 03,
+        step 7 slice D): its outcome can be fetched like any call's while it
+        runs and after. A refusal (non-200) means nothing was sent; a handler
+        that sent a mutation and then failed answers done with its error; one
+        whose mutations are not answered yet is unknown until they are."""
+        rec = Record(local=True)
+        refused = self._register(dispatch, rec)
+        if refused is not None:
+            return refused
+        before = self._ledger_mark()
+        self._tl.rec = rec
+        try:
+            code, body = self.local(call, args['operation'], args) if call in LOCAL else self.create(args, cmd, deadline)
+        except Exception as e:
+            code, body = 503, {'error': '%s: %s' % (call, e.__class__.__name__)}
+        finally:
+            self._tl.rec = None
+        # a ledger entry (a retirement, a module entry) is a mutation too
+        after = self._ledger_mark()
+        appended = before is not None and after is not None and after[0] is before[0] and after[1:] != before[1:]
+        if appended and after is not None and after[2] is not None:
+            rec.ledger = (after[0], after[2][0])
+        with self.lock:
+            sent = list(rec.sent)
+            if not sent and not appended and code != 200:
+                self.records.pop(dispatch, None)  # nothing was sent
+                return code, body
+            if code != 200:
+                kept: Optional[Dict[str, Any]] = {'outcome': 'done', 'r': -5, 'error': str(body.get('error', 'failed'))}
+            elif body.get('outcome') == 'unknown':
+                kept = None  # its mutation's answer decides (_outcome)
+            else:
+                kept = dict(body)
+                if call in CREDENTIALS and 'out' in kept:
+                    kept = {'outcome': 'done', 'r': kept.get('r', 0), 'error': 'a credential is not kept; ask again'}
+            rec.result, rec.returned = kept, True
+            if not rec.finished():
+                return 200, {'outcome': 'unknown'}
+            rec.answered = kept is not None
+        if code != 200:
+            return 200, kept or {'outcome': 'unknown'}
+        return 200, body
+
+    def _ledger_mark(self) -> Optional[Tuple[Any, int, Optional[Tuple[str, str]]]]:
+        """The ledger with its sequence number and pending append, to tell
+        whether a handler appended (None without a ledger)."""
+        try:
+            led, _ = self.authority()
+        except Exception:
+            return None
+        return led, getattr(led, 'seq', 0), getattr(led, 'pending', None)
+
     # --- calls for the ledger's operations (ledger.py) ------------------------
 
     def _track(self, daemon: str, job: Job) -> None:
@@ -809,9 +892,17 @@ class Channel:
         job = self.commands.submit(cmd, reduce)
         if job is None:
             return None
+        self._sent(cmd, job)
         if daemon is not None:
             self._track(daemon, job)
         return job if job.ev.wait(MAX_BRIDGE_DEADLINE) else None
+
+    def _sent(self, cmd: Dict[str, Any], job: Job) -> None:
+        """Count a mutation a local handler sent in its dispatch record."""
+        rec = getattr(self._tl, 'rec', None)
+        if rec is not None and cmd.get('prefix') not in READ_PREFIXES:
+            with self.lock:
+                rec.sent.append(job)
 
     def create(self, args: Dict[str, Any], cmd: Dict[str, Any], deadline: float) -> Tuple[int, Dict[str, Any]]:
         """auth get-or-create of the daemon an accepted add deploys, while that
@@ -833,6 +924,7 @@ class Channel:
             job = self.commands.submit(cmd)
             if job is None:
                 return 429, {'error': 'too many outstanding bridge calls'}
+            self._sent(cmd, job)
             self._track(daemon, job)
         if not job.ev.wait(deadline):
             return 200, {'outcome': 'unknown'}
@@ -1325,6 +1417,17 @@ class Channel:
         return {'outcome': 'done', 'r': 0, 'out': json.dumps({'entries': page, 'more': len(page) < len(rest)}), 'outs': ''}
 
     def _outcome(self, dispatch: str, rec: Record) -> Dict[str, Any]:
+        if rec.local:
+            if not rec.finished():
+                return {'outcome': 'unknown'}
+            with self.lock:
+                if rec.done_at is None:
+                    rec.done_at = time.monotonic()
+            if rec.result is not None:
+                return rec.result
+            # auth get-or-create answered after its call returned unknown
+            job = rec.sent[-1]
+            return {'outcome': 'done', 'r': job.r, 'error': 'a credential is not kept; ask again'}
         job = rec.job
         if job is None or not job.ev.is_set():
             return {'outcome': 'unknown'}
@@ -1347,7 +1450,7 @@ class Channel:
         """Drop completed outcomes after their keep time; pending ones stay. Under self.lock."""
         now = time.monotonic()
         for k, rec in list(self.records.items()):
-            if rec.job is not None and rec.job.ev.is_set() and rec.done_at is None:
+            if rec.finished() and rec.done_at is None:
                 rec.done_at = now
             if rec.done_at is not None and now - rec.done_at > (ANSWERED_KEEP if rec.answered else LATE_KEEP):
                 del self.records[k]

@@ -303,6 +303,26 @@ func RecordsInit(name, image string) *spec.ContainerConfig {
 	return c
 }
 
+// RecordsJob renders the recovery job that reads an agent's records, and
+// with session records its suspension (plan 03, step 7 slice D): the agent
+// binary as the agent's user, with the records volume only. It writes its
+// report as a job result.
+func RecordsJob(name, image, fsid, job, inputs, session string) *spec.ContainerConfig {
+	c := spec.Container(name, image)
+	c.ContainerEntrypoint = []string{"/cephadm-talos", "records", "--fsid", fsid, "--job", job, "--inputs", inputs}
+	if session != "" {
+		c.ContainerEntrypoint = append(c.ContainerEntrypoint, "--session", session)
+	}
+
+	c.ContainerEnvironment = []string{"JOB=" + job, "JOB_INPUTS=" + inputs, "CMD=records " + job}
+	c.RunAsConfig = spec.RunAs(AgentUID, AgentUID)
+	c.SecurityConfig = spec.Restricted()
+	c.MountsConfig = []spec.Mount{spec.UserVolume(spec.RecordsVolumeName, records.Mount)}
+	c.RestartConfig = spec.RestartNever()
+
+	return c
+}
+
 // Probe renders a container that prints the Ceph version and architecture of
 // an image and exits, read back from its log. Unlike a Job it needs nothing from
 // a cluster (no records volume, no ceph.conf), so it runs before bootstrap.

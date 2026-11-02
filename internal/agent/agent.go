@@ -398,6 +398,8 @@ func (a *Agent) Handler() http.Handler {
 		mux.HandleFunc("POST /v1/grant", a.Granter.HandleGrant)
 		mux.HandleFunc("GET /v1/operations/{id}", a.Granter.HandleOperation)
 		mux.HandleFunc("POST /v1/handoff", a.Granter.HandleHandoff)
+		mux.HandleFunc("POST /v1/suspend", a.Granter.HandleSuspend)
+		mux.HandleFunc("GET /v1/suspend", a.Granter.HandleSuspendState)
 		mux.HandleFunc("GET /v1/node", a.Granter.HandleNode)
 		mux.HandleFunc("POST /v1/abandon", a.Granter.HandleAbandon)
 		mux.HandleFunc("POST /v1/close", a.Granter.HandleClose)
@@ -586,7 +588,9 @@ func Main(ctx context.Context) error {
 	wg.Go(func() { a.Run(ctx) })
 
 	// the leader, while this host's mgr is the active one and heartbeats it
-	leader := &LeaderLoop{Self: self, Channel: ch, ClientTLS: clientTLS, Repos: repos, CACert: string(pems[0]), ApprovalKey: os.Getenv(daemons.EnvApprovalKey)}
+	leader := &LeaderLoop{Self: self, Channel: ch, ClientTLS: clientTLS, Repos: repos, CACert: string(pems[0]), ApprovalKey: os.Getenv(daemons.EnvApprovalKey),
+		Records: recs, Suspended: a.Granter.Suspended}
+	a.Granter.Leader = leader
 	wg.Go(func() { leader.Run(ctx) })
 
 	srv := &http.Server{

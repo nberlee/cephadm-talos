@@ -60,6 +60,9 @@ type Granter struct {
 	// confirm replaces Channel.Confirm in tests
 	confirm func(ctx context.Context, t ConfirmTarget, revision int64, operation, inputsHash string) (wire.Confirmation, time.Time, error)
 
+	// Leader is the agent's leader loop, paused while the agent is suspended
+	Leader *LeaderLoop
+
 	mu chan struct{} // one grant at a time; a buffered channel so a waiter can give up
 	// reports admits one node report at a time
 	reports chan struct{}
@@ -448,6 +451,11 @@ func (g *Granter) reconcile(ctx context.Context) error {
 }
 
 func (g *Granter) grant(ctx context.Context, gr wire.Grant) (wire.Operation, error) {
+	// checked under the grant slot, which a suspension takes after its record
+	if err := g.suspended(); err != nil {
+		return wire.Operation{}, err
+	}
+
 	if err := g.admitted(gr.Epoch); err != nil {
 		return wire.Operation{}, err
 	}
@@ -797,6 +805,10 @@ func (g *Granter) Abandon(ctx context.Context, a wire.Abandon) (wire.Operation, 
 }
 
 func (g *Granter) abandon(ctx context.Context, a wire.Abandon) (wire.Operation, error) {
+	if err := g.suspended(); err != nil {
+		return wire.Operation{}, err
+	}
+
 	if err := g.admitted(a.Epoch); err != nil {
 		return wire.Operation{}, err
 	}
@@ -871,6 +883,10 @@ func (g *Granter) Close(ctx context.Context, c wire.Close) (int64, error) {
 }
 
 func (g *Granter) close(ctx context.Context, c wire.Close) (int64, error) {
+	if err := g.suspended(); err != nil {
+		return 0, err
+	}
+
 	f, err := g.floor()
 	if err != nil {
 		return 0, err
@@ -1069,6 +1085,23 @@ func (g *Granter) HandleHandoff(w http.ResponseWriter, r *http.Request) {
 
 	if err := dec.Decode(&h); err != nil || h.Version != wire.Version || h.FSID != g.Channel.Self.FSID || h.Host != g.Channel.Self.Name || h.Revision < 0 {
 		http.Error(w, "malformed handoff", http.StatusBadRequest)
+
+		return
+	}
+
+	// under the grant slot, which a suspension takes after its record: a
+	// handoff admitted before it ends before the receipt, a later one is refused
+	select {
+	case g.mu <- struct{}{}:
+		defer func() { <-g.mu }()
+	case <-r.Context().Done():
+		http.Error(w, "the agent is busy", http.StatusServiceUnavailable)
+
+		return
+	}
+
+	if err := g.suspended(); err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
 
 		return
 	}

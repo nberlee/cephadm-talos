@@ -340,6 +340,11 @@ type Local struct {
 	Approval     string `json:"approval,omitempty"`
 	// AdminKey is the client.admin secret, as on a cephadm admin host
 	AdminKey string `json:"admin_key,omitempty"`
+	// AgentCACert and AgentImage are the agent CA's certificate and the agent
+	// image (public), for a suspension or recovery while the cluster state
+	// cannot be read (plan 03, step 7 slice D)
+	AgentCACert string `json:"agent_ca_cert,omitempty"`
+	AgentImage  string `json:"agent_image,omitempty"`
 }
 
 // LocalHost is how the workstation reaches a node.
@@ -390,7 +395,8 @@ func Load(fsid string) (*State, error) {
 	}
 
 	if l.OperatorCert != "" {
-		st.Agent = &Agent{OperatorCert: l.OperatorCert, OperatorKey: l.OperatorKey, ApprovalPriv: l.ApprovalPriv, Approval: l.Approval}
+		st.Agent = &Agent{OperatorCert: l.OperatorCert, OperatorKey: l.OperatorKey, ApprovalPriv: l.ApprovalPriv, Approval: l.Approval,
+			CACert: l.AgentCACert, Image: l.AgentImage}
 	}
 
 	if l.AdminKey != "" {
@@ -435,6 +441,7 @@ func (s *State) SaveLocked() error {
 
 	if s.Agent != nil {
 		l.OperatorCert, l.OperatorKey = s.Agent.OperatorCert, s.Agent.OperatorKey
+		l.AgentCACert, l.AgentImage = s.Agent.CACert, s.Agent.Image
 		l.ApprovalPriv, l.Approval = s.Agent.ApprovalPriv, s.Agent.Approval
 	}
 

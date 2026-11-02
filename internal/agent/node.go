@@ -1389,7 +1389,8 @@ func (n *Node) RebootBefore(ctx context.Context, until time.Time, revision int64
 // another boot (the call can no longer run), "completed" once a newer instance
 // than the recorded one exists (Talos stopped the old one, within its stop
 // timeout, and started the next), "refused" if the recorded one is still the
-// current one after ApplySettle, else "" (not known yet).
+// current one after ApplySettle, "uncertain" if it is gone and no newer one
+// came within ApplySettle, else "" (not known yet).
 func (n *Node) RestartOutcome(ctx context.Context, instance, boot string, at time.Time) (string, error) {
 	// a call of another boot can no longer run, whatever instances there are
 	now, err := n.Talos.BootID(ctx, "")
@@ -1407,6 +1408,16 @@ func (n *Node) RestartOutcome(ctx context.Context, instance, boot string, at tim
 	}
 
 	cur, err := n.Talos.Instance(ctx, "", instance[:i])
+	if errors.Is(err, talos.ErrNotFound) {
+		// the old instance is gone and no newer one exists yet (it may wait on
+		// its dependencies): after the limit, nobody can tell
+		if time.Since(at) > ApplySettle {
+			return wire.OpUncertain, nil
+		}
+
+		return "", nil
+	}
+
 	if err != nil {
 		return "", err
 	}
@@ -1589,4 +1600,75 @@ func (n *Node) AckBefore(ctx context.Context, until time.Time, revision int64) e
 	}
 
 	return n.writeJSON(fenceRecord, fence{Schema: ownershipSchema, Revision: revision})
+}
+
+// NodeSnapshot is the node's ownership, fence and whether an apply's outcome
+// is still open, read together.
+type NodeSnapshot struct {
+	Own    Ownership
+	Fence  int64
+	Intent bool
+	// IntentBoot and IntentAt say when the open apply was sent
+	IntentBoot string
+	IntentAt   time.Time
+}
+
+// Snapshot reads the ownership, the fence and the apply intent under the lock.
+func (n *Node) Snapshot(ctx context.Context) (NodeSnapshot, error) {
+	if err := n.lock(ctx); err != nil {
+		return NodeSnapshot{}, err
+	}
+	defer n.unlock()
+
+	own, _, err := n.ownership()
+	if err != nil {
+		return NodeSnapshot{}, err
+	}
+
+	f, err := n.fence()
+	if err != nil {
+		return NodeSnapshot{}, err
+	}
+
+	var intent applyIntent
+
+	pending, err := n.readJSON(applyRecord, &intent)
+	if err != nil {
+		return NodeSnapshot{}, err
+	}
+
+	return NodeSnapshot{Own: own, Fence: f, Intent: pending, IntentBoot: intent.BootID, IntentAt: intent.At}, nil
+}
+
+// ended reports whether a container can no longer run: its status completed
+// or failed, or neither its document nor any instance left (a missing status
+// alone may be one not created yet, or an instance still exiting).
+func (n *Node) ended(ctx context.Context, name string) (bool, error) {
+	st, err := n.Talos.ContainerStatuses(ctx, "")
+	if err != nil {
+		return false, err
+	}
+
+	if s, ok := st[name]; ok {
+		return s.State == containers.ContainerStateCompleted || s.State == containers.ContainerStateFailed, nil
+	}
+
+	owners, err := n.Talos.InstanceOwners(ctx, "")
+	if err != nil || slices.Contains(owners, name) {
+		return false, err
+	}
+
+	cfg, err := n.Talos.MachineConfig(ctx, "")
+	if err != nil {
+		return false, err
+	}
+
+	docs, err := parseDocs(cfg)
+	if err != nil {
+		return false, err
+	}
+
+	_, configured := docs["ContainerConfig/"+name]
+
+	return !configured, nil
 }

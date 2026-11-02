@@ -1575,7 +1575,7 @@ func (l *LeaderLoop) stopHost(ctx context.Context, b *Bridge, js store.Backend, 
 
 			// no answer is expected; a refusal (no standby) is retried until the
 			// operation fails, and the successor checks the mgr map again
-			if err := b.MgrFail(ctx, op.ID, agid); err != nil {
+			if err := b.MgrFail(ctx, op.ID, agid, active, h.Name); err != nil {
 				return false, fmt.Errorf("%w: failing the active mgr on %s over: %w", errRetry, h.Name, err)
 			}
 
@@ -2427,7 +2427,7 @@ func (l *LeaderLoop) upgradeStep(ctx context.Context, b *Bridge, js store.Backen
 				return err
 			}
 
-			if err := b.MgrFail(ctx, u.Op, agid); err != nil {
+			if err := b.MgrFail(ctx, u.Op, agid, d.ID, h.Name); err != nil {
 				return wait(fmt.Sprintf("failing the active mgr over: %v", err))
 			}
 

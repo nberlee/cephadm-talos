@@ -12,6 +12,7 @@ cephadm-talos CLI (docs/plans/02-agents-and-read-path.md).
 
 import base64
 import datetime
+import errno
 import hashlib
 import http.client
 import json
@@ -95,6 +96,7 @@ def _accepting(f: Any) -> Any:
     @functools.wraps(f)
     def w(self: Any, *args: Any, **kwargs: Any) -> Any:
         with _ACCEPT_LOCK:
+            self._not_suspended()
             return f(self, *args, **kwargs)
     return w
 
@@ -102,6 +104,9 @@ UUID_RE = re.compile(r'\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
 
 # the CLI's enrollment records (cephadm-talos host add after the handoff)
 ENROLL_PREFIX = 'cephadm-talos/enroll/'
+# the CLI's control record while the cluster is suspended for a recovery
+# (plan 03, step 7 slice D): nothing is accepted while it exists
+SUSPENSION_KEY = 'cephadm-talos/suspension'
 
 
 def choose_incarnation(entries: Dict[str, str], own: Optional[int]) -> str:
@@ -519,6 +524,20 @@ class Module(orchestrator.Orchestrator, MgrModule):
     def _inventory(self) -> Dict[str, Any]:
         entries = self.get_store_prefix(STORE_PREFIX)
         return inventory_from_store(entries, choose_incarnation(entries, getattr(self, '_gid', None)))
+
+    def _not_suspended(self) -> None:
+        """Refuse an acceptance while the CLI's suspension record exists, or
+        cannot be read (checked under _ACCEPT_LOCK, before every acceptance)."""
+        r, out, err = self.mon_command({'prefix': 'config-key get', 'key': SUSPENSION_KEY})
+        if r == -errno.ENOENT:
+            return
+        if r != 0:
+            raise OrchestratorError('cannot read the suspension record (%s): nothing is accepted' % err.strip())
+        try:
+            session = json.loads(out)['session']
+        except (ValueError, KeyError, TypeError):
+            session = '(unreadable)'
+        raise OrchestratorError('the cluster is suspended for recovery session %s: nothing is accepted until `cephadm-talos resume`' % session)
 
     def _authority(self) -> Tuple[ledger.Ledger, ledger.Fold]:
         """This incarnation's ledger and the fold it authorizes; raises without them."""

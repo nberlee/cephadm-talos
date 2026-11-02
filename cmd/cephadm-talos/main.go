@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -51,6 +52,7 @@ Commands:
   shell [--host H] [--stdin] -- <cmd...>   run a command with the admin keyring on a node (--stdin: pass stdin on)
   orch [--request U] [-i F|-] -- <words>   run a ceph orch command once per request uuid (retry with --request)
   handoff                                  hand the nodes to their agents and the state to the leader
+  suspend [--reboot] [--force]             suspend the agents and the leader for a recovery session
   approve [--image REF] [--prepare H:DISK] [--zap H:DISK] [--drop H:SERIAL:ACTION] [--show]
                                            sign and publish the operator's approval of images and disks
   rm-cluster [--zap] --yes-i-really-mean-it  remove the whole cluster from all hosts
@@ -99,6 +101,12 @@ func run() error {
 	// prepares the agent's records on every boot, as root with CHOWN and FOWNER (plan 03, item 6)
 	if args[0] == "records-init" {
 		return records.Init(records.Mount, daemons.AgentUID, daemons.AgentUID)
+	}
+
+	// reads (and with --session suspends) an agent's records, in a recovery job
+	// on a node whose agent does not answer (plan 03, step 7 slice D)
+	if args[0] == "records" {
+		return recordsJob(args[1:])
 	}
 
 	// stored in the cluster state at bootstrap: must not depend on the working directory
@@ -150,17 +158,38 @@ func run() error {
 	// the cluster's state is in its mons (plan 03, item 4); a dry run reads it too.
 	// rm-cluster also works when no mon answers: it removes what the nodes
 	// known to this workstation configure
+	var localCA, localImage string
+	if st.Agent != nil {
+		localCA, localImage = st.Agent.CACert, st.Agent.Image
+	}
+
 	if err := o.Open(ctx); err != nil {
-		if cmd != "rm-cluster" {
+		if cmd != "rm-cluster" && cmd != "suspend" {
 			return err
 		}
 
 		fmt.Fprintln(os.Stderr, "warning:", err)
-		fmt.Fprintln(os.Stderr, "warning: removing what the hosts in this workstation's state configure")
+		fmt.Fprintln(os.Stderr, "warning: working from the hosts in this workstation's state")
+	} else if o.St.Agent != nil && (o.St.Agent.CACert != localCA || o.St.Agent.Image != localImage) {
+		// kept locally for a suspension or recovery without the mons
+		if err := o.KeepLocal(); err != nil {
+			fmt.Fprintln(os.Stderr, "warning:", err)
+		}
 	}
 
 	if cmd == "rm-cluster" {
 		return rmCluster(ctx, o, args)
+	}
+
+	if cmd == "suspend" {
+		fs := flag.NewFlagSet("suspend", flag.ExitOnError)
+		reboot := fs.Bool("reboot", false, "reboot a node whose unanswering agent's last apply may still land, instead of waiting up to 10 minutes")
+		force := fs.Bool("force", false, "remove a job an unanswering agent started that still runs, instead of waiting for it")
+		_ = fs.Parse(args)
+
+		_, err := o.Suspend(ctx, orch.SuspendOptions{Reboot: *reboot, Force: *force})
+
+		return err
 	}
 
 	// once a leader owns the cluster state the CLI reads it and changes
@@ -489,4 +518,33 @@ func rmCluster(ctx context.Context, o *orch.Orch, args []string) error {
 	}
 
 	return o.RemoveCluster(ctx, *zap)
+}
+
+// recordsJob is the recovery job's command: it reads the agent's records,
+// records the suspension with --session, and writes the report as its result.
+func recordsJob(args []string) error {
+	fs := flag.NewFlagSet("records", flag.ExitOnError)
+	fsid := fs.String("fsid", "", "cluster fsid")
+	job := fs.String("job", "", "job id")
+	inputs := fs.String("inputs", "", "job inputs")
+	session := fs.String("session", "", "record the suspension for this recovery session")
+	_ = fs.Parse(args)
+
+	jobs := filepath.Join(records.Mount, records.JobsDir)
+
+	rep, err := agent.InspectRecords(&records.Store{Dir: filepath.Join(records.Mount, records.RecordsDir)}, *session)
+	if err != nil {
+		if werr := agent.WriteJobResult(jobs, *fsid, *job, *inputs, 1, []byte(err.Error())); werr != nil {
+			return errors.Join(err, werr)
+		}
+
+		return err
+	}
+
+	out, err := json.Marshal(rep)
+	if err != nil {
+		return err
+	}
+
+	return agent.WriteJobResult(jobs, *fsid, *job, *inputs, 0, out)
 }

@@ -16,11 +16,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/siderolabs/talos/pkg/machinery/config/config"
 
 	"github.com/nberlee/cephadm-talos/internal/pki"
+	"github.com/nberlee/cephadm-talos/internal/records"
 	"github.com/nberlee/cephadm-talos/internal/render"
 	"github.com/nberlee/cephadm-talos/internal/spec"
 	"github.com/nberlee/cephadm-talos/internal/state"
@@ -141,6 +143,68 @@ type LeaderLoop struct {
 	agentURL func(h state.Host) string
 	now      func() time.Time
 	logf     func(format string, args ...any)
+
+	// Records holds the bridge intents (nil: none, in tests); Suspended says
+	// whether the agent is suspended, when no tick may run (plan 03, step 7
+	// slice D)
+	Records   *records.Store
+	Suspended func() bool
+	// tickMu guards cancelTick and ticking: Pause cancels a running tick and
+	// waits for it to return
+	tickMu     sync.Mutex
+	cancelTick context.CancelFunc
+	ticking    chan struct{}
+}
+
+// paused reports whether the agent is suspended.
+func (l *LeaderLoop) paused() bool { return l.Suspended != nil && l.Suspended() }
+
+// Pause cancels a running tick and waits until it returned; no tick starts
+// while Suspended reports true, which the caller made so first.
+func (l *LeaderLoop) Pause(ctx context.Context) error {
+	l.tickMu.Lock()
+	cancel, done := l.cancelTick, l.ticking
+	l.tickMu.Unlock()
+
+	if cancel == nil {
+		return nil
+	}
+
+	cancel()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// tick runs one tick unless the agent is suspended, cancellable by Pause.
+func (l *LeaderLoop) tick(ctx context.Context, lead *Leader) {
+	l.tickMu.Lock()
+	if l.paused() {
+		l.tickMu.Unlock()
+
+		return
+	}
+
+	tctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	l.cancelTick, l.ticking = cancel, done
+	l.tickMu.Unlock()
+
+	defer func() {
+		l.tickMu.Lock()
+		l.cancelTick, l.ticking = nil, nil
+		l.tickMu.Unlock()
+		cancel()
+		close(done)
+	}()
+
+	if err := l.Tick(tctx, lead.GID, lead.Epoch); err != nil {
+		l.log("%v", err)
+	}
 }
 
 func (l *LeaderLoop) clock() time.Time {
@@ -173,9 +237,7 @@ func (l *LeaderLoop) Run(ctx context.Context) {
 
 	for {
 		if lead := l.active(); lead != nil {
-			if err := l.Tick(ctx, lead.GID, lead.Epoch); err != nil {
-				l.log("%v", err)
-			}
+			l.tick(ctx, lead)
 		}
 
 		select {
@@ -213,13 +275,14 @@ func (l *LeaderLoop) bridge() *Bridge {
 		addr = "127.0.0.1"
 	}
 
-	return &Bridge{TLS: l.ClientTLS, Addr: addr, Mgr: l.Self.Name, FSID: l.Self.FSID}
+	return &Bridge{TLS: l.ClientTLS, Addr: addr, Mgr: l.Self.Name, FSID: l.Self.FSID, Intents: l.Records}
 }
 
 // Tick takes over from earlier incarnations as far as it can, then carries
 // out the incarnation's pending requests, in id order.
 func (l *LeaderLoop) Tick(ctx context.Context, gid, epoch int64) error {
 	b := l.bridge()
+	b.GID, b.Epoch = gid, epoch
 	prefix := JournalPrefix(gid)
 
 	js, err := b.Store(ctx, prefix)

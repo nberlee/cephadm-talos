@@ -314,6 +314,56 @@ type HandoffReply struct {
 	Owned    int   `json:"owned"`
 }
 
+// Suspend is the CLI's request that an agent suspend for a recovery session
+// (plan 03, step 7 slice D), with the operator certificate.
+type Suspend struct {
+	Version int    `json:"version"`
+	FSID    string `json:"fsid"`
+	Host    string `json:"host"`
+	Session string `json:"session"`
+}
+
+// SuspendReceipt is a suspended agent's state once nothing it started runs:
+// what the CLI must not touch, and what re-adoption keeps.
+type SuspendReceipt struct {
+	Version  int    `json:"version"`
+	Session  string `json:"session"`
+	Host     string `json:"host"`
+	Revision int64  `json:"revision"` // the ownership's
+	Fence    int64  `json:"fence"`
+	Floor    int64  `json:"floor"` // the session floor
+	// Unresolved are the operations whose outcome is uncertain, Intents the
+	// bridge calls whose outcome the module did not give
+	Unresolved []Operation       `json:"unresolved"`
+	Intents    []BridgeIntent    `json:"intents"`
+	Owned      map[string]string `json:"owned"` // "<kind>/<name>" -> hash
+}
+
+// SuspendState is the answer while an agent drains: Waiting says for what.
+type SuspendState struct {
+	Version int             `json:"version"`
+	Session string          `json:"session"`
+	Waiting []string        `json:"waiting,omitempty"`
+	Receipt *SuspendReceipt `json:"receipt,omitempty"`
+}
+
+// BridgeIntent is the leader's agent's record of a mutating bridge call made
+// before the call (plan 03, step 7 slice D): until its outcome is known, it
+// reserves the operation's daemon and host for the CLI's recovery.
+type BridgeIntent struct {
+	Version   int    `json:"version"`
+	Dispatch  string `json:"dispatch"`
+	Call      string `json:"call"`
+	Operation string `json:"operation,omitempty"`
+	// Daemon and Host are what the operation changes, as far as the leader
+	// knew it when it made the call
+	Daemon string `json:"daemon,omitempty"`
+	Host   string `json:"host,omitempty"`
+	GID    int64  `json:"gid"`
+	Epoch  int64  `json:"epoch"`
+	At     int64  `json:"at"`
+}
+
 // NodeReport is what an agent tells the leader about its node: what it owns,
 // its drift, the cluster's containers it has and its disks, for the leader to
 // skip documents the node already has and to check a revision before granting.

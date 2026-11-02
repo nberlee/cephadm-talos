@@ -41,6 +41,11 @@ from orchestrator import DaemonDescriptionStatus as S  # noqa: E402
 
 from talos import module as m  # noqa: E402
 
+# the suspension gate reads a config-key through the mons, which the module
+# doubles here do not answer: off, except in the test that checks it
+_not_suspended = m.Module._not_suspended
+m.Module._not_suspended = lambda self: None
+
 NOW = datetime.datetime(2026, 10, 28, 12, 0, tzinfo=datetime.timezone.utc)
 
 
@@ -569,6 +574,19 @@ class Acceptance(unittest.TestCase):
         for mod in (self.module(sealed=False)[0], self.module(active=False)[0]):
             self.assertTrue(m.Module.daemon_action(mod, 'restart', 'mgr.h3').exception_str)
             self.assertEqual(mod._ledger.executable(), [])
+
+    def test_nothing_is_accepted_while_the_cluster_is_suspended(self):
+        session = '0b8f3a52-7c1e-4d3a-9f6e-2a4b5c6d7e8f'
+        for answer, accepted in (((-2, '', 'ENOENT'), True), ((0, json.dumps({'session': session}), ''), False),
+                                 ((-110, '', 'timed out'), False)):
+            mod, _ = self.module()
+            mod._not_suspended = types.MethodType(_not_suspended, mod)
+            mod.mon_command = lambda cmd, a=answer: a if cmd == {'prefix': 'config-key get', 'key': m.SUSPENSION_KEY} else (-22, '', '')
+            res = m.Module.daemon_action(mod, 'restart', 'mon.h1')
+            self.assertEqual(not res.exception_str, accepted, (answer, res.exception_str))
+            self.assertEqual(len(mod._ledger.executable()), 1 if accepted else 0)
+            if answer[0] == 0:
+                self.assertIn(session, res.exception_str)
 
 
 class AddAndRemove(unittest.TestCase):

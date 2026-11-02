@@ -793,7 +793,9 @@ class LedgerCallsTest(unittest.TestCase):
         self.assertEqual(self.call('secret get', name=name)[1]['outcome'], 'done')
         self.assertEqual(self.call('secret get', name='issued/op-%016x/%s/mgr-server.key' % (7, out['attempt']))[0], 400)
         self.assertEqual(self.call('auth get-or-create', entity='mgr.h2', operation=add)[1]['outcome'], 'done')
-        self.assertEqual(self.ch.outcome('%016x' % (900 + self.n))[0], 404)  # never kept
+        code, kept = self.ch.outcome('%016x' % (900 + self.n))  # kept for a suspension, never the credential
+        self.assertEqual((code, kept['outcome']), (200, 'done'))
+        self.assertNotIn('out', kept)
         # not for the CLI's mgr, nor under another operation
         self.assertEqual(self.call('auth get-or-create', entity='mgr.h1', operation=add)[0], 400)
         # not for a restart, nor for a mon's add
@@ -803,13 +805,17 @@ class LedgerCallsTest(unittest.TestCase):
         rm = self.accept('remove_daemon', 'mgr.h2', 'h2')
         stuck = b.Job({})
         self.ch._track('mgr.h2', stuck)
-        self.assertEqual(self.call('retire', operation=rm)[0], 409)
+        # the retirement closed the generation (a ledger entry) before it waited:
+        # sent, so done with the error rather than a refusal
+        code, out = self.call('retire', operation=rm)
+        self.assertEqual((code, out['outcome']), (200, 'done'))
+        self.assertIn('not answered yet', out['error'])
         self.assertEqual(self.call('auth get-or-create', entity='mgr.h2', operation=add)[0], 400)
         self.assertEqual(self.call('mgr cert', operation=add)[0], 400)
         stuck.complete(0, '', '')
         # an auth rm without an answer is tracked: the retirement waits for it
         self.mons.late = True
-        self.assertEqual(self.call('retire', operation=rm)[0], 503)
+        self.assertEqual(self.call('retire', operation=rm), (200, {'outcome': 'unknown'}))  # sent: no refusal
         self.assertEqual(self.call('retire', operation=rm)[0], 409)
         self.mons.late = False
         self.mons.pending[0].complete(0, '', '')
@@ -851,6 +857,21 @@ class ApprovalCallTest(unittest.TestCase):
         mons.kv['cephadm-talos/approvals/x'] = 'not one'
         self.assertEqual(call(2)[1]['out'], '{"serial": 10}')
         self.assertEqual(ch.bridge({'version': 1, 'call': 'approval', 'args': {'x': 1}, 'deadline': 5, 'dispatch_id': '%016x' % 3})[0], 400)
+
+
+class LedgerAppendOutcomeTest(LedgerCallsTest):
+    def test_a_retirement_whose_ledger_write_is_unanswered_stays_unknown(self):
+        inv = inventory('mon.h1@h1', 'mgr.h1@h1')
+        inv['hosts'].append({'name': 'h3', 'addr': '10.0.0.3'})
+        self.ch.authority = lambda: (self.led, lg.Fold(inv, self.led.executable()))
+        rmh = self.accept('remove_host', None, 'h3')
+        self.led.mon.silent = 1  # the retirement's entry is stored but not answered
+        self.assertEqual(self.call('retire host', operation=rmh), (200, {'outcome': 'unknown'}))
+        dispatch = '%016x' % (900 + self.n)
+        self.assertEqual(self.ch.outcome(dispatch), (200, {'outcome': 'unknown'}))
+        self.led.settle()
+        code, out = self.ch.outcome(dispatch)
+        self.assertEqual((code, out['outcome']), (200, 'done'))
 
 
 class CreationTest(LedgerCallsTest):
@@ -969,7 +990,10 @@ class MaintenanceCallsTest(unittest.TestCase):
         self.fold('mon.h1@h1', 'osd.3@h1')
         enter = self.maint('enter_maintenance')
         self.mons.late = True
-        self.assertEqual(self.call('noout set', operation=enter)[0], 503)
+        # sent, unanswered: unknown, and its outcome can be fetched by its dispatch id
+        self.assertEqual(self.call('noout set', operation=enter), (200, {'outcome': 'unknown'}))
+        dispatch = '%016x' % (900 + self.n)
+        self.assertEqual(self.ch.outcome(dispatch), (200, {'outcome': 'unknown'}))
         exit_ = self.maint('exit_maintenance')
         for call in ('noout unset', 'maintained'):
             self.assertEqual(self.call(call, operation=exit_)[0], 409, call)
@@ -977,7 +1001,12 @@ class MaintenanceCallsTest(unittest.TestCase):
         for res in self.mons.pending:
             res.complete(0, '', '')
         self.assertTrue(wait_until(lambda: not self.ch._pending('host/h1')))
+        code, out = self.ch.outcome(dispatch)
+        self.assertEqual((code, out['outcome']), (200, 'done'))  # with the handler's error: it gave up waiting
         self.assertEqual(self.call('noout unset', operation=exit_)[1]['outcome'], 'done')
+        # a refusal sent nothing and keeps no outcome
+        self.assertEqual(self.call('noout set', operation='op-%016x' % 99)[0], 400)
+        self.assertEqual(self.ch.outcome('%016x' % (900 + self.n))[0], 404)
 
     def test_a_powercycle_has_the_calls_of_both(self):
         self.fold('mon.h1@h1', 'osd.3@h1')
