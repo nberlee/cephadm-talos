@@ -9,8 +9,8 @@ import (
 )
 
 // requestScript runs in a Ceph container with the admin key in CEPH_ARGS: it
-// parses a ceph orch command's words with the mgr's own command descriptions
-// (as the ceph CLI does), hashes the command with its input, and sends it once
+// parses a ceph orch command's words with the command descriptions the mon
+// serves, the mgr's included (as the ceph CLI does), hashes the command with its input, and sends it once
 // per request uuid through `ceph orch talos request` (plan 03, step 7). The
 // request comes as JSON on stdin, after the key.
 const requestScript = `
@@ -21,19 +21,20 @@ req = json.load(sys.stdin)
 c = rados.Rados(conffile='/etc/ceph/ceph.conf')
 c.conf_parse_env()
 c.connect(timeout=60)
-ret, out, err = json_command(c, target=('mgr', ''), prefix='get_command_descriptions')
+ret, out, err = json_command(c, target=('mon', ''), prefix='get_command_descriptions')
 if ret != 0:
-    sys.exit('the mgr command descriptions: %s' % err)
+    sys.exit('the command descriptions: %s' % err)
 cmd = validate_command(parse_json_funcsigs(out.decode(), 'cli'), ['orch'] + req['words'])
 if not cmd:
     sys.exit(22)
 cmd = dict(cmd)
+cmd.pop('target', None)
 body = {'cmd': cmd, 'inbuf': req.get('inbuf')}
 inputs = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
-ret, out, err = json_command(c, target=('mgr', ''), prefix='orch talos request',
+ret, out, err = json_command(c, target=('mon-mgr', ''), prefix='orch talos request',
                              argdict={'request': req['request'], 'inputs': inputs}, inbuf=json.dumps(body).encode(), timeout=120)
-sys.stdout.write(out.decode())
-sys.stderr.write(err)
+for f, t in ((sys.stdout, out.decode()), (sys.stderr, err)):
+    f.write(t if not t or t.endswith('\n') else t + '\n')
 sys.exit(-ret if ret < 0 else ret)
 `
 
