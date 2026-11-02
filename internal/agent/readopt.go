@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math"
 	"net/http"
 	"sort"
 	"strings"
@@ -30,6 +31,9 @@ type readoption struct {
 	Revision  int64             `json:"revision"`
 	Docs      map[string]string `json:"docs"`
 	Activated bool              `json:"activated,omitempty"`
+	// Epoch is the activation's boundary: heartbeats of that mgr map epoch or
+	// before make no tick
+	Epoch int64 `json:"epoch,omitempty"`
 }
 
 // changesHash is the SHA-256 of the changes' JSON (its keys sorted).
@@ -157,8 +161,16 @@ func (n *Node) readopt(ctx context.Context, session string, changes map[string]s
 		return readoption{}, err
 	}
 
+	// an enrollment that stopped before its handoff: the agent owns nothing,
+	// so the node must have no cluster document but the journaled changes
 	if !found {
-		return readoption{}, errors.New("the agent owns nothing to adopt again: it was never handed its node")
+		own = Ownership{Schema: ownershipSchema, Docs: map[string]string{}}
+
+		if a, err := n.approval(); err != nil {
+			return readoption{}, err
+		} else if a != nil {
+			own.ApprovalSerial = a.Serial
+		}
 	}
 
 	hash, err := changesHash(changes)
@@ -326,7 +338,7 @@ func (g *Granter) Activate(ctx context.Context, a wire.Activate) error {
 	}
 
 	if !r.Activated {
-		r.Activated = true
+		r.Activated, r.Epoch = true, a.Epoch
 		if err := g.Node.writeJSON(readoptRecord, r); err != nil {
 			return err
 		}
@@ -337,6 +349,21 @@ func (g *Granter) Activate(ctx context.Context, a wire.Activate) error {
 	}
 
 	return nil
+}
+
+// Boundary is the epoch of the last activation's boundary, 0 without one;
+// an unreadable record makes every heartbeat count as before it.
+func (g *Granter) Boundary() int64 {
+	r, found, err := g.Node.readoption()
+
+	switch {
+	case err != nil:
+		return math.MaxInt64
+	case !found || !r.Activated:
+		return 0
+	}
+
+	return r.Epoch
 }
 
 // HandleReadopt serves POST /v1/readopt from the operator's certificate.

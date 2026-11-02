@@ -253,6 +253,13 @@ func (o *Orch) recoverMon(ctx context.Context, rec *state.Recovery, h state.Host
 	case configured && marker != cur.env["DEPLOY_ID"]:
 		return fmt.Errorf("its store's marker %s is not the document's deployment id %s: not started (the entrypoint would rebuild the store)", marker, cur.env["DEPLOY_ID"])
 	case configured:
+		if !slices.Contains(hr.Restarted, doc) {
+			hr.Restarted = append(hr.Restarted, doc)
+			if err := rec.Save(); err != nil {
+				return err
+			}
+		}
+
 		o.printf("mon.%s: restarting it on its store\n", h.Name)
 
 		return o.Talos.Restart(ctx, h.Addr, doc)
@@ -330,13 +337,20 @@ func (o *Orch) journalHash(ctx context.Context, rec *state.Recovery, h state.Hos
 // reservedMon refuses a mon an uncertain operation or an open bridge intent
 // may still change: on its node, an apply's or a reboot's documents are not
 // known, so it reserves the node, and a restart reserves its daemon's
-// document (a job changes no mon document); a bridge intent, on whichever
+// document; an apply intent the agent left reserves the node; a job whose
+// document the ownership shows applied (its revision
+// at most the ownership's) changes no mon document, while one whose apply is
+// uncertain reserves the node like any apply; a bridge intent, on whichever
 // host the leader made it, reserves its daemon, or with no daemon its host.
 func reservedMon(rec *state.Recovery, host, doc string) error {
 	if hr := rec.Hosts[host]; hr != nil && hr.Receipt != nil {
+		if hr.Receipt.ApplyPending {
+			return errors.New("an apply of the node's agent has no known outcome: the node is reserved")
+		}
+
 		for _, op := range hr.Receipt.Unresolved {
 			switch {
-			case op.Job != nil:
+			case op.Job != nil && op.Revision <= hr.Receipt.Revision:
 			case op.Instance != "":
 				if strings.HasPrefix(op.Instance, doc+"-") {
 					return fmt.Errorf("its restart in operation %s has no known outcome", op.Operation)

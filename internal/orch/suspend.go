@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -454,6 +455,18 @@ func (o *Orch) suspendNode(ctx context.Context, h state.Host, rec *state.Recover
 		// recorded before the removal, so the resumption applies the agent
 		// again whatever happened; confirmed once its instances are gone
 		if !hr.RemovingAgent {
+			// its certificates, from its document while it is there
+			if hr.AgentCert == "" {
+				docs, err := o.configuredDocs(ctx, h.Addr, doc)
+				if err != nil {
+					return nil, err
+				}
+
+				if d, ok := docs[doc]; ok {
+					hr.AgentCert, hr.AgentClientCert = unb64(d.env[daemons.EnvCert]), unb64(d.env[daemons.EnvClientCert])
+				}
+			}
+
 			hr.RemovingAgent = true
 			if err := rec.Save(); err != nil {
 				return nil, err
@@ -514,8 +527,18 @@ func (o *Orch) suspendNode(ctx context.Context, h state.Host, rec *state.Recover
 
 	return &wire.SuspendReceipt{
 		Version: wire.Version, Session: rec.Session, Host: h.Name, Revision: rep.Revision, Fence: rep.Fence, Floor: rep.Floor,
-		Unresolved: rep.Open, Intents: rep.Intents, Owned: rep.Owned, Prepared: rep.Prepared,
+		Unresolved: rep.Open, Intents: rep.Intents, Owned: rep.Owned, Prepared: rep.Prepared, ApplyPending: rep.ApplyBoot != "",
 	}, nil
+}
+
+// unb64 decodes a base64 value, "" if it is not one.
+func unb64(s string) string {
+	b, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return ""
+	}
+
+	return string(b)
 }
 
 // recordsJob runs the recovery job under the id the journal keeps for its
@@ -582,7 +605,11 @@ func (o *Orch) awaitStarted(ctx context.Context, h state.Host, rec *state.Recove
 	for _, op := range rep.Open {
 		switch {
 		case op.Job != nil:
-			if opts.Force {
+			// only a job whose apply the ownership shows and no apply intent
+			// is left: one whose apply the agent did not record (or not
+			// finish recording) is waited for, as its removal would make its
+			// reconcile take the apply for refused
+			if opts.Force && op.Revision <= rep.Revision && rep.ApplyBoot == "" {
 				// a removal the re-adoption expects, journaled before it
 				hr := rec.Host(h.Name)
 				if v, ok := hr.Changes["ContainerConfig/"+op.Job.Doc]; !ok || v != "" {

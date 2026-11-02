@@ -1492,15 +1492,11 @@ var resultRCRe = regexp.MustCompile(`^rc (0|-?[1-9][0-9]{0,4})$`)
 // "" while it runs.
 func (n *Node) JobOutcome(ctx context.Context, job wire.JobRef) (string, *wire.JobResult, error) {
 	// nothing is decided while the job's container runs: its result is
-	// visible before the job synced and exited
-	st, err := n.Talos.ContainerStatuses(ctx, "")
-	if err != nil {
+	// visible before the job synced and exited; it is decided once its
+	// container completed or failed, or its document and instances are gone
+	// (a job the operator removed: `suspend --force`)
+	if ended, err := n.ended(ctx, job.Doc); err != nil || !ended {
 		return "", nil, err
-	}
-
-	s, ok := st[job.Doc]
-	if !ok || (s.State != containers.ContainerStateCompleted && s.State != containers.ContainerStateFailed) {
-		return "", nil, nil
 	}
 
 	b, err := os.ReadFile(n.jobFile(job.ID, "result"))

@@ -27,10 +27,13 @@ func TestReservedMon(t *testing.T) {
 		ok      bool
 	}{
 		{&wire.SuspendReceipt{}, true},
-		{&wire.SuspendReceipt{Unresolved: []wire.Operation{{Operation: "op-1", Job: &wire.JobRef{ID: "a"}}}}, true},
+		// a job whose document the ownership shows applied; one whose apply is uncertain reserves the node
+		{&wire.SuspendReceipt{Revision: 3, Unresolved: []wire.Operation{{Operation: "op-1", Revision: 3, Job: &wire.JobRef{ID: "a"}}}}, true},
+		{&wire.SuspendReceipt{Revision: 3, Unresolved: []wire.Operation{{Operation: "op-1", Revision: 4, Job: &wire.JobRef{ID: "a"}}}}, false},
 		{&wire.SuspendReceipt{Unresolved: []wire.Operation{{Operation: "op-1", Instance: "ceph-x-osd-0-2"}}}, true},
 		{&wire.SuspendReceipt{Unresolved: []wire.Operation{{Operation: "op-1", Instance: doc + "-2"}}}, false},
 		{&wire.SuspendReceipt{Unresolved: []wire.Operation{{Operation: "op-1"}}}, false}, // an apply: the node
+		{&wire.SuspendReceipt{Revision: 3, ApplyPending: true, Unresolved: []wire.Operation{{Operation: "op-1", Revision: 3, Job: &wire.JobRef{ID: "a"}}}}, false},
 		{&wire.SuspendReceipt{Intents: []wire.BridgeIntent{{Call: "mon rm", Daemon: "mon.h1"}}}, false},
 		{&wire.SuspendReceipt{Intents: []wire.BridgeIntent{{Call: "retire", Daemon: "mgr.h1"}}}, true},
 	} {

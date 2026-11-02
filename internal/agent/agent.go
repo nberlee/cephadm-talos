@@ -591,7 +591,7 @@ func Main(ctx context.Context) error {
 
 	// the leader, while this host's mgr is the active one and heartbeats it
 	leader := &LeaderLoop{Self: self, Channel: ch, ClientTLS: clientTLS, Repos: repos, CACert: string(pems[0]), ApprovalKey: os.Getenv(daemons.EnvApprovalKey),
-		Records: recs, Suspended: a.Granter.Suspended}
+		Records: recs, Suspended: a.Granter.Suspended, Boundary: a.Granter.Boundary}
 	a.Granter.Leader = leader
 	wg.Go(func() { leader.Run(ctx) })
 

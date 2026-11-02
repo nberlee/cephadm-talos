@@ -340,6 +340,10 @@ type SuspendReceipt struct {
 	Prepared []string          `json:"prepared,omitempty"`
 	Intents  []BridgeIntent    `json:"intents"`
 	Owned    map[string]string `json:"owned"` // "<kind>/<name>" -> hash
+	// ApplyPending: an apply intent is left that the agent could not decide
+	// (it settled, but the config matches neither its before nor its after):
+	// the whole node is reserved
+	ApplyPending bool `json:"apply_pending,omitempty"`
 }
 
 // SuspendState is the answer while an agent drains: Waiting says for what.

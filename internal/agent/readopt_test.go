@@ -3,9 +3,11 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"testing"
 
 	"github.com/nberlee/cephadm-talos/internal/daemons"
+	"github.com/nberlee/cephadm-talos/internal/pki"
 	"github.com/nberlee/cephadm-talos/internal/wire"
 )
 
@@ -168,4 +170,94 @@ func mustJSON(t *testing.T, v any) []byte {
 	must(t, err)
 
 	return b
+}
+
+func TestAnActivationFencesTheHeartbeatsOfBefore(t *testing.T) {
+	g := newTestGranter(t)
+	ctx := context.Background()
+
+	l := &LeaderLoop{Boundary: g.Boundary}
+
+	if l.replaced(&Leader{Epoch: 3}) {
+		t.Fatal("a heartbeat fenced without a resumption")
+	}
+
+	must(t, g.Suspend(ctx, testSession))
+
+	r, err := g.Readopt(ctx, testSession, nil)
+	must(t, err)
+	must(t, g.Activate(ctx, wire.Activate{Version: wire.Version, FSID: testFSID, Host: "h1", Session: testSession, Revision: r.Revision, Epoch: 9}))
+
+	// the old process's heartbeat, still fresh or delayed, makes no tick; the
+	// new incarnation's does, also after an agent restart (from the records)
+	l2 := &LeaderLoop{Boundary: NewGranter(g.Node, g.Channel, nil, g.Records).Boundary}
+
+	for _, ll := range []*LeaderLoop{l, l2} {
+		if !ll.replaced(&Leader{GID: 100, Epoch: 9}) || ll.replaced(&Leader{GID: 200, Epoch: 12}) {
+			t.Fatalf("boundary %d", ll.Boundary())
+		}
+	}
+
+	// a damaged record fences every heartbeat
+	must(t, g.Records.Write(readoptRecord, []byte("{")))
+
+	if !l.replaced(&Leader{Epoch: 1 << 40}) {
+		t.Fatal("a damaged re-adoption record fenced nothing")
+	}
+}
+
+func TestAnAgentNeverHandedItsNodeReadoptsNothing(t *testing.T) {
+	n, tc, f := testNodeFake(t)
+	ch, err := NewChannel(pki.Identity{FSID: testFSID, Role: pki.RoleAgent, Name: "h1"})
+	must(t, err)
+
+	g := &testGranter{Granter: NewGranter(n, ch, nil, n.Records), patches: &countingPatch{Client: tc}, fake: f}
+	ctx := context.Background()
+
+	must(t, g.Suspend(ctx, testSession))
+
+	// the node has ceph.conf, a cluster document: not adopted without a change
+	if _, err := g.Readopt(ctx, testSession, nil); err == nil {
+		t.Fatal("an unowned cluster document was adopted")
+	}
+
+	cfg, err := tc.MachineConfig(ctx, "")
+	must(t, err)
+
+	hashes, err := DocHashes(cfg)
+	must(t, err)
+
+	conf := "EtcFileConfig/ceph/ceph.conf"
+
+	// journaled as the recovery's change, it is
+	r, err := g.Readopt(ctx, testSession, map[string]string{conf: hashes[conf]})
+	if err != nil || r.Revision != 1 || len(r.Docs) != 1 {
+		t.Fatalf("re-adoption of an agent never handed its node: %+v %v", r, err)
+	}
+
+	if own, _, err := n.ownership(); err != nil || own.ApprovalSerial != 1 {
+		t.Fatalf("ownership: %+v %v", own, err)
+	}
+}
+
+func TestARemovedJobIsDecidedFromItsResult(t *testing.T) {
+	n, tc, _ := testNodeFake(t)
+	ctx := context.Background()
+
+	job := wire.JobRef{ID: "abcdef", Doc: "ceph-" + testFSID[:8] + "-job-abcdef", Inputs: "x"}
+	must(t, os.WriteFile(n.jobFile(job.ID, "result"), []byte("rc 0\ninputs x\ndone"), 0o644))
+
+	// configured, no status yet: not decided
+	must(t, tc.Patch(ctx, "", mustRender(daemons.Probe(job.Doc, testImage))))
+
+	if st, _, err := n.JobOutcome(ctx, job); err != nil || st != "" {
+		t.Fatalf("a configured job: %q %v", st, err)
+	}
+
+	// removed (suspend --force) and no instance left: its result decides it
+	must(t, tc.Patch(ctx, "", []byte("apiVersion: v1alpha1\nkind: ContainerConfig\nname: "+job.Doc+"\n$patch: delete\n")))
+
+	if st, res, err := n.JobOutcome(ctx, job); err != nil || st != wire.OpCompleted || res == nil || res.Output != "done" {
+		t.Fatalf("a removed job: %q %+v %v", st, res, err)
+	}
 }

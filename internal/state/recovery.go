@@ -95,10 +95,20 @@ type RecoveryHost struct {
 	// again); AgentRemoved once every instance of it is gone
 	RemovingAgent bool `json:"removing_agent,omitempty"`
 	AgentRemoved  bool `json:"agent_removed,omitempty"`
+	// AgentCert and AgentClientCert are the removed agent's certificates
+	// (public), read from its document before the removal: the resumption
+	// applies it again with them when neither the state nor an enrollment
+	// record has them (a host removed through the leader)
+	AgentCert       string `json:"agent_cert,omitempty"`
+	AgentClientCert string `json:"agent_client_cert,omitempty"`
 	// Changes are the cluster documents the recovery applied ("<kind>/<name>"
 	// -> the hash the node has, ChangePending before it is known) or removed
 	// (""): what the re-adoption expects besides the agent's ownership
 	Changes map[string]string `json:"changes,omitempty"`
+	// Restarted are the mon documents the recovery restarted on their stores
+	// (recorded before the restart): the resumption checks them against the
+	// published state too
+	Restarted []string `json:"restarted,omitempty"`
 	// Applying are the documents the recovery is applying, before their hash
 	// is read back: what each must be
 	Applying map[string]Applying `json:"applying,omitempty"`
@@ -147,6 +157,13 @@ func LoadRecovery(fsid string) (*Recovery, error) {
 	var r Recovery
 	if err := json.Unmarshal(b, &r); err != nil || r.Schema != RecoverySchema || r.FSID != fsid || r.Session == "" {
 		return nil, fmt.Errorf("the recovery journal %s is damaged", recoveryPath(fsid))
+	}
+
+	// a resumed session whose journal was not removed yet has ended; read
+	// only (an unlocked reader must not remove a newer session's journal):
+	// the next session's journal replaces it
+	if r.Phase == PhaseResumed {
+		return nil, nil
 	}
 
 	if r.Hosts == nil {

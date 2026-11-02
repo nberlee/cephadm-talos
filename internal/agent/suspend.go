@@ -194,7 +194,7 @@ func (g *Granter) SuspendState(ctx context.Context) (wire.SuspendState, error) {
 	st.Receipt = &wire.SuspendReceipt{
 		Version: wire.Version, Session: s.Session, Host: g.Channel.Self.Name,
 		Revision: snap.Own.Revision, Fence: snap.Fence, Floor: floor,
-		Unresolved: unresolved, Intents: intents, Owned: snap.Own.Docs, Prepared: prepared,
+		Unresolved: unresolved, Intents: intents, Owned: snap.Own.Docs, Prepared: prepared, ApplyPending: snap.Intent,
 	}
 
 	return st, nil

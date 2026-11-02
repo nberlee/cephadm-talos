@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"slices"
 	"sort"
@@ -68,7 +69,13 @@ func (o *Orch) Resume(ctx context.Context) error {
 		}
 	}
 
+	// the session's hosts; once a re-adoption began, only the journaled ones
+	// (the leader may add a host after an activation)
 	hosts := o.removalHosts(rec)
+
+	if slices.ContainsFunc(slices.Collect(maps.Values(rec.Hosts)), func(hr *state.RecoveryHost) bool { return hr.Readopt != nil }) {
+		hosts = journaledHosts(rec)
+	}
 
 	for _, h := range hosts {
 		if hr := rec.Hosts[h.Name]; hr == nil || hr.Receipt == nil {
@@ -80,6 +87,12 @@ func (o *Orch) Resume(ctx context.Context) error {
 	// before the phase changes, so a refusal leaves `recover mons` open, and
 	// again on a retry
 	for _, h := range hosts {
+		// a host re-adopted already is past the check: once activated, the
+		// leader may have changed the state since
+		if rec.Hosts[h.Name].Readopt != nil {
+			continue
+		}
+
 		if err := o.checkChanges(ctx, rec, h); err != nil {
 			return fmt.Errorf("%s: %w (resume changes no cluster state)", h.Name, err)
 		}
@@ -191,6 +204,18 @@ func (o *Orch) Resume(ctx context.Context) error {
 	return rec.Close()
 }
 
+// journaledHosts are the hosts the session journaled, by name.
+func journaledHosts(rec *state.Recovery) []state.Host {
+	names := slices.Sorted(maps.Keys(rec.Hosts))
+	hosts := make([]state.Host, 0, len(names))
+
+	for _, n := range names {
+		hosts = append(hosts, state.Host{Name: n, Addr: rec.Hosts[n].Addr})
+	}
+
+	return hosts
+}
+
 // controlStore is where the control record lives: config-key through exec.
 func (o *Orch) controlStore(ctx context.Context) (store.Backend, error) {
 	if o.StoreBackend != nil {
@@ -219,7 +244,7 @@ func (o *Orch) removeControl(ctx context.Context) error {
 // from the cluster's secrets, and waits until it answers suspended for the
 // session (it starts from its records).
 func (o *Orch) restoreAgent(ctx context.Context, rec *state.Recovery, h state.Host) error {
-	ah, err := o.agentHost(ctx, h)
+	ah, err := o.agentHost(ctx, h, rec.Hosts[h.Name])
 	if err != nil {
 		return err
 	}
@@ -236,9 +261,12 @@ func (o *Orch) restoreAgent(ctx context.Context, rec *state.Recovery, h state.Ho
 	for {
 		r, err := o.suspendAgent(ctx, h, rec.Session)
 		if err == nil {
-			if r.Revision != rec.Hosts[h.Name].Receipt.Revision {
-				return fmt.Errorf("its agent is at revision %d, the suspension's receipt at %d", r.Revision, rec.Hosts[h.Name].Receipt.Revision)
+			if old := rec.Hosts[h.Name].Receipt; r.Revision != old.Revision && !advanced(old, r.Revision) {
+				return fmt.Errorf("its agent is at revision %d, the suspension's receipt at %d", r.Revision, old.Revision)
 			}
+
+			// its own receipt, after it reconciled what its records left open
+			rec.Hosts[h.Name].Receipt = r
 
 			break
 		}
@@ -253,14 +281,22 @@ func (o *Orch) restoreAgent(ctx context.Context, rec *state.Recovery, h state.Ho
 	return rec.Save()
 }
 
+// advanced reports whether a restored agent's revision is one an unresolved
+// operation of its receipt left open: an apply it reconciled once it ran.
+func advanced(receipt *wire.SuspendReceipt, revision int64) bool {
+	return slices.ContainsFunc(receipt.Unresolved, func(op wire.Operation) bool { return op.Revision == revision })
+}
+
 // agentHost is a host with its agent's certificates (the state's, or an
 // enrollment record's) and keys (the cluster's secrets).
-func (o *Orch) agentHost(ctx context.Context, h state.Host) (state.Host, error) {
+func (o *Orch) agentHost(ctx context.Context, h state.Host, hr *state.RecoveryHost) (state.Host, error) {
 	adm, err := o.confirmedAdminHost()
 	if err != nil {
 		return state.Host{}, err
 	}
 
+	// the certificates: the state's, an enrollment record's, else the ones
+	// the suspension read from the agent's document before it removed it
 	if sh, ok := o.St.Host(h.Name); ok {
 		h = sh
 	} else {
@@ -270,16 +306,20 @@ func (o *Orch) agentHost(ctx context.Context, h state.Host) (state.Host, error) 
 		}
 
 		b, err := recs.Get(ctx, EnrollPrefix+h.Name)
-		if err != nil {
+
+		switch {
+		case err == nil:
+			var e Enrollment
+			if err := json.Unmarshal(b, &e); err != nil || e.Name != h.Name {
+				return state.Host{}, fmt.Errorf("enrollment record %s: damaged", h.Name)
+			}
+
+			h.AgentCert, h.AgentClientCert = e.AgentCert, e.AgentClientCert
+		case errors.Is(err, store.ErrNotFound):
+			h.AgentCert, h.AgentClientCert = hr.AgentCert, hr.AgentClientCert
+		default:
 			return state.Host{}, fmt.Errorf("its enrollment record: %w", err)
 		}
-
-		var e Enrollment
-		if err := json.Unmarshal(b, &e); err != nil || e.Name != h.Name {
-			return state.Host{}, fmt.Errorf("enrollment record %s: damaged", h.Name)
-		}
-
-		h.AgentCert, h.AgentClientCert = e.AgentCert, e.AgentClientCert
 	}
 
 	if h.AgentCert == "" || h.AgentClientCert == "" {
@@ -310,10 +350,11 @@ func (o *Orch) agentHost(ctx context.Context, h state.Host) (state.Host, error) 
 	return h, nil
 }
 
-// checkChanges checks the documents the recovery changed on a host against
-// the published state: each a mon or mgr the state names on that host, with
-// its deployment id and the host's address, the host not in maintenance. A
-// document still being applied, or a removal, refuses.
+// checkChanges checks the documents the recovery applied or restarted on a
+// host against the published state: each a mon or mgr the state names on
+// that host, with its deployment id and the host's address, the host not in
+// maintenance. A document still being applied, or a removal other than of a
+// job, refuses.
 func (o *Orch) checkChanges(ctx context.Context, rec *state.Recovery, h state.Host) error {
 	hr := rec.Hosts[h.Name]
 
@@ -321,19 +362,7 @@ func (o *Orch) checkChanges(ctx context.Context, rec *state.Recovery, h state.Ho
 		return errors.New("a document the recovery applied is not confirmed: run `cephadm-talos recover mons` again")
 	}
 
-	if len(hr.Changes) == 0 {
-		return nil
-	}
-
-	sh, ok := o.St.Host(h.Name)
-	if !ok {
-		return errors.New("the recovery changed a host the cluster state does not name")
-	}
-
-	docs, err := o.configuredDocs(ctx, sh.Addr, "ceph-"+o.St.Short()+"-")
-	if err != nil {
-		return err
-	}
+	var names []string
 
 	for key, hash := range hr.Changes {
 		name, ok := strings.CutPrefix(key, "ContainerConfig/")
@@ -345,6 +374,32 @@ func (o *Orch) checkChanges(ctx context.Context, rec *state.Recovery, h state.Ho
 			return fmt.Errorf("the recovery changed %s, which no resumption adopts", key)
 		}
 
+		names = append(names, name)
+	}
+
+	for _, name := range hr.Restarted {
+		if !slices.Contains(names, name) {
+			names = append(names, name)
+		}
+	}
+
+	if len(names) == 0 {
+		return nil
+	}
+
+	sort.Strings(names)
+
+	sh, ok := o.St.Host(h.Name)
+	if !ok {
+		return errors.New("the recovery changed a host the cluster state does not name")
+	}
+
+	docs, err := o.configuredDocs(ctx, sh.Addr, "ceph-"+o.St.Short()+"-")
+	if err != nil {
+		return err
+	}
+
+	for _, name := range names {
 		i := slices.IndexFunc(o.St.Daemons, func(d state.Daemon) bool {
 			return (d.Type == state.TypeMon || d.Type == state.TypeMgr) && o.St.DocName(d) == name
 		})
@@ -510,7 +565,7 @@ func (m mgrMap) gids() []int64 {
 	return out
 }
 
-// mgrDump reads the mgr map; mgrFail fails the active mgr. Tests replace them.
+// mgrDump reads the mgr map; mgrFail fails a mgr by its gid. Tests replace them.
 var (
 	mgrDump = func(ctx context.Context, o *Orch) (mgrMap, error) {
 		adm, err := o.adminHost()
@@ -530,13 +585,14 @@ var (
 
 		return m, nil
 	}
-	mgrFail = func(ctx context.Context, o *Orch) error {
+	mgrFail = func(ctx context.Context, o *Orch, gid int64) error {
 		adm, err := o.adminHost()
 		if err != nil {
 			return err
 		}
 
-		_, err = o.jobInput(ctx, adm.Addr, "ceph mgr fail", nil, time.Minute)
+		// by gid: a replacement active meanwhile is not failed
+		_, err = o.jobInput(ctx, adm.Addr, fmt.Sprintf("ceph mgr fail %d", gid), nil, time.Minute)
 
 		return err
 	}
@@ -637,7 +693,7 @@ func (o *Orch) drawBoundary(ctx context.Context, rec *state.Recovery, hosts []st
 		case m.ActiveGID != 0 && slices.Contains(b.GIDs, m.ActiveGID) && !failed[m.ActiveGID]:
 			o.printf("failing mgr gid %d of before\n", m.ActiveGID)
 
-			if err := mgrFail(ctx, o); err == nil {
+			if err := mgrFail(ctx, o, m.ActiveGID); err == nil {
 				failed[m.ActiveGID] = true
 			}
 		}

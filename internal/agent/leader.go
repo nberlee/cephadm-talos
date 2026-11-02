@@ -149,6 +149,10 @@ type LeaderLoop struct {
 	// slice D)
 	Records   *records.Store
 	Suspended func() bool
+	// Boundary is the mgr map epoch of the last resumption's boundary: a
+	// heartbeat of that epoch or before is from a process the resumption
+	// replaced, and makes no tick (plan 03, step 7 slice D, item 10)
+	Boundary func() int64
 	// tickMu guards cancelTick and ticking: Pause cancels a running tick and
 	// waits for it to return
 	tickMu     sync.Mutex
@@ -158,6 +162,12 @@ type LeaderLoop struct {
 
 // paused reports whether the agent is suspended.
 func (l *LeaderLoop) paused() bool { return l.Suspended != nil && l.Suspended() }
+
+// replaced reports whether a heartbeat is from a mgr process the last
+// resumption replaced: of its boundary's epoch or before.
+func (l *LeaderLoop) replaced(lead *Leader) bool {
+	return l.Boundary != nil && lead.Epoch <= l.Boundary()
+}
 
 // Pause cancels a running tick and waits until it returned; no tick starts
 // while Suspended reports true, which the caller made so first.
@@ -183,7 +193,7 @@ func (l *LeaderLoop) Pause(ctx context.Context) error {
 // tick runs one tick unless the agent is suspended, cancellable by Pause.
 func (l *LeaderLoop) tick(ctx context.Context, lead *Leader) {
 	l.tickMu.Lock()
-	if l.paused() {
+	if l.paused() || l.replaced(lead) {
 		l.tickMu.Unlock()
 
 		return
