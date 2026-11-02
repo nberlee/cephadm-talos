@@ -1672,3 +1672,7 @@ func (n *Node) ended(ctx context.Context, name string) (bool, error) {
 
 	return !configured, nil
 }
+
+// DocHashes returns the hash of every document of a machine config, keyed
+// "<kind>/<name>", as the agent records them (for the CLI's recovery journal).
+func DocHashes(cfg string) (map[string]string, error) { return parseDocs(cfg) }

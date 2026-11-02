@@ -226,12 +226,12 @@ func (o *Orch) runJobKeep(ctx context.Context, node string, doc *spec.ContainerC
 		return JobResult{}, o.apply(ctx, node, doc)
 	}
 
+	ended := false
+
 	// Always clean up, also on timeout, ctrl-c or an apply error (the client may
 	// fail after Talos accepted the config). A `never` job left behind runs again
 	// on the next boot, where its claim keeps it from repeating its work; a
 	// document left behind is still an error of its own.
-	ended := false
-
 	defer func() {
 		if keep && !ended {
 			return
@@ -384,6 +384,18 @@ func (o *Orch) ShellInput(ctx context.Context, host string, cmd []string, input 
 		var ok bool
 		if h, ok = o.St.Host(host); !ok {
 			return 1, fmt.Errorf("unknown host %q", host)
+		}
+	} else if !o.opened {
+		// without the cluster state (no mon answers, or recovery): any node
+		// with a running mgr or mon container of the cluster (plan 03, step 7
+		// slice D, item 8)
+		rec, err := state.LoadRecovery(o.St.FSID)
+		if err != nil {
+			return 1, err
+		}
+
+		if h, err = o.offlineExecHost(ctx, rec); err != nil {
+			return 1, err
 		}
 	} else {
 		var err error
@@ -1048,7 +1060,7 @@ func (o *Orch) zapTargets(ctx context.Context, rec *state.Recovery) ([]state.Zap
 	}
 
 	for _, h := range o.removalHosts(rec) {
-		envs, err := o.configuredEnv(ctx, h.Addr, "ceph-"+o.St.Short()+"-")
+		envs, err := o.configuredDocs(ctx, h.Addr, "ceph-"+o.St.Short()+"-")
 		if err != nil {
 			return nil, err
 		}
@@ -1061,7 +1073,7 @@ func (o *Orch) zapTargets(ctx context.Context, rec *state.Recovery) ([]state.Zap
 		sort.Strings(names)
 
 		for _, n := range names {
-			if env := envs[n]; env["DEVICE"] != "" && env["OSD_ID"] == "" {
+			if env := envs[n].env; env["DEVICE"] != "" && env["OSD_ID"] == "" {
 				if err := add(h, env["DEVICE"], env["DISK_SERIAL"], false); err != nil {
 					return nil, err
 				}
@@ -1123,9 +1135,9 @@ func (o *Orch) diskBySerial(ctx context.Context, node, serial string) (string, e
 	return "", nil
 }
 
-// configuredEnv returns the environment of each cluster container configured
-// on a node.
-func (o *Orch) configuredEnv(ctx context.Context, node, prefix string) (map[string]map[string]string, error) {
+// configuredDocs returns the image and environment of each cluster
+// container configured on a node.
+func (o *Orch) configuredDocs(ctx context.Context, node, prefix string) (map[string]configuredDoc, error) {
 	defer o.reading()()
 
 	cfg, err := o.Talos.MachineConfig(ctx, node)
@@ -1133,20 +1145,33 @@ func (o *Orch) configuredEnv(ctx context.Context, node, prefix string) (map[stri
 		return nil, err
 	}
 
-	out := map[string]map[string]string{}
+	out := map[string]configuredDoc{}
 	dec := yaml.NewDecoder(strings.NewReader(cfg))
 
 	for {
 		var m struct {
 			Kind        string   `yaml:"kind"`
 			Name        string   `yaml:"name"`
+			Image       string   `yaml:"image"`
 			Environment []string `yaml:"environment"`
+			Contents    string   `yaml:"contents"`
+			Mounts      []map[string]struct {
+				Name        string `yaml:"name"`
+				Destination string `yaml:"destination"`
+			} `yaml:"mounts"`
 		}
 
 		if err := dec.Decode(&m); errors.Is(err, io.EOF) {
 			return out, nil
 		} else if err != nil {
 			return nil, fmt.Errorf("%s: machine config: %w", node, err)
+		}
+
+		// ceph.conf, under its own key: its fsid line
+		if m.Kind == "EtcFileConfig" && m.Name == "ceph/ceph.conf" {
+			out[cephConfDoc] = configuredDoc{env: map[string]string{"FSID": confFSID(m.Contents)}}
+
+			continue
 		}
 
 		if m.Kind != "ContainerConfig" || !strings.HasPrefix(m.Name, prefix) {
@@ -1161,7 +1186,20 @@ func (o *Orch) configuredEnv(ctx context.Context, node, prefix string) (map[stri
 			}
 		}
 
-		out[m.Name] = env
+		d := configuredDoc{image: m.Image, env: env, volumes: map[string]string{}}
+
+		// every mount, whatever its kind, by destination
+		for _, mt := range m.Mounts {
+			for kind, v := range mt {
+				d.mounts = append(d.mounts, v.Destination)
+
+				if kind == "volume" {
+					d.volumes[v.Destination] = v.Name
+				}
+			}
+		}
+
+		out[m.Name] = d
 	}
 }
 

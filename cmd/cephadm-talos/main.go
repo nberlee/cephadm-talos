@@ -53,6 +53,7 @@ Commands:
   orch [--request U] [-i F|-] -- <words>   run a ceph orch command once per request uuid (retry with --request)
   handoff                                  hand the nodes to their agents and the state to the leader
   suspend [--reboot] [--force]             suspend the agents and the leader for a recovery session
+  recover mons [--image REF]               bring the mons of a suspended cluster back on their stores
   approve [--image REF] [--prepare H:DISK] [--zap H:DISK] [--drop H:SERIAL:ACTION] [--show]
                                            sign and publish the operator's approval of images and disks
   rm-cluster [--zap] [--reboot] [--force] --yes-i-really-mean-it
@@ -159,15 +160,38 @@ func run() error {
 	// the cluster's state is in its mons (plan 03, item 4); a dry run reads it too.
 	// rm-cluster also works when no mon answers: it removes what the nodes
 	// known to this workstation configure
+	// recovery needs no cluster state, and neither does shell during a
+	// session: both start before Open and the CLI's maintenance (plan 03,
+	// step 7 slice D, items 7 and 8)
+	if cmd == "recover" {
+		if len(args) == 0 || args[0] != "mons" {
+			return errors.New("recover mons [--image REF]")
+		}
+
+		fs := flag.NewFlagSet("recover mons", flag.ExitOnError)
+		image := fs.String("image", "", "the Ceph image (by digest) of a mon whose document is applied again, if its node has no other")
+		_ = fs.Parse(args[1:])
+
+		return o.RecoverMons(ctx, *image)
+	}
+
+	if cmd == "shell" && o.InRecovery() {
+		return runCommand(ctx, o, cmd, args)
+	}
+
 	var localCA, localImage string
 	if st.Agent != nil {
 		localCA, localImage = st.Agent.CACert, st.Agent.Image
 	}
 
+	offline := false
+
 	if err := o.Open(ctx); err != nil {
-		if cmd != "rm-cluster" && cmd != "suspend" {
+		if cmd != "rm-cluster" && cmd != "suspend" && cmd != "shell" {
 			return err
 		}
+
+		offline = true
 
 		fmt.Fprintln(os.Stderr, "warning:", err)
 		fmt.Fprintln(os.Stderr, "warning: working from the hosts in this workstation's state")
@@ -180,6 +204,12 @@ func run() error {
 
 	if cmd == "rm-cluster" {
 		return rmCluster(ctx, o, args)
+	}
+
+	// without the cluster state, shell execs into a mgr or mon container of
+	// the nodes this workstation knows, and the CLI writes nothing
+	if offline && cmd == "shell" {
+		return runCommand(ctx, o, cmd, args)
 	}
 
 	if cmd == "suspend" {

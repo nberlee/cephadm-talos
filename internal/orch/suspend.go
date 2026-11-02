@@ -688,3 +688,11 @@ func (o *Orch) ended(ctx context.Context, h state.Host, name string) (bool, erro
 
 	return err == nil && !slices.Contains(docs, name), err
 }
+
+// InRecovery reports whether a recovery session of the cluster is open on
+// this workstation (its journal exists, not resumed).
+func (o *Orch) InRecovery() bool {
+	rec, err := state.LoadRecovery(o.St.FSID)
+
+	return err != nil || rec != nil
+}

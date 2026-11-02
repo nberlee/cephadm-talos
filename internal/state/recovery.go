@@ -77,6 +77,21 @@ type RecoveryHost struct {
 	// again); AgentRemoved once every instance of it is gone
 	RemovingAgent bool `json:"removing_agent,omitempty"`
 	AgentRemoved  bool `json:"agent_removed,omitempty"`
+	// Changes are the cluster documents the recovery applied ("<kind>/<name>"
+	// -> the hash the node has, ChangePending before it is known) or removed
+	// (""): what the re-adoption expects besides the agent's ownership
+	Changes map[string]string `json:"changes,omitempty"`
+	// Applying are the documents the recovery is applying, before their hash
+	// is read back: what each must be
+	Applying map[string]Applying `json:"applying,omitempty"`
+}
+
+// Applying is what a document the recovery applies must be: its hash as the
+// agent computes it, before the apply.
+type Applying struct {
+	Hash     string `json:"hash"`
+	DeployID string `json:"deploy_id"`
+	Image    string `json:"image"`
 }
 
 // RecoveryJob is a job the session runs.
@@ -84,6 +99,11 @@ type RecoveryJob struct {
 	ID     string `json:"id"`
 	Host   string `json:"host"`
 	Inputs string `json:"inputs"`
+	// Done: its result was read; a later inspection is a new job (a job
+	// replays its result under the same id). Cleaned: its document and
+	// instances are gone
+	Done    bool `json:"done,omitempty"`
+	Cleaned bool `json:"cleaned,omitempty"`
 }
 
 func recoveryPath(fsid string) string { return filepath.Join(Root(), fsid, "recovery.json") }

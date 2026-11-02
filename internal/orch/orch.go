@@ -50,6 +50,9 @@ type Orch struct {
 	secrets store.Backend
 	// opened: the cluster's state was read from its mons
 	opened bool
+	// inspectMon replaces the inspection job of a mon's store in tests
+	inspectMon func(h state.Host) (string, error)
+
 	// incarnation is the one the state was read from: "cli", or a leader's
 	incarnation string
 	// sealed, handingOver: the state read was handed over, or being handed over
