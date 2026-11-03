@@ -30,7 +30,8 @@ CHUNK = 32 << 10
 MANIFEST_SCHEMA = 1
 # the longest a list is valid (the agents refuse longer ones), and how often
 # an unchanged set is issued again
-MAX_VALID_HOURS = 168
+MAX_VALID_MINUTES = 7 * 24 * 60
+MIN_VALID_MINUTES = 5  # the option's floor, for tests
 REISSUE = datetime.timedelta(days=1)
 # an entry is kept a day past its not_after, then pruned
 PRUNE_AFTER = datetime.timedelta(days=1)
@@ -77,6 +78,12 @@ def entry(until: datetime.datetime, reason: str) -> str:
     return json.dumps({'not_after': iso(until), 'reason': reason}, sort_keys=True)
 
 
+def serial_ok(n: int) -> bool:
+    """A serial a list can name: positive and under 2^159, the CRL builder's
+    limit (RFC 5280's 20 octets, the sign bit clear)."""
+    return 0 < n < 1 << 159
+
+
 def parse_serial(s: str) -> int:
     """A serial as the operator gives it: decimal, or hex with 0x or with colons
     (as openssl prints it)."""
@@ -90,8 +97,8 @@ def parse_serial(s: str) -> int:
             n = int(s, 10)
     except ValueError:
         raise ValueError('serial %r: decimal, 0x<hex> or colon-separated hex' % s)
-    if n <= 0 or n.bit_length() > 160:
-        raise ValueError('serial %r is not a certificate serial' % s)
+    if not serial_ok(n):
+        raise ValueError('serial %r is not a certificate serial (1 to 2^159 - 1)' % s)
     return n
 
 
@@ -105,8 +112,8 @@ def parse_revoked(dump: Dict[str, str], now: datetime.datetime) -> Tuple[Dict[in
         if not k.startswith(REVOKED_PREFIX):
             continue
         s = k[len(REVOKED_PREFIX):]
-        if not SERIAL_RE.match(s):
-            continue
+        if not SERIAL_RE.match(s) or not serial_ok(int(s)):
+            continue  # never in a list: one would stop every later issuance
         try:
             until = parse_iso(json.loads(v)['not_after'])
         except (ValueError, KeyError, TypeError):
@@ -285,10 +292,12 @@ class Issuer:
         self.published = False
 
     def due(self, revoked: Dict[int, datetime.datetime], now: datetime.datetime) -> bool:
-        return self.serials is None or set(revoked) != self.serials or self.at is None or now - self.at >= REISSUE
+        # daily, or at half the validity when that comes first (a shortened one)
+        every = min(REISSUE, getattr(self, 'valid', REISSUE * 2) / 2)
+        return self.serials is None or set(revoked) != self.serials or self.at is None or now - self.at >= every
 
     def tick(self, mon: Mon, ca_cert: bytes, revoked: Dict[int, datetime.datetime], stale: List[str],
-             now: datetime.datetime, valid_hours: int) -> bool:
+             now: datetime.datetime, valid_minutes: int) -> bool:
         """Prune, issue when due, publish; True when a new list was issued.
         Raises CRLError when it cannot issue or publish."""
         for k in stale:
@@ -303,14 +312,14 @@ class Issuer:
         theirs = int(m['number']) if m is not None else 0
         keys = set(list_keys(mon, CRL_PREFIX))
         issued = False
+        self.valid = datetime.timedelta(minutes=max(MIN_VALID_MINUTES, min(MAX_VALID_MINUTES, int(valid_minutes))))
         if self.due(revoked, now):
             key = mon({'prefix': 'config-key get', 'key': 'cephadm-talos/secrets/agent-ca.key'}, DEADLINE)
             if key is None or key[0] != 0 or not ca_cert:
                 raise CRLError('the agent CA is not available')
             self.counter += 1
             number = (self.epoch << 32) + self.counter
-            valid = datetime.timedelta(hours=max(1, min(MAX_VALID_HOURS, int(valid_hours))))
-            self.der = issue_crl(ca_cert, key[1].encode(), revoked, number, now, valid)
+            self.der = issue_crl(ca_cert, key[1].encode(), revoked, number, now, self.valid)
             self.number, self.serials, self.at, self.published = number, set(revoked), now, False
             issued = True
         if self.der is None:

@@ -611,8 +611,8 @@ class Module(orchestrator.Orchestrator, MgrModule):
         Option('talos_cert_renew_days', type='int', default=30, min=1, desc='renew certificates that expire within this many days'),
         # the validity of the agent CA's revocation list (plan 04, step 3): at
         # most 7 days, the agents' limit; a lower value is for tests
-        Option('talos_crl_valid_hours', type='int', default=revocation.MAX_VALID_HOURS, min=1, max=revocation.MAX_VALID_HOURS,
-               desc='validity of the agent CA revocation list, in hours'),
+        Option('talos_crl_valid_minutes', type='int', default=revocation.MAX_VALID_MINUTES, min=revocation.MIN_VALID_MINUTES, max=revocation.MAX_VALID_MINUTES,
+               desc='validity of the agent CA revocation list, in minutes (shorter for tests)'),
     ]
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -937,9 +937,9 @@ class Module(orchestrator.Orchestrator, MgrModule):
             return issuer
         issuer = issuer or revocation.Issuer(epoch)
         try:
-            hours = self.get_module_option('talos_crl_valid_hours') or revocation.MAX_VALID_HOURS
+            minutes = self.get_module_option('talos_crl_valid_minutes') or revocation.MAX_VALID_MINUTES
             if issuer.tick(self._ledger_mon(cmds), channel.ca_cert, read[0], read[1],
-                           datetime.datetime.now(datetime.timezone.utc), int(hours)):
+                           datetime.datetime.now(datetime.timezone.utc), int(minutes)):
                 self.log.info('revocation list %d issued (%d serials)', issuer.number, len(issuer.serials or ()))
             if issuer.der is not None and issuer.published:
                 self._crl = (issuer.number, issuer.der)

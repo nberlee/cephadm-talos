@@ -85,9 +85,13 @@ class RevokedSetTest(unittest.TestCase):
         self.assertEqual(rv.parse_serial('255'), 255)
         self.assertEqual(rv.parse_serial('0xff'), 255)
         self.assertEqual(rv.parse_serial('00:FF'), 255)
-        for bad in ('0', '-1', 'zz', '0x' + 'f' * 50):
+        for bad in ('0', '-1', 'zz', '0x' + 'f' * 50, str(1 << 159)):
             with self.assertRaises(ValueError):
                 rv.parse_serial(bad)
+        self.assertEqual(rv.parse_serial(str((1 << 159) - 1)), (1 << 159) - 1)
+        # an entry no list can name is skipped by readers, so it cannot stop issuance
+        revoked, _ = rv.parse_revoked({rv.REVOKED_PREFIX + str(1 << 159): json.dumps({'not_after': '2030-01-01T00:00:00+00:00'})}, NOW)
+        self.assertEqual(revoked, {})
 
     def test_a_predecessors_write_after_a_takeover_counts(self):
         """Revocations are config-key entries apart from the ledger: an entry a
@@ -131,7 +135,7 @@ class IssuerTest(unittest.TestCase):
         self.addCleanup(setattr, rv, 'CHUNK', old)
         until = NOW + datetime.timedelta(days=30)
         iss = rv.Issuer(9)
-        self.assertTrue(iss.tick(self.kv, self.cert, {5: until, 6: until}, [], NOW, 168))
+        self.assertTrue(iss.tick(self.kv, self.cert, {5: until, 6: until}, [], NOW, 10080))
         number, der = self.published()
         self.assertEqual(number, (9 << 32) + 1)
         c = crl(der)
@@ -142,20 +146,28 @@ class IssuerTest(unittest.TestCase):
         manifest = json.loads(self.kv.kv[rv.CRL_MANIFEST])
         self.assertGreater(len(manifest['chunks']), 1)
         # unchanged and fresh: nothing new
-        self.assertFalse(iss.tick(self.kv, self.cert, {5: until, 6: until}, [], NOW + datetime.timedelta(hours=1), 168))
+        self.assertFalse(iss.tick(self.kv, self.cert, {5: until, 6: until}, [], NOW + datetime.timedelta(hours=1), 10080))
         # the set changed: the next number, the older chunks gone
-        self.assertTrue(iss.tick(self.kv, self.cert, {5: until}, [], NOW + datetime.timedelta(hours=2), 168))
+        self.assertTrue(iss.tick(self.kv, self.cert, {5: until}, [], NOW + datetime.timedelta(hours=2), 10080))
         number2, der2 = self.published()
         self.assertEqual(number2, number + 1)
         self.assertFalse([k for k in self.kv.kv if k.startswith('%s%d/' % (rv.CRL_PREFIX, number))])
         # daily, also unchanged; the option shortens the validity
-        self.assertTrue(iss.tick(self.kv, self.cert, {5: until}, [], NOW + datetime.timedelta(days=1, hours=3), 2))
+        self.assertTrue(iss.tick(self.kv, self.cert, {5: until}, [], NOW + datetime.timedelta(days=1, hours=3), 120))
         c = crl(self.published()[1])
         self.assertEqual(c.next_update_utc - c.last_update_utc, datetime.timedelta(hours=2))
+        # a shortened validity is reissued at its half, so a running module never lets it go stale
+        t = NOW + datetime.timedelta(days=1, hours=3)
+        self.assertFalse(iss.tick(self.kv, self.cert, {5: until}, [], t + datetime.timedelta(minutes=59), 120))
+        self.assertTrue(iss.tick(self.kv, self.cert, {5: until}, [], t + datetime.timedelta(minutes=60), 120))
+        # the floor: 5 minutes
+        iss.tick(self.kv, self.cert, {5: until, 6: until}, [], t + datetime.timedelta(minutes=61), 1)
+        c = crl(self.published()[1])
+        self.assertEqual(c.next_update_utc - c.last_update_utc, datetime.timedelta(minutes=5))
         # never more than 7 days
         iss2 = rv.Issuer(9)
         iss2.counter = 50
-        iss2.tick(self.kv, self.cert, {}, [], NOW, 1000)
+        iss2.tick(self.kv, self.cert, {}, [], NOW, 60000)
         c = crl(self.published()[1])
         self.assertEqual(c.next_update_utc - c.last_update_utc, datetime.timedelta(days=7))
 
@@ -163,17 +175,17 @@ class IssuerTest(unittest.TestCase):
         k = rv.REVOKED_PREFIX + '9'
         self.kv.kv[k] = rv.entry(NOW - datetime.timedelta(days=3), 'old')
         revoked, old = rv.read_revoked(self.kv, NOW)
-        rv.Issuer(1).tick(self.kv, self.cert, revoked, old, NOW, 168)
+        rv.Issuer(1).tick(self.kv, self.cert, revoked, old, NOW, 10080)
         self.assertNotIn(k, self.kv.kv)
 
     def test_a_predecessors_late_list_does_not_supersede(self):
         until = NOW + datetime.timedelta(days=30)
         pred, succ = rv.Issuer(9), rv.Issuer(10)
-        pred.tick(self.kv, self.cert, {5: until}, [], NOW, 168)
-        succ.tick(self.kv, self.cert, {5: until, 6: until}, [], NOW, 168)
+        pred.tick(self.kv, self.cert, {5: until}, [], NOW, 10080)
+        succ.tick(self.kv, self.cert, {5: until, 6: until}, [], NOW, 10080)
         self.assertEqual(self.published()[0], (10 << 32) + 1)
         # the predecessor issues again later: still a lower number
-        pred.tick(self.kv, self.cert, {5: until, 7: until}, [], NOW + datetime.timedelta(minutes=1), 168)
+        pred.tick(self.kv, self.cert, {5: until, 7: until}, [], NOW + datetime.timedelta(minutes=1), 10080)
         self.assertLess(pred.number, succ.number)
         # and its write landed after the successor's: a lower number in the manifest
         parts, manifest = rv.chunks(pred.der, pred.number)
@@ -181,15 +193,15 @@ class IssuerTest(unittest.TestCase):
         self.kv.kv[rv.CRL_MANIFEST] = manifest
         self.assertEqual(self.published()[0], pred.number)
         # the successor sees it and publishes its own again
-        self.assertFalse(succ.tick(self.kv, self.cert, {5: until, 6: until}, [], NOW + datetime.timedelta(minutes=2), 168))
+        self.assertFalse(succ.tick(self.kv, self.cert, {5: until, 6: until}, [], NOW + datetime.timedelta(minutes=2), 10080))
         self.assertEqual(self.published()[0], succ.number)
 
     def test_a_stale_module_never_replaces_a_successors_list(self):
         until = NOW + datetime.timedelta(days=30)
         pred, succ = rv.Issuer(9), rv.Issuer(10)
-        succ.tick(self.kv, self.cert, {5: until}, [], NOW, 168)
+        succ.tick(self.kv, self.cert, {5: until}, [], NOW, 10080)
         # the predecessor's first list after the successor's: issued, not published
-        self.assertTrue(pred.tick(self.kv, self.cert, {5: until, 6: until}, [], NOW, 168))
+        self.assertTrue(pred.tick(self.kv, self.cert, {5: until, 6: until}, [], NOW, 10080))
         self.assertEqual(self.published()[0], succ.number)
         self.assertTrue([k for k in self.kv.kv if k.startswith('%s%d/' % (rv.CRL_PREFIX, succ.number))])
 
@@ -198,16 +210,16 @@ class IssuerTest(unittest.TestCase):
         iss = rv.Issuer(9)
         self.kv.lose.add(rv.CRL_MANIFEST)
         with self.assertRaises(rv.CRLError):
-            iss.tick(self.kv, self.cert, {5: until}, [], NOW, 168)
+            iss.tick(self.kv, self.cert, {5: until}, [], NOW, 10080)
         self.assertFalse(iss.published)
         # the write landed: the next tick sees it in the store, published
-        self.assertFalse(iss.tick(self.kv, self.cert, {5: until}, [], NOW + datetime.timedelta(seconds=5), 168))
+        self.assertFalse(iss.tick(self.kv, self.cert, {5: until}, [], NOW + datetime.timedelta(seconds=5), 10080))
         self.assertTrue(iss.published)
         self.assertEqual(self.published()[0], iss.number)
         # a partial write of this number (a chunk missing) is written again
         chunk = json.loads(self.kv.kv[rv.CRL_MANIFEST])['chunks'][0]
         del self.kv.kv[chunk]
-        iss.tick(self.kv, self.cert, {5: until}, [], NOW + datetime.timedelta(seconds=10), 168)
+        iss.tick(self.kv, self.cert, {5: until}, [], NOW + datetime.timedelta(seconds=10), 10080)
         self.assertIn(chunk, self.kv.kv)
         self.assertTrue(iss.published)
 
@@ -226,7 +238,7 @@ class IssuerTest(unittest.TestCase):
         rv.PAGE = 1024
         self.addCleanup(setattr, rv, 'PAGE', old_page)
         iss = rv.Issuer(9)
-        iss.tick(self.kv, self.cert, revoked, [], NOW, 168)
+        iss.tick(self.kv, self.cert, revoked, [], NOW, 10080)
         self.assertTrue(iss.published)
         self.assertGreater(len(json.loads(self.kv.kv[rv.CRL_MANIFEST])['chunks']), 4)
         self.assertEqual(len(crl(self.published()[1])), 400)
@@ -239,11 +251,11 @@ class IssuerTest(unittest.TestCase):
     def test_no_ca_key_is_an_error(self):
         del self.kv.kv['cephadm-talos/secrets/agent-ca.key']
         with self.assertRaises(rv.CRLError):
-            rv.Issuer(1).tick(self.kv, self.cert, {}, [], NOW, 168)
+            rv.Issuer(1).tick(self.kv, self.cert, {}, [], NOW, 10080)
 
     def test_the_go_verifier_reads_the_number_as_issued(self):
         """The number exceeds 2^53: the manifest carries it as a string."""
-        rv.Issuer(1 << 20).tick(self.kv, self.cert, {}, [], NOW, 168)
+        rv.Issuer(1 << 20).tick(self.kv, self.cert, {}, [], NOW, 10080)
         self.assertIsInstance(json.loads(self.kv.kv[rv.CRL_MANIFEST])['number'], str)
 
 
