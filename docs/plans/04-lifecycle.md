@@ -17,7 +17,7 @@ Plan 03 as built (docs/architecture.md), Ceph v21.2.0, the combined Talos build 
 1. **Renewal by the module.** The module checks every certificate of the cluster state once a day and renews each that expires within 30 days, as cephadm's certificate manager does. It accepts each renewal as a ledger operation of its own (`renew <kind> <name>`), which authorizes the bridge to release that renewal's new keys and nothing else, so the leader carries it out like any operation and a takeover continues it:
    - mgr certificates: issued by the module (the existing `mgr cert` path), granted as the mgr host's files; the module loads them (item 2);
    - agent certificates: issued by the module, the keys stored as secrets; the leader grants the agent its new document (C2). Depends on C2;
-   - generated RGW certificates (2 years): the existing reissue and roll of step 6e, triggered by the expiry;
+   - generated RGW certificates: issued for at most 1 year from now on (365 days, under the 398 days browsers accept for a server certificate; a setting may lower it), by the CLI and by the module alike (today 2 years in both); renewed 30 days before expiry through the existing reissue and roll of step 6e, triggered by the expiry;
    - the old certificate stays valid until the new one is verified in use (an agent answering with it, the module serving it), then it is revoked (item 3) if it has not expired.
 2. **The module reloads its credentials.** Today it reads its server certificate, the CA it trusts and its confirmation signing key only at start; it watches their files and loads them when they change, keeping the old ones on a load that fails.
 3. **The operator's client certificate** is the recovery credential. The CLI renews it on any command when it expires within 60 days (reading the agent CA key through exec with `client.admin`, as enrollment does), and the module raises a health warning from 60 days before its expiry, so it is renewed while the mons answer. If it has expired anyway, the CLI's suspension treats an agent refusing the operator certificate for its expiry like an agent that does not answer and suspends that node through Talos (plan 03's item 5).
@@ -107,6 +107,8 @@ Rotation of the agent CA and the approval key (milestone 4); monmap surgery for 
 Open decisions for sign-off: A4, an agent with an expired CRL fails open (reports) or closed; B1, the agents' own CephX identity with `mgr dump` through exec (recommended), or a per-incarnation signing key.
 
 ## Review
+
+User, after round 6 (2026-11-03): generated RGW certificates at most 1 year, as browsers may access the RGWs (A1).
 
 Codex round 4 and 5 (2026-11-03), fixed: the module fails its own mgr over when its local agent (the leader) stops answering, so a standby's agent repairs it; admission does not re-check a retained, unchanged document against changed node facts, so an address change's roll keeps VIP before RGW, also after the old address is gone, and the RGW certificate is rolled before the mon moves.
 
