@@ -245,6 +245,10 @@ const (
 	EnvImageRepos = "CEPHADM_TALOS_IMAGE_REPOS"
 	// EnvApprovalKey is the public key of the operator's approvals (internal/approval)
 	EnvApprovalKey = "CEPHADM_TALOS_APPROVAL_KEY"
+	// EnvCRLFailClosed, "1", makes the agent refuse all but the revocation
+	// list's delivery and the operator's calls while its list is past its
+	// nextUpdate (plan 04, step 3); a pinned input, set by the CLI only
+	EnvCRLFailClosed = "CEPHADM_TALOS_CRL_FAIL_CLOSED"
 )
 
 // ImageRepository is the repository of an image reference, normalized as
@@ -263,8 +267,9 @@ const AgentUID = 50
 
 // Agent renders the node agent: Talos access to its own node over the machined
 // socket, its status served on the host network (internal/agent). repos are
-// the image repositories its admission policy allows.
-func Agent(name, recordsInit, image string, repos []string, approvalKey, caPEM, certPEM, keyPEM, clientCertPEM, clientKeyPEM string) *spec.ContainerConfig {
+// the image repositories its admission policy allows; crlClosed sets the
+// fail-closed revocation list policy.
+func Agent(name, recordsInit, image string, repos []string, approvalKey string, crlClosed bool, caPEM, certPEM, keyPEM, clientCertPEM, clientKeyPEM string) *spec.ContainerConfig {
 	b64 := func(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
 
 	c := spec.Container(name, image)
@@ -276,6 +281,9 @@ func Agent(name, recordsInit, image string, repos []string, approvalKey, caPEM, 
 		EnvClientKey + "=" + b64(clientKeyPEM),
 		EnvImageRepos + "=" + strings.Join(repos, " "),
 		EnvApprovalKey + "=" + approvalKey,
+	}
+	if crlClosed {
+		c.ContainerEnvironment = append(c.ContainerEnvironment, EnvCRLFailClosed+"=1")
 	}
 	c.RunAsConfig = spec.RunAs(AgentUID, AgentUID)
 	c.SecurityConfig = spec.Restricted()

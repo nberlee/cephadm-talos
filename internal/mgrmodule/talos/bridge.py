@@ -35,7 +35,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
-from . import ledger
+from . import ledger, revocation
 
 WIRE_VERSION = 1
 # confirmations, for every agent; the bridge, for the local agent only, on loopback
@@ -332,6 +332,15 @@ def _operation_with(*more: str) -> Callable[[Dict[str, Any]], Dict[str, Any]]:
 _operation = _operation_with()
 
 
+def _operation_certs(args: Dict[str, Any]) -> Dict[str, Any]:
+    """An operation with the certificates before it the leader journaled
+    (plan 04, step 3): revoked once the module retires them."""
+    certs = args.get('certs', [])
+    if not isinstance(certs, list) or len(certs) > 4 or not all(isinstance(c, str) and 0 < len(c) <= 8192 for c in certs):
+        raise ValueError('certs: up to 4 PEM certificates')
+    return _operation({k: v for k, v in args.items() if k != 'certs'})
+
+
 def _osd_dump(args: Dict[str, Any]) -> Dict[str, Any]:
     if args:
         raise ValueError('osd dump takes no arguments')
@@ -377,16 +386,16 @@ ALLOWLIST: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     'ledger': _ledger,
     'approval': _approval,
     'mgr cert': _operation,
-    'mgr cert done': _operation,
+    'mgr cert done': _operation_certs,
     'agent cert': _operation,
-    'agent cert done': _operation,
+    'agent cert done': _operation_certs,
     'bind disk': _operation_with('serial', 'link', 'job'),
     'confirm osd': _operation_with('osd'),
     'close create': _operation,
     'osd out': _operation,
     'drain': _operation,
     'osd dump': _osd_dump,
-    'retire': _operation,
+    'retire': _operation_certs,
     'retire host': _operation,
     'mon rm': _operation,
     'ok to stop': _operation,
@@ -1047,7 +1056,7 @@ class Channel:
                 if call in ('osd out', 'drain') or (call == 'retire' and op is not None and op['kind'] == 'remove_osd'):
                     return self._removal(call, led, fold, ops, op)
                 if call == 'retire':
-                    return self._retire(led, fold, ops, op)
+                    return self._retire(led, fold, ops, op, (args or {}).get('certs', []))
                 if call == 'mon rm':
                     return self._mon_rm(led, fold, ops, op)
                 if call in ('ok to stop', 'noout set', 'noout unset', 'maintained'):
@@ -1063,9 +1072,9 @@ class Channel:
                 if call == 'agent cert':
                     return self._agent_cert(led, fold, op)
                 if call == 'agent cert done':
-                    return self._agent_cert_done(led, fold, op)
+                    return self._agent_cert_done(led, fold, op, (args or {}).get('certs', []))
                 if call == 'mgr cert done':
-                    return self._mgr_cert_done(led, fold, op)
+                    return self._mgr_cert_done(led, fold, op, (args or {}).get('certs', []))
                 if call == 'rgw cert done':
                     return self._rgw_cert_done(led, fold, ops, op, (args or {}).get('keep'))
                 if call in ('bind disk', 'confirm osd', 'close create'):
@@ -1086,9 +1095,11 @@ class Channel:
             return 503, {'error': 'the agent CA is not available'}
         certs = issue_mgr_certs(self.ca_cert, job.outb.encode(), self.fsid, host, fold.hosts[host])
         attempt = secrets.token_hex(8)
-        for role in ('server', 'client'):
-            key = '%sissued/%s/%s/mgr-%s.key' % (SECRET_PREFIX, op['id'], attempt, role)
-            w = self._mon({'prefix': 'config-key set', 'key': key, 'val': certs[role + '_key']}, name)
+        # the certificates beside the keys, so a retirement revokes them (plan 04, step 3)
+        for item in ('server_key', 'client_key', 'server_cert', 'client_cert'):
+            role, kind = item.split('_')
+            key = '%sissued/%s/%s/mgr-%s.%s' % (SECRET_PREFIX, op['id'], attempt, role, 'key' if kind == 'key' else 'crt')
+            w = self._mon({'prefix': 'config-key set', 'key': key, 'val': certs[item]}, name)
             if w is None or w.r != 0:
                 return 503, {'error': 'the key of attempt %s was not written; ask again' % attempt}
         out = {'attempt': attempt, 'server_cert': certs['server_cert'], 'client_cert': certs['client_cert']}
@@ -1123,10 +1134,12 @@ class Channel:
             out[role + '_cert'] = job.outb
         return 200, {'outcome': 'done', 'r': 0, 'out': json.dumps(out), 'outs': ''}
 
-    def _mgr_cert_done(self, led: Any, fold: Any, op: Optional[Dict[str, Any]]) -> Tuple[int, Dict[str, Any]]:
+    def _mgr_cert_done(self, led: Any, fold: Any, op: Optional[Dict[str, Any]], certs: List[str] = []) -> Tuple[int, Dict[str, Any]]:
         """A renewal's end: the mgr keeps the renewal's keys; every other key of
-        that mgr (its add's, the CLI's, earlier renewals') is retired by a module
-        entry first, then deleted. Asked again, it deletes what is left."""
+        that mgr (its add's, the CLI's, earlier renewals') is revoked (its
+        certificates kept beside the keys, and the ones before the renewal the
+        leader passes), retired by a module entry, then deleted. Asked again,
+        it revokes and deletes what the fold retired."""
         if op is None or op['kind'] != 'renew_mgr' or op['id'] not in fold.mgr_renewals.get(op['daemon'], {}):
             return 400, {'error': 'no renewal of a mgr in its open generation'}
         name, host = op['daemon'], op['host']
@@ -1134,7 +1147,15 @@ class Channel:
             return 400, {'error': 'the renewal issued no certificates'}
         if op['id'] in fold.mgr_retired:  # a later renewal's done retired it: nothing of it is in use
             return 200, {'outcome': 'done', 'r': 0, 'out': '', 'outs': ''}
-        if not any(e['kind'] == 'mgr_cert_done' and e['of'] == op['id'] for _, e in led.executable()):
+        appended = any(e['kind'] == 'mgr_cert_done' and e['of'] == op['id'] for _, e in led.executable())
+        gen = fold.open_generation(name)
+        retiring = {o for o in list(fold.mgr_renewals.get(name, {})) + [gen] if o not in (None, 'cli') and o in fold.mgr_retired} \
+            if appended else fold.mgr_retiring(name, op['id'], host)
+        refused = self._revoke(['%sissued/%s/' % (SECRET_PREFIX, o) for o in retiring if o is not None and not o.startswith('cli')],
+                               'mgr', host, certs, '%sissued/%s/' % (SECRET_PREFIX, op['id']), 'renewal %s' % op['id'])
+        if refused is not None:
+            return refused
+        if not appended:
             led.append({'id': 'm-' + secrets.token_hex(8), 'kind': 'mgr_cert_done', 'of': op['id'], 'daemon': name, 'host': host, 'keep': op['id']})
         # only what the fold retired: a later renewal's keys stay, also when an
         # earlier renewal's done is asked again
@@ -1182,10 +1203,11 @@ class Channel:
             out[role + '_cert'] = job.outb
         return 200, {'outcome': 'done', 'r': 0, 'out': json.dumps(out), 'outs': ''}
 
-    def _agent_cert_done(self, led: Any, fold: Any, op: Optional[Dict[str, Any]]) -> Tuple[int, Dict[str, Any]]:
+    def _agent_cert_done(self, led: Any, fold: Any, op: Optional[Dict[str, Any]], certs: List[str] = []) -> Tuple[int, Dict[str, Any]]:
         """An agent renewal's end, as a mgr renewal's: the host's other agent
-        keys are retired by a module entry, then only what the fold retired is
-        deleted; a renewal a later one retired changes nothing."""
+        certificates are revoked, their keys retired by a module entry, then
+        only what the fold retired is deleted; a renewal a later one retired
+        changes nothing."""
         if op is None or op['kind'] != 'renew_agent' or op['id'] not in fold.agent_renewals.get(op['host'], {}):
             return 400, {'error': 'no renewal of an agent of a host in the cluster'}
         host = op['host']
@@ -1193,7 +1215,13 @@ class Channel:
             return 400, {'error': 'the renewal issued no certificates'}
         if op['id'] in fold.agent_retired:
             return 200, {'outcome': 'done', 'r': 0, 'out': '', 'outs': ''}
-        if not any(e['kind'] == 'agent_cert_done' and e['of'] == op['id'] for _, e in led.executable()):
+        appended = any(e['kind'] == 'agent_cert_done' and e['of'] == op['id'] for _, e in led.executable())
+        retiring = {o for o in fold.agent_renewals.get(host, {}) if o in fold.agent_retired} if appended else fold.agent_retiring(host, op['id'])
+        refused = self._revoke(['%sissued/%s/' % (SECRET_PREFIX, o) for o in retiring if not o.startswith('cli')],
+                               'agent', host, certs, '%sissued/%s/' % (SECRET_PREFIX, op['id']), 'renewal %s' % op['id'])
+        if refused is not None:
+            return refused
+        if not appended:
             led.append({'id': 'm-' + secrets.token_hex(8), 'kind': 'agent_cert_done', 'of': op['id'], 'host': host, 'keep': op['id']})
         _, after = self.authority()
         old = ['%sissued/%s/' % (SECRET_PREFIX, o) for o in after.agent_renewals.get(host, {}) if o in after.agent_retired]
@@ -1209,7 +1237,8 @@ class Channel:
                     return 503, {'error': 'cannot remove a key of the agent of %s; ask again' % host}
         return 200, {'outcome': 'done', 'r': 0, 'out': '', 'outs': ''}
 
-    def _retire(self, led: Any, fold: Any, ops: Dict[str, Dict[str, Any]], op: Optional[Dict[str, Any]]) -> Tuple[int, Dict[str, Any]]:
+    def _retire(self, led: Any, fold: Any, ops: Dict[str, Dict[str, Any]], op: Optional[Dict[str, Any]],
+                certs: List[str] = []) -> Tuple[int, Dict[str, Any]]:
         if op is None or op['kind'] != 'remove_daemon':
             return 400, {'error': 'no removal of a daemon'}
         name = op['daemon']
@@ -1243,6 +1272,13 @@ class Channel:
         # and the keys of its renewals (plan 04, step 1)
         if name.startswith('mgr.'):
             mine += ['%sissued/%s/' % (SECRET_PREFIX, o) for o in fold.mgr_renewals.get(name, {})]
+        # a mgr's certificates are revoked before their keys go: the issued ones
+        # kept beside the keys, and the ones the leader journaled before it
+        # cleared them from the state (plan 04, step 3)
+        if name.startswith('mgr.'):
+            refused = self._revoke([p for p in mine if p.endswith('/')], 'mgr', op['host'], certs, None, 'removal %s' % op['id'])
+            if refused is not None:
+                return refused
         # the generation's keys only, reduced before the output limit applies
         keys = self._mon({'prefix': 'config-key ls'}, None, lambda out: json.dumps([k for k in json.loads(out) if any(k.startswith(p) for p in mine)]))
         if keys is None or keys.r != 0 or keys.too_large:
@@ -1254,6 +1290,60 @@ class Channel:
                     return 503, {'error': 'cannot remove a key of %s; ask again' % name}
         led.append({'id': 'm-' + secrets.token_hex(8), 'kind': 'retire', 'of': op['id'], 'daemon': name, 'host': op['host']})
         return 200, done
+
+    def _revoke(self, prefixes: List[str], role: str, host: str, passed: List[str], keep: Optional[str],
+                reason: str) -> Optional[Tuple[int, Dict[str, Any]]]:
+        """Write the revocation entries (plan 04, step 3) of the certificates
+        of a role kept below prefixes and of the ones the leader passed, each
+        checked (the agent CA's, for that host's role), never of the ones kept
+        below keep. Idempotent, only adds; a refusal if they are not all
+        written."""
+        want = [p for p in prefixes if p]
+        listed = [] if not want and keep is None else None
+        if listed is None:
+            scope = want + ([keep] if keep else [])
+            job = self._mon({'prefix': 'config-key ls'}, None,
+                            lambda out: json.dumps([k for k in json.loads(out) if k.endswith('.crt') and any(k.startswith(p) for p in scope)]))
+            if job is None or job.r != 0 or job.too_large:
+                return 503, {'error': 'cannot list the certificates; ask again'}
+            listed = json.loads(job.outb)
+        items: Dict[int, Any] = {}
+        kept: Set[int] = set()
+        for k in listed:
+            if not k.rsplit('/', 1)[-1].startswith(role + '-'):
+                continue
+            ok, pem = self._secret_or_absent(k[len(SECRET_PREFIX):])
+            if not ok:
+                return 503, {'error': 'cannot read %s; ask again' % k}
+            if pem is None:
+                continue
+            try:
+                serial, until = revocation.cert_serial(pem)
+            except ValueError:
+                continue
+            if keep and k.startswith(keep):
+                kept.add(serial)
+            elif any(k.startswith(p) for p in want):
+                items[serial] = until
+        for pem in passed:
+            try:
+                serial, until = revocation.check_cert(pem, self.ca_cert, self.fsid, role, host)
+            except ValueError as e:
+                return 400, {'error': 'a certificate to revoke: %s' % e}
+            items[serial] = until
+        for serial in kept:
+            items.pop(serial, None)
+        for serial, until in sorted(items.items()):
+            key = '%s%d' % (revocation.REVOKED_PREFIX, serial)
+            got = self._mon({'prefix': 'config-key get', 'key': key})
+            if got is None or got.r not in (0, -2):
+                return 503, {'error': 'cannot read the revocation of %d; ask again' % serial}
+            if got.r == 0:
+                continue  # written once, never changed
+            w = self._mon({'prefix': 'config-key set', 'key': key, 'val': revocation.entry(until, reason)})
+            if w is None or w.r != 0:
+                return 503, {'error': 'the revocation of %d was not written; ask again' % serial}
+        return None
 
     def _mon_rm(self, led: Any, fold: Any, ops: Dict[str, Dict[str, Any]], op: Optional[Dict[str, Any]]) -> Tuple[int, Dict[str, Any]]:
         """A mon's removal from the monmap before its documents go, as cephadm's

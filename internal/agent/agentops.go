@@ -217,7 +217,7 @@ func (l *LeaderLoop) renewAgent(ctx context.Context, b *Bridge, js store.Backend
 		}
 	}
 
-	if err := b.AgentCertDone(ctx, op.ID); err != nil {
+	if err := b.AgentCertDone(ctx, op.ID, []string{rec.ServerCert, rec.ClientCert}); err != nil {
 		return fmt.Errorf("%w: %v", errWait, err)
 	}
 
@@ -245,7 +245,7 @@ func (l *LeaderLoop) renewAgentFailed(ctx context.Context, b *Bridge, js store.B
 	}
 
 	if rec.Retiring {
-		return b.AgentCertDone(ctx, op.ID)
+		return b.AgentCertDone(ctx, op.ID, []string{rec.ServerCert, rec.ClientCert})
 	}
 
 	return l.changeState(ctx, b, gid, func(st *state.State) error {

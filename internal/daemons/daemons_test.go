@@ -2,6 +2,7 @@ package daemons
 
 import (
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
@@ -141,8 +142,18 @@ func TestCephConfAndImageRepository(t *testing.T) {
 		}
 	}
 
-	a := Agent("ceph-0123abcd-agent-h1", "ceph-0123abcd-records-init-h1", "registry/agent:1", []string{"quay.io/ceph/ceph", "quay.io/ceph/keepalived"}, "approval-key", "ca", "c", "k", "cc", "ck")
+	a := Agent("ceph-0123abcd-agent-h1", "ceph-0123abcd-records-init-h1", "registry/agent:1", []string{"quay.io/ceph/ceph", "quay.io/ceph/keepalived"}, "approval-key", false, "ca", "c", "k", "cc", "ck")
 	if !strings.Contains(strings.Join(a.ContainerEnvironment, "\n"), EnvImageRepos+"=quay.io/ceph/ceph quay.io/ceph/keepalived") {
 		t.Error("the agent document misses its image repositories")
+	}
+
+	// the fail-closed revocation list policy, only when set (plan 04, step 3)
+	if strings.Contains(strings.Join(a.ContainerEnvironment, "\n"), EnvCRLFailClosed) {
+		t.Error("fail closed without the setting")
+	}
+
+	closed := Agent("ceph-0123abcd-agent-h1", "ceph-0123abcd-records-init-h1", "registry/agent:1", nil, "approval-key", true, "ca", "c", "k", "cc", "ck")
+	if !slices.Contains(closed.ContainerEnvironment, EnvCRLFailClosed+"=1") {
+		t.Error("the setting is not in the document")
 	}
 }

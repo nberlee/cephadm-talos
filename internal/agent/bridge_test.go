@@ -64,6 +64,8 @@ type fakeBridge struct {
 	rgwCert string
 	// standbys are the standby mgrs mgr dump lists
 	standbys []string
+	// certs are the certificates to revoke each call carried, by "<call> <operation>"
+	certs map[string][]string
 }
 
 func (m *fakeBridge) run(req wire.BridgeRequest) map[string]any {
@@ -160,6 +162,17 @@ func (m *fakeBridge) run(req wire.BridgeRequest) map[string]any {
 		return map[string]any{"outcome": "done", "r": 0, "out": string(b)}
 	case "retire", "retire host", "mon rm", "ok to stop", "noout set", "noout unset", "maintained", "upgrade done", "upgrade refused", "ok to stop daemon", "retire keepalived", "mgr cert done", "agent cert done":
 		m.retired = append(m.retired, req.Call+" "+str("operation"))
+
+		if list, ok := req.Args["certs"].([]any); ok {
+			if m.certs == nil {
+				m.certs = map[string][]string{}
+			}
+
+			for _, c := range list {
+				s, _ := c.(string)
+				m.certs[req.Call+" "+str("operation")] = append(m.certs[req.Call+" "+str("operation")], s)
+			}
+		}
 
 		return map[string]any{"outcome": "done", "r": 0, "out": ""}
 	case "rgw cert":

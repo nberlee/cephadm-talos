@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nberlee/cephadm-talos/internal/crl"
 	"github.com/nberlee/cephadm-talos/internal/pki"
 	"github.com/nberlee/cephadm-talos/internal/records"
 	"github.com/nberlee/cephadm-talos/internal/store"
@@ -68,6 +69,9 @@ type Bridge struct {
 	Addr string      // the mgr host's address: the agent's own host, or 127.0.0.1
 	Mgr  string      // the mgr's name, its certificate's identity
 	FSID string
+	// CRL refuses a module whose server certificate the agent's list names
+	// (plan 04, step 3); nil checks its validity only
+	CRL *crl.Holder
 
 	// Intents keeps a record of every mutating call before it is made, until
 	// its outcome is known (plan 03, step 7 slice D); nil keeps none (tests).
@@ -188,9 +192,11 @@ func (b *Bridge) client() *http.Client {
 			return errors.New("no server certificate")
 		}
 
-		_, err := pki.Require(cs.PeerCertificates[0], pki.Identity{FSID: b.FSID, Role: pki.RoleMgr, Name: b.Mgr})
+		if _, err := pki.Require(cs.PeerCertificates[0], pki.Identity{FSID: b.FSID, Role: pki.RoleMgr, Name: b.Mgr}); err != nil {
+			return err
+		}
 
-		return err
+		return b.CRL.Check(cs.PeerCertificates[0])
 	}
 
 	return &http.Client{Transport: &http.Transport{TLSClientConfig: cfg, DisableKeepAlives: true}}
@@ -629,11 +635,30 @@ func (b *Bridge) MgrCert(ctx context.Context, op string) (MgrCerts, error) {
 }
 
 // MgrCertDone tells the module that a renewal's mgr certificates are the
-// ones in use: the keys of that mgr's other certificates are removed.
-func (b *Bridge) MgrCertDone(ctx context.Context, op string) error {
-	_, err := b.do(ctx, "mgr cert done", map[string]any{"operation": op})
+// ones in use: that mgr's other certificates are revoked, with certs, the
+// ones before the renewal the leader journaled (plan 04, step 3), and their
+// keys removed.
+func (b *Bridge) MgrCertDone(ctx context.Context, op string, certs []string) error {
+	_, err := b.do(ctx, "mgr cert done", withCerts(map[string]any{"operation": op}, certs))
 
 	return err
+}
+
+// withCerts adds the certificates to revoke to a call's arguments.
+func withCerts(args map[string]any, certs []string) map[string]any {
+	var list []string
+
+	for _, c := range certs {
+		if c != "" {
+			list = append(list, c)
+		}
+	}
+
+	if len(list) > 0 {
+		args["certs"] = list
+	}
+
+	return args
 }
 
 // AgentCerts are an agent's certificates the module issued for its renewal
@@ -661,9 +686,10 @@ func (b *Bridge) AgentCert(ctx context.Context, op string) (AgentCerts, error) {
 }
 
 // AgentCertDone tells the module that a renewal's agent certificates are the
-// ones in use: the keys of that agent's other certificates are removed.
-func (b *Bridge) AgentCertDone(ctx context.Context, op string) error {
-	_, err := b.do(ctx, "agent cert done", map[string]any{"operation": op})
+// ones in use: that agent's other certificates are revoked, with certs, the
+// ones before the renewal, and their keys removed.
+func (b *Bridge) AgentCertDone(ctx context.Context, op string, certs []string) error {
+	_, err := b.do(ctx, "agent cert done", withCerts(map[string]any{"operation": op}, certs))
 
 	return err
 }
@@ -711,6 +737,15 @@ func (b *Bridge) RetireKeepalived(ctx context.Context, op, daemon string) error 
 // "retire" for a daemon (auth rm, its keys), "retire host" for a host.
 func (b *Bridge) Retire(ctx context.Context, call, op string) error {
 	_, err := b.do(ctx, call, map[string]any{"operation": op})
+
+	return err
+}
+
+// RetireWith is Retire of a daemon with the certificates the leader
+// journaled before it cleared them from the state, which the module revokes
+// (a mgr's, plan 04 step 3).
+func (b *Bridge) RetireWith(ctx context.Context, op string, certs []string) error {
+	_, err := b.do(ctx, "retire", withCerts(map[string]any{"operation": op}, certs))
 
 	return err
 }

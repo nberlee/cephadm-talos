@@ -21,6 +21,7 @@ import (
 
 	"github.com/siderolabs/talos/pkg/machinery/config/config"
 
+	"github.com/nberlee/cephadm-talos/internal/crl"
 	"github.com/nberlee/cephadm-talos/internal/pki"
 	"github.com/nberlee/cephadm-talos/internal/records"
 	"github.com/nberlee/cephadm-talos/internal/render"
@@ -117,6 +118,9 @@ type LeaderLoop struct {
 	// Policy inputs for the pre-check of a revision: the agents check it again
 	Repos  []string
 	CACert string
+	// CRL is the agent's installed revocation list: the leader refuses a
+	// module or agent whose server certificate it names (plan 04, step 3)
+	CRL *crl.Holder
 	// Every is the tick; 0 is 5 seconds
 	Every time.Duration
 
@@ -288,7 +292,7 @@ func (l *LeaderLoop) bridge() *Bridge {
 		addr = "127.0.0.1"
 	}
 
-	return &Bridge{TLS: l.ClientTLS, Addr: addr, Mgr: l.Self.Name, FSID: l.Self.FSID, Intents: l.Records}
+	return &Bridge{TLS: l.ClientTLS, Addr: addr, Mgr: l.Self.Name, FSID: l.Self.FSID, Intents: l.Records, CRL: l.CRL}
 }
 
 // Tick takes over from earlier incarnations as far as it can, then carries
@@ -865,9 +869,11 @@ func (l *LeaderLoop) agentClient(h state.Host) *http.Client {
 			return errors.New("no server certificate")
 		}
 
-		_, err := pki.Require(cs.PeerCertificates[0], pki.Identity{FSID: l.Self.FSID, Role: pki.RoleAgent, Name: h.Name})
+		if _, err := pki.Require(cs.PeerCertificates[0], pki.Identity{FSID: l.Self.FSID, Role: pki.RoleAgent, Name: h.Name}); err != nil {
+			return err
+		}
 
-		return err
+		return l.CRL.Check(cs.PeerCertificates[0])
 	}
 
 	return &http.Client{Transport: &http.Transport{TLSClientConfig: cfg, DisableKeepAlives: true}, Timeout: grantTimeout + 30*time.Second}
@@ -1217,7 +1223,7 @@ func (l *LeaderLoop) revision(ctx context.Context, b *Bridge, js store.Backend, 
 		disks = append(disks, Disk{Serial: d.Serial, Symlinks: d.Symlinks})
 	}
 
-	pol := &Policy{FSID: l.Self.FSID, Host: h.Name, Repos: l.Repos, CACert: l.CACert}
+	pol := &Policy{FSID: l.Self.FSID, Host: h.Name, Repos: l.Repos, CACert: l.CACert, CRL: l.CRL}
 	if err := pol.Check(docs, disks, rep.Containers, l.appr); err != nil {
 		return fail(err)
 	}

@@ -111,6 +111,15 @@ func TestARenewalRenewsTheActiveMgrsCertificates(t *testing.T) {
 	if got := s.calls(); !slices.Equal(got, []string{"mgr cert done " + renew.Op.ID}) {
 		t.Fatalf("calls %v", got)
 	}
+
+	// with the certificates before, for their revocation (plan 04, step 3)
+	s.module.mu.Lock()
+	certs := s.module.certs["mgr cert done "+renew.Op.ID]
+	s.module.mu.Unlock()
+
+	if !slices.Equal(certs, []string{before.MgrServerCert, before.MgrClientCert}) {
+		t.Fatalf("revoked with the done: %d certificates", len(certs))
+	}
 }
 
 func TestAMgrRenewalInMaintenanceGrantsNothing(t *testing.T) {

@@ -89,7 +89,7 @@ func (o *Orch) RestoreAgent(ctx context.Context, name string, previous bool) err
 		return fmt.Errorf("%s: %w", name, err)
 	}
 
-	repos, approvalKey := hr.AgentRepos, hr.AgentApprovalKey
+	repos, approvalKey, crlClosed := hr.AgentRepos, hr.AgentApprovalKey, hr.AgentCRLFailClosed
 	if !hr.AgentPinned {
 		doc := o.agentDocName(h)
 
@@ -104,6 +104,7 @@ func (o *Orch) RestoreAgent(ctx context.Context, name string, previous bool) err
 		}
 
 		repos, approvalKey = strings.Fields(d.env[daemons.EnvImageRepos]), d.env[daemons.EnvApprovalKey]
+		crlClosed = d.env[daemons.EnvCRLFailClosed] == "1"
 	}
 
 	image := o.St.Agent.Image
@@ -120,7 +121,7 @@ func (o *Orch) RestoreAgent(ctx context.Context, name string, previous bool) err
 
 	o.printf("%s: restoring its agent with %s\n", name, image)
 
-	if err := o.agentReturn(ctx, rec, h, o.agentDocsWith(ah, image, repos, approvalKey)); err != nil {
+	if err := o.agentReturn(ctx, rec, h, o.agentDocsWith(ah, image, repos, approvalKey, crlClosed)); err != nil {
 		return fmt.Errorf("%s: %w", name, err)
 	}
 
@@ -455,6 +456,11 @@ func (o *Orch) agentServes(h state.Host, certPEM string) (bool, error) {
 	defer conn.Close() //nolint:errcheck
 
 	peers := conn.ConnectionState().PeerCertificates
+	if len(peers) > 0 {
+		if err := o.checkAgent(peers[0]); err != nil {
+			return false, err
+		}
+	}
 
 	return len(peers) > 0 && peers[0].Equal(want), nil
 }

@@ -59,12 +59,20 @@ func TestShapes(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// the revocation list policy (plan 04, step 3)
+	for _, p := range []string{CRLClosed, CRLOpen} {
+		if err := (Approval{Version: Version, FSID: fsid, Serial: 3, CRL: p}).Check(fsid); err != nil {
+			t.Fatal(err)
+		}
+	}
+
 	for _, bad := range []Approval{
 		{Version: 2, FSID: fsid, Serial: 3},
 		{Version: Version, FSID: fsid, Serial: 0},
 		{Version: Version, FSID: fsid, Serial: 3, Images: []string{"quay.io/ceph/ceph:v20"}},
 		{Version: Version, FSID: fsid, Serial: 3, Disks: []Disk{{Host: "h1", Serial: "x", Action: "wipe", Since: 3}}},
 		{Version: Version, FSID: fsid, Serial: 3, Disks: []Disk{{Host: "h1", Serial: "x", Action: Zap, Since: 4}}},
+		{Version: Version, FSID: fsid, Serial: 3, CRL: "sideways"},
 		{Version: Version, FSID: fsid, Serial: 3, Disks: []Disk{{Host: "../h", Serial: "x", Action: Zap, Since: 3}}},
 		{Version: Version, FSID: fsid, Serial: 3, Disks: []Disk{{Host: "h1", Serial: "x", Action: Zap, Since: 3}, {Host: "h1", Serial: "x", Action: Zap, Since: 3}}},
 	} {

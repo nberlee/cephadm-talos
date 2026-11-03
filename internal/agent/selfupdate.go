@@ -147,6 +147,10 @@ func (n *Node) selfCert(caPEM, certPEM, keyPEM string, usage x509.ExtKeyUsage) (
 		return nil, errors.New("not this host's agent's certificate")
 	}
 
+	if n.Policy != nil && n.Policy.CRL.Current().Names(cert) {
+		return nil, errors.New("revoked")
+	}
+
 	if err := privateKey(keyPEM); err != nil {
 		return nil, err
 	}
@@ -221,7 +225,8 @@ func (n *Node) selfDocs(ctx context.Context, typed map[string]typedDoc, su wire.
 	}
 
 	init := n.docName("records-init")
-	agent := daemons.Agent(n.docName("agent"), init, image, strings.Fields(cur.env[daemons.EnvImageRepos]), cur.env[daemons.EnvApprovalKey],
+	// the pinned inputs as the current document has them: repositories, approval key, revocation list policy
+	agent := daemons.Agent(n.docName("agent"), init, image, strings.Fields(cur.env[daemons.EnvImageRepos]), cur.env[daemons.EnvApprovalKey], cur.env[daemons.EnvCRLFailClosed] == "1",
 		pems[daemons.EnvCA], pems[daemons.EnvCert], pems[daemons.EnvKey], pems[daemons.EnvClientCert], pems[daemons.EnvClientKey])
 
 	var docs []Doc

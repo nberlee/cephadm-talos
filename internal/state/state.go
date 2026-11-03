@@ -99,6 +99,20 @@ type Agent struct {
 	ApprovalKey  string `json:"approval_key,omitempty"`
 	ApprovalPriv string `json:"approval_priv,omitempty"`
 	Approval     string `json:"approval,omitempty"`
+	// CRLFailClosed is the agents' revocation list policy the CLI renders
+	// in their documents (plan 04, step 3): the workstation's only, never
+	// in the published state, which the module could write
+	CRLFailClosed bool `json:"crl_fail_closed,omitempty"`
+	// OperatorRevoke is a renewed operator certificate's predecessor, to be
+	// revoked once the module accepts `orch talos revoke` (workstation only)
+	OperatorRevoke []PendingRevoke `json:"operator_revoke,omitempty"`
+}
+
+// PendingRevoke is a certificate the CLI revokes on every command until the
+// module accepted it: its serial (decimal) and expiry.
+type PendingRevoke struct {
+	Serial   string    `json:"serial"`
+	NotAfter time.Time `json:"not_after"`
 }
 
 // RGW holds the object gateway settings shared by all rgw and vip daemons.
@@ -387,6 +401,11 @@ type Local struct {
 	// cannot be read (plan 03, step 7 slice D)
 	AgentCACert string `json:"agent_ca_cert,omitempty"`
 	AgentImage  string `json:"agent_image,omitempty"`
+	// CRLFailClosed is the agents' revocation list policy, chosen at
+	// bootstrap or by `crl-policy` (plan 04, step 3); OperatorRevoke the
+	// operator certificate whose revocation is pending
+	CRLFailClosed  bool            `json:"crl_fail_closed,omitempty"`
+	OperatorRevoke []PendingRevoke `json:"operator_revoke,omitempty"`
 }
 
 // LocalHost is how the workstation reaches a node.
@@ -438,7 +457,7 @@ func Load(fsid string) (*State, error) {
 
 	if l.OperatorCert != "" {
 		st.Agent = &Agent{OperatorCert: l.OperatorCert, OperatorKey: l.OperatorKey, ApprovalPriv: l.ApprovalPriv, Approval: l.Approval,
-			CACert: l.AgentCACert, Image: l.AgentImage}
+			CACert: l.AgentCACert, Image: l.AgentImage, CRLFailClosed: l.CRLFailClosed, OperatorRevoke: l.OperatorRevoke}
 	}
 
 	if l.AdminKey != "" {
@@ -485,6 +504,7 @@ func (s *State) SaveLocked() error {
 		l.OperatorCert, l.OperatorKey = s.Agent.OperatorCert, s.Agent.OperatorKey
 		l.AgentCACert, l.AgentImage = s.Agent.CACert, s.Agent.Image
 		l.ApprovalPriv, l.Approval = s.Agent.ApprovalPriv, s.Agent.Approval
+		l.CRLFailClosed, l.OperatorRevoke = s.Agent.CRLFailClosed, s.Agent.OperatorRevoke
 	}
 
 	b, err := json.MarshalIndent(l, "", "  ")
@@ -740,6 +760,7 @@ func (s *State) Records() (map[string][]byte, error) {
 	if s.Agent != nil {
 		a := *s.Agent
 		a.OperatorCert, a.OperatorKey, a.ApprovalPriv, a.Approval = "", "", "", ""
+		a.CRLFailClosed, a.OperatorRevoke = false, nil
 		c.Agent = &a
 	}
 
@@ -827,6 +848,10 @@ func (s *State) ApplyRecords(recs map[string][]byte) error {
 	if s.Agent != nil && operator != nil {
 		s.Agent.OperatorCert, s.Agent.OperatorKey = operator.OperatorCert, operator.OperatorKey
 		s.Agent.ApprovalPriv, s.Agent.Approval = operator.ApprovalPriv, operator.Approval
+		// the workstation's, whatever the published state says
+		s.Agent.CRLFailClosed, s.Agent.OperatorRevoke = operator.CRLFailClosed, operator.OperatorRevoke
+	} else if s.Agent != nil {
+		s.Agent.CRLFailClosed, s.Agent.OperatorRevoke = false, nil
 	}
 
 	return nil

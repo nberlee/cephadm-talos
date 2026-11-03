@@ -41,6 +41,13 @@ func agentApproval(t *testing.T, serial int64) approval.Signed {
 func withAgentDocs(t *testing.T, n *Node, f *talostest.Node, ca testCA) string {
 	t.Helper()
 
+	return withAgentDocsPolicy(t, n, f, ca, false)
+}
+
+// withAgentDocsPolicy is withAgentDocs with the revocation list policy given.
+func withAgentDocsPolicy(t *testing.T, n *Node, f *talostest.Node, ca testCA, crlClosed bool) string {
+	t.Helper()
+
 	ctx := context.Background()
 
 	addr := network.NewAddressStatus(network.NamespaceName, "lo/127.0.0.1/8")
@@ -51,7 +58,7 @@ func withAgentDocs(t *testing.T, n *Node, f *talostest.Node, ca testCA) string {
 	cc, ck := ca.pair(pki.RoleAgent, n.Host, x509.ExtKeyUsageClientAuth, testFSID)
 
 	init := n.docName("records-init")
-	agent := daemons.Agent(n.docName("agent"), init, agentImage, []string{"quay.io/ceph/ceph"}, testApprovalPub, ca.cert, sc, sk, cc, ck)
+	agent := daemons.Agent(n.docName("agent"), init, agentImage, []string{"quay.io/ceph/ceph"}, testApprovalPub, crlClosed, ca.cert, sc, sk, cc, ck)
 
 	tc, ok := n.Talos.(*countingPatch)
 	if !ok {
@@ -388,5 +395,27 @@ func TestAPullGrant(t *testing.T) {
 
 	if op, _, _ := g.readOp("op-p9"); op.State != wire.OpRefused {
 		t.Fatalf("an interrupted pull: %+v", op)
+	}
+}
+
+func TestASelfUpdateKeepsTheFailClosedPolicy(t *testing.T) {
+	img := &talostest.ImageService{Cache: map[string]string{}, Remote: map[string]string{}}
+	g := newTestGranter(t, img)
+	ca := newTestCA(t)
+	ctx := context.Background()
+
+	withAgentDocsPolicy(t, g.Node, g.fake, ca, true)
+	must(t, g.Node.RecordApproval(ctx, agentApproval(t, 2)))
+
+	sc, sk := ca.pair(pki.RoleAgent, "h1", x509.ExtKeyUsageServerAuth, testFSID)
+	cc, ck := ca.pair(pki.RoleAgent, "h1", x509.ExtKeyUsageClientAuth, testFSID)
+
+	if op, err := g.Grant(ctx, selfGrant(2, "op-s1", wire.SelfUpdate{Cert: sc, Key: sk, ClientCert: cc, ClientKey: ck})); err != nil || op.State != wire.OpCompleted {
+		t.Fatalf("self-update: %+v %v", op, err)
+	}
+
+	// a pinned input, as the CA and the repositories (plan 04, step 3)
+	if d := ownOnNode(t, g.Node); d.env[daemons.EnvCRLFailClosed] != "1" {
+		t.Fatal("the self-update dropped the fail-closed policy")
 	}
 }

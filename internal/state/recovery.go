@@ -108,6 +108,9 @@ type RecoveryHost struct {
 	AgentPinned      bool     `json:"agent_pinned,omitempty"`
 	AgentRepos       []string `json:"agent_repos,omitempty"`
 	AgentApprovalKey string   `json:"agent_approval_key,omitempty"`
+	// AgentCRLFailClosed: the removed agent's document set the fail-closed
+	// revocation list policy (plan 04, step 3); rendered again with it
+	AgentCRLFailClosed bool `json:"agent_crl_fail_closed,omitempty"`
 	// AgentServerKey and AgentClientKey are the secret names of the removed
 	// agent's keys (Host.AgentKeySecret), journaled with its certificates
 	AgentServerKey string `json:"agent_server_key,omitempty"`

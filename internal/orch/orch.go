@@ -21,6 +21,7 @@ import (
 
 	"github.com/nberlee/cephadm-talos/internal/agent"
 	"github.com/nberlee/cephadm-talos/internal/cephx"
+	"github.com/nberlee/cephadm-talos/internal/crl"
 	"github.com/nberlee/cephadm-talos/internal/daemons"
 	"github.com/nberlee/cephadm-talos/internal/pki"
 	"github.com/nberlee/cephadm-talos/internal/render"
@@ -66,6 +67,13 @@ type Orch struct {
 	StoreBackend store.Backend
 	// AuthGet replaces `auth get` through exec (tests)
 	AuthGet func(entity string) (key string, found bool, err error)
+	// CRLFailClosed is bootstrap's choice of the agents' revocation list
+	// policy (--crl-fail-closed, plan 04 step 3)
+	CRLFailClosed bool
+	// RevokeCert replaces `ceph orch talos revoke` through exec (tests)
+	RevokeCert func(ctx context.Context, serial string, until time.Time) error
+	// crl is the agent CA's revocation list the CLI holds (CRL)
+	crl *crl.Holder
 }
 
 // Managed reports whether the leader owns the cluster state (plan 03, step

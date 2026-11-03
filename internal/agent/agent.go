@@ -26,6 +26,7 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/resources/containers"
 	"github.com/siderolabs/talos/pkg/machinery/role"
 
+	"github.com/nberlee/cephadm-talos/internal/crl"
 	"github.com/nberlee/cephadm-talos/internal/daemons"
 	"github.com/nberlee/cephadm-talos/internal/pki"
 	"github.com/nberlee/cephadm-talos/internal/records"
@@ -72,6 +73,10 @@ type Record struct {
 	Records string `json:"records,omitempty"`
 	// Node is the agent's ownership of its node's Ceph documents (plan 03, item 7)
 	Node *NodeStatus `json:"node,omitempty"`
+	// CRLNumber is the number of the agent's revocation list (decimal, "" before
+	// any) and CRLStale whether it is past its nextUpdate (plan 04, step 3)
+	CRLNumber string `json:"crl_number,omitempty"`
+	CRLStale  bool   `json:"crl_stale,omitempty"`
 }
 
 // Agent keeps the last complete observation of its node.
@@ -100,6 +105,11 @@ type Agent struct {
 	Granter *Granter
 	// Exec runs the agent's admin socket queries; nil runs none
 	Exec Execer
+	// CRL is the agent CA's revocation list the agent installed (plan 04,
+	// step 3); nil checks peer certificates' validity only and takes no list
+	CRL *crl.Holder
+	// CRLPolicy is the agent's fail-closed setting; nil fails open
+	CRLPolicy *CRLPolicy
 
 	// versions caches each daemon's reported version per instance
 	versions map[string]versionSeen
@@ -362,6 +372,11 @@ func (a *Agent) observe(ctx context.Context) error {
 	a.daemonVersions(ctx, rec, statuses)
 
 	rec.ObservedAt = a.now()
+	if l := a.CRL.Current(); l != nil {
+		rec.CRLNumber = l.Number.String()
+	}
+
+	rec.CRLStale = a.CRL != nil && a.crlStale(rec.ObservedAt)
 
 	a.recMu.Lock()
 	a.rec = rec
@@ -390,6 +405,14 @@ func (a *Agent) Run(ctx context.Context) {
 // was attempted in the last 5 seconds.
 func (a *Agent) Handler() http.Handler {
 	mux := http.NewServeMux()
+	if a.CRL != nil {
+		mux.HandleFunc("POST /v1/crl", a.HandleCRL)
+	}
+
+	if a.CRLPolicy != nil {
+		mux.HandleFunc("POST /v1/policy", a.HandlePolicy)
+	}
+
 	if a.Channel != nil {
 		mux.HandleFunc("POST /v1/heartbeat", a.Channel.HandleHeartbeat)
 	}
@@ -447,7 +470,7 @@ func (a *Agent) Handler() http.Handler {
 		_, _ = w.Write(b)
 	})
 
-	return mux
+	return a.guard(mux)
 }
 
 // TLSConfig returns the server side of the mutual TLS: the agent's certificate,
@@ -567,13 +590,30 @@ func Main(ctx context.Context) error {
 	}
 
 	recs := &records.Store{Dir: dir}
+
+	// the revocation list from the agent's records, installed before anything
+	// is served, and its policy (plan 04, step 3): a self-update or a restored
+	// document starts the agent with its records
+	revoked := NewCRLHolder(string(pems[0]), recs)
+	if err := revoked.Load(); err != nil {
+		log.Printf("the recorded revocation list: %v", err)
+	}
+
+	crlPolicy, err := LoadCRLPolicy(recs, os.Getenv(daemons.EnvCRLFailClosed) == "1", os.Getenv(daemons.EnvApprovalKey), self.FSID)
+	if err != nil {
+		return fmt.Errorf("records: %w", err)
+	}
+
+	ch.CRL = revoked
+
 	// from the agent's own document, which only the CLI writes; no
 	// repositories admit no image
 	repos := strings.Fields(os.Getenv(daemons.EnvImageRepos))
 	node := &Node{Talos: tc, Records: recs, JobsDir: filepath.Join(records.Mount, records.JobsDir), FSID: self.FSID, Host: self.Name, Policy: &Policy{
-		FSID: self.FSID, Host: self.Name, CACert: string(pems[0]), Repos: repos, ApprovalKey: os.Getenv(daemons.EnvApprovalKey),
+		FSID: self.FSID, Host: self.Name, CACert: string(pems[0]), Repos: repos, ApprovalKey: os.Getenv(daemons.EnvApprovalKey), CRL: revoked,
 	}}
 	a := &Agent{
+		CRL: revoked, CRLPolicy: crlPolicy,
 		Talos: tc, Life: ctx, Channel: ch, Records: recs, Node: node, Granter: NewGranter(node, ch, clientTLS, recs),
 		Exec: func(ctx context.Context, container string, args []string, stdout, stderr io.Writer) (int, error) {
 			return tc.Exec(ctx, "", container, args, nil, stdout, stderr)
@@ -590,7 +630,7 @@ func Main(ctx context.Context) error {
 	wg.Go(func() { a.Run(ctx) })
 
 	// the leader, while this host's mgr is the active one and heartbeats it
-	leader := &LeaderLoop{Self: self, Channel: ch, ClientTLS: clientTLS, Repos: repos, CACert: string(pems[0]), ApprovalKey: os.Getenv(daemons.EnvApprovalKey),
+	leader := &LeaderLoop{Self: self, Channel: ch, ClientTLS: clientTLS, Repos: repos, CACert: string(pems[0]), CRL: revoked, ApprovalKey: os.Getenv(daemons.EnvApprovalKey),
 		Records: recs, Suspended: a.Granter.Suspended, Boundary: a.Granter.Boundary, OwnReport: node.Report}
 	a.Granter.Leader = leader
 	wg.Go(func() { leader.Run(ctx) })

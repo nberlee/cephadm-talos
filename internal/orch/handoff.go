@@ -238,9 +238,12 @@ func (o *Orch) handOver(ctx context.Context, h state.Host) error {
 			return errors.New("no server certificate")
 		}
 
-		_, err := pki.Require(cs.PeerCertificates[0], pki.Identity{FSID: o.St.FSID, Role: pki.RoleAgent, Name: h.Name})
+		if _, err := pki.Require(cs.PeerCertificates[0], pki.Identity{FSID: o.St.FSID, Role: pki.RoleAgent, Name: h.Name}); err != nil {
+			return err
+		}
 
-		return err
+		// not an agent the revocation list names (plan 04, step 3)
+		return o.checkAgent(cs.PeerCertificates[0])
 	}
 
 	body, err := json.Marshal(wire.Handoff{Version: wire.Version, FSID: o.St.FSID, Host: h.Name, Revision: 1})

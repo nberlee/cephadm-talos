@@ -19,6 +19,7 @@ import (
 
 	"github.com/nberlee/cephadm-talos/internal/approval"
 	"github.com/nberlee/cephadm-talos/internal/cephx"
+	"github.com/nberlee/cephadm-talos/internal/crl"
 	"github.com/nberlee/cephadm-talos/internal/daemons"
 	"github.com/nberlee/cephadm-talos/internal/mgrmodule"
 	"github.com/nberlee/cephadm-talos/internal/pki"
@@ -42,6 +43,9 @@ type Policy struct {
 	// (internal/approval): images and disk jobs are admitted only as the
 	// highest approval the agent verified allows
 	ApprovalKey string
+	// CRL refuses mgr and agent certificates the agent's revocation list
+	// names (plan 04, step 3); nil checks their validity only
+	CRL *crl.Holder
 }
 
 // diskUse is a job of a grant that needs a disk entry of the approval; its
@@ -734,6 +738,10 @@ func (p *Policy) mgrCert(contents string, usage x509.ExtKeyUsage) error {
 
 	if _, err := pki.Require(cert, pki.Identity{FSID: p.FSID, Role: pki.RoleMgr, Name: p.Host}); err != nil {
 		return errors.New("not this host's mgr's certificate")
+	}
+
+	if p.CRL.Current().Names(cert) {
+		return errors.New("revoked")
 	}
 
 	return nil

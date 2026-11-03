@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/nberlee/cephadm-talos/internal/crl"
 	"github.com/nberlee/cephadm-talos/internal/pki"
 	"github.com/nberlee/cephadm-talos/internal/wire"
 )
@@ -48,6 +49,9 @@ type Leader struct {
 type Channel struct {
 	Self    pki.Identity // the agent's own identity: cluster and host
 	Session string       // new on every start
+	// CRL refuses a module whose server certificate the agent's list names
+	// (plan 04, step 3); nil checks its validity only
+	CRL *crl.Holder
 
 	mu     sync.Mutex
 	leader *Leader
@@ -152,6 +156,10 @@ func (c *Channel) Confirm(ctx context.Context, tlsCfg *tls.Config, t ConfirmTarg
 		}
 
 		if _, err := pki.Require(cs.PeerCertificates[0], pki.Identity{FSID: c.Self.FSID, Role: pki.RoleMgr, Name: t.Mgr}); err != nil {
+			return err
+		}
+
+		if err := c.CRL.Check(cs.PeerCertificates[0]); err != nil {
 			return err
 		}
 

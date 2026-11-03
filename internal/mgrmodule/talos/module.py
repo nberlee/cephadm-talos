@@ -33,7 +33,7 @@ from ceph.deployment.service_spec import PlacementSpec, ServiceSpec
 from mgr_module import CLICommandBase, CommandResult, HandleCommandResult, MgrModule, Option
 from orchestrator import DaemonDescription, DaemonDescriptionStatus, OrchestratorError, handle_orch_error, UpgradeStatusSpec
 
-from . import bridge, ledger
+from . import bridge, ledger, revocation
 
 TalosCLICommand = CLICommandBase.make_registry_subtype("TalosCLICommand")
 
@@ -308,11 +308,26 @@ def require_identity(peercert: Optional[Dict[str, Any]], fsid: str, role: str, n
     return got[2]
 
 
+def check_not_revoked(peercert: Optional[Dict[str, Any]], revoked: Any, now: Optional[float] = None) -> None:
+    """Refuse a verified peer certificate the revoked set names, or one outside
+    its validity (plan 04, step 3): the module is the list's issuer and reads
+    the set itself, no CRL is parsed."""
+    if not peercert or not peercert.get('serialNumber'):
+        raise ValueError('no peer certificate')
+    serial = int(peercert['serialNumber'], 16)
+    if serial in revoked:
+        raise ValueError('the peer certificate (serial %d) is revoked' % serial)
+    t = time.time() if now is None else now
+    if not ssl.cert_time_to_seconds(peercert['notBefore']) <= t <= ssl.cert_time_to_seconds(peercert['notAfter']):
+        raise ValueError('the peer certificate is not valid now')
+
+
 def fetch_record(addr: str, tls: ssl.SSLContext, refresh: bool = False,
-                 expect: Optional[Tuple[str, str]] = None) -> Dict[str, Any]:
+                 expect: Optional[Tuple[str, str]] = None, revoked: Any = ()) -> Dict[str, Any]:
     """Fetch and validate one agent's status record within an overall deadline; raises on any problem.
 
-    expect is the (fsid, host) the agent's certificate must be issued to."""
+    expect is the (fsid, host) the agent's certificate must be issued to;
+    revoked the serials it must not have."""
     total = REFRESH_TIMEOUT if refresh else REQUEST_TIMEOUT
     conn = http.client.HTTPSConnection(addr, AGENT_PORT, context=tls, timeout=total)
     expired = threading.Event()
@@ -341,6 +356,7 @@ def fetch_record(addr: str, tls: ssl.SSLContext, refresh: bool = False,
             cut()
         if expect is not None:
             require_identity(conn.sock.getpeercert(), expect[0], 'agent', expect[1])
+            check_not_revoked(conn.sock.getpeercert(), revoked)
         conn.request('GET', '/status?refresh=1' if refresh else '/status')
         resp = conn.getresponse()
         body = resp.read(MAX_RECORD + 1)
@@ -370,6 +386,9 @@ def validate_record(rec: Any) -> Dict[str, Any]:
                 or not isinstance(c.get('exit_code', 0), int) or isinstance(c.get('exit_code', 0), bool) \
                 or not isinstance(c.get('version', ''), str):
             raise ValueError('invalid container %r in status record' % name)
+    if not isinstance(rec.get('crl_number', ''), str) or not re.match(r'\A\d{0,40}\Z', rec.get('crl_number', '')) \
+            or not isinstance(rec.get('crl_stale', False), bool):
+        raise ValueError('invalid revocation list state in status record')
     rec['observed_at'] = parse_time(rec['observed_at'])
     return rec
 
@@ -590,18 +609,78 @@ class Module(orchestrator.Orchestrator, MgrModule):
         # the renewal threshold of the daily certificate check (plan 04, step 1); a
         # larger value renews earlier, for tests
         Option('talos_cert_renew_days', type='int', default=30, min=1, desc='renew certificates that expire within this many days'),
+        # the validity of the agent CA's revocation list (plan 04, step 3): at
+        # most 7 days, the agents' limit; a lower value is for tests
+        Option('talos_crl_valid_hours', type='int', default=revocation.MAX_VALID_HOURS, min=1, max=revocation.MAX_VALID_HOURS,
+               desc='validity of the agent CA revocation list, in hours'),
     ]
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._poller = Poller(self._fetch)
+        # the revoked set (serials), read with the ledger every leadership tick
+        self._revoked: frozenset = frozenset()
+        # the list this module issued last: (number, DER)
+        self._crl: Optional[Tuple[int, bytes]] = None
+
+    def _set_health(self, part: str, checks: Dict[str, Any]) -> None:
+        """Replace one part's health checks (the certificate check's, the
+        revocation list's); set_health_checks replaces them all."""
+        with self.__dict__.setdefault('_health_lock', threading.Lock()):
+            parts = self.__dict__.setdefault('_health_parts', {})
+            parts[part] = checks
+            merged: Dict[str, Any] = {}
+            for c in parts.values():
+                merged.update(c)
+            self.set_health_checks(merged)
+
+    def _require_identity(self, peercert: Optional[Dict[str, Any]], fsid: str, role: str, name: Optional[str] = None) -> str:
+        """require_identity, and not a revoked or expired certificate."""
+        got = require_identity(peercert, fsid, role, name)
+        check_not_revoked(peercert, getattr(self, '_revoked', ()))
+        return got
 
     def _fetch(self, addr: str, refresh: bool) -> Dict[str, Any]:
         inv = self._inventory()
         names = [h['name'] for h in inv['hosts'] if h['addr'] == addr]
         if len(names) != 1:
             raise ValueError('address %s is not one inventory host' % addr)
-        return fetch_record(addr, tls_context(), refresh=refresh, expect=(inv['fsid'], names[0]))
+        return fetch_record(addr, tls_context(), refresh=refresh, expect=(inv['fsid'], names[0]), revoked=getattr(self, '_revoked', ()))
+
+    def _deliver_crl(self, inv: Dict[str, Any]) -> None:
+        """Send the list to every inventory host whose poll failed or reported a
+        lower number (plan 04, step 3), apart from the poll's authentication:
+        the agent's server certificate is checked against the agent CA and
+        its identity, not the revoked set (the list is public), so an agent
+        whose own certificate was revoked still gets lists. Then report the
+        agents whose list is past its nextUpdate."""
+        crl = getattr(self, '_crl', None)
+        obs = self._poller.snapshot()
+        stale = sorted(n for n, (rec, _) in obs.items() if rec is not None and rec.get('crl_stale'))
+        self._set_health('crl_stale', {'TALOS_CRL_STALE': {
+            'severity': 'warning', 'summary': 'agents hold a revocation list past its nextUpdate', 'count': len(stale),
+            'detail': ['the agent of %s' % n for n in stale]}} if stale else {})
+        if crl is None:
+            return
+        number, der = crl
+        body = json.dumps({'crl': base64.b64encode(der).decode()}).encode()
+        for h in inv['hosts']:
+            rec, _ = obs.get(h['name'], (None, ''))
+            if rec is not None and int(rec.get('crl_number') or 0) >= number:
+                continue
+            try:
+                self._poller.executor.submit(self._send_crl, inv['fsid'], h, body)
+            except RuntimeError:  # shut down meanwhile
+                return
+
+    def _send_crl(self, fsid: str, h: Dict[str, Any], body: bytes) -> None:
+        try:
+            status, reply = bridge.post_json(h['addr'], AGENT_PORT, tls_context(), '/v1/crl', body, REQUEST_TIMEOUT,
+                                             lambda cert: require_identity(cert, fsid, 'agent', h['name']))
+            if status != 200:
+                self.log.info('the agent of %s refused the revocation list: %d %s', h['name'], status, reply[:200].decode(errors='replace'))
+        except Exception as e:
+            self.log.info('the revocation list was not delivered to %s: %s', h['name'], e)
 
     def _inventory(self) -> Dict[str, Any]:
         entries = self.get_store_prefix(STORE_PREFIX)
@@ -782,9 +861,14 @@ class Module(orchestrator.Orchestrator, MgrModule):
         if leadership.candidate is None:
             self.log.warning('this mgr was not active in the map it started with; it confirms nothing')
         channel: Optional[bridge.Channel] = None
+        issuer: Optional[revocation.Issuer] = None
         nonce = ''
         try:
             while not self._poller.stop.is_set():
+                try:
+                    self._read_revoked(bridge_cmds)
+                except revocation.CRLError as e:
+                    self.log.warning('%s', e)
                 try:
                     inv = self._inventory()
                     if channel is None:
@@ -792,7 +876,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
                                                         os.path.join(TALOS_DIR, 'mgr-server.key'))
                         c = bridge.Channel(
                             inv['fsid'], self.get_mgr_id(), leadership, bridge_cmds, creds.ctx, creds.server_key,
-                            require_identity, self.log, self._authority, creds.ca_cert, creds.digest)
+                            self._require_identity, self.log, self._authority, creds.ca_cert, creds.digest)
                         c.start()
                         channel = c  # only a started channel; a failed start is retried
                     else:
@@ -812,6 +896,9 @@ class Module(orchestrator.Orchestrator, MgrModule):
                                 self._ledger.settle()  # an append the mons did not answer
                         except ledger.LedgerError as e:
                             self.log.warning('the ledger: %s', e)
+                        # the list, before and independent of the heartbeat: a
+                        # fail-closed agent may refuse it until it has a new list
+                        issuer = self._issue_crl(bridge_cmds, issuer, epoch, channel)
                         nonce = self._heartbeat(inv, gid, epoch, nonce)
                         self._schedule_cert_check()
                 except InventoryError as e:
@@ -825,6 +912,38 @@ class Module(orchestrator.Orchestrator, MgrModule):
             leader_cmds.stop()
             bridge_cmds.stop()
 
+    def _read_revoked(self, cmds: bridge.Commands) -> List[str]:
+        """Read the revoked set (plan 04, step 3); returns the keys of the
+        entries to prune. A failed read keeps the set read before."""
+        revoked, old = revocation.read_revoked(self._ledger_mon(cmds), datetime.datetime.now(datetime.timezone.utc))
+        self._revoked = frozenset(revoked)
+        self._revoked_until = revoked
+        self._revoked_old = old
+        return old
+
+    def _issue_crl(self, cmds: bridge.Commands, issuer: Optional[revocation.Issuer], epoch: int,
+                   channel: Optional[bridge.Channel]) -> Optional[revocation.Issuer]:
+        """Prune, issue and publish the list as the leader (plan 04, step 3);
+        TALOS_CRL when it cannot. Returns the leadership's issuer."""
+        led = getattr(self, '_ledger', None)
+        if led is None or not led.ready or channel is None:
+            return issuer
+        issuer = issuer or revocation.Issuer(epoch)
+        try:
+            hours = self.get_module_option('talos_crl_valid_hours') or revocation.MAX_VALID_HOURS
+            if issuer.tick(self._ledger_mon(cmds), channel.ca_cert, getattr(self, '_revoked_until', {}), getattr(self, '_revoked_old', []),
+                           datetime.datetime.now(datetime.timezone.utc), int(hours)):
+                self.log.info('revocation list %d issued (%d serials)', issuer.number, len(issuer.serials or ()))
+            self._revoked_old = []
+            if issuer.der is not None and issuer.published:
+                self._crl = (issuer.number, issuer.der)
+            self._set_health('crl', {})
+        except Exception as e:
+            self.log.warning('the revocation list: %s', e)
+            self._set_health('crl', {'TALOS_CRL': {'severity': 'warning', 'summary': 'the agent CA revocation list cannot be issued or published',
+                                                   'count': 1, 'detail': [str(e) or e.__class__.__name__]}})
+        return issuer
+
     def _heartbeat(self, inv: Dict[str, Any], gid: int, epoch: int, nonce: str) -> str:
         """Tell the local agent it is the leader's; returns the agent's session nonce."""
         mine = [h['addr'] for h in inv['hosts'] if h['name'] == self.get_mgr_id()]
@@ -832,7 +951,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
             raise ValueError('this mgr\'s host %s is not one inventory host' % self.get_mgr_id())
         status, body = bridge.post_json(
             mine[0], AGENT_PORT, tls_context(), '/v1/heartbeat', bridge.heartbeat_body(inv['fsid'], self.get_mgr_id(), gid, epoch, nonce),
-            bridge.HEARTBEAT_INTERVAL, lambda cert: require_identity(cert, inv['fsid'], 'agent', self.get_mgr_id()))
+            bridge.HEARTBEAT_INTERVAL, lambda cert: self._require_identity(cert, inv['fsid'], 'agent', self.get_mgr_id()))
         if status != 200:
             raise ValueError('agent answered %d to the heartbeat' % status)
         reply = json.loads(body)
@@ -847,7 +966,9 @@ class Module(orchestrator.Orchestrator, MgrModule):
         lead.start()
         while not self._poller.stop.is_set():
             try:
-                self._poller.poll(self._inventory()['hosts'])
+                inv = self._inventory()
+                self._poller.poll(inv['hosts'])
+                self._deliver_crl(inv)
             except InventoryError as e:
                 self.log.warning('%s', e)
             except Exception:  # polling must survive anything
@@ -1266,7 +1387,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
         if end is not None and end - now <= OPERATOR_WARN_BEFORE:
             warn('TALOS_OPERATOR_CERT_EXPIRING', "the operator's certificate expires within 60 days",
                  ['it expires %s: any cephadm-talos command renews it' % end.isoformat()])
-        self.set_health_checks(checks)
+        self._set_health('certs', checks)
 
     def _schedule_cert_check(self) -> None:
         """Run the daily certificate check, at the leader's first tick and then
@@ -1555,6 +1676,26 @@ class Module(orchestrator.Orchestrator, MgrModule):
             return HandleCommandResult(stdout=self._accept_agent_upgrade(image, resume, stop))
         except OrchestratorError as e:
             return HandleCommandResult(retval=-22, stderr=str(e))
+
+    @TalosCLICommand.Write('orch talos revoke')
+    def _revoke(self, serial: str, until: Optional[str] = None) -> HandleCommandResult:
+        """Revoke a certificate of the agent CA by its serial (decimal, 0x<hex> or colon-separated hex), until a date (ISO 8601; default 3 years)"""
+        try:
+            n = revocation.parse_serial(serial)
+            now = datetime.datetime.now(datetime.timezone.utc)
+            end = revocation.parse_iso(until) if until else revocation.add_years(now, revocation.REVOKE_YEARS)
+        except ValueError as e:
+            return HandleCommandResult(retval=-22, stderr=str(e))
+        key = '%s%d' % (revocation.REVOKED_PREFIX, n)
+        r, out, err = self.mon_command({'prefix': 'config-key get', 'key': key})
+        if r == 0:
+            return HandleCommandResult(stdout='serial %d is revoked already: %s' % (n, out))
+        if r != -errno.ENOENT:
+            return HandleCommandResult(retval=r, stderr='cannot read the revoked set: %s' % err)
+        r, _, err = self.mon_command({'prefix': 'config-key set', 'key': key, 'val': revocation.entry(end, 'operator')})
+        if r != 0:
+            return HandleCommandResult(retval=r, stderr='not revoked: %s' % err)
+        return HandleCommandResult(stdout='serial %d revoked until %s; the next revocation list names it' % (n, revocation.iso(end)))
 
     @TalosCLICommand.Read('orch talos agent upgrade status')
     def _agent_upgrade_show(self) -> HandleCommandResult:

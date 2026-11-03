@@ -31,7 +31,7 @@ Usage:
   cephadm-talos [global flags] <command> [args]
 
 Commands:
-  bootstrap --mon-node <ip> --agent-image IMG [--image IMG] [--refresh]
+  bootstrap --mon-node <ip> --agent-image IMG [--image IMG] [--refresh] [--crl-fail-closed]
                                            create a cluster: 1 mon + 1 mgr on the node
   host add <ip>                            add a Talos node (volume + ceph.conf)
   host ls                                  list hosts
@@ -59,6 +59,7 @@ Commands:
   agent restore <host> [--previous]        in a recovery session: apply a suspended host's agent again (--previous: the known good image)
   approve [--image REF] [--prepare H:DISK] [--zap H:DISK] [--drop H:SERIAL:ACTION] [--show]
                                            sign and publish the operator's approval of images and disks
+  crl-policy closed|open                   the agents' policy for a revocation list past its nextUpdate (default open)
   rm-cluster [--zap] [--reboot] [--force] --yes-i-really-mean-it
                                            remove the whole cluster from all hosts (suspends a handed-over one first)
   conf                                     print the generated ceph.conf
@@ -136,7 +137,10 @@ func run() error {
 		image := fs.String("image", orch.DefaultImage, "Ceph container image (pinned to its digest)")
 		refresh := fs.Bool("refresh", false, "pull the image tag again even if the node has it")
 		agentImage := fs.String("agent-image", "", "cephadm-talos agent image (hack/agent-image.sh builds one)")
+		crlClosed := fs.Bool("crl-fail-closed", false, "agents refuse all but the operator's calls while their revocation list is past its nextUpdate")
 		_ = fs.Parse(args)
+
+		o.CRLFailClosed = *crlClosed
 
 		if *node == "" {
 			return errors.New("bootstrap needs --mon-node <ip>")
@@ -221,6 +225,19 @@ func run() error {
 		if err := o.EnsureOperatorCert(ctx); err != nil {
 			fmt.Fprintln(os.Stderr, "warning: the operator certificate:", err)
 		}
+
+		// a replaced operator certificate is revoked, retried on every command,
+		// and the published revocation list read before any agent is called
+		// (plan 04, step 3)
+		if err := o.RevokePending(ctx); err != nil {
+			fmt.Fprintln(os.Stderr, "warning:", err)
+		}
+
+		if o.Managed() {
+			if err := o.RefreshCRL(ctx); err != nil {
+				fmt.Fprintln(os.Stderr, "warning: the revocation list:", err)
+			}
+		}
 	}
 
 	if cmd == "suspend" {
@@ -265,7 +282,7 @@ func run() error {
 	// nothing itself (plan 03, step 6): changes go through `ceph orch`
 	if o.Managed() {
 		switch cmd {
-		case "ps", "ls", "conf", "logs", "shell", "handoff", "approve", "orch":
+		case "ps", "ls", "conf", "logs", "shell", "handoff", "approve", "orch", "crl-policy":
 		case "host":
 			// enrollment, then `ceph orch host add` (plan 03, step 7)
 			if len(args) == 0 || args[0] != "ls" && args[0] != "add" {
@@ -531,6 +548,12 @@ func runCommand(ctx context.Context, o *orch.Orch, cmd string, args []string) er
 		return o.Handoff(ctx)
 	case "approve":
 		return approve(ctx, o, args)
+	case "crl-policy":
+		if len(args) != 1 {
+			return errors.New("crl-policy closed|open")
+		}
+
+		return o.SetCRLPolicy(ctx, args[0])
 	case "conf":
 		fmt.Print(o.CephConf())
 

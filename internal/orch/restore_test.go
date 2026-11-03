@@ -293,7 +293,7 @@ func TestAResumptionFinishesALandedRestoreAsRendered(t *testing.T) {
 	}
 
 	previous := "docker.io/registry/agent@sha256:" + strings.Repeat("bb", 32)
-	docs := o.agentDocsWith(ah, previous, o.imageRepos(), o.St.Agent.ApprovalKey)
+	docs := o.agentDocsWith(ah, previous, o.imageRepos(), o.St.Agent.ApprovalKey, false)
 
 	hashes, err := docHashes(docs)
 	if err != nil {
@@ -429,7 +429,7 @@ func TestAnAgentApplyIsDecidedFromItsDispatchDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	docs := o.agentDocsWith(ah, "docker.io/registry/agent@sha256:"+strings.Repeat("bb", 32), o.imageRepos(), o.St.Agent.ApprovalKey)
+	docs := o.agentDocsWith(ah, "docker.io/registry/agent@sha256:"+strings.Repeat("bb", 32), o.imageRepos(), o.St.Agent.ApprovalKey, false)
 
 	hashes, err := docHashes(docs)
 	if err != nil {

@@ -272,7 +272,7 @@ func (o *Orch) restoreAgent(ctx context.Context, rec *state.Recovery, h state.Ho
 	// with the pinned inputs its document had, if the suspension read them
 	docs := o.agentDocs(ah)
 	if hr := rec.Hosts[h.Name]; hr.AgentPinned {
-		docs = o.agentDocsWith(ah, o.St.Agent.Image, hr.AgentRepos, hr.AgentApprovalKey)
+		docs = o.agentDocsWith(ah, o.St.Agent.Image, hr.AgentRepos, hr.AgentApprovalKey, hr.AgentCRLFailClosed)
 	}
 
 	// journaled, and an interrupted self-update settled, as agent restore does

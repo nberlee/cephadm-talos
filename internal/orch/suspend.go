@@ -317,9 +317,12 @@ func (o *Orch) operatorClient(h state.Host) (*http.Client, error) {
 			return errors.New("no server certificate")
 		}
 
-		_, err := pki.Require(cs.PeerCertificates[0], pki.Identity{FSID: o.St.FSID, Role: pki.RoleAgent, Name: h.Name})
+		if _, err := pki.Require(cs.PeerCertificates[0], pki.Identity{FSID: o.St.FSID, Role: pki.RoleAgent, Name: h.Name}); err != nil {
+			return err
+		}
 
-		return err
+		// not an agent the revocation list names (plan 04, step 3)
+		return o.checkAgent(cs.PeerCertificates[0])
 	}
 
 	return &http.Client{Transport: &http.Transport{TLSClientConfig: cfg, DisableKeepAlives: true}, Timeout: 2 * time.Minute}, nil
@@ -473,6 +476,7 @@ func (o *Orch) suspendNode(ctx context.Context, h state.Host, rec *state.Recover
 				if d, ok := docs[doc]; ok {
 					hr.AgentCert, hr.AgentClientCert = unb64(d.env[daemons.EnvCert]), unb64(d.env[daemons.EnvClientCert])
 					hr.AgentPinned, hr.AgentRepos, hr.AgentApprovalKey = true, strings.Fields(d.env[daemons.EnvImageRepos]), d.env[daemons.EnvApprovalKey]
+					hr.AgentCRLFailClosed = d.env[daemons.EnvCRLFailClosed] == "1"
 				}
 
 				// the state's AgentKeys; for a host the state does not have, the

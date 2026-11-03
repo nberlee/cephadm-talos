@@ -1026,6 +1026,85 @@ class LedgerCallsTest(unittest.TestCase):
         self.assertEqual(sorted(k for k in self.mons.kv if '/host/' in k), [b.SECRET_PREFIX + 'host/h1/agent-server.key'])
 
 
+class RevocationCallsTest(LedgerCallsTest):
+    """plan 04, step 3: retirements write the revocation entries of the
+    certificates they retire before their module entry and before any key is
+    deleted; the kept ones are never listed."""
+
+    def revoked(self):
+        from talos import revocation as rv
+        return {int(k[len(rv.REVOKED_PREFIX):]) for k in self.mons.kv if k.startswith(rv.REVOKED_PREFIX)}
+
+    def serial(self, pem):
+        return x509.load_pem_x509_certificate(pem.encode()).serial_number
+
+    def watch_appends(self):
+        """The revoked set as it was at each module entry's append."""
+        seen = []
+        append = self.led.append
+
+        def watched(op):
+            seen.append((op['kind'], set(self.revoked())))
+            return append(op)
+        self.led.append = watched
+        return seen
+
+    def test_an_agent_renewal_revokes_the_clis_and_earlier_certificates(self):
+        cli = b.issue_mgr_certs(self.ca, self.mons.kv[b.SECRET_PREFIX + 'agent-ca.key'].encode(), 'f1', 'h1', '10.0.0.1', 'agent')
+        r1 = self.accept('renew_agent', None, 'h1')
+        first = json.loads(self.call('agent cert', operation=r1)[1]['out'])
+        seen = self.watch_appends()
+        # a certificate of another host is refused, nothing appended
+        other = b.issue_mgr_certs(self.ca, self.mons.kv[b.SECRET_PREFIX + 'agent-ca.key'].encode(), 'f1', 'h2', '10.0.0.2', 'agent')
+        self.assertEqual(self.call('agent cert done', operation=r1, certs=[other['client_cert']])[0], 400)
+        self.assertEqual(seen, [])
+        code, reply = self.call('agent cert done', operation=r1, certs=[cli['server_cert'], cli['client_cert']])
+        self.assertEqual((code, reply['outcome']), (200, 'done'), reply)
+        want = {self.serial(cli['server_cert']), self.serial(cli['client_cert'])}
+        self.assertEqual(seen, [('agent_cert_done', want)])  # written before the module entry
+        self.assertTrue(want - {self.serial(first['server_cert'])})
+        self.assertNotIn(self.serial(first['server_cert']), self.revoked())
+        # the next renewal revokes the first one's, kept beside its keys
+        r2 = self.accept('renew_agent', None, 'h1')
+        second = json.loads(self.call('agent cert', operation=r2)[1]['out'])
+        self.assertEqual(self.call('agent cert done', operation=r2, certs=[first['server_cert'], first['client_cert']])[1]['outcome'], 'done')
+        self.assertEqual(self.revoked(), want | {self.serial(first['server_cert']), self.serial(first['client_cert'])})
+        self.assertNotIn(self.serial(second['client_cert']), self.revoked())
+        # the kept certificates passed by mistake are never listed
+        r3 = self.accept('renew_agent', None, 'h1')
+        third = json.loads(self.call('agent cert', operation=r3)[1]['out'])
+        before = self.revoked()
+        self.call('agent cert done', operation=r3, certs=[third['client_cert']])
+        self.assertNotIn(self.serial(third['client_cert']), self.revoked())
+        self.assertIn(self.serial(second['client_cert']), self.revoked())
+        self.assertTrue(before <= self.revoked())
+
+    def test_a_mgr_renewal_and_removal(self):
+        key = self.mons.kv[b.SECRET_PREFIX + 'agent-ca.key'].encode()
+        add = self.accept('add_daemon', 'mgr.h2', 'h2')
+        added = json.loads(self.call('mgr cert', operation=add)[1]['out'])
+        # the add keeps its certificates beside the keys now
+        prefix = '%sissued/%s/%s/' % (b.SECRET_PREFIX, add, added['attempt'])
+        self.assertEqual(self.mons.kv[prefix + 'mgr-server.crt'], added['server_cert'])
+        r1 = self.accept('renew_mgr', 'mgr.h2', 'h2')
+        renewed = json.loads(self.call('mgr cert', operation=r1)[1]['out'])
+        seen = self.watch_appends()
+        self.assertEqual(self.call('mgr cert done', operation=r1, certs=[added['server_cert'], added['client_cert']])[1]['outcome'], 'done')
+        add_serials = {self.serial(added['server_cert']), self.serial(added['client_cert'])}
+        self.assertEqual(seen, [('mgr_cert_done', add_serials)])
+        self.assertFalse(any(k.startswith(prefix) for k in self.mons.kv))  # then the keys went
+        # asked again: written again (idempotent), nothing of the kept renewal
+        self.assertEqual(self.call('mgr cert done', operation=r1)[1]['outcome'], 'done')
+        self.assertEqual(self.revoked(), add_serials)
+        # the removal revokes the renewal's (kept beside its keys) and the ones the leader journaled
+        cli = b.issue_mgr_certs(self.ca, key, 'f1', 'h2', '10.0.0.2')
+        rm = self.accept('remove_daemon', 'mgr.h2', 'h2')
+        self.assertEqual(self.call('retire', operation=rm, certs=[cli['client_cert']])[1]['outcome'], 'done')
+        self.assertEqual(self.revoked(), add_serials | {self.serial(renewed['server_cert']), self.serial(renewed['client_cert']),
+                                                        self.serial(cli['client_cert'])})
+        self.assertFalse([k for k in self.mons.kv if k.startswith(b.SECRET_PREFIX + 'issued/')])
+
+
 class ApprovalCallTest(unittest.TestCase):
     def test_the_newest_approval(self):
         ch, mons = BridgeTest.channel(self)

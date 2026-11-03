@@ -923,6 +923,18 @@ func (l *LeaderLoop) removeDaemon(ctx context.Context, b *Bridge, js store.Backe
 	}
 
 	if d, exists := st.Find(op.Daemon); exists {
+		// a mgr's certificates, journaled before the state drops them: the
+		// module revokes them with its retirement (plan 04, step 3)
+		if typ == state.TypeMgr && (h.MgrServerCert != "" || h.MgrClientCert != "") {
+			if _, found, err := l.readJournal(ctx, b, js, gid, op.ID+".certs"); err != nil {
+				return err
+			} else if !found {
+				if err := writeJSONKey(ctx, js, rollKey(gid, op.ID+".certs"), removedCerts{ServerCert: h.MgrServerCert, ClientCert: h.MgrClientCert}); err != nil {
+					return err
+				}
+			}
+		}
+
 		if err := l.changeState(ctx, b, gid, func(st *state.State) error {
 			st.RemoveDaemon(d)
 
@@ -961,7 +973,12 @@ func (l *LeaderLoop) removeDaemon(ctx context.Context, b *Bridge, js store.Backe
 		}
 	}
 
-	if err := b.Retire(ctx, "retire", op.ID); err != nil {
+	certs, _, err := l.readJournal(ctx, b, js, gid, op.ID+".certs")
+	if err != nil {
+		return err
+	}
+
+	if err := b.RetireWith(ctx, op.ID, []string{certs.ServerCert, certs.ClientCert}); err != nil {
 		return err
 	}
 

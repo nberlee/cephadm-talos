@@ -356,17 +356,14 @@ class Fold:
                 self.mgr_renewals.setdefault(e['daemon'], {})[e['id']] = None
             elif kind == 'mgr_cert' and e['of'] in self.mgr_renewals.get(e['daemon'], {}):
                 self.mgr_renewals[e['daemon']][e['of']] = e['attempt']
-            elif kind == 'mgr_cert_done' and e['keep'] in self.mgr_renewals.get(e['daemon'], {}) and e['keep'] not in self.mgr_retired:
-                gen = self.open_generation(e['daemon'])
-                self.mgr_retired.update(o for o in self.mgr_renewals[e['daemon']] if o != e['keep'])
-                self.mgr_retired.add(gen if gen != 'cli' else 'cli/' + e['host'])
+            elif kind == 'mgr_cert_done':
+                self.mgr_retired.update(self.mgr_retiring(e['daemon'], e['keep'], e['host']))
             elif kind == 'renew_agent' and e['host'] in self.hosts:
                 self.agent_renewals.setdefault(e['host'], {})[e['id']] = None
             elif kind == 'agent_cert' and e['of'] in self.agent_renewals.get(e['host'], {}):
                 self.agent_renewals[e['host']][e['of']] = e['attempt']
-            elif kind == 'agent_cert_done' and e['keep'] in self.agent_renewals.get(e['host'], {}) and e['keep'] not in self.agent_retired:
-                self.agent_retired.update(o for o in self.agent_renewals[e['host']] if o != e['keep'])
-                self.agent_retired.add('cli/' + e['host'])
+            elif kind == 'agent_cert_done':
+                self.agent_retired.update(self.agent_retiring(e['host'], e['keep']))
             elif kind == 'upgrade_agent':
                 self.agent_upgrade = e['id']
             elif kind == 'apply_ingress':
@@ -395,6 +392,22 @@ class Fold:
                 self.daemons[e['daemon']], self.generations[e['daemon']], self.uuids[e['daemon']] = c['host'], (e['of'], True), e['uuid']
             elif kind == 'close_create' and e['of'] in self.creations:
                 self.creations[e['of']]['closed'] = True
+
+    def mgr_retiring(self, name: str, keep: str, host: str) -> Set[str]:
+        """What a mgr_cert_done keeping a renewal retires: the mgr's other
+        renewals and its generation's keys (the CLI's by host); nothing for a
+        renewal retired already."""
+        if keep not in self.mgr_renewals.get(name, {}) or keep in self.mgr_retired:
+            return set()
+        gen = self.open_generation(name)
+        return {o for o in self.mgr_renewals[name] if o != keep} | {gen if gen != 'cli' else 'cli/' + host}
+
+    def agent_retiring(self, host: str, keep: str) -> Set[str]:
+        """What an agent_cert_done keeping a renewal retires: the host's other
+        agent renewals and the CLI's keys."""
+        if keep not in self.agent_renewals.get(host, {}) or keep in self.agent_retired:
+            return set()
+        return {o for o in self.agent_renewals[host] if o != keep} | {'cli/' + host}
 
     def creating(self, op_id: str) -> Optional[Dict[str, Any]]:
         """An OSD creation that may still use client.bootstrap-osd: bound, neither

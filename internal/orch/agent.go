@@ -34,7 +34,7 @@ func (o *Orch) agentDocName(h state.Host) string {
 // setupAgent creates the agent CA and the operator's client certificate, and
 // pins the agent image to the digest Talos pulls on node.
 func (o *Orch) setupAgent(ctx context.Context, node, image string, refresh bool) error {
-	a := &state.Agent{Image: image}
+	a := &state.Agent{Image: image, CRLFailClosed: o.CRLFailClosed}
 
 	if !o.Talos.DryRun {
 		o.printf("pulling the agent image %s on %s\n", image, node)
@@ -193,13 +193,15 @@ func (o *Orch) agentDocs(h state.Host) []any {
 		return nil
 	}
 
-	return o.agentDocsWith(h, o.St.Agent.Image, o.imageRepos(), o.St.Agent.ApprovalKey)
+	return o.agentDocsWith(h, o.St.Agent.Image, o.imageRepos(), o.St.Agent.ApprovalKey, false)
 }
 
 // agentDocsWith are a host's agent documents with an image and pinned inputs
 // (repositories, approval key) given: a restored agent keeps the ones its
-// document had (plan 04, step 2).
-func (o *Orch) agentDocsWith(h state.Host, image string, repos []string, approvalKey string) []any {
+// document had (plan 04, step 2). The revocation list policy is the
+// workstation's, or closed if the agent's document had it closed (a
+// document can only make it stricter, plan 04 step 3).
+func (o *Orch) agentDocsWith(h state.Host, image string, repos []string, approvalKey string, crlClosed bool) []any {
 	if o.St.Agent == nil || h.AgentCert == "" {
 		return nil
 	}
@@ -209,7 +211,8 @@ func (o *Orch) agentDocsWith(h state.Host, image string, repos []string, approva
 	return []any{
 		spec.RecordsVolume(),
 		daemons.RecordsInit(init, image),
-		daemons.Agent(o.agentDocName(h), init, image, repos, approvalKey, o.St.Agent.CACert, h.AgentCert, h.AgentKey, h.AgentClientCert, h.AgentClientKey),
+		daemons.Agent(o.agentDocName(h), init, image, repos, approvalKey, crlClosed || o.St.Agent.CRLFailClosed, o.St.Agent.CACert,
+			h.AgentCert, h.AgentKey, h.AgentClientCert, h.AgentClientKey),
 	}
 }
 
@@ -294,9 +297,13 @@ func (o *Orch) EnsureOperatorCert(ctx context.Context) error {
 			o.St.Agent.CAKey = string(v)
 		}
 
+		old := o.St.Agent.OperatorCert
 		if err := o.issueOperatorCert(); err != nil {
 			return err
 		}
+
+		// its predecessor is revoked by later commands, saved with it (plan 04, step 3)
+		o.pendingRevoke(old)
 
 		o.printf("renewed the operator certificate\n")
 

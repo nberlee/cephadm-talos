@@ -26,10 +26,12 @@ type ApprovalChange struct {
 	// Prepare and Zap are "<host>:<serial>" or "<host>:/dev/<disk>";
 	// Drop is "<host>:<serial>:<action>"
 	Prepare, Zap, Drop []string
+	// CRL sets the agents' revocation list policy (crl-policy, plan 04 step 3)
+	CRL string
 }
 
 func (c ApprovalChange) empty() bool {
-	return len(c.AddImages)+len(c.DropImages)+len(c.Prepare)+len(c.Zap)+len(c.Drop) == 0
+	return len(c.AddImages)+len(c.DropImages)+len(c.Prepare)+len(c.Zap)+len(c.Drop) == 0 && c.CRL == ""
 }
 
 // lastApproval is the last approval this workstation signed, nil before any.
@@ -196,6 +198,9 @@ func (o *Orch) approvals(ctx context.Context) (store.Backend, error) {
 
 // change applies an ApprovalChange to the next approval.
 func (o *Orch) change(ctx context.Context, a *approval.Approval, c ApprovalChange) error {
+	// set only in the approval that carries it: the agents take it from POST /v1/policy
+	a.CRL = c.CRL
+
 	for _, img := range c.AddImages {
 		if !slices.Contains(a.Images, img) {
 			a.Images = append(a.Images, img)

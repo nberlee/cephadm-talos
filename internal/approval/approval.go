@@ -35,7 +35,18 @@ type Approval struct {
 	// Images are image references by digest ("<repository>@sha256:<hex>")
 	Images []string `json:"images"`
 	Disks  []Disk   `json:"disks"`
+	// CRL, set only in an approval `cephadm-talos crl-policy` sends to the
+	// agents, is the agent CA revocation list policy: CRLClosed or CRLOpen
+	// (plan 04, step 3). Agents take it only from POST /v1/policy, never
+	// from a grant.
+	CRL string `json:"crl,omitempty"`
 }
+
+// The revocation list policies an approval may set.
+const (
+	CRLClosed = "closed"
+	CRLOpen   = "open"
+)
 
 // Disk is one approved use of a disk: one job, once (the agent records the
 // entry when it admits the job). Since is the serial of the approval that
@@ -73,6 +84,10 @@ func (a Approval) Check(fsid string) error {
 		if !imageRe.MatchString(img) {
 			return fmt.Errorf("approval: image %q is not a digest reference", img)
 		}
+	}
+
+	if a.CRL != "" && a.CRL != CRLClosed && a.CRL != CRLOpen {
+		return fmt.Errorf("approval: crl %q is neither %s nor %s", a.CRL, CRLClosed, CRLOpen)
 	}
 
 	seen := map[string]bool{}

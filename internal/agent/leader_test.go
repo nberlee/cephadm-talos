@@ -1146,10 +1146,17 @@ func TestLeaderAddsAndRemovesAMgr(t *testing.T) {
 
 	s.module.mu.Lock()
 	retired := slices.Clone(s.module.retired)
+	revoked := s.module.certs["retire "+rm.Op.ID]
 	s.module.mu.Unlock()
 
 	if !slices.Equal(retired, []string{"retire " + rm.Op.ID}) {
 		t.Fatalf("retired %v", retired)
+	}
+
+	// the mgr's certificates, journaled before the state dropped them, go with
+	// the retirement for their revocation (plan 04, step 3)
+	if !slices.Equal(revoked, []string{h.MgrServerCert, h.MgrClientCert}) {
+		t.Fatalf("revoked with the retirement: %d certificates", len(revoked))
 	}
 
 	// a host with daemons is not removed

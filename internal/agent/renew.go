@@ -110,7 +110,7 @@ func (l *LeaderLoop) renewMgr(ctx context.Context, b *Bridge, js store.Backend, 
 		}
 	}
 
-	if err := b.MgrCertDone(ctx, op.ID); err != nil {
+	if err := b.MgrCertDone(ctx, op.ID, []string{rec.ServerCert, rec.ClientCert}); err != nil {
 		return fmt.Errorf("%w: %v", errWait, err)
 	}
 
@@ -137,7 +137,7 @@ func (l *LeaderLoop) renewMgrFailed(ctx context.Context, b *Bridge, js store.Bac
 	}
 
 	if rec.Retiring {
-		return b.MgrCertDone(ctx, op.ID)
+		return b.MgrCertDone(ctx, op.ID, []string{rec.ServerCert, rec.ClientCert})
 	}
 
 	return l.changeState(ctx, b, gid, func(st *state.State) error {
@@ -192,6 +192,42 @@ func (l *LeaderLoop) readRenewal(ctx context.Context, b *Bridge, js store.Backen
 	}
 
 	return rec, found, nil
+}
+
+// removedCerts are a removed mgr's certificates, journaled (below
+// "roll/<op>.certs") before the state drops them, for their revocation.
+type removedCerts struct {
+	ServerCert string `json:"server_cert,omitempty"`
+	ClientCert string `json:"client_cert,omitempty"`
+}
+
+// readJournal reads a removal's journaled certificates: this incarnation's,
+// else an earlier incarnation's (a takeover resumes from it).
+func (l *LeaderLoop) readJournal(ctx context.Context, b *Bridge, js store.Backend, gid int64, name string) (removedCerts, bool, error) {
+	rec, found, err := readJSONKey[removedCerts](ctx, js, rollKey(gid, name))
+	if err != nil || found {
+		return rec, found, err
+	}
+
+	all, err := b.Store(ctx, store.Prefix+"inc/")
+	if err != nil {
+		return rec, false, err
+	}
+
+	keys, err := all.List(ctx, store.Prefix+"inc/")
+	if err != nil {
+		return rec, false, err
+	}
+
+	for _, k := range keys {
+		if strings.HasSuffix(k, "/journal/roll/"+name) {
+			if rec, found, err = readJSONKey[removedCerts](ctx, all, k); err != nil || found {
+				return rec, found, err
+			}
+		}
+	}
+
+	return rec, false, nil
 }
 
 // renewRGWCert renews the generated RGW certificate (plan 04, step 1): a new
