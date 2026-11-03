@@ -859,6 +859,16 @@ class LedgerCallsTest(unittest.TestCase):
         self.assertEqual(self.call('mgr cert done', operation=r1)[1]['outcome'], 'done')
         self.assertIn('%sissued/%s/%s/mgr-server.key' % (b.SECRET_PREFIX, r2, second['attempt']), self.mons.kv)
         self.assertEqual(self.call('secret get', name='issued/%s/%s/mgr-server.key' % (r2, second['attempt']))[1]['outcome'], 'done')
+        # a renewal that issued but never finished, retired by a later one's done:
+        # finishing it later changes nothing
+        r3 = self.accept('renew_mgr', 'mgr.h1', 'h1')
+        self.call('mgr cert', operation=r3)
+        r4 = self.accept('renew_mgr', 'mgr.h1', 'h1')
+        fourth = json.loads(self.call('mgr cert', operation=r4)[1]['out'])
+        self.call('mgr cert done', operation=r4)
+        self.assertEqual(self.call('mgr cert done', operation=r3)[1]['outcome'], 'done')
+        self.assertEqual(self.call('secret get', name='issued/%s/%s/mgr-server.key' % (r4, fourth['attempt']))[1]['outcome'], 'done')
+        self.assertFalse(any(e['kind'] == 'mgr_cert_done' and e['of'] == r3 for _, e in self.led.executable()))
 
     def test_a_mgr_from_add_to_retirement(self):
         from cryptography import x509

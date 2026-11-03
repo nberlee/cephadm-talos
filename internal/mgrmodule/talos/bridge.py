@@ -1100,6 +1100,8 @@ class Channel:
         name, host = op['daemon'], op['host']
         if fold.mgr_renewals[name][op['id']] is None:
             return 400, {'error': 'the renewal issued no certificates'}
+        if op['id'] in fold.mgr_retired:  # a later renewal's done retired it: nothing of it is in use
+            return 200, {'outcome': 'done', 'r': 0, 'out': '', 'outs': ''}
         if not any(e['kind'] == 'mgr_cert_done' and e['of'] == op['id'] for _, e in led.executable()):
             led.append({'id': 'm-' + secrets.token_hex(8), 'kind': 'mgr_cert_done', 'of': op['id'], 'daemon': name, 'host': host, 'keep': op['id']})
         # only what the fold retired: a later renewal's keys stay, also when an

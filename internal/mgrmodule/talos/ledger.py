@@ -326,7 +326,7 @@ class Fold:
                 self.mgr_renewals.setdefault(e['daemon'], {})[e['id']] = None
             elif kind == 'mgr_cert' and e['of'] in self.mgr_renewals.get(e['daemon'], {}):
                 self.mgr_renewals[e['daemon']][e['of']] = e['attempt']
-            elif kind == 'mgr_cert_done' and e['keep'] in self.mgr_renewals.get(e['daemon'], {}):
+            elif kind == 'mgr_cert_done' and e['keep'] in self.mgr_renewals.get(e['daemon'], {}) and e['keep'] not in self.mgr_retired:
                 gen = self.open_generation(e['daemon'])
                 self.mgr_retired.update(o for o in self.mgr_renewals[e['daemon']] if o != e['keep'])
                 self.mgr_retired.add(gen if gen != 'cli' else 'cli/' + e['host'])
