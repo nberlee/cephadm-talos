@@ -745,7 +745,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
             raise OrchestratorError('%s has operation %s in progress (orch talos operation %s)' % (daemon or host, busy, busy))
         # a mgr's renewal changes its certificates in the state only while its
         # host is in maintenance; the exit renders them (plan 04, step 1)
-        if kind not in ('exit_maintenance', 'renew_mgr'):
+        if kind not in ('exit_maintenance', 'renew_mgr', 'renew_agent'):
             self._not_in_maintenance(host)
         op_id = op_id or 'op-' + os.urandom(8).hex()
         entry = {'id': op_id, 'kind': kind, 'host': host, **extra, **self._request_fields()}
@@ -1210,7 +1210,16 @@ class Module(orchestrator.Orchestrator, MgrModule):
             if min(ends) - now <= CERT_ALERT_BEFORE:
                 alerts.append('mgr.%s certificates expire %s' % (h['name'], min(ends).isoformat()))
             if min(ends) - now <= renew_before:
-                self._accept_renewal(lambda: self._accept('renew_mgr', 'mgr.' + h['name'], h['name']))
+                self._accept_renewal(lambda name=h['name']: self._accept('renew_mgr', 'mgr.' + name, name))
+        # every host's agent certificates (plan 04, step 2)
+        for h in hosts or []:
+            ends = [cert_not_after(h.get(k)) for k in ('agent_cert', 'agent_client_cert') if h.get(k)]
+            if not ends:
+                continue
+            if min(ends) - now <= CERT_ALERT_BEFORE:
+                alerts.append('the agent of %s: certificates expire %s' % (h['name'], min(ends).isoformat()))
+            if min(ends) - now <= renew_before:
+                self._accept_renewal(lambda name=h['name']: self._accept('renew_agent', None, name))
         # the RGW certificates: the ones the daemons name and the ones they serve
         rgw = (cluster or {}).get('rgw') or {}
         certs = {c['id']: c for c in rgw.get('certs') or []}
@@ -1525,6 +1534,46 @@ class Module(orchestrator.Orchestrator, MgrModule):
         if isinstance(res, tuple):
             return HandleCommandResult(*res)
         return res
+
+    @TalosCLICommand.Write('orch talos agent upgrade')
+    def _agent_upgrade(self, image: Optional[str] = None, resume: bool = False) -> HandleCommandResult:
+        """Upgrade every agent to an image the operator approved, one host at a time; or resume a paused upgrade"""
+        try:
+            return HandleCommandResult(stdout=self._accept_agent_upgrade(image, resume))
+        except OrchestratorError as e:
+            return HandleCommandResult(retval=-22, stderr=str(e))
+
+    def _accept_agent_upgrade(self, image: Optional[str], resume: bool) -> str:
+        """An agent upgrade (plan 04, step 2): by digest, approved, from the agent
+        image's repository; no other agent or Ceph upgrade unfinished."""
+        self._settle()
+        led, fold = self._authority()
+        running = None
+        for _, e in led.executable():
+            if e['kind'] in ('upgrade_agent', 'upgrade_start'):
+                rec = self._journal(e['id'])
+                if rec is None or rec.get('state') not in TERMINAL:
+                    running = e
+        if resume:
+            if image or running is None or running['kind'] != 'upgrade_agent':
+                raise OrchestratorError('--resume takes no image, and needs an agent upgrade in progress')
+            op = self._accept_cluster('upgrade_agent_resume', upgrade=running['id'])
+            return 'Scheduled to resume agent upgrade %s (operation %s)' % (running['id'], op)
+        if running is not None:
+            raise OrchestratorError('operation %s (%s) is in progress' % (running['id'], running['kind']))
+        if not isinstance(image, str) or not ledger.IMAGE_RE.match(image):
+            raise OrchestratorError('name the image by its digest: <repository>@sha256:<hex>')
+        entries = self.get_store_prefix(STORE_PREFIX)
+        cluster, _ = record_from_store(entries, choose_incarnation(entries, getattr(self, '_gid', None)), 'cluster')
+        current = ((cluster or {}).get('agent') or {}).get('image') or ''
+        if image.split('@')[0] != current.split('@')[0]:
+            raise OrchestratorError('the agents run images of %s' % current.split('@')[0])
+        if image == current:
+            raise OrchestratorError('the agents run %s already' % image)
+        if image not in self._approved_images():
+            raise OrchestratorError('the operator has not approved %s (cephadm-talos approve --image)' % image)
+        op = self._accept_cluster('upgrade_agent', image=image)
+        return 'Scheduled to upgrade the agents to %s (operation %s)' % (image, op)
 
     @TalosCLICommand.Read('orch talos operation')
     def _operation(self, id: str) -> HandleCommandResult:

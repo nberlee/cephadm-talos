@@ -344,6 +344,36 @@ class MgrRenewalFoldTest(unittest.TestCase):
         lg.check_entry(k, json.dumps(e))
 
 
+class AgentRenewalFoldTest(unittest.TestCase):
+    """An agent's renewed keys (plan 04, step 2), and the agents' upgrade kinds."""
+
+    def test_renewals_and_kinds(self):
+        inv = {'hosts': [{'name': 'h1', 'addr': '10.0.0.1'}], 'daemons': []}
+        r1 = entry(5, 1, 'op-%016x' % 1, kind='renew_agent', host='h1')
+        c1 = entry(5, 2, 'm-%016x' % 2, kind='agent_cert', of='op-%016x' % 1, host='h1', attempt='ab' * 8)
+        d1 = entry(5, 3, 'm-%016x' % 3, kind='agent_cert_done', of='op-%016x' % 1, host='h1', keep='op-%016x' % 1)
+        r2 = entry(5, 4, 'op-%016x' % 4, kind='renew_agent', host='h1')
+        c2 = entry(5, 5, 'm-%016x' % 5, kind='agent_cert', of='op-%016x' % 4, host='h1', attempt='cd' * 8)
+        d2 = entry(5, 6, 'm-%016x' % 6, kind='agent_cert_done', of='op-%016x' % 4, host='h1', keep='op-%016x' % 4)
+        up = entry(5, 7, 'op-%016x' % 7, kind='upgrade_agent', image='registry/agent@sha256:' + 'ab' * 32)
+        res = entry(5, 8, 'op-%016x' % 8, kind='upgrade_agent_resume', upgrade='op-%016x' % 7)
+        for k, e in (r1, c1, d1, r2, c2, d2, up, res):
+            lg.check_entry(k, json.dumps(e))
+        self.assertFalse(lg.Fold(inv, [r1]).agent_keys_allowed('op-%016x' % 1))  # not issued yet
+        f = lg.Fold(inv, [r1, c1, d1, r2, c2])
+        self.assertTrue(f.agent_keys_allowed('op-%016x' % 1) and f.agent_keys_allowed('op-%016x' % 4))
+        self.assertIn('cli/h1', f.agent_retired)
+        f = lg.Fold(inv, [r1, c1, d1, r2, c2, d2])
+        self.assertFalse(f.agent_keys_allowed('op-%016x' % 1))
+        self.assertTrue(f.agent_keys_allowed('op-%016x' % 4))
+        for bad in (dict(kind='renew_agent', host='h1', daemon='mgr.h1'), dict(kind='renew_agent'),
+                    dict(kind='upgrade_agent', image='registry/agent:latest'), dict(kind='upgrade_agent', image='r@sha256:' + 'ab' * 32, host='h1'),
+                    dict(kind='upgrade_agent_resume', upgrade='x')):
+            k, e = entry(5, 9, 'op-%016x' % 9, **bad)
+            with self.assertRaises(lg.LedgerError, msg=bad):
+                lg.check_entry(k, json.dumps(e))
+
+
 class IngressFoldTest(unittest.TestCase):
     IMG = 'quay.io/ceph/keepalived@sha256:' + 'cd' * 32
 

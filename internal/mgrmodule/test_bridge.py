@@ -824,6 +824,25 @@ class LedgerCallsTest(unittest.TestCase):
             op['daemon'] = daemon
         return self.led.append(op)[1]['id']
 
+    def test_an_agent_renewal(self):
+        """plan 04, step 2: an agent's certificates once per renewal, its keys
+        released for it, the CLI's agent keys deleted by its done."""
+        from cryptography import x509
+        self.mons.kv[b.SECRET_PREFIX + 'host/h1/agent-server.key'] = 'old'
+        self.assertEqual(self.call('agent cert', operation=self.accept('restart', 'mgr.h1', 'h1'))[0], 400)
+        r = self.accept('renew_agent', None, 'h1')
+        out = json.loads(self.call('agent cert', operation=r)[1]['out'])
+        self.assertEqual(json.loads(self.call('agent cert', operation=r)[1]['out']), out)
+        srv = x509.load_pem_x509_certificate(out['server_cert'].encode())
+        san = srv.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+        self.assertEqual(san.get_values_for_type(x509.UniformResourceIdentifier), ['cephadm-talos://f1/agent/h1'])
+        name = 'issued/%s/%s/agent-server.key' % (r, out['attempt'])
+        self.assertEqual(self.call('secret get', name=name)[1]['outcome'], 'done')
+        self.assertEqual(self.call('secret get', name='host/h1/agent-server.key')[0], 400)  # never the CLI's agent keys
+        self.assertEqual(self.call('agent cert done', operation=r)[1]['outcome'], 'done')
+        self.assertNotIn(b.SECRET_PREFIX + 'host/h1/agent-server.key', self.mons.kv)
+        self.assertEqual(self.call('secret get', name=name)[1]['outcome'], 'done')
+
     def test_a_mgr_renewal(self):
         """plan 04, step 1: issued once per renewal, the keys released until a
         later done retires them, the CLI's host keys deleted by the first done."""

@@ -29,12 +29,14 @@ OP_RE = re.compile(r'\Aop-[0-9a-f]{16}\Z')
 KINDS = ('restart', 'redeploy', 'add_daemon', 'remove_daemon', 'remove_host', 'create_osd', 'remove_osd', 'enter_maintenance', 'exit_maintenance', 'powercycle_host',
          'upgrade_start', 'upgrade_pause', 'upgrade_resume', 'upgrade_stop', 'apply_ingress', 'add_host',
          # renewals the module accepts by itself (plan 04, step 1)
-         'renew_mgr', 'renew_rgw_cert')
+         'renew_mgr', 'renew_rgw_cert',
+         # an agent's certificates and the agents' image (plan 04, step 2)
+         'renew_agent', 'upgrade_agent', 'upgrade_agent_resume')
 # the upgrade's kinds, operations and module entries: about the cluster, without a host
 UPGRADE_CONTROLS = ('upgrade_pause', 'upgrade_resume', 'upgrade_stop')
 UPGRADE_KINDS = ('upgrade_start',) + UPGRADE_CONTROLS + ('upgrade_done', 'upgrade_refused')
 # entries about the cluster, without a host: the upgrade's and the RGW certificates'
-HOSTLESS = UPGRADE_KINDS + ('rgw_cert', 'rgw_cert_done', 'apply_ingress', 'renew_rgw_cert')
+HOSTLESS = UPGRADE_KINDS + ('rgw_cert', 'rgw_cert_done', 'apply_ingress', 'renew_rgw_cert', 'upgrade_agent', 'upgrade_agent_resume')
 VIP_RE = re.compile(r'\A(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}/(?:3[0-2]|[12]?\d)\Z')
 IMAGE_RE = re.compile(r'\A[a-z0-9][a-z0-9._/:-]{0,254}@sha256:[0-9a-f]{64}\Z')
 # kinds that are about a whole host: every other operation on it waits for them
@@ -46,7 +48,7 @@ STOPS, STARTS = ('enter_maintenance', 'powercycle_host'), ('exit_maintenance', '
 # the module's own entries (ids m-<hex>), which carry out a removal: close a
 # daemon's generation, retire the daemon, retire a host; end a host's maintenance
 MODULE_KINDS = ('close', 'retire', 'retire_host', 'bind', 'confirm', 'close_create', 'drained', 'maintained', 'upgrade_done', 'upgrade_refused',
-                'rgw_cert', 'rgw_cert_done', 'mgr_cert', 'mgr_cert_done')
+                'rgw_cert', 'rgw_cert_done', 'mgr_cert', 'mgr_cert_done', 'agent_cert', 'agent_cert_done')
 # an RGW serving certificate's id (internal/state RGWCert): generated, the operator's, the CLI's
 RGW_CERT_RE = re.compile(r'\A(?:issued/op-[0-9a-f]{16}/[0-9a-f]{16}|user/op-[0-9a-f]{16}|cli)\Z')
 DEVICE_RE = re.compile(r'\A/dev/[A-Za-z0-9][A-Za-z0-9._:/-]{0,200}\Z')
@@ -122,6 +124,13 @@ def check_entry(key: str, raw: str) -> Dict[str, Any]:
             raise LedgerError('mgr_cert entry %s' % key)
         if kind == 'mgr_cert_done' and not (isinstance(e.get('keep'), str) and OP_RE.match(e['keep'])):
             raise LedgerError('mgr_cert_done entry %s' % key)
+        # a renewed agent's certificates, as a mgr's but by host
+        if kind in ('agent_cert', 'agent_cert_done') and daemon is not None:
+            raise LedgerError('%s entry %s' % (kind, key))
+        if kind == 'agent_cert' and not (isinstance(e.get('attempt'), str) and re.match(r'\A[0-9a-f]{16}\Z', e['attempt'])):
+            raise LedgerError('agent_cert entry %s' % key)
+        if kind == 'agent_cert_done' and not (isinstance(e.get('keep'), str) and OP_RE.match(e['keep'])):
+            raise LedgerError('agent_cert_done entry %s' % key)
         return e
     if kind not in KINDS or (e.get('request') is not None and not (isinstance(e['request'], str) and UUID_RE.match(e['request']))):
         raise LedgerError('operation entry %s' % key)
@@ -146,6 +155,20 @@ def check_entry(key: str, raw: str) -> Dict[str, Any]:
         return e
     if kind == 'renew_rgw_cert':
         if daemon is not None or set(e) - {'version', 'id', 'kind', 'gid', 'epoch', 'seq'}:
+            raise LedgerError('operation entry %s' % key)
+        return e
+    if kind == 'renew_agent':
+        if daemon is not None or set(e) - {'version', 'id', 'kind', 'host', 'gid', 'epoch', 'seq'}:
+            raise LedgerError('operation entry %s' % key)
+        return e
+    if kind == 'upgrade_agent':
+        if daemon is not None or not isinstance(e.get('image'), str) or not IMAGE_RE.match(e['image']) \
+                or set(e) - {'version', 'id', 'kind', 'image', 'gid', 'epoch', 'seq', 'request', 'inputs'}:
+            raise LedgerError('operation entry %s' % key)
+        return e
+    if kind == 'upgrade_agent_resume':
+        if daemon is not None or not isinstance(e.get('upgrade'), str) or not OP_RE.match(e['upgrade']) \
+                or set(e) - {'version', 'id', 'kind', 'upgrade', 'gid', 'epoch', 'seq', 'request', 'inputs'}:
             raise LedgerError('operation entry %s' % key)
         return e
     if kind == 'renew_mgr':
@@ -270,6 +293,13 @@ class Fold:
         # CLI's (by host) or a renewal's, by a later mgr_cert_done
         self.mgr_renewals: Dict[str, Dict[str, Optional[str]]] = {}
         self.mgr_retired: Set[str] = set()
+        # an agent's renewals (by host: op id -> attempt) and the retired ones;
+        # 'cli/<host>' for the CLI's agent keys
+        self.agent_renewals: Dict[str, Dict[str, Optional[str]]] = {}
+        self.agent_retired: Set[str] = set()
+        # the agents' upgrade in progress: its operation, until the leader's
+        # state says it ended (the fold sees its acceptance only)
+        self.agent_upgrade: Optional[str] = None
         # the CLI's RGW settings, and the ingress VIP (address without prefix)
         self.cli_rgw: Dict[str, Any] = inventory.get('cli_rgw') or {}
         self.vip: Optional[str] = (self.cli_rgw.get('vip') or '').split('/')[0] or None
@@ -330,6 +360,15 @@ class Fold:
                 gen = self.open_generation(e['daemon'])
                 self.mgr_retired.update(o for o in self.mgr_renewals[e['daemon']] if o != e['keep'])
                 self.mgr_retired.add(gen if gen != 'cli' else 'cli/' + e['host'])
+            elif kind == 'renew_agent' and e['host'] in self.hosts:
+                self.agent_renewals.setdefault(e['host'], {})[e['id']] = None
+            elif kind == 'agent_cert' and e['of'] in self.agent_renewals.get(e['host'], {}):
+                self.agent_renewals[e['host']][e['of']] = e['attempt']
+            elif kind == 'agent_cert_done' and e['keep'] in self.agent_renewals.get(e['host'], {}) and e['keep'] not in self.agent_retired:
+                self.agent_retired.update(o for o in self.agent_renewals[e['host']] if o != e['keep'])
+                self.agent_retired.add('cli/' + e['host'])
+            elif kind == 'upgrade_agent':
+                self.agent_upgrade = e['id']
             elif kind == 'apply_ingress':
                 self.ingress = {'vip': e['vip'], 'vrid': e['vrid'], 'op': e['id'], 'hosts': list(e['hosts'])}
                 self.vip = e['vip'].split('/')[0]
@@ -395,6 +434,11 @@ class Fold:
             if gen is not None and (gen == op or op in self.mgr_renewals.get(n, {})):
                 return True
         return False
+
+    def agent_keys_allowed(self, op: str) -> bool:
+        """Whether an agent's issued keys of a renewal may be released: a renewal
+        of a host in the fold, issued, not retired."""
+        return op not in self.agent_retired and any(self.agent_renewals.get(h, {}).get(op) for h in self.hosts)
 
     def secret_allowed(self, name: str, host: Optional[str]) -> bool:
         """Whether `secret get` may release a secret (host for a host's keys)."""

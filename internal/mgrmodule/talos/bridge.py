@@ -273,7 +273,8 @@ SECRET_PREFIX = 'cephadm-talos/secrets/'
 SECRET_RE = re.compile(r'\A(?:host/([A-Za-z0-9][A-Za-z0-9._-]{0,127})/mgr-(?:server|client)\.key|rgw/server\.key|rgw/vrrp'
                        r'|issued/(op-[0-9a-f]{16})/[0-9a-f]{16}/mgr-(?:server|client)\.key'
                        r'|(?:issued/op-[0-9a-f]{16}/[0-9a-f]{16}|user/op-[0-9a-f]{16})/rgw-server\.key'
-                       r'|ingress/op-[0-9a-f]{16}/vrrp)\Z')
+                       r'|ingress/op-[0-9a-f]{16}/vrrp'
+                       r'|issued/(op-[0-9a-f]{16})/[0-9a-f]{16}/agent-(?:server|client)\.key)\Z')
 
 
 def _secret_get(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -359,7 +360,7 @@ READ_PREFIXES = {'auth get', 'config get', 'config-key get', 'config-key ls', 'm
 # calls the module answers itself, for operations of its ledger (ledger.py)
 LOCAL = {'mgr cert', 'retire', 'retire host', 'bind disk', 'confirm osd', 'close create', 'osd out', 'drain', 'mon rm',
          'ok to stop', 'noout set', 'noout unset', 'maintained', 'mgr fail', 'ok to stop daemon', 'upgrade done', 'upgrade refused',
-         'rgw cert', 'rgw cert done', 'retire keepalived', 'mgr cert done'}
+         'rgw cert', 'rgw cert done', 'retire keepalived', 'mgr cert done', 'agent cert', 'agent cert done'}
 
 ALLOWLIST: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     'status': _no_args('status'),
@@ -377,6 +378,8 @@ ALLOWLIST: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     'approval': _approval,
     'mgr cert': _operation,
     'mgr cert done': _operation,
+    'agent cert': _operation,
+    'agent cert done': _operation,
     'bind disk': _operation_with('serial', 'link', 'job'),
     'confirm osd': _operation_with('osd'),
     'close create': _operation,
@@ -400,10 +403,11 @@ ALLOWLIST: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
 }
 
 
-def issue_mgr_certs(ca_cert_pem: bytes, ca_key_pem: bytes, fsid: str, host: str, addr: str) -> Dict[str, str]:
-    """A mgr's server certificate (for its host's address and name) and client
-    certificate, as internal/pki issues them: P-256, 3 years, the identity
-    cephadm-talos://<fsid>/mgr/<host> as URI SAN, one extended key usage each."""
+def issue_mgr_certs(ca_cert_pem: bytes, ca_key_pem: bytes, fsid: str, host: str, addr: str, of: str = 'mgr') -> Dict[str, str]:
+    """A mgr's (or with of 'agent' an agent's) server certificate (for its
+    host's address and name) and client certificate, as internal/pki issues
+    them: P-256, 3 years, the identity cephadm-talos://<fsid>/<of>/<host> as
+    URI SAN, one extended key usage each."""
     import datetime
     import ipaddress
     from cryptography import x509
@@ -414,11 +418,11 @@ def issue_mgr_certs(ca_cert_pem: bytes, ca_key_pem: bytes, fsid: str, host: str,
     out: Dict[str, str] = {}
     for role, usage in (('server', ExtendedKeyUsageOID.SERVER_AUTH), ('client', ExtendedKeyUsageOID.CLIENT_AUTH)):
         key = ec.generate_private_key(ec.SECP256R1())
-        sans: List[x509.GeneralName] = [x509.UniformResourceIdentifier('cephadm-talos://%s/mgr/%s' % (fsid, host))]
+        sans: List[x509.GeneralName] = [x509.UniformResourceIdentifier('cephadm-talos://%s/%s/%s' % (fsid, of, host))]
         if role == 'server':
             sans += [x509.DNSName(host), x509.IPAddress(ipaddress.ip_address(addr))]
         b = (x509.CertificateBuilder()
-             .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, 'mgr ' + host)]))
+             .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, of + ' ' + host)]))
              .issuer_name(ca.subject).public_key(key.public_key()).serial_number(x509.random_serial_number())
              .not_valid_before(now - datetime.timedelta(hours=1)).not_valid_after(now + datetime.timedelta(days=3 * 365))
              .add_extension(x509.KeyUsage(digital_signature=True, content_commitment=False, key_encipherment=False, data_encipherment=False,
@@ -825,7 +829,8 @@ class Channel:
                 return 200, self._ledger_page(led, args['after'])
             if call == 'secret get':
                 m = SECRET_RE.match(args['name'])
-                allowed = fold.secret_allowed(args['name'], m.group(1)) if m.group(2) is None else fold.mgr_keys_allowed(m.group(2))
+                allowed = fold.agent_keys_allowed(m.group(3)) if m.group(3) is not None else \
+                    fold.secret_allowed(args['name'], m.group(1)) if m.group(2) is None else fold.mgr_keys_allowed(m.group(2))
             elif call == 'auth get-or-create':
                 allowed = True  # checked with its operation under the lock retirement takes (create)
             elif args['entity'] == 'client.bootstrap-osd':
@@ -1032,6 +1037,10 @@ class Channel:
                     return self._rgw_cert(led, fold, op)
                 if call == 'retire keepalived':
                     return self._retire_keepalived(led, fold, ops, op, (args or {}).get('daemon'))
+                if call == 'agent cert':
+                    return self._agent_cert(led, fold, op)
+                if call == 'agent cert done':
+                    return self._agent_cert_done(led, fold, op)
                 if call == 'mgr cert done':
                     return self._mgr_cert_done(led, fold, op)
                 if call == 'rgw cert done':
@@ -1120,6 +1129,61 @@ class Channel:
                 rm = self._mon({'prefix': 'config-key rm', 'key': k}, name)
                 if rm is None or rm.r not in (0, -2):
                     return 503, {'error': 'cannot remove a key of %s; ask again' % name}
+        return 200, {'outcome': 'done', 'r': 0, 'out': '', 'outs': ''}
+
+    def _agent_cert(self, led: Any, fold: Any, op: Optional[Dict[str, Any]]) -> Tuple[int, Dict[str, Any]]:
+        """A renewal's agent certificates (plan 04, step 2): as a mgr renewal's,
+        issued once per renewal with a module entry, kept beside the keys."""
+        if op is None or op['kind'] != 'renew_agent' or op['id'] not in fold.agent_renewals.get(op['host'], {}) or op['host'] not in fold.hosts:
+            return 400, {'error': 'no renewal of an agent of a host in the cluster'}
+        host = op['host']
+        attempt = fold.agent_renewals[host][op['id']]
+        if attempt is None:
+            job = self._mon({'prefix': 'config-key get', 'key': SECRET_PREFIX + 'agent-ca.key'})
+            if job is None or job.r != 0 or not self.ca_cert:
+                return 503, {'error': 'the agent CA is not available'}
+            certs = issue_mgr_certs(self.ca_cert, job.outb.encode(), self.fsid, host, fold.hosts[host], 'agent')
+            attempt = secrets.token_hex(8)
+            for item in ('server_key', 'client_key', 'server_cert', 'client_cert'):
+                role, kind = item.split('_')
+                key = '%sissued/%s/%s/agent-%s.%s' % (SECRET_PREFIX, op['id'], attempt, role, 'key' if kind == 'key' else 'crt')
+                w = self._mon({'prefix': 'config-key set', 'key': key, 'val': certs[item]})
+                if w is None or w.r != 0:
+                    return 503, {'error': 'the certificates of attempt %s were not written; ask again' % attempt}
+            led.append({'id': 'm-' + secrets.token_hex(8), 'kind': 'agent_cert', 'of': op['id'], 'host': host, 'attempt': attempt})
+        out = {'attempt': attempt}
+        for role in ('server', 'client'):
+            job = self._mon({'prefix': 'config-key get', 'key': '%sissued/%s/%s/agent-%s.crt' % (SECRET_PREFIX, op['id'], attempt, role)})
+            if job is None or job.r != 0:
+                return 503, {'error': 'the certificates of attempt %s cannot be read; ask again' % attempt}
+            out[role + '_cert'] = job.outb
+        return 200, {'outcome': 'done', 'r': 0, 'out': json.dumps(out), 'outs': ''}
+
+    def _agent_cert_done(self, led: Any, fold: Any, op: Optional[Dict[str, Any]]) -> Tuple[int, Dict[str, Any]]:
+        """An agent renewal's end, as a mgr renewal's: the host's other agent
+        keys are retired by a module entry, then only what the fold retired is
+        deleted; a renewal a later one retired changes nothing."""
+        if op is None or op['kind'] != 'renew_agent' or op['id'] not in fold.agent_renewals.get(op['host'], {}):
+            return 400, {'error': 'no renewal of an agent of a host in the cluster'}
+        host = op['host']
+        if fold.agent_renewals[host][op['id']] is None:
+            return 400, {'error': 'the renewal issued no certificates'}
+        if op['id'] in fold.agent_retired:
+            return 200, {'outcome': 'done', 'r': 0, 'out': '', 'outs': ''}
+        if not any(e['kind'] == 'agent_cert_done' and e['of'] == op['id'] for _, e in led.executable()):
+            led.append({'id': 'm-' + secrets.token_hex(8), 'kind': 'agent_cert_done', 'of': op['id'], 'host': host, 'keep': op['id']})
+        _, after = self.authority()
+        old = ['%sissued/%s/' % (SECRET_PREFIX, o) for o in after.agent_renewals.get(host, {}) if o in after.agent_retired]
+        if 'cli/' + host in after.agent_retired:
+            old += ['%shost/%s/agent-server.key' % (SECRET_PREFIX, host), '%shost/%s/agent-client.key' % (SECRET_PREFIX, host)]
+        keys = self._mon({'prefix': 'config-key ls'}, None, lambda out: json.dumps([k for k in json.loads(out) if any(k.startswith(p) for p in old)]))
+        if keys is None or keys.r != 0 or keys.too_large:
+            return 503, {'error': 'cannot list the secrets; ask again'}
+        for k in json.loads(keys.outb):
+            if any(k.startswith(p) for p in old):
+                rm = self._mon({'prefix': 'config-key rm', 'key': k})
+                if rm is None or rm.r not in (0, -2):
+                    return 503, {'error': 'cannot remove a key of the agent of %s; ask again' % host}
         return 200, {'outcome': 'done', 'r': 0, 'out': '', 'outs': ''}
 
     def _retire(self, led: Any, fold: Any, ops: Dict[str, Dict[str, Any]], op: Optional[Dict[str, Any]]) -> Tuple[int, Dict[str, Any]]:

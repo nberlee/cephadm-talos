@@ -699,6 +699,49 @@ class CertCheck(unittest.TestCase):
         self.assertEqual(self.health['now']['TALOS_RGW_CERT_EXPIRING']['count'], 1)
 
 
+class AgentRenewalAndUpgrade(unittest.TestCase):
+    """plan 04, step 2: agents' certificates in the daily check; the agent upgrade command."""
+    IMG = 'registry/agent@sha256:' + 'ab' * 32
+
+    def module(self, approved=()):
+        hosts = [{'name': 'h1', 'addr': '10.0.0.1', 'agent_cert': cert_until(10), 'agent_client_cert': cert_until(1000)},
+                 {'name': 'h2', 'addr': '10.0.0.2', 'agent_cert': cert_until(1000), 'agent_client_cert': cert_until(1000)}]
+        mod, entries = Acceptance.module(self)
+        entries.update(state_entries(inventory(), {'fsid': 'f', 'sealed': True, 'agent': {'image': 'registry/agent@sha256:' + 'cd' * 32}},
+                                     hosts=hosts, daemons=[]))
+        mod.get_mgr_id = lambda: 'h2'
+        mod._rgw_port = lambda: None
+        mod.get_module_option = lambda name: None
+        mod.set_health_checks = lambda checks: None
+        mod.mon_command = lambda cmd: (-2, '', '')
+        mod._approved_images = lambda: list(approved)
+        import logging
+        mod._logger = logging.getLogger('test')
+        return mod, entries
+
+    def test_the_daily_check_renews_an_agent(self):
+        mod, _ = self.module()
+        m.Module._check_certs(mod)
+        self.assertEqual([(e['kind'], e['host']) for _, e in mod._ledger.executable()], [('renew_agent', 'h1')])
+
+    def test_the_upgrade_command(self):
+        mod, entries = self.module()
+        for image in ('registry/agent:latest', 'other/agent@sha256:' + 'ab' * 32, 'registry/agent@sha256:' + 'cd' * 32, self.IMG):
+            res = m.Module._agent_upgrade(mod, image)
+            self.assertNotEqual(res.retval, 0, image)  # tag, repository, current, not approved
+        mod._approved_images = lambda: [self.IMG]
+        res = m.Module._agent_upgrade(mod, self.IMG)
+        self.assertEqual(res.retval, 0, res.stderr)
+        [(_, up)] = mod._ledger.executable()
+        self.assertEqual((up['kind'], up['image']), ('upgrade_agent', self.IMG))
+        self.assertNotEqual(m.Module._agent_upgrade(mod, self.IMG).retval, 0)  # one at a time
+        res = m.Module._agent_upgrade(mod, None, True)
+        self.assertEqual(res.retval, 0, res.stderr)
+        self.assertEqual(mod._ledger.executable()[-1][1]['upgrade'], up['id'])
+        entries['talos/inc/20/journal/op/' + up['id']] = json.dumps({'state': 'completed'})
+        self.assertNotEqual(m.Module._agent_upgrade(mod, None, True).retval, 0)  # nothing to resume
+
+
 class AddAndRemove(unittest.TestCase):
     def module(self, inv=None):
         mod, entries = Acceptance.module(self, inv=inv)
