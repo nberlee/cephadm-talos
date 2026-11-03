@@ -1,6 +1,6 @@
 # Capability matrix
 
-What cephadm-talos provides of the Ceph orchestrator interface, for Ceph v20.2.4 (tag `v20.2.4`, commit `7f793731f1b39eb4f465e960113d2363c311b964`). Status is `implemented`, `milestone N` (planned in that [roadmap](../ROADMAP.md) milestone) or `unsupported`. The `implemented` rows are the read path of [plan 02](plans/02-agents-and-read-path.md): a mgr module installed as `cephadm` (Ceph accepts only `cephadm`, `rook` and `test_orchestrator` as backend), fed by the cephadm-talos agents. Everything else still goes through the cephadm-talos CLI.
+What cephadm-talos provides of the Ceph orchestrator interface, for Ceph v20.2.4 (tag `v20.2.4`, commit `7f793731f1b39eb4f465e960113d2363c311b964`). Status is `implemented`, `milestone N` (planned in that [roadmap](../ROADMAP.md) milestone) or `unsupported`. The `implemented` rows are the read path of [plan 02](plans/02-agents-and-read-path.md) and the write path of [plan 03](plans/03-write-path.md): a mgr module installed as `cephadm` (Ceph accepts only `cephadm`, `rook` and `test_orchestrator` as backend), with the leader in the active mgr's cephadm-talos agent carrying the operations out. A note on an `implemented` row names what of it is supported; anything else of that command is refused. [docs/architecture.md](architecture.md) ("The ledger") lists every accepted form.
 
 The first four sections are checked against the Ceph source by `hack/capabilities.py <ceph source>`; the last two are maintained by hand.
 
@@ -8,10 +8,10 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 
 | Name | Status | Note |
 |---|---|---|
-| `add_daemon` | milestone 5 |  |
-| `add_host` | milestone 5 |  |
+| `add_daemon` | implemented | write path (plan 03): mon and mgr on a host; rgw `default`, one per host, with a port and the operator's certificate; no other service |
+| `add_host` | implemented | write path (plan 03): a node the CLI enrolled (`cephadm-talos host add`), with labels stored only |
 | `add_host_label` | milestone 5 |  |
-| `apply` | milestone 5 |  |
+| `apply` | implemented | write path (plan 03): one keepalived-only ingress (`apply -i`), and host specs of enrolled nodes (to `add_host`); no other service spec |
 | `apply_alertmanager` | milestone 5 |  |
 | `apply_ceph_exporter` | milestone 5 |  |
 | `apply_crash` | milestone 5 |  |
@@ -50,12 +50,12 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `cert_store_set_cert` | milestone 5 |  |
 | `cert_store_set_key` | milestone 5 |  |
 | `cert_store_set_pair` | milestone 5 |  |
-| `create_osds` | milestone 5 |  |
-| `daemon_action` | milestone 5 |  |
+| `create_osds` | implemented | write path (plan 03): one disk on one host, nothing else of a drive group; the disk approved by the operator |
+| `daemon_action` | implemented | write path (plan 03): restart and redeploy (without an image); not start, stop, reconfig or rotate-key |
 | `describe_service` | milestone 5 |  |
 | `drain_host` | milestone 5 |  |
-| `enter_host_maintenance` | milestone 5 |  |
-| `exit_host_maintenance` | milestone 5 |  |
+| `enter_host_maintenance` | implemented | write path (plan 03): with `--force`; not with `--yes-i-really-mean-it` |
+| `exit_host_maintenance` | implemented | write path (plan 03): not with `--force` or `--offline` |
 | `generate_certificates` | milestone 5 |  |
 | `get_alertmanager_access_info` | milestone 5 |  |
 | `get_facts` | milestone 5 |  |
@@ -65,7 +65,7 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `get_prometheus_access_info` | milestone 5 |  |
 | `get_security_config` | milestone 5 |  |
 | `hardware_light` | milestone 5 | to validate on Talos (node-proxy talks to the BMC over Redfish) |
-| `hardware_powercycle` | milestone 5 | to validate on Talos (node-proxy talks to the BMC over Redfish) |
+| `hardware_powercycle` | implemented | write path (plan 03): maintenance enter, a Talos reboot, maintenance exit; no BMC |
 | `hardware_shutdown` | milestone 5 | to validate on Talos (node-proxy talks to the BMC over Redfish) |
 | `hardware_status` | milestone 5 | to validate on Talos (node-proxy talks to the BMC over Redfish) |
 | `host_ok_to_stop` | milestone 5 |  |
@@ -80,11 +80,11 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `pause` | milestone 5 |  |
 | `plan` | milestone 5 |  |
 | `preview_osdspecs` | milestone 5 |  |
-| `remove_daemons` | milestone 5 |  |
-| `remove_host` | milestone 5 |  |
+| `remove_daemons` | implemented | write path (plan 03): mons, mgrs and RGWs (not the active mgr, not the last mon or mgr) |
+| `remove_host` | implemented | write path (plan 03): a host without daemons that does not run the active mgr; not `--offline` or `--rm-crush-entry` |
 | `remove_host_label` | milestone 5 |  |
-| `remove_osds` | milestone 5 |  |
-| `remove_osds_status` | milestone 5 |  |
+| `remove_osds` | implemented | write path (plan 03): with `--zap` and `--force`; not `--replace` or `--no-destroy` |
+| `remove_osds_status` | implemented | write path (plan 03): the phase, without PG counts |
 | `remove_prometheus_target` | milestone 5 |  |
 | `remove_service` | milestone 5 |  |
 | `replace_device` | milestone 5 |  |
@@ -111,11 +111,11 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `upgrade_available` | milestone 5 |  |
 | `upgrade_check` | milestone 5 |  |
 | `upgrade_ls` | milestone 5 |  |
-| `upgrade_pause` | milestone 5 |  |
-| `upgrade_resume` | milestone 5 |  |
-| `upgrade_start` | milestone 5 |  |
-| `upgrade_status` | milestone 5 |  |
-| `upgrade_stop` | milestone 5 |  |
+| `upgrade_pause` | implemented | write path (plan 03) |
+| `upgrade_resume` | implemented | write path (plan 03) |
+| `upgrade_start` | implemented | write path (plan 03): by digest, an image of the operator's approval, the cluster's repository; no other option |
+| `upgrade_status` | implemented | write path (plan 03): the upgrade with the leader's progress |
+| `upgrade_stop` | implemented | write path (plan 03) |
 | `zap_device` | milestone 5 |  |
 
 ## ceph orch commands
@@ -127,7 +127,7 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `orch` | milestone 5 | service action: start, stop, restart, redeploy, reconfig of a whole service |
 | `orch alertmanager get-credentials` | milestone 5 |  |
 | `orch alertmanager set-credentials` | milestone 5 |  |
-| `orch apply` | milestone 5 |  |
+| `orch apply` | implemented | write path (plan 03): `-i` with one keepalived-only ingress, or host specs of enrolled nodes |
 | `orch apply iscsi` | milestone 5 | to validate on Talos (configfs, kernel modules) |
 | `orch apply jaeger` | milestone 5 |  |
 | `orch apply mds` | milestone 5 |  |
@@ -156,39 +156,39 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `orch client-keyring ls` | milestone 5 |  |
 | `orch client-keyring rm` | milestone 5 |  |
 | `orch client-keyring set` | milestone 5 |  |
-| `orch daemon` | milestone 5 |  |
-| `orch daemon add` | milestone 5 |  |
+| `orch daemon` | implemented | write path (plan 03): `restart` and `redeploy` of one daemon |
+| `orch daemon add` | implemented | write path (plan 03): `mon` and `mgr` on a host; `-i` with an RGW spec carrying the operator's certificate |
 | `orch daemon add iscsi` | milestone 5 | to validate on Talos (configfs, kernel modules) |
 | `orch daemon add mds` | milestone 5 |  |
 | `orch daemon add nfs` | milestone 5 |  |
 | `orch daemon add nvmeof` | milestone 5 | needs draft 08 (memlock) |
-| `orch daemon add osd` | milestone 5 |  |
-| `orch daemon add rgw` | milestone 5 |  |
-| `orch daemon redeploy` | milestone 5 |  |
-| `orch daemon rm` | milestone 5 |  |
+| `orch daemon add osd` | implemented | write path (plan 03): `<host>:/dev/<disk>`, one disk |
+| `orch daemon add rgw` | implemented | write path (plan 03): `default <host> [--port N]` |
+| `orch daemon redeploy` | implemented | write path (plan 03): without `--image` |
+| `orch daemon rm` | implemented | write path (plan 03): mons, mgrs and RGWs |
 | `orch device ls` | milestone 5 |  |
 | `orch device replace` | milestone 5 |  |
 | `orch device zap` | milestone 5 |  |
 | `orch get-security-config` | milestone 5 |  |
 | `orch hardware light` | milestone 5 | to validate on Talos (node-proxy talks to the BMC over Redfish) |
-| `orch hardware powercycle` | milestone 5 | to validate on Talos (node-proxy talks to the BMC over Redfish) |
+| `orch hardware powercycle` | implemented | write path (plan 03): maintenance enter, a Talos reboot, maintenance exit; no BMC |
 | `orch hardware shutdown` | milestone 5 | to validate on Talos (node-proxy talks to the BMC over Redfish) |
 | `orch hardware status` | milestone 5 | to validate on Talos (node-proxy talks to the BMC over Redfish) |
-| `orch host add` | milestone 5 |  |
+| `orch host add` | implemented | write path (plan 03): a node the CLI enrolled |
 | `orch host drain` | milestone 5 |  |
 | `orch host drain stop` | milestone 5 |  |
 | `orch host label add` | milestone 5 |  |
 | `orch host label rm` | milestone 5 |  |
 | `orch host ls` | implemented | read path (plan 02): the talos mgr module, installed as `cephadm` |
-| `orch host maintenance enter` | milestone 5 |  |
-| `orch host maintenance exit` | milestone 5 |  |
+| `orch host maintenance enter` | implemented | write path (plan 03) |
+| `orch host maintenance exit` | implemented | write path (plan 03) |
 | `orch host ok-to-stop` | milestone 5 |  |
 | `orch host rescan` | milestone 5 |  |
-| `orch host rm` | milestone 5 |  |
+| `orch host rm` | implemented | write path (plan 03): a host without daemons |
 | `orch host set-addr` | milestone 5 |  |
 | `orch ls` | milestone 5 |  |
-| `orch osd rm` | milestone 5 |  |
-| `orch osd rm status` | milestone 5 |  |
+| `orch osd rm` | implemented | write path (plan 03): with `--zap` and `--force` |
+| `orch osd rm status` | implemented | write path (plan 03) |
 | `orch osd rm stop` | milestone 5 |  |
 | `orch osd set-spec-affinity` | milestone 5 |  |
 | `orch pause` | milestone 5 |  |
@@ -215,11 +215,11 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `orch update service` | milestone 5 |  |
 | `orch upgrade check` | milestone 5 |  |
 | `orch upgrade ls` | milestone 5 |  |
-| `orch upgrade pause` | milestone 5 |  |
-| `orch upgrade resume` | milestone 5 |  |
-| `orch upgrade start` | milestone 5 |  |
-| `orch upgrade status` | milestone 5 |  |
-| `orch upgrade stop` | milestone 5 |  |
+| `orch upgrade pause` | implemented | write path (plan 03) |
+| `orch upgrade resume` | implemented | write path (plan 03) |
+| `orch upgrade start` | implemented | write path (plan 03): `--image <repository>@sha256:<hex>` |
+| `orch upgrade status` | implemented | write path (plan 03) |
+| `orch upgrade stop` | implemented | write path (plan 03) |
 
 ## Service types
 
@@ -233,7 +233,7 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `crash` | milestone 5 |  |
 | `elasticsearch` | milestone 5 |  |
 | `grafana` | milestone 5 |  |
-| `ingress` | milestone 5 |  |
+| `ingress` | implemented | write path (plan 03): keepalived only, `rgw.default` in front of `rgw.default` |
 | `iscsi` | milestone 5 | to validate on Talos (configfs, kernel modules) |
 | `jaeger-agent` | milestone 5 |  |
 | `jaeger-collector` | milestone 5 |  |
@@ -361,24 +361,24 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `grafana.protocol` | milestone 5 |  |
 | `grafana.service_id` | milestone 5 |  |
 | `grafana.unmanaged` | milestone 5 |  |
-| `ingress.backend_service` | milestone 5 |  |
+| `ingress.backend_service` | implemented | write path (plan 03): `rgw.default` |
 | `ingress.config` | milestone 5 |  |
 | `ingress.custom_configs` | milestone 5 |  |
 | `ingress.enable_haproxy_protocol` | milestone 5 |  |
 | `ingress.enable_stats` | milestone 5 |  |
 | `ingress.extra_container_args` | milestone 5 |  |
 | `ingress.extra_entrypoint_args` | milestone 5 |  |
-| `ingress.first_virtual_router_id` | milestone 5 |  |
+| `ingress.first_virtual_router_id` | implemented | write path (plan 03) |
 | `ingress.frontend_port` | milestone 5 |  |
 | `ingress.health_check_interval` | milestone 5 |  |
-| `ingress.keepalive_only` | milestone 5 |  |
-| `ingress.keepalived_password` | milestone 5 |  |
+| `ingress.keepalive_only` | implemented | write path (plan 03): `true` |
+| `ingress.keepalived_password` | implemented | write path (plan 03): 1 to 8 letters and digits |
 | `ingress.monitor_password` | milestone 5 |  |
 | `ingress.monitor_port` | milestone 5 |  |
 | `ingress.monitor_user` | milestone 5 |  |
 | `ingress.networks` | milestone 5 |  |
-| `ingress.placement` | milestone 5 |  |
-| `ingress.service_id` | milestone 5 |  |
+| `ingress.placement` | implemented | write path (plan 03): 1 to 15 named hosts with an RGW |
+| `ingress.service_id` | implemented | write path (plan 03): `rgw.default` |
 | `ingress.ssl` | milestone 5 |  |
 | `ingress.ssl_cert` | milestone 5 |  |
 | `ingress.ssl_ciphers` | milestone 5 |  |
@@ -388,7 +388,7 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `ingress.unmanaged` | milestone 5 |  |
 | `ingress.use_keepalived_multicast` | milestone 5 |  |
 | `ingress.virtual_interface_networks` | milestone 5 |  |
-| `ingress.virtual_ip` | milestone 5 |  |
+| `ingress.virtual_ip` | implemented | write path (plan 03): one IPv4 address with its prefix length |
 | `ingress.virtual_ips_list` | milestone 5 |  |
 | `ingress.vrrp_interface_network` | milestone 5 |  |
 | `iscsi.api_password` | milestone 5 | to validate on Talos (configfs, kernel modules) |
@@ -745,8 +745,8 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `rgw.rgw_bucket_counters_cache_size` | milestone 5 |  |
 | `rgw.rgw_exit_timeout_secs` | milestone 5 |  |
 | `rgw.rgw_frontend_extra_args` | milestone 5 |  |
-| `rgw.rgw_frontend_port` | milestone 5 |  |
-| `rgw.rgw_frontend_ssl_certificate` | milestone 5 |  |
+| `rgw.rgw_frontend_port` | implemented | write path (plan 03): one port for every RGW |
+| `rgw.rgw_frontend_ssl_certificate` | implemented | write path (plan 03): the operator's certificate and key (`daemon add -i`) |
 | `rgw.rgw_frontend_type` | milestone 5 |  |
 | `rgw.rgw_realm` | milestone 5 |  |
 | `rgw.rgw_realm_token` | milestone 5 |  |
@@ -755,7 +755,7 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `rgw.rgw_zone` | milestone 5 |  |
 | `rgw.rgw_zonegroup` | milestone 5 |  |
 | `rgw.service_id` | milestone 5 |  |
-| `rgw.ssl` | milestone 5 |  |
+| `rgw.ssl` | implemented | write path (plan 03): an RGW always serves HTTPS; `ssl: false` does not turn TLS off |
 | `rgw.subcluster` | milestone 5 |  |
 | `rgw.unmanaged` | milestone 5 |  |
 | `rgw.update_endpoints` | milestone 5 |  |
@@ -814,22 +814,22 @@ The dashboard's orchestrator-backed pages (`src/pybind/mgr/dashboard/frontend/sr
 | Upgrade | milestone 5 | |
 | Expand cluster (create-cluster) | milestone 5 | |
 
-## PoC CLI commands
+## CLI commands
 
-What the PoC `cephadm-talos` CLI does today. These commands work but are not a `ceph orch` interface.
+What the `cephadm-talos` CLI does. Before the handoff it is the only writer and changes the cluster itself; after it (`handoff`), it refuses its own changes and the cluster is changed through `ceph orch`.
 
-| Command | Closest `ceph orch` command |
-|---|---|
-| `bootstrap` | `cephadm bootstrap` |
-| `host add`, `host ls`, `host rm` | `orch host add`, `orch host ls`, `orch host rm` |
-| `host maintenance enter`, `host maintenance exit` | `orch host maintenance enter`, `orch host maintenance exit` |
-| `host reboot` | none (maintenance enter, Talos reboot, maintenance exit) |
-| `deploy mon`, `deploy mgr`, `deploy osd`, `deploy rgw`, `deploy vip` | `orch daemon add` |
-| `ps`, `ls` | `orch ps` |
-| `logs` | `cephadm logs` |
-| `restart`, `redeploy` | `orch daemon restart`, `orch daemon redeploy` |
-| `rm` | `orch daemon rm`, `orch osd rm` |
-| `upgrade` | `orch upgrade start` |
-| `shell` | `cephadm shell` |
-| `rm-cluster` | `cephadm rm-cluster` |
-| `conf` | none (prints ceph.conf and the admin keyring) |
+| Command | After the handoff | Closest cephadm command |
+|---|---|---|
+| `bootstrap` | | `cephadm bootstrap` |
+| `handoff` | resumes an interrupted handoff | none (the agents take their nodes, the leader the state) |
+| `host add` | enrolls the node, then `orch host add` | `orch host add` |
+| `host ls` | yes | `orch host ls` |
+| `host rm`, `host maintenance enter`, `host maintenance exit`, `host reboot` | refused: `orch host rm`, `orch host maintenance`, `orch hardware powercycle` | `orch host rm`, `orch host maintenance enter`, `orch host maintenance exit` |
+| `deploy mon`, `deploy mgr`, `deploy osd`, `deploy rgw`, `deploy vip` | refused: `orch daemon add`, `orch apply -i` (ingress) | `orch daemon add`, `orch apply ingress` |
+| `restart`, `redeploy`, `rm`, `upgrade` | refused: `orch daemon restart`, `orch daemon redeploy`, `orch daemon rm`, `orch osd rm`, `orch upgrade start` | the same `orch` commands |
+| `ps`, `ls`, `logs`, `conf` | yes | `orch ps`, `cephadm logs` |
+| `shell` | yes, through exec into a mgr or mon container; without a mgr or the mons into a mon | `cephadm shell` |
+| `orch` | yes: a `ceph orch` command once per request uuid | none |
+| `approve` | yes: the operator's signed approval of images and disks | none |
+| `suspend`, `recover mons`, `resume` | yes: recovery after the handoff | none |
+| `rm-cluster` | yes, after suspending the agents | `cephadm rm-cluster` |

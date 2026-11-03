@@ -13,38 +13,39 @@ Also available as [SVG](demo/demo.svg) and as an [asciinema recording](demo/demo
 
 My main goal was to find out whether [Talos Linux](https://www.talos.dev) can replace the operating system of my dedicated Ceph cluster. That means Talos as an immutable, API-managed OS that runs Ceph directly, without Kubernetes and without Rook.
 
-cephadm-talos is a small Go CLI that mimics cephadm's orchestration on top of Talos. It covers bootstrap, adding hosts, deploying mon/mgr/OSD daemons, `ps`, `shell`, upgrade, removal and host maintenance.
+cephadm-talos is a cephadm clone for Talos: a Go CLI that bootstraps the cluster, an agent on every node, and a mgr module behind `ceph orch`. After bootstrap the CLI hands the cluster over, and from then on it is changed through `ceph orch`, as with cephadm: daemons, OSDs, hosts, maintenance, rolling upgrades, RGW and its keepalived ingress.
 
-There is no SSH, no systemd and no python on the hosts. Each Ceph daemon is a Talos `ContainerConfig` machine config document (Talos 1.15+), applied through the Talos API (the machinery Go client, no `talosctl`) in no-reboot mode, and run by Talos itself in the containerd namespace `taloscontainers`.
+There is no SSH, no systemd and no python on the hosts. Each Ceph daemon is a Talos `ContainerConfig` machine config document, applied through the Talos API (the machinery Go client, no `talosctl`) in no-reboot mode, and run by Talos itself in the containerd namespace `taloscontainers`. How the pieces talk to each other, and what each of them may do, is in [docs/architecture.md](docs/architecture.md).
 
-The demo above runs on 3 Talos v1.15.0-alpha.1 nodes created with `--skip-etcd-k8s`. There is no Kubernetes and no etcd: the machine config's `cluster:` section is empty. The pauses in the recording, mostly image pulls, are shortened.
+The demo above runs on 3 Talos v1.15.0-alpha.1 nodes created with `--skip-etcd-k8s`, with the CLI of the proof of concept. There is no Kubernetes and no etcd: the machine config's `cluster:` section is empty. The pauses in the recording, mostly image pulls, are shortened.
 
 ## Requirements
 
-- Talos **1.15** or newer on the nodes, amd64, and the latest Ceph release (today v20.2.4); see [docs/support.md](docs/support.md). cephadm-talos needs `ContainerConfig`, `EtcFileConfig` and container logs and restart in the `taloscontainers` namespace.
+- Talos nodes, amd64, built from the combined branch of our open Talos PRs until they are released, and the latest Ceph release (today v20.2.4); see [docs/support.md](docs/support.md). Workload isolation must be off until Talos PR #14603 is released.
+- The agent image in a registry the nodes can pull from (`hack/agent-image.sh` builds and pushes it).
 - A talosconfig for the nodes (`--talosconfig`, `$TALOSCONFIG` or `~/.talos/config`). `talosctl` itself is not needed.
 - Free raw disks on the nodes for OSDs. These must not be claimed by any Talos volume.
-- No Ceph tooling on your workstation. `ceph` commands run in short-lived job containers on the nodes (`cephadm-talos shell`).
+- No Ceph tooling on your workstation. `ceph` commands run through Talos exec in a Ceph container on the nodes (`cephadm-talos shell`), the admin keyring passed over stdin.
 
 ## How cephadm concepts map to Talos
 
 | cephadm | cephadm-talos |
 |---|---|
-| SSH + `cephadm` python binary on the host | machine config patches through the Talos API |
-| systemd unit `ceph-<fsid>@<daemon>` + `unit.run` | `ContainerConfig` `ceph-<fsid8>-<type>-<id>`, run by Talos in containerd namespace `taloscontainers` |
+| SSH + `cephadm` python binary on the host | machine config documents applied through the Talos API: by the CLI until the handoff, then only by each node's agent on its own node |
+| the cephadm mgr module (`ceph orch`) | a mgr module installed as `cephadm`: it accepts `ceph orch` commands into a ledger in config-key; the leader, in the active mgr's agent, carries them out by granting changes to the agents |
+| cephadm's host agent | `cephadm-talos agent`, one container per node with access to its own node's Talos API only; it applies what the leader grants, after a confirmation from the active mgr and checks against the operator's approval |
+| systemd unit `ceph-<fsid>@<daemon>` + `unit.run` | `ContainerConfig` `ceph-<fsid8>-<type>-<id>`, with a restart backoff and a stop timeout |
 | `/var/lib/ceph/<fsid>` | `UserVolumeConfig` `ceph` (`volumeType: directory`, `/var/mnt/ceph`), mounted at `/var/lib/ceph` |
 | `/etc/ceph/ceph.conf` written over SSH | `EtcFileConfig` `ceph/ceph.conf` |
-| keyring files written over SSH | base64 env var in the document, written to the daemon dir by the entrypoint |
-| `cephadm shell` / `cephadm ceph-volume` | `cephadm-talos shell`: a short-lived "job" `ContainerConfig`; its output is read from the container log, then the document is deleted |
-| `ceph orch ps` / `cephadm ls` | `cephadm-talos ps`: inventory + `ContainerStatus` resources |
-| `ceph orch daemon rm`, `ceph orch upgrade` | `cephadm-talos rm`, `cephadm-talos upgrade` |
-| `ceph orch host maintenance enter/exit` (`systemctl disable --now ceph-<fsid>.target`) | `cephadm-talos host maintenance enter/exit` (documents removed and re-applied, as Talos has no stop/disable) |
+| keyring files written over SSH | base64 env var in the daemon's document; mon auth is authoritative |
+| cluster state in the mon config-key store | the same: the cluster state is in config-key, published by the leader; the workstation keeps `ceph.conf`, the admin keyring and the nodes' contacts |
+| `cephadm shell` | `cephadm-talos shell`: exec into a running mgr or mon container |
+| `cephadm ceph-volume` | one-shot job containers (`restart: never`) with result files: OSD preparation, zap |
+| `ceph orch daemon add/rm`, `osd rm`, `host add/rm/maintenance`, `hardware powercycle`, `upgrade` | the same `ceph orch` commands, a subset of their options ([capability matrix](docs/capabilities.md)) |
+| `ceph orch apply ingress` (haproxy + keepalived) | `ceph orch apply -i` with a keepalived-only ingress (no haproxy) |
 | `cephadm rm-cluster` | `cephadm-talos rm-cluster` |
-| `ceph orch apply rgw` (+ `ingress`: haproxy + keepalived) | `cephadm-talos deploy rgw` (HTTPS, generated CA) + `deploy vip` (keepalived only, no haproxy) |
-| cluster state in mon config-key store | `~/.cephadm-talos/<fsid>/state.json` (authoritative, on the workstation); a derived inventory without keys goes to every host as `/etc/ceph/talos/inventory.json` |
-| the cephadm mgr module (`ceph orch`) | a read-only module installed under the name `cephadm`; it polls a `cephadm-talos agent` container on every host over mutual TLS (port 4721) for `orch status`, `orch host ls` and `orch ps` |
 
-Every container entrypoint is idempotent. It does any first-start work (`ceph-mon --mkfs`, `ceph-volume raw prepare`), then `exec`s the daemon in the foreground. Talos restarts an exited container after 5s.
+The operator signs which images the cluster may run and which disks may be prepared as OSDs (`cephadm-talos approve`), with a key only the workstation holds; the agents refuse other images and preparations, also from a compromised leader (a zap needs either an approval or the cluster's BlueStore label on the disk). This does not hold on a compromised leader's own node, where its agent is root-equivalent, nor, if that node is a Talos control plane, on the nodes that trust the same Talos CA, for which such an agent can sign itself Talos credentials ([docs/architecture.md](docs/architecture.md), "Security implications").
 
 ## Usage
 
@@ -57,46 +58,76 @@ go build -o cephadm-talos ./cmd/cephadm-talos
 # hack/agent-image.sh [push-ref [pull-ref]] pushes it and prints the pinned reference
 AGENT=$(hack/agent-image.sh)
 
-# create the cluster: 1 mon + 1 mgr, an agent per host, `ceph orch` backed by the module
-./cephadm-talos --talosconfig ./.talosconfig bootstrap --mon-node 10.5.0.2 --agent-image "$AGENT"
+# create the cluster (1 mon + 1 mgr, the agent, the mgr module), then hand it
+# to the agents and the leader
+./cephadm-talos --talosconfig ./.talosconfig bootstrap --mon-node 10.5.0.3 --image quay.io/ceph/ceph:v20.2.4 --agent-image "$AGENT"
+./cephadm-talos handoff
 
-# more hosts and daemons (talosconfig/context are remembered)
-./cephadm-talos host add 10.5.0.3
+# more nodes: the CLI enrolls each (its agent, no cluster document), then `ceph orch host add`
+./cephadm-talos host add 10.5.0.2
 ./cephadm-talos host add 10.5.0.4
-./cephadm-talos deploy mon cephadm-talos-controlplane-2
-./cephadm-talos deploy mon cephadm-talos-controlplane-3
-./cephadm-talos deploy mgr cephadm-talos-controlplane-2
-./cephadm-talos deploy osd cephadm-talos-controlplane-1 /dev/sda
-./cephadm-talos deploy osd cephadm-talos-controlplane-2 /dev/sda
-./cephadm-talos deploy osd cephadm-talos-controlplane-3 /dev/sda
 
-./cephadm-talos ps
+# from here on, ceph orch
+./cephadm-talos shell -- ceph orch daemon add mon cephadm-talos-controlplane-1
+./cephadm-talos shell -- ceph orch daemon add mon cephadm-talos-controlplane-3
+./cephadm-talos shell -- ceph orch daemon add mgr cephadm-talos-controlplane-3
+
+# OSDs: the operator approves each disk first
+./cephadm-talos approve --prepare cephadm-talos-controlplane-1:/dev/sda --prepare cephadm-talos-controlplane-2:/dev/sda
+./cephadm-talos shell -- ceph orch daemon add osd cephadm-talos-controlplane-1:/dev/sda
+./cephadm-talos shell -- ceph orch daemon add osd cephadm-talos-controlplane-2:/dev/sda
+
 ./cephadm-talos shell -- ceph -s
-./cephadm-talos shell -- ceph orch ps                     # from the agents, through the mgr
-./cephadm-talos shell -- 'ceph osd tree; ceph df'
+./cephadm-talos shell -- ceph orch ps
+./cephadm-talos shell -- ceph orch talos operation <id>    # what an accepted operation did
+./cephadm-talos orch -- daemon add mgr cephadm-talos-controlplane-1   # once per request uuid, retry with --request
 ./cephadm-talos logs -f mon.cephadm-talos-controlplane-1
 
-# S3 over HTTPS behind a virtual IP (keepalived, VRRP unicast + gratuitous ARP)
-./cephadm-talos deploy rgw cephadm-talos-controlplane-1            # beast on :443, cert from a generated cluster CA
-./cephadm-talos deploy rgw cephadm-talos-controlplane-2
-./cephadm-talos deploy vip cephadm-talos-controlplane-1 --vip 10.5.0.200/24
-./cephadm-talos deploy vip cephadm-talos-controlplane-2
-./cephadm-talos shell -- radosgw-admin user create --uid demo --display-name Demo
-curl --cacert ~/.cephadm-talos/<fsid>/rgw-ca.crt https://10.5.0.200/
+# a rolling upgrade to an approved image, by digest
+./cephadm-talos approve --image quay.io/ceph/ceph@sha256:<digest>
+./cephadm-talos shell -- ceph orch upgrade start --image quay.io/ceph/ceph@sha256:<digest>
+./cephadm-talos shell -- ceph orch upgrade status
 
-./cephadm-talos upgrade --image quay.io/ceph/ceph:v20.2.4
-./cephadm-talos rm --zap osd.2
-./cephadm-talos host maintenance enter cephadm-talos-controlplane-3   # ok-to-stop, noout, stop daemons
-./cephadm-talos host maintenance exit cephadm-talos-controlplane-3
-./cephadm-talos host reboot cephadm-talos-controlplane-3              # enter + Talos reboot + exit
-./cephadm-talos rm-cluster --zap --yes-i-really-mean-it               # remove everything (like cephadm rm-cluster)
+# maintenance and a managed reboot (noout, ok-to-stop, stop, Talos reboot, back)
+./cephadm-talos shell -- ceph orch host maintenance enter cephadm-talos-controlplane-3
+./cephadm-talos shell -- ceph orch host maintenance exit cephadm-talos-controlplane-3
+./cephadm-talos shell -- ceph orch hardware powercycle cephadm-talos-controlplane-3 --yes-i-really-mean-it
+
+# S3 over HTTPS behind a virtual IP: RGWs, then a keepalived-only ingress
+# (ingress.yaml below)
+./cephadm-talos shell -- ceph orch daemon add rgw default cephadm-talos-controlplane-1
+./cephadm-talos shell -- ceph orch daemon add rgw default cephadm-talos-controlplane-2
+./cephadm-talos shell -- ceph config set mgr mgr/cephadm/container_image_keepalived quay.io/ceph/keepalived@sha256:<digest>
+./cephadm-talos approve --image quay.io/ceph/keepalived@sha256:<digest>
+./cephadm-talos shell --stdin -- ceph orch apply -i - < ingress.yaml
+
+# recovery after the handoff: suspend the agents and the leader, bring the
+# mons back on their stores, hand the cluster back
+./cephadm-talos suspend
+./cephadm-talos recover mons
+./cephadm-talos resume
+
+./cephadm-talos rm-cluster --zap --yes-i-really-mean-it   # remove everything (like cephadm rm-cluster)
 ```
 
-`deploy rgw --cert F --key F` uses your own certificate instead of the generated one. The generated server certificate covers the VIP, every host IP and hostname, and is reissued (and the rgws restarted) when a host or the VIP is added. `deploy vip` places keepalived (`quay.io/ceph/keepalived:2.2.4`, as cephadm's ingress uses). The VIP is held by the first vip host whose local rgw answers, and moves on failure or `host maintenance enter`. Talos's own VIP cannot be used here: it elects its holder through etcd.
+`ingress.yaml`:
 
-`bootstrap` and `upgrade` pin the image to its digest: they pull it on one node, read the digest Talos resolved, and run `ceph --version` in it. Only the supported Ceph release is accepted (`--skip-version-check` for testing). A tag the node already has resolves to the digest it pulled before; `--refresh` pulls it again. cephx keys are always AES256KRB5 (`aes256k`).
+```yaml
+service_type: ingress
+service_id: rgw.default
+placement:
+  hosts: [cephadm-talos-controlplane-1, cephadm-talos-controlplane-2]
+spec:
+  backend_service: rgw.default
+  keepalive_only: true
+  virtual_ip: 10.5.0.200/24
+```
 
-`--dry-run` prints the machine config patches instead of applying them. `-v` prints every Talos API call. Both are global flags and go before the command.
+A `ceph orch` command returns once the module accepted it, before the leader carried it out; a command that depends on an earlier one (maintenance after an upgrade, its exit after its enter, an ingress after its RGWs) is refused until that one finished. `ceph orch talos operation <id>` and `ceph orch upgrade status` show the progress.
+
+`bootstrap` pins the image to its digest: it pulls it on one node, reads the digest Talos resolved, and checks the Ceph version in it. Only the supported Ceph release is accepted (`--skip-version-check` for testing). cephx keys are always AES256KRB5 (`aes256k`). An RGW serves HTTPS with a certificate from a generated cluster CA (`daemon add -i` with an RGW spec takes your own); keepalived moves the VIP to the next host with a healthy RGW.
+
+Before the handoff the CLI also changes the cluster itself (`deploy`, `rm`, `upgrade`, `host maintenance` and the rest of the proof of concept's commands); after it, those commands are refused and point to `ceph orch`. `--dry-run` prints the machine config patches instead of applying them. `-v` prints every Talos API call. Both are global flags and go before the command.
 
 ## Local QEMU test cluster without Kubernetes
 
@@ -116,6 +147,7 @@ sudo chown -R $USER .talosconfig .clusters
 
 Notes:
 
+- Until our Talos PRs are released, the nodes run the combined build of their branches (see [docs/support.md](docs/support.md)), not the factory image above.
 - `--with-apply-config` is needed with `--iso-path`, or the nodes wait in maintenance mode forever.
 - The extra disk is SATA (`/dev/sda`); Talos itself is installed on `/dev/vda`.
 - A host firewall such as ufw has to allow the cluster network (DHCP, DNS and forwarding for 10.5.0.0/24).
@@ -136,13 +168,21 @@ npx svg-term-cli --in /tmp/demo.v2.cast --out demo/demo.svg --window
 ## Layout
 
 ```
-cmd/cephadm-talos    CLI
-internal/orch        bootstrap/deploy/rm/upgrade/ps/shell/maintenance
+cmd/cephadm-talos    CLI, and the agent's entrypoints (agent, records-init, records)
+internal/orch        the CLI: bootstrap, handoff, enrollment, shell, suspension, recovery, rm-cluster
+internal/agent       the node agent: grants, admission, records, the leader and its ledger work
+internal/mgrmodule   the mgr module (Python), installed as `cephadm`
 internal/daemons     ContainerConfig per daemon type + embedded entrypoint scripts
+internal/render      rendering of a host's documents, shared by CLI and leader
+internal/state       the cluster state, local.json and the recovery journal
+internal/store       config-key access: manifests, chunked records, secrets
+internal/wire        the messages between CLI, agents and module
+internal/pki         certificates and their identities
+internal/approval    the operator's signed approvals
+internal/records     the agent's durable records on its node
 internal/spec        Talos document types (minimal) and rendering
 internal/talos       Talos API client (machinery)
 internal/cephx       CephX key generation
-internal/state       local inventory
 demo/                asciinema recording scripts and output
 upstream/talos       Talos feature requests and their status
 ```
