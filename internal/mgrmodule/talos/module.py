@@ -1204,11 +1204,13 @@ class Module(orchestrator.Orchestrator, MgrModule):
                 continue
             h = by_name[d['host']]
             ends = [cert_not_after(h.get(k)) for k in ('mgr_server_cert', 'mgr_client_cert') if h.get(k)]
-            if not ends or min(ends) - now > renew_before:
+            if not ends:
                 continue
+            # the warning's threshold is fixed; only renewal follows the setting
             if min(ends) - now <= CERT_ALERT_BEFORE:
                 alerts.append('mgr.%s certificates expire %s' % (h['name'], min(ends).isoformat()))
-            self._accept_renewal(lambda: self._accept('renew_mgr', 'mgr.' + h['name'], h['name']))
+            if min(ends) - now <= renew_before:
+                self._accept_renewal(lambda: self._accept('renew_mgr', 'mgr.' + h['name'], h['name']))
         # the RGW certificates: the ones the daemons name and the ones they serve
         rgw = (cluster or {}).get('rgw') or {}
         certs = {c['id']: c for c in rgw.get('certs') or []}
@@ -1225,16 +1227,17 @@ class Module(orchestrator.Orchestrator, MgrModule):
             served_user = served is not None and any(leaf_der(u) == served for u in user_certs)
             served_end = der_not_after(served) if served is not None else None
             for end, is_user in ((cert_not_after(c.get('cert')) if c and c.get('cert') else None, bool(c and c.get('user'))), (served_end, served_user)):
-                if end is None or end - now > renew_before:
+                if end is None:
                     continue
                 if is_user:
                     line = 'rgw.%s serves the operator\'s certificate, which expires %s' % (d['host'], end.isoformat())
-                    if line not in user:
+                    if end - now <= CERT_RENEW_BEFORE and line not in user:
                         user.append(line)
                     continue
-                due_generated = True
                 if end - now <= CERT_ALERT_BEFORE:
                     alerts.append('rgw.%s certificate expires %s' % (d['host'], end.isoformat()))
+                if end - now <= renew_before:
+                    due_generated = True
         if due_generated:
             self._accept_renewal(lambda: self._accept_rgw_renewal())
         if user:

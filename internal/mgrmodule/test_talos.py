@@ -670,6 +670,12 @@ class CertCheck(unittest.TestCase):
         self.renew_days = 2000
         m.Module._check_certs(mod)
         self.assertIn(('renew_mgr', 'mgr.h2', 'h2'), [(e['kind'], e.get('daemon'), e['host']) for _, e in mod._ledger.executable()])
+        # it moves renewal only: the 7 day warning stays
+        self.assertEqual(self.health['now']['TALOS_CERT_RENEWAL']['count'], 1)
+        self.renew_days = 1
+        mod, _ = self.module()
+        m.Module._check_certs(mod)
+        self.assertEqual(self.health['now']['TALOS_CERT_RENEWAL']['count'], 1)  # h3's, 5 days, though not yet due
 
     def test_rgw_renewal_for_generated_certificates_only(self):
         mod, entries = self.module(rgw={'h1': 'issued/op-%016x/%s' % (1, 'ab' * 8), 'h2': 'user/op-%016x' % 2})
