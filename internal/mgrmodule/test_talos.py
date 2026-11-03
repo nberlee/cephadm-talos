@@ -735,6 +735,7 @@ class AgentRenewalAndUpgrade(unittest.TestCase):
         [(_, up)] = mod._ledger.executable()
         self.assertEqual((up['kind'], up['image']), ('upgrade_agent', self.IMG))
         self.assertNotEqual(m.Module._agent_upgrade(mod, self.IMG).retval, 0)  # one at a time
+        self.assertIn('agent upgrade', m.Module.upgrade_start(mod, 'quay.io/ceph/ceph@sha256:' + 'ef' * 32, None, None, None, None, None).exception_str)
         res = m.Module._agent_upgrade(mod, None, True)
         self.assertEqual(res.retval, 0, res.stderr)
         self.assertEqual(mod._ledger.executable()[-1][1]['upgrade'], up['id'])

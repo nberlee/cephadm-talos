@@ -1328,6 +1328,9 @@ class Module(orchestrator.Orchestrator, MgrModule):
         _, fold = self._authority()
         if fold.upgrade is not None:
             raise OrchestratorError('an upgrade is in progress (operation %s)' % fold.upgrade['op'])
+        agents = self._agent_upgrade_running(self._authority()[0])
+        if agents is not None:
+            raise OrchestratorError('the agent upgrade %s is in progress' % agents['id'])
         if fold.maintenance:
             raise OrchestratorError('hosts in maintenance: %s' % ', '.join(sorted(fold.maintenance)))
         current = self._inventory().get('image', '')
@@ -1543,15 +1546,14 @@ class Module(orchestrator.Orchestrator, MgrModule):
         except OrchestratorError as e:
             return HandleCommandResult(retval=-22, stderr=str(e))
 
-    def _accept_agent_upgrade(self, image: Optional[str], resume: bool) -> str:
-        """An agent upgrade (plan 04, step 2): by digest, approved, from the agent
-        image's repository; no other agent or Ceph upgrade unfinished."""
-        self._settle()
-        led, fold = self._authority()
+    def _agent_upgrade_running(self, led: Any) -> Optional[Dict[str, Any]]:
+        """The agent upgrade in progress: the leader's record of it until it is
+        finished, or an accepted one before the leader recorded it."""
         entries = self.get_store_prefix(STORE_PREFIX)
-        cluster, _ = record_from_store(entries, choose_incarnation(entries, getattr(self, '_gid', None)), 'cluster')
-        # in progress: the leader's record of an agent upgrade until it is finished,
-        # an accepted one before the leader recorded it, or a Ceph upgrade
+        try:
+            cluster, _ = record_from_store(entries, choose_incarnation(entries, getattr(self, '_gid', None)), 'cluster')
+        except InventoryError:
+            cluster = None
         rec_up = (cluster or {}).get('agent_upgrade') or {}
         running = None
         for _, e in led.executable():
@@ -1559,6 +1561,16 @@ class Module(orchestrator.Orchestrator, MgrModule):
                 rec = self._journal(e['id'])
                 if rec_up.get('op') == e['id'] and not rec_up.get('finished') or rec_up.get('op') != e['id'] and (rec is None or rec.get('state') not in TERMINAL):
                     running = e
+        return running
+
+    def _accept_agent_upgrade(self, image: Optional[str], resume: bool) -> str:
+        """An agent upgrade (plan 04, step 2): by digest, approved, from the agent
+        image's repository; no other agent or Ceph upgrade unfinished."""
+        self._settle()
+        led, fold = self._authority()
+        entries = self.get_store_prefix(STORE_PREFIX)
+        cluster, _ = record_from_store(entries, choose_incarnation(entries, getattr(self, '_gid', None)), 'cluster')
+        running = self._agent_upgrade_running(led)
         if running is None and fold.upgrade is not None:
             running = {'id': fold.upgrade['op'], 'kind': 'upgrade_start'}
         if resume:
