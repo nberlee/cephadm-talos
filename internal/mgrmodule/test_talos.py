@@ -790,11 +790,11 @@ class AgentRenewalAndUpgrade(unittest.TestCase):
         entries.update(state_entries(inventory(), {'fsid': 'f', 'sealed': True, 'agent': {'image': cur},
                                                    'agent_upgrade': {'op': up['id'], 'from': cur, 'image': cur, 'stopped': self.IMG, 'finished': False}}, hosts=[], daemons=[]))
         self.assertNotEqual(m.Module._agent_upgrade(mod, None, False, True).retval, 0)
-        self.assertIn('rolling back', m.Module._agent_upgrade(mod).stdout)
+        self.assertIn('rolling back', m.Module._agent_upgrade_show(mod).stdout)
         self.assertEqual(m.Module._agent_upgrade(mod, None, True).retval, 0)  # a paused rollback resumes
         entries.update(state_entries(inventory(), {'fsid': 'f', 'sealed': True, 'agent': {'image': cur},
                                                    'agent_upgrade': {'op': up['id'], 'from': cur, 'image': cur, 'stopped': self.IMG, 'finished': True}}, hosts=[], daemons=[]))
-        self.assertIn('stopped, rolled back', m.Module._agent_upgrade(mod).stdout)
+        self.assertIn('stopped, rolled back', m.Module._agent_upgrade_show(mod).stdout)
         self.assertNotEqual(m.Module._agent_upgrade(mod, None, False, True).retval, 0)  # nothing to stop
 
 

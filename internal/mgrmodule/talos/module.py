@@ -1550,11 +1550,17 @@ class Module(orchestrator.Orchestrator, MgrModule):
 
     @TalosCLICommand.Write('orch talos agent upgrade')
     def _agent_upgrade(self, image: Optional[str] = None, resume: bool = False, stop: bool = False) -> HandleCommandResult:
-        """Upgrade every agent to an image the operator approved, one host at a time; resume a paused upgrade; stop it, rolling back to the image it upgrades from; without arguments, show it"""
+        """Upgrade every agent to an image the operator approved, one host at a time; resume a paused upgrade; stop it, rolling back to the image it upgrades from"""
         try:
-            if image is None and not resume and not stop:
-                return HandleCommandResult(stdout=self._agent_upgrade_status())
             return HandleCommandResult(stdout=self._accept_agent_upgrade(image, resume, stop))
+        except OrchestratorError as e:
+            return HandleCommandResult(retval=-22, stderr=str(e))
+
+    @TalosCLICommand.Read('orch talos agent upgrade status')
+    def _agent_upgrade_show(self) -> HandleCommandResult:
+        """Show the last agent upgrade: running, paused, stopping, finished or rolled back"""
+        try:
+            return HandleCommandResult(stdout=self._agent_upgrade_status())
         except OrchestratorError as e:
             return HandleCommandResult(retval=-22, stderr=str(e))
 
