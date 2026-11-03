@@ -261,3 +261,21 @@ func sha256Hex(b []byte) string {
 
 	return hex.EncodeToString(s[:])
 }
+
+func TestRemovingAClusterReadsTheListBeforeSuspending(t *testing.T) {
+	o, h, a := suspendSetup(t)
+	o.sealed = true // handed over: the agents own it
+
+	publishCRL(t, o, 4, h.AgentCert)
+
+	// the agent is refused as revoked, so it is never asked to suspend
+	_ = o.RemoveCluster(context.Background(), false, SuspendOptions{})
+
+	if l := o.CRL().Current(); l == nil || l.Number.Int64() != 4 {
+		t.Fatal("rm-cluster did not read the published list")
+	}
+
+	if a.posts != 0 {
+		t.Fatalf("a revoked agent was asked to suspend %d times", a.posts)
+	}
+}

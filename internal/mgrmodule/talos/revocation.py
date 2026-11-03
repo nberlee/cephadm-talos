@@ -37,8 +37,13 @@ PRUNE_AFTER = datetime.timedelta(days=1)
 # a revocation without --until is kept as long as the longest lifetime issued
 REVOKE_YEARS = 3
 DEADLINE = 10.0
+# a page of keys stays well below the command output limit (bridge.MAX_OUTPUT)
+PAGE = 128 << 10
+# the answer to an output above that limit (EFBIG, module._ledger_mon)
+TOO_LARGE = -27
 
-Mon = Callable[[Dict[str, Any], float], Optional[Tuple[int, str, str]]]
+# mon(cmd, deadline[, reduce]): the reduce runs in the mgr before the output limit applies
+Mon = Callable[..., Optional[Tuple[int, str, str]]]
 
 
 class CRLError(Exception):
@@ -113,15 +118,74 @@ def parse_revoked(dump: Dict[str, str], now: datetime.datetime) -> Tuple[Dict[in
     return out, old
 
 
-def read_revoked(mon: Mon, now: datetime.datetime) -> Tuple[Dict[int, datetime.datetime], List[str]]:
-    res = mon({'prefix': 'config-key dump', 'key': REVOKED_PREFIX}, DEADLINE)
+def list_keys(mon: Mon, prefix: str) -> List[str]:
+    """The keys below a prefix, in pages: `config-key ls` reduced in the mgr
+    before the command output limit applies."""
+    out: List[str] = []
+    after = ''
+    while True:
+        res = mon({'prefix': 'config-key ls'}, DEADLINE, _page(prefix, after))
+        if res is None or res[0] != 0:
+            raise CRLError('cannot list %s' % prefix)
+        try:
+            page = json.loads(res[1])
+            keys, more = page['keys'], page['more']
+        except (ValueError, KeyError, TypeError):
+            raise CRLError('cannot list %s' % prefix)
+        out += keys
+        if not more or not keys:
+            return out
+        after = keys[-1]
+
+
+def _page(prefix: str, after: str) -> Callable[[str], str]:
+    def reduce(raw: str) -> str:
+        page: List[str] = []
+        size = 0
+        rest = sorted(k for k in json.loads(raw) if isinstance(k, str) and k.startswith(prefix) and k > after)
+        for k in rest:
+            size += len(k) + 4
+            if size > PAGE:
+                break
+            page.append(k)
+        return json.dumps({'keys': page, 'more': len(page) < len(rest)})
+    return reduce
+
+
+def dump_bounded(mon: Mon, prefix: str) -> Dict[str, str]:
+    """`config-key dump` of a prefix, split into the prefixes one digit longer
+    while one answer exceeds the command output limit (the revoked serials
+    are decimal)."""
+    res = mon({'prefix': 'config-key dump', 'key': prefix}, DEADLINE)
+    if res is not None and res[0] == TOO_LARGE:
+        if len(prefix) >= len(REVOKED_PREFIX) + 50:
+            raise CRLError('cannot read %s within the output limit' % prefix)
+        out: Dict[str, str] = {}
+        # the entry named by the prefix itself, then the longer ones
+        if prefix != REVOKED_PREFIX:
+            got = mon({'prefix': 'config-key get', 'key': prefix}, DEADLINE)
+            if got is None or got[0] not in (0, -2):
+                raise CRLError('cannot read %s' % prefix)
+            if got[0] == 0:
+                out[prefix] = got[1]
+        for d in '0123456789':
+            out.update(dump_bounded(mon, prefix + d))
+        return out
     if res is None or res[0] != 0:
-        raise CRLError('cannot read the revoked set')
+        raise CRLError('cannot read %s' % prefix)
     try:
         dump = json.loads(res[1] or '{}')
     except ValueError:
-        raise CRLError('cannot read the revoked set')
-    return parse_revoked(dump if isinstance(dump, dict) else {}, now)
+        raise CRLError('cannot read %s' % prefix)
+    if not isinstance(dump, dict):
+        raise CRLError('cannot read %s' % prefix)
+    return dump
+
+
+def read_revoked(mon: Mon, now: datetime.datetime) -> Tuple[Dict[int, datetime.datetime], List[str]]:
+    """The revoked set and the keys to prune; raises CRLError unless the whole
+    set was read."""
+    return parse_revoked(dump_bounded(mon, REVOKED_PREFIX), now)
 
 
 def cert_serial(pem: str) -> Tuple[int, datetime.datetime]:
@@ -229,20 +293,15 @@ class Issuer:
         Raises CRLError when it cannot issue or publish."""
         for k in stale:
             mon({'prefix': 'config-key rm', 'key': k}, DEADLINE)  # pruned again next time if unanswered
-        res = mon({'prefix': 'config-key dump', 'key': CRL_PREFIX}, DEADLINE)
-        if res is None or res[0] != 0:
+        res = mon({'prefix': 'config-key get', 'key': CRL_MANIFEST}, DEADLINE)
+        if res is None or res[0] not in (0, -2):
             raise CRLError('cannot read the published list')
         try:
-            entries = json.loads(res[1] or '{}')
-            if not isinstance(entries, dict):
-                raise ValueError('not an object')
+            m = read_manifest(res[1]) if res[0] == 0 else None
         except ValueError:
-            raise CRLError('cannot read the published list')
-        try:
-            m = read_manifest(entries[CRL_MANIFEST]) if CRL_MANIFEST in entries else None
-        except (ValueError, KeyError):
             m = None
         theirs = int(m['number']) if m is not None else 0
+        keys = set(list_keys(mon, CRL_PREFIX))
         issued = False
         if self.due(revoked, now):
             key = mon({'prefix': 'config-key get', 'key': 'cephadm-talos/secrets/agent-ca.key'}, DEADLINE)
@@ -254,17 +313,25 @@ class Issuer:
             self.der = issue_crl(ca_cert, key[1].encode(), revoked, number, now, valid)
             self.number, self.serials, self.at, self.published = number, set(revoked), now, False
             issued = True
-        # published while the manifest has a lower number: a predecessor's late
-        # write does not hide this list, and a successor's is never replaced
-        if self.der is not None and theirs < self.number:
-            parts, manifest = chunks(self.der, self.number)
+        if self.der is None:
+            return issued
+        parts, manifest = chunks(self.der, self.number)
+        # published is what the store holds: the manifest of this number with
+        # this list's digest and every chunk (a write whose answer was lost counts)
+        held = m is not None and theirs == self.number and m['sha256'] == hashlib.sha256(self.der).hexdigest() and set(parts) <= keys
+        # written while the manifest has a lower number or is a partial write of
+        # this one: a predecessor's late write does not hide this list, and a
+        # successor's is never replaced
+        if not held and theirs <= self.number:
             for k, v in list(parts.items()) + [(CRL_MANIFEST, manifest)]:
                 w = mon({'prefix': 'config-key set', 'key': k, 'val': v}, DEADLINE)
                 if w is None or w[0] != 0:
                     raise CRLError('the list %d was not published' % self.number)
-            self.published = True
+            held = True
+        self.published = held
+        if held:
             # older numbers' chunks, after the manifest moved on
-            for k in entries:
+            for k in keys:
                 mk = CRL_KEY_RE.match(k)
                 if mk and int(mk.group(1)) < self.number:
                     mon({'prefix': 'config-key rm', 'key': k}, DEADLINE)

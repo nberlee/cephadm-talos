@@ -26,14 +26,29 @@ class KV:
     def __init__(self) -> None:
         self.kv = {}
         self.silent = False
+        self.lose = set()   # keys whose set lands without an answer
+        self.limit = b.MAX_OUTPUT
+        self.dumps = []
 
-    def __call__(self, cmd, deadline):
+    def __call__(self, cmd, deadline, reduce=None):
         if self.silent:
             return None
         p, k = cmd['prefix'], cmd.get('key')
+        if p == 'config-key ls':
+            out = json.dumps(sorted(self.kv))
+            out = reduce(out) if reduce else out
+            return (-27, '', '') if len(out) > self.limit else (0, out, '')
         if p == 'config-key dump':
-            return 0, json.dumps({x: v for x, v in self.kv.items() if x.startswith(k)}), ''
+            self.dumps.append(k)
+            out = json.dumps({x: v for x, v in self.kv.items() if x.startswith(k)})
+            return (-27, '', '') if len(out) > self.limit else (0, out, '')
+        if p == 'config-key set' and k in self.lose:
+            self.lose.discard(k)
+            self.kv[k] = cmd['val']
+            return None
         if p == 'config-key get':
+            if k in self.kv and len(self.kv[k]) > getattr(self, 'get_limit', 1 << 30):
+                return -27, '', ''
             return (0, self.kv[k], '') if k in self.kv else (-2, '', 'ENOENT')
         if p == 'config-key set':
             self.kv[k] = cmd['val']
@@ -178,6 +193,49 @@ class IssuerTest(unittest.TestCase):
         self.assertEqual(self.published()[0], succ.number)
         self.assertTrue([k for k in self.kv.kv if k.startswith('%s%d/' % (rv.CRL_PREFIX, succ.number))])
 
+    def test_a_lost_answer_to_the_manifest_write_counts_from_the_store(self):
+        until = NOW + datetime.timedelta(days=30)
+        iss = rv.Issuer(9)
+        self.kv.lose.add(rv.CRL_MANIFEST)
+        with self.assertRaises(rv.CRLError):
+            iss.tick(self.kv, self.cert, {5: until}, [], NOW, 168)
+        self.assertFalse(iss.published)
+        # the write landed: the next tick sees it in the store, published
+        self.assertFalse(iss.tick(self.kv, self.cert, {5: until}, [], NOW + datetime.timedelta(seconds=5), 168))
+        self.assertTrue(iss.published)
+        self.assertEqual(self.published()[0], iss.number)
+        # a partial write of this number (a chunk missing) is written again
+        chunk = json.loads(self.kv.kv[rv.CRL_MANIFEST])['chunks'][0]
+        del self.kv.kv[chunk]
+        iss.tick(self.kv, self.cert, {5: until}, [], NOW + datetime.timedelta(seconds=10), 168)
+        self.assertIn(chunk, self.kv.kv)
+        self.assertTrue(iss.published)
+
+    def test_many_revocations_are_read_and_listed_within_the_output_limit(self):
+        self.kv.limit = 4096  # a small limit stands for the mgr's 256 KiB
+        until = NOW + datetime.timedelta(days=30)
+        for serial in range(1000, 1400):
+            self.kv.kv['%s%d' % (rv.REVOKED_PREFIX, serial)] = rv.entry(until, 'r')
+        revoked, _ = rv.read_revoked(self.kv, NOW)
+        self.assertEqual(len(revoked), 400)
+        self.assertIn(rv.REVOKED_PREFIX + '1', self.kv.dumps)  # split by the next digit
+        old = rv.CHUNK
+        rv.CHUNK = 256
+        self.addCleanup(setattr, rv, 'CHUNK', old)
+        old_page = rv.PAGE
+        rv.PAGE = 1024
+        self.addCleanup(setattr, rv, 'PAGE', old_page)
+        iss = rv.Issuer(9)
+        iss.tick(self.kv, self.cert, revoked, [], NOW, 168)
+        self.assertTrue(iss.published)
+        self.assertGreater(len(json.loads(self.kv.kv[rv.CRL_MANIFEST])['chunks']), 4)
+        self.assertEqual(len(crl(self.published()[1])), 400)
+        # an entry too large for one answer even alone: an error, never a partial set
+        self.kv.limit = 10
+        self.kv.get_limit = 10
+        with self.assertRaises(rv.CRLError):
+            rv.read_revoked(self.kv, NOW)
+
     def test_no_ca_key_is_an_error(self):
         del self.kv.kv['cephadm-talos/secrets/agent-ca.key']
         with self.assertRaises(rv.CRLError):
@@ -309,6 +367,46 @@ class RevokeCommandTest(unittest.TestCase):
         self.assertEqual(m.Module._revoke(mod, '43', until='2030-01-01T00:00:00Z').retval, 0)
         self.assertEqual(json.loads(kv.kv[rv.REVOKED_PREFIX + '43'])['not_after'], '2030-01-01T00:00:00Z')
         self.assertEqual(m.Module._revoke(mod, 'nope').retval, -22)
+
+
+class IssueOnlyFromACompleteReadTest(unittest.TestCase):
+    """A failed read of the revoked set issues nothing, keeps the set the
+    verifiers use and does not clear TALOS_CRL."""
+
+    def test_a_failed_read(self):
+        cert, key = ca()
+        kv = KV()
+        kv.kv['cephadm-talos/secrets/agent-ca.key'] = key
+        kv.kv[rv.REVOKED_PREFIX + '42'] = rv.entry(NOW + datetime.timedelta(days=30), 'r')
+        mod = object.__new__(m.Module)
+        mod._ledger_mon = lambda cmds: kv
+        import logging
+        mod._logger = logging.getLogger('test')
+        mod.get_module_option = lambda name: None
+        health = {}
+        mod.set_health_checks = lambda checks: health.update(now=checks)
+
+        class Led:
+            ready = True
+        mod._ledger = Led()
+
+        class Ch:
+            ca_cert = cert
+        read = m.Module._read_revoked(mod, None)
+        issuer = m.Module._issue_crl(mod, None, None, 9, Ch(), read)
+        self.assertEqual(sorted(r.serial_number for r in crl(issuer.der)), [42])
+        self.assertNotIn('TALOS_CRL', health['now'])
+        first = issuer.number
+        # the read fails: the set is kept, nothing issued, the warning raised
+        kv.silent = True
+        with self.assertRaises(rv.CRLError):
+            m.Module._read_revoked(mod, None)
+        self.assertEqual(mod._revoked, frozenset({42}))
+        kv.silent = False
+        issuer.at = NOW - datetime.timedelta(days=2)  # due
+        self.assertIs(m.Module._issue_crl(mod, None, issuer, 9, Ch(), None), issuer)
+        self.assertEqual(issuer.number, first)
+        self.assertIn('TALOS_CRL', health['now'])
 
 
 class DeliveryTest(unittest.TestCase):

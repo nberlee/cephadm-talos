@@ -793,6 +793,14 @@ func (o *Orch) RemoveCluster(ctx context.Context, zap bool, opts SuspendOptions)
 	}
 
 	if owned && (rec == nil || rec.Phase == state.PhaseSuspending || rec.Phase == state.PhaseSuspended) {
+		// the published revocation list before any agent is called, as every
+		// other command reads it (plan 04, step 3); without the mons, the saved one
+		if o.opened && o.Managed() {
+			if err := o.RefreshCRL(ctx); err != nil {
+				o.printf("warning: the revocation list: %v\n", err)
+			}
+		}
+
 		if rec, err = o.suspendLocked(ctx, opts); err != nil {
 			return err
 		}

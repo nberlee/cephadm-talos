@@ -841,8 +841,8 @@ class Module(orchestrator.Orchestrator, MgrModule):
         return op_id
 
     def _ledger_mon(self, cmds: bridge.Commands) -> Callable[[Dict[str, Any], float], Optional[Tuple[int, str, str]]]:
-        def mon(cmd: Dict[str, Any], deadline: float) -> Optional[Tuple[int, str, str]]:
-            job = cmds.submit(cmd)
+        def mon(cmd: Dict[str, Any], deadline: float, reduce: Optional[Callable[[str], str]] = None) -> Optional[Tuple[int, str, str]]:
+            job = cmds.submit(cmd, reduce)
             if job is None or not job.ev.wait(deadline):
                 return None
             if job.too_large:
@@ -865,10 +865,11 @@ class Module(orchestrator.Orchestrator, MgrModule):
         nonce = ''
         try:
             while not self._poller.stop.is_set():
+                read = None
                 try:
-                    self._read_revoked(bridge_cmds)
+                    read = self._read_revoked(bridge_cmds)
                 except revocation.CRLError as e:
-                    self.log.warning('%s', e)
+                    self.log.warning('the revoked set: %s', e)
                 try:
                     inv = self._inventory()
                     if channel is None:
@@ -898,7 +899,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
                             self.log.warning('the ledger: %s', e)
                         # the list, before and independent of the heartbeat: a
                         # fail-closed agent may refuse it until it has a new list
-                        issuer = self._issue_crl(bridge_cmds, issuer, epoch, channel)
+                        issuer = self._issue_crl(bridge_cmds, issuer, epoch, channel, read)
                         nonce = self._heartbeat(inv, gid, epoch, nonce)
                         self._schedule_cert_check()
                 except InventoryError as e:
@@ -912,29 +913,34 @@ class Module(orchestrator.Orchestrator, MgrModule):
             leader_cmds.stop()
             bridge_cmds.stop()
 
-    def _read_revoked(self, cmds: bridge.Commands) -> List[str]:
-        """Read the revoked set (plan 04, step 3); returns the keys of the
-        entries to prune. A failed read keeps the set read before."""
+    def _read_revoked(self, cmds: bridge.Commands) -> Tuple[Dict[int, datetime.datetime], List[str]]:
+        """Read the whole revoked set (plan 04, step 3): the set and the keys of
+        the entries to prune. A failed read raises and keeps the set read
+        before for the module's verifiers."""
         revoked, old = revocation.read_revoked(self._ledger_mon(cmds), datetime.datetime.now(datetime.timezone.utc))
         self._revoked = frozenset(revoked)
-        self._revoked_until = revoked
-        self._revoked_old = old
-        return old
+        return revoked, old
 
     def _issue_crl(self, cmds: bridge.Commands, issuer: Optional[revocation.Issuer], epoch: int,
-                   channel: Optional[bridge.Channel]) -> Optional[revocation.Issuer]:
-        """Prune, issue and publish the list as the leader (plan 04, step 3);
-        TALOS_CRL when it cannot. Returns the leadership's issuer."""
+                   channel: Optional[bridge.Channel],
+                   read: Optional[Tuple[Dict[int, datetime.datetime], List[str]]]) -> Optional[revocation.Issuer]:
+        """Prune, issue and publish the list as the leader (plan 04, step 3),
+        only from this tick's complete read of the revoked set (read; None when
+        it failed): a list from an incomplete set would re-admit revoked
+        certificates. TALOS_CRL when it cannot. Returns the leadership's issuer."""
         led = getattr(self, '_ledger', None)
         if led is None or not led.ready or channel is None:
+            return issuer
+        if read is None:
+            self._set_health('crl', {'TALOS_CRL': {'severity': 'warning', 'summary': 'the agent CA revocation list cannot be issued or published',
+                                                   'count': 1, 'detail': ['the revoked set cannot be read']}})
             return issuer
         issuer = issuer or revocation.Issuer(epoch)
         try:
             hours = self.get_module_option('talos_crl_valid_hours') or revocation.MAX_VALID_HOURS
-            if issuer.tick(self._ledger_mon(cmds), channel.ca_cert, getattr(self, '_revoked_until', {}), getattr(self, '_revoked_old', []),
+            if issuer.tick(self._ledger_mon(cmds), channel.ca_cert, read[0], read[1],
                            datetime.datetime.now(datetime.timezone.utc), int(hours)):
                 self.log.info('revocation list %d issued (%d serials)', issuer.number, len(issuer.serials or ()))
-            self._revoked_old = []
             if issuer.der is not None and issuer.published:
                 self._crl = (issuer.number, issuer.der)
             self._set_health('crl', {})
