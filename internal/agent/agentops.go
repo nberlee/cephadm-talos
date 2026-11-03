@@ -343,6 +343,11 @@ func (l *LeaderLoop) agentUpgradeStep(ctx context.Context, b *Bridge, js store.B
 		l.holding = holdAll
 	}
 
+	// a stop takes effect once no step is in progress, also on a paused upgrade
+	if u.Stopping && u.Step == "" {
+		return l.rollBack(ctx, b, gid, st, *u)
+	}
+
 	if u.Paused {
 		return nil
 	}
@@ -438,7 +443,11 @@ func (l *LeaderLoop) agentUpgradeStep(ctx context.Context, b *Bridge, js store.B
 			return nil
 		}
 
-		st.Agent.PreviousImage, st.Agent.Image = au.From, au.Image
+		// a stopped upgrade's rollback leaves the agents' images as they were
+		if au.Stopped == "" {
+			st.Agent.PreviousImage, st.Agent.Image = au.From, au.Image
+		}
+
 		au.Finished, au.Step, au.StepAt = true, "", time.Time{}
 
 		return nil
@@ -640,6 +649,62 @@ func (l *LeaderLoop) pauseAgentUpgrade(ctx context.Context, b *Bridge, gid int64
 	return fmt.Errorf("%w: agent upgrade %s paused: %s", errRetry, op, cause)
 }
 
+// rollBack turns a stopped agent upgrade into its rollback (plan 04, step 2,
+// item 7): the target it gave up recorded as Stopped, the image it upgraded
+// from the target (From stays, the known good), a new attempt, not paused,
+// no host pulled (nothing guarantees a node kept the old image) and the
+// hosts done those whose agent runs the old image's digest. The same steps
+// follow.
+func (l *LeaderLoop) rollBack(ctx context.Context, b *Bridge, gid int64, st *state.State, u state.AgentUpgrade) error {
+	var done []string
+
+	for _, h := range st.Hosts {
+		// a host whose report cannot be read is updated again
+		if rep, err := l.nodeReport(ctx, h); err == nil && runsAgent(st, rep, h.Name, u.From) {
+			done = append(done, h.Name)
+		}
+	}
+
+	if err := l.changeState(ctx, b, gid, func(st *state.State) error {
+		au := st.AgentUpgrade
+		if au == nil || au.Op != u.Op || au.Finished || !au.Stopping || au.Step != "" {
+			return nil
+		}
+
+		au.Stopped, au.Image, au.Stopping = au.Image, au.From, false
+		au.Attempt, au.Paused, au.Error, au.Verify = au.Attempt+1, false, "", false
+		au.Pulled, au.Done, au.StepAt = nil, done, time.Time{}
+
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	l.log("agent upgrade %s stopped: rolling back to %s", u.Op, u.From)
+
+	return fmt.Errorf("%w: agent upgrade %s rolls back to %s", errRetry, u.Op, u.From)
+}
+
+// agentUpgradeStop stops an agent upgrade (upgrade_agent_stop), changing its
+// record alone: marked stopping, it becomes its rollback once no step is in
+// progress (rollBack). A rollback is not stopped again.
+func (l *LeaderLoop) agentUpgradeStop(ctx context.Context, b *Bridge, js store.Backend, gid int64, op LedgerOp) error {
+	if err := l.changeState(ctx, b, gid, func(st *state.State) error {
+		au := st.AgentUpgrade
+		if au == nil || au.Op != op.Upgrade || au.Finished || au.Stopping || au.Stopped != "" {
+			return nil // ended already, or stopping
+		}
+
+		au.Stopping = true
+
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	return finish(ctx, js, gid, op, wire.OpCompleted, nil)
+}
+
 // agentUpgradeResume resumes a paused agent upgrade (upgrade_agent_resume),
 // changing its record alone: the paused step starts again, with grants of a
 // new attempt.
@@ -661,9 +726,9 @@ func (l *LeaderLoop) agentUpgradeResume(ctx context.Context, b *Bridge, js store
 	return finish(ctx, js, gid, op, wire.OpCompleted, nil)
 }
 
-// agentResumeAhead carries out the resumes of the agent upgrade in progress
-// (op) among the executable operations after a ledger key, ahead of their
-// turn, as controlsAhead does the Ceph upgrade's.
+// agentResumeAhead carries out the controls (resumes, stops) of the agent
+// upgrade in progress (op) among the executable operations after a ledger
+// key, ahead of their turn, as controlsAhead does the Ceph upgrade's.
 func (l *LeaderLoop) agentResumeAhead(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, after, op string) error {
 	for {
 		entries, more, err := b.Ledger(ctx, after)
@@ -672,7 +737,7 @@ func (l *LeaderLoop) agentResumeAhead(ctx context.Context, b *Bridge, js store.B
 		}
 
 		for _, e := range entries {
-			if e.Op.Kind == KindAgentResume && e.Op.Upgrade == op {
+			if isAgentControl(e.Op.Kind) && e.Op.Upgrade == op {
 				if _, err := l.ledgerOp(ctx, b, js, gid, epoch, e); err != nil {
 					return err
 				}
@@ -686,3 +751,6 @@ func (l *LeaderLoop) agentResumeAhead(ctx context.Context, b *Bridge, js store.B
 		}
 	}
 }
+
+// isAgentControl reports whether a kind is one of an agent upgrade's controls.
+func isAgentControl(kind string) bool { return kind == KindAgentResume || kind == KindAgentStop }

@@ -767,6 +767,36 @@ class AgentRenewalAndUpgrade(unittest.TestCase):
                                                    'agent_upgrade': {'op': up['id'], 'image': self.IMG, 'finished': True}}, hosts=[], daemons=[]))
         self.assertNotEqual(m.Module._agent_upgrade(mod, None, True).retval, 0)  # nothing to resume
 
+    def test_the_stop(self):
+        mod, entries = self.module()
+        cur = 'registry/agent@sha256:' + 'cd' * 32
+        self.assertNotEqual(m.Module._agent_upgrade(mod, None, False, True).retval, 0)  # nothing to stop
+        mod._approved_images = lambda: [self.IMG]
+        self.assertEqual(m.Module._agent_upgrade(mod, self.IMG).retval, 0)
+        [(_, up)] = mod._ledger.executable()
+        # the image it upgrades from must be approved
+        res = m.Module._agent_upgrade(mod, None, False, True)
+        self.assertIn('roll back', res.stderr)
+        mod._approved_images = lambda: [self.IMG, cur]
+        self.assertNotEqual(m.Module._agent_upgrade(mod, self.IMG, False, True).retval, 0)  # no image with --stop
+        res = m.Module._agent_upgrade(mod, None, False, True)
+        self.assertEqual(res.retval, 0, res.stderr)
+        stop = mod._ledger.executable()[-1][1]
+        self.assertEqual((stop['kind'], stop['upgrade']), ('upgrade_agent_stop', up['id']))
+        self.assertNotEqual(m.Module._agent_upgrade(mod, None, False, True).retval, 0)  # stopping already
+        # the leader turned it into a rollback: shown so, and not stopped again
+        for jid in (up['id'], stop['id']):
+            entries['talos/inc/20/journal/op/' + jid] = json.dumps({'state': 'completed'})
+        entries.update(state_entries(inventory(), {'fsid': 'f', 'sealed': True, 'agent': {'image': cur},
+                                                   'agent_upgrade': {'op': up['id'], 'from': cur, 'image': cur, 'stopped': self.IMG, 'finished': False}}, hosts=[], daemons=[]))
+        self.assertNotEqual(m.Module._agent_upgrade(mod, None, False, True).retval, 0)
+        self.assertIn('rolling back', m.Module._agent_upgrade(mod).stdout)
+        self.assertEqual(m.Module._agent_upgrade(mod, None, True).retval, 0)  # a paused rollback resumes
+        entries.update(state_entries(inventory(), {'fsid': 'f', 'sealed': True, 'agent': {'image': cur},
+                                                   'agent_upgrade': {'op': up['id'], 'from': cur, 'image': cur, 'stopped': self.IMG, 'finished': True}}, hosts=[], daemons=[]))
+        self.assertIn('stopped, rolled back', m.Module._agent_upgrade(mod).stdout)
+        self.assertNotEqual(m.Module._agent_upgrade(mod, None, False, True).retval, 0)  # nothing to stop
+
 
 class AddAndRemove(unittest.TestCase):
     def module(self, inv=None):

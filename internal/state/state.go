@@ -248,6 +248,11 @@ type AgentUpgrade struct {
 	// Verify: resumed; the hosts done are checked to run the target again
 	// before the next step (a restore may have put one back on an earlier image)
 	Verify bool `json:"verify,omitempty"`
+	// Stopping: stopped by the operator, a rollback once no step is in
+	// progress; Stopped: the target the rollback gave up, Image then From
+	// (plan 04, step 2, item 7)
+	Stopping bool   `json:"stopping,omitempty"`
+	Stopped  string `json:"stopped,omitempty"`
 }
 
 // ImageOf is the image a daemon runs: its own, else the cluster's.

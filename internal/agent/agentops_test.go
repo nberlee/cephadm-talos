@@ -565,3 +565,95 @@ func TestTheCephAndTheAgentUpgradeExcludeEachOther(t *testing.T) {
 		t.Fatalf("a Ceph step beside an agent step: %+v", st.Upgrade)
 	}
 }
+
+func TestAStoppedAgentUpgradeRollsBack(t *testing.T) {
+	s, _ := agentSetup(t)
+	ctx := context.Background()
+
+	up := startUpgrade(t, s) // h1's self-update waits for its agent on the target
+	s.leader.OwnReport = ownRunning(s, agentImage)
+
+	// the stop runs ahead of its turn; the step in progress ends first
+	stop := s.acceptOp(KindAgentStop, 2, func(op *LedgerOp) { op.Upgrade = up.Op.ID })
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if op := s.op(t, stop.Op.ID); op.State != wire.OpCompleted {
+		t.Fatalf("stop %+v", op)
+	}
+
+	if u := s.agentUpgrade(t); !u.Stopping || u.Stopped != "" || u.Step != "self/h1" {
+		t.Fatalf("while the step ends %+v", u)
+	}
+
+	agentRunning(t, s, agentImage2)
+	must(t, s.leader.Tick(ctx, 42, 5)) // h1's step ends
+	must(t, s.leader.Tick(ctx, 42, 5)) // the rollback
+
+	// the target gave up, from the target; h0 runs the old image, h1 does not
+	u := s.agentUpgrade(t)
+	if u.Stopped != agentImage2 || u.Image != agentImage || u.From != agentImage || u.Stopping || u.Paused || u.Attempt != 1 ||
+		len(u.Pulled) != 0 || !slices.Equal(u.Done, []string{"h0"}) {
+		t.Fatalf("the rollback %+v", u)
+	}
+
+	// a rollback is not stopped again
+	again := s.acceptOp(KindAgentStop, 3, func(op *LedgerOp) { op.Upgrade = up.Op.ID })
+	s.changeUpgrade(t, func(u *state.AgentUpgrade) { u.Pulled = []string{"h0"} }) // the harness cannot grant h0
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if op := s.op(t, again.Op.ID); op.State != wire.OpCompleted || s.agentUpgrade(t).Stopping {
+		t.Fatalf("a stop of the rollback %+v %+v", op, s.agentUpgrade(t))
+	}
+
+	// the same steps: h1 pulls the old image and updates itself back
+	for i := 0; i < 3; i++ {
+		must(t, s.leader.Tick(ctx, 42, 5))
+	}
+
+	if d := ownOnNode(t, s.agent.Node); d.image != agentImage {
+		t.Fatalf("h1's document %s", d.image)
+	}
+
+	agentRunning(t, s, agentImage)
+	must(t, s.leader.Tick(ctx, 42, 5)) // h1 done
+	must(t, s.leader.Tick(ctx, 42, 5)) // finished
+
+	st, _, err := s.leader.clusterState(ctx, s.leader.bridge())
+	must(t, err)
+
+	if st.Agent.Image != agentImage || st.Agent.PreviousImage != "" || !st.AgentUpgrade.Finished || st.AgentUpgrade.Stopped != agentImage2 {
+		t.Fatalf("after the rollback %+v %+v", st.Agent, st.AgentUpgrade)
+	}
+}
+
+func TestAStopOfAPausedUpgradeRollsBackAndAResumeContinuesIt(t *testing.T) {
+	s, _ := agentSetup(t)
+	ctx := context.Background()
+
+	up := startUpgrade(t, s)
+	s.leader.OwnReport = ownRunning(s, agentImage)
+
+	s.changeUpgrade(t, func(u *state.AgentUpgrade) { u.StepAt = time.Now().Add(-agentUpgradeWithin - time.Minute) })
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if u := s.agentUpgrade(t); !u.Paused {
+		t.Fatalf("not paused %+v", u)
+	}
+
+	// stopped while paused: the rollback, not paused
+	s.acceptOp(KindAgentStop, 2, func(op *LedgerOp) { op.Upgrade = up.Op.ID })
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if u := s.agentUpgrade(t); u.Paused || u.Stopped != agentImage2 || u.Image != agentImage {
+		t.Fatalf("the rollback %+v", u)
+	}
+
+	// the rollback pauses as the upgrade did, and a resume continues it
+	s.changeUpgrade(t, func(u *state.AgentUpgrade) { u.Paused, u.Error = true, "self/h1 did not end" })
+	res := s.acceptOp(KindAgentResume, 3, func(op *LedgerOp) { op.Upgrade = up.Op.ID })
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if u := s.agentUpgrade(t); s.op(t, res.Op.ID).State != wire.OpCompleted || u.Paused || u.Attempt != 2 || u.Stopped != agentImage2 || u.Image != agentImage {
+		t.Fatalf("after the resume %+v", u)
+	}
+}

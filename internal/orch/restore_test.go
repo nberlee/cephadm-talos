@@ -129,6 +129,17 @@ func TestAgentRestorePreviousTakesTheKnownGood(t *testing.T) {
 	if d := docs[o.agentDocName(h)]; d.image != from {
 		t.Fatalf("restored %s", d.image)
 	}
+
+	// a stopped upgrade's rollback: its target is from, which stays the known good
+	o.St.AgentUpgrade = &state.AgentUpgrade{Op: "op-0000000000000002", From: from, Image: from, Stopped: o.St.Agent.Image}
+
+	if err := o.RestoreAgent(ctx, "h1", true); err == nil || !strings.Contains(err.Error(), "does not run") {
+		t.Fatalf("during a rollback: %v", err)
+	}
+
+	if docs, err = o.configuredDocs(ctx, h.Addr, o.agentDocName(h)); err != nil || docs[o.agentDocName(h)].image != from {
+		t.Fatalf("restored during a rollback %s %v", docs[o.agentDocName(h)].image, err)
+	}
 }
 
 func TestASuspensionJournalsTheRemovedAgentsInputs(t *testing.T) {

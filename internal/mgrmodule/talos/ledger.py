@@ -31,12 +31,12 @@ KINDS = ('restart', 'redeploy', 'add_daemon', 'remove_daemon', 'remove_host', 'c
          # renewals the module accepts by itself (plan 04, step 1)
          'renew_mgr', 'renew_rgw_cert',
          # an agent's certificates and the agents' image (plan 04, step 2)
-         'renew_agent', 'upgrade_agent', 'upgrade_agent_resume')
+         'renew_agent', 'upgrade_agent', 'upgrade_agent_resume', 'upgrade_agent_stop')
 # the upgrade's kinds, operations and module entries: about the cluster, without a host
 UPGRADE_CONTROLS = ('upgrade_pause', 'upgrade_resume', 'upgrade_stop')
 UPGRADE_KINDS = ('upgrade_start',) + UPGRADE_CONTROLS + ('upgrade_done', 'upgrade_refused')
 # entries about the cluster, without a host: the upgrade's and the RGW certificates'
-HOSTLESS = UPGRADE_KINDS + ('rgw_cert', 'rgw_cert_done', 'apply_ingress', 'renew_rgw_cert', 'upgrade_agent', 'upgrade_agent_resume')
+HOSTLESS = UPGRADE_KINDS + ('rgw_cert', 'rgw_cert_done', 'apply_ingress', 'renew_rgw_cert', 'upgrade_agent', 'upgrade_agent_resume', 'upgrade_agent_stop')
 VIP_RE = re.compile(r'\A(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}/(?:3[0-2]|[12]?\d)\Z')
 IMAGE_RE = re.compile(r'\A[a-z0-9][a-z0-9._/:-]{0,254}@sha256:[0-9a-f]{64}\Z')
 # kinds that are about a whole host: every other operation on it waits for them
@@ -166,7 +166,7 @@ def check_entry(key: str, raw: str) -> Dict[str, Any]:
                 or set(e) - {'version', 'id', 'kind', 'image', 'gid', 'epoch', 'seq', 'request', 'inputs'}:
             raise LedgerError('operation entry %s' % key)
         return e
-    if kind == 'upgrade_agent_resume':
+    if kind in ('upgrade_agent_resume', 'upgrade_agent_stop'):
         if daemon is not None or not isinstance(e.get('upgrade'), str) or not OP_RE.match(e['upgrade']) \
                 or set(e) - {'version', 'id', 'kind', 'upgrade', 'gid', 'epoch', 'seq', 'request', 'inputs'}:
             raise LedgerError('operation entry %s' % key)

@@ -357,7 +357,8 @@ class AgentRenewalFoldTest(unittest.TestCase):
         d2 = entry(5, 6, 'm-%016x' % 6, kind='agent_cert_done', of='op-%016x' % 4, host='h1', keep='op-%016x' % 4)
         up = entry(5, 7, 'op-%016x' % 7, kind='upgrade_agent', image='registry/agent@sha256:' + 'ab' * 32)
         res = entry(5, 8, 'op-%016x' % 8, kind='upgrade_agent_resume', upgrade='op-%016x' % 7)
-        for k, e in (r1, c1, d1, r2, c2, d2, up, res):
+        stop = entry(5, 10, 'op-%016x' % 10, kind='upgrade_agent_stop', upgrade='op-%016x' % 7)
+        for k, e in (r1, c1, d1, r2, c2, d2, up, res, stop):
             lg.check_entry(k, json.dumps(e))
         self.assertFalse(lg.Fold(inv, [r1]).agent_keys_allowed('op-%016x' % 1))  # not issued yet
         f = lg.Fold(inv, [r1, c1, d1, r2, c2])
@@ -368,7 +369,8 @@ class AgentRenewalFoldTest(unittest.TestCase):
         self.assertTrue(f.agent_keys_allowed('op-%016x' % 4))
         for bad in (dict(kind='renew_agent', host='h1', daemon='mgr.h1'), dict(kind='renew_agent'),
                     dict(kind='upgrade_agent', image='registry/agent:latest'), dict(kind='upgrade_agent', image='r@sha256:' + 'ab' * 32, host='h1'),
-                    dict(kind='upgrade_agent_resume', upgrade='x')):
+                    dict(kind='upgrade_agent_resume', upgrade='x'), dict(kind='upgrade_agent_stop', upgrade='x'),
+                    dict(kind='upgrade_agent_stop', upgrade='op-%016x' % 7, host='h1'), dict(kind='upgrade_agent_stop')):
             k, e = entry(5, 9, 'op-%016x' % 9, **bad)
             with self.assertRaises(lg.LedgerError, msg=bad):
                 lg.check_entry(k, json.dumps(e))

@@ -1549,10 +1549,12 @@ class Module(orchestrator.Orchestrator, MgrModule):
         return res
 
     @TalosCLICommand.Write('orch talos agent upgrade')
-    def _agent_upgrade(self, image: Optional[str] = None, resume: bool = False) -> HandleCommandResult:
-        """Upgrade every agent to an image the operator approved, one host at a time; or resume a paused upgrade"""
+    def _agent_upgrade(self, image: Optional[str] = None, resume: bool = False, stop: bool = False) -> HandleCommandResult:
+        """Upgrade every agent to an image the operator approved, one host at a time; resume a paused upgrade; stop it, rolling back to the image it upgrades from; without arguments, show it"""
         try:
-            return HandleCommandResult(stdout=self._accept_agent_upgrade(image, resume))
+            if image is None and not resume and not stop:
+                return HandleCommandResult(stdout=self._agent_upgrade_status())
+            return HandleCommandResult(stdout=self._accept_agent_upgrade(image, resume, stop))
         except OrchestratorError as e:
             return HandleCommandResult(retval=-22, stderr=str(e))
 
@@ -1573,9 +1575,39 @@ class Module(orchestrator.Orchestrator, MgrModule):
                     running = e
         return running
 
-    def _accept_agent_upgrade(self, image: Optional[str], resume: bool) -> str:
+    def _agent_upgrade_record(self) -> Dict[str, Any]:
+        """The leader's record of the last agent upgrade, {} without one."""
+        entries = self.get_store_prefix(STORE_PREFIX)
+        try:
+            cluster, _ = record_from_store(entries, choose_incarnation(entries, getattr(self, '_gid', None)), 'cluster')
+        except InventoryError:
+            return {}
+        return (cluster or {}).get('agent_upgrade') or {}
+
+    def _agent_upgrade_status(self) -> str:
+        """The last agent upgrade as its record shows it: running (or rolling
+        back after a stop), paused, finished or stopped."""
+        rec = self._agent_upgrade_record()
+        if not rec:
+            return 'No agent upgrade'
+        if rec.get('finished'):
+            state = 'stopped, rolled back to %s (gave up %s)' % (rec.get('image'), rec.get('stopped')) if rec.get('stopped') else 'finished'
+        elif rec.get('stopped'):
+            state = 'stopped, rolling back to %s (gave up %s)' % (rec.get('image'), rec.get('stopped'))
+        elif rec.get('stopping'):
+            state = 'stopping'
+        else:
+            state = 'running'
+        if rec.get('paused') and not rec.get('finished'):
+            state += ', paused: %s' % rec.get('error', '')
+        return json.dumps({'operation': rec.get('op'), 'from': rec.get('from'), 'target': rec.get('image'), 'state': state,
+                           'step': rec.get('step', ''), 'done': rec.get('done') or []}, indent=2, sort_keys=True)
+
+    def _accept_agent_upgrade(self, image: Optional[str], resume: bool, stop: bool = False) -> str:
         """An agent upgrade (plan 04, step 2): by digest, approved, from the agent
-        image's repository; no other agent or Ceph upgrade unfinished."""
+        image's repository; no other agent or Ceph upgrade unfinished. Its
+        resume, and its stop: a rollback to the image it upgrades from, which
+        must be in the operator's current approval; not of a rollback."""
         self._settle()
         led, fold = self._authority()
         entries = self.get_store_prefix(STORE_PREFIX)
@@ -1583,6 +1615,22 @@ class Module(orchestrator.Orchestrator, MgrModule):
         running = self._agent_upgrade_running(led)
         if running is None and fold.upgrade is not None:
             running = {'id': fold.upgrade['op'], 'kind': 'upgrade_start'}
+        if stop:
+            if image or resume or running is None or running['kind'] != 'upgrade_agent':
+                raise OrchestratorError('--stop takes no image, and needs an agent upgrade in progress')
+            rec = self._agent_upgrade_record()
+            ours = rec.get('op') == running['id']
+            for _, e in led.executable():
+                if e['kind'] == 'upgrade_agent_stop' and e['upgrade'] == running['id'] and ((self._journal(e['id']) or {}).get('state') not in TERMINAL or not ours):
+                    raise OrchestratorError('agent upgrade %s is stopping already (operation %s)' % (running['id'], e['id']))
+            if ours and (rec.get('stopping') or rec.get('stopped')):
+                raise OrchestratorError('agent upgrade %s is stopping already' % running['id'])
+            # the image it upgrades from: the record's, else the agents' image the leader records as it
+            back = rec.get('from') if ours else ((cluster or {}).get('agent') or {}).get('image')
+            if not back or back not in self._approved_images():
+                raise OrchestratorError('the operator has not approved %s, the image to roll back to (cephadm-talos approve --image)' % back)
+            op = self._accept_cluster('upgrade_agent_stop', upgrade=running['id'])
+            return 'Scheduled to stop agent upgrade %s, rolling back to %s (operation %s)' % (running['id'], back, op)
         if resume:
             if image or running is None or running['kind'] != 'upgrade_agent':
                 raise OrchestratorError('--resume takes no image, and needs an agent upgrade in progress')
