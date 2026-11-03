@@ -11,7 +11,7 @@ import (
 )
 
 // SupportedCeph is the only Ceph release this build supports (docs/support.md).
-const SupportedCeph = "20.2.4"
+const SupportedCeph = "21.2.0"
 
 // SupportedArch is the only CPU architecture this build supports, as `uname -m` reports it.
 const SupportedArch = "x86_64"
@@ -19,7 +19,7 @@ const SupportedArch = "x86_64"
 // imageInfo is an image reference resolved to a digest and probed.
 type imageInfo struct {
 	Ref     string // name@sha256:...
-	Version string // Ceph version, e.g. 20.2.4
+	Version string // Ceph version, e.g. 21.2.0
 	Arch    string // uname -m inside the image on the probed node
 }
 

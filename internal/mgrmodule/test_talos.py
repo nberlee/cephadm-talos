@@ -91,6 +91,21 @@ def record(containers, observed=NOW):
     return {'schema': 2, 'hostname': 'h', 'talos_version': 'v1.15.0', 'observed_at': observed, 'containers': containers}
 
 
+class InterfaceTest(unittest.TestCase):
+    def test_overrides_keep_the_orchestrators_parameters(self):
+        """Ceph's orchestrator CLI calls these methods with the interface's
+        arguments: an override must accept every one of them."""
+        import inspect
+        import orchestrator
+        for name, ours in vars(m.Module).items():
+            theirs = getattr(orchestrator.Orchestrator, name, None)
+            if name.startswith('_') or not callable(ours) or theirs is None:
+                continue
+            want = list(inspect.signature(theirs).parameters)
+            have = list(inspect.signature(ours).parameters)
+            self.assertEqual(have, want, name)
+
+
 class StatusMapping(unittest.TestCase):
     def status(self, c, host=None, daemon=None, obs=None):
         d = daemon or {'doc_name': 'x'}
@@ -613,6 +628,14 @@ class AddAndRemove(unittest.TestCase):
             self.assertTrue(m.Module.add_daemon(mod, spec).exception_str, spec)
         self.assertTrue(m.Module.add_daemon(mod, self.spec('mon', 'h2')).result)
         self.assertEqual(self.ops(mod), [('add_daemon', 'mgr.h2', 'h2'), ('add_daemon', 'mon.h2', 'h2')])
+        # a spec field this backend does not take, also one only a newer Ceph has, is refused, not ignored
+        from ceph.deployment.service_spec import ServiceSpec
+        for extra in ({'config': {'a': 'b'}}, {'spec': {'termination_grace_period_seconds': 120}}):
+            try:
+                spec = ServiceSpec.from_json(dict({'service_type': 'mgr', 'placement': {'hosts': ['h1']}}, **extra))
+            except Exception:
+                continue  # an older Ceph refuses it itself
+            self.assertTrue(m.Module.add_daemon(mod, spec).exception_str, extra)
 
     def test_daemon_rm_and_host_rm(self):
         mod, entries = self.module()
@@ -708,6 +731,8 @@ class Upgrade(unittest.TestCase):
             self.assertTrue(m.Module.upgrade_start(mod, args[0], None, None, None, None, None).exception_str, args)
         mod, _ = self.module(approved=[self.IMG])
         self.assertTrue(m.Module.upgrade_start(mod, self.IMG, '20.2.5', None, None, None, None).exception_str)
+        # Ceph 21's `orch upgrade start` passes the CRUSH bucket filter too
+        self.assertIn('only --image', m.Module.upgrade_start(mod, self.IMG, None, None, None, None, None, 'rack', 'r1').exception_str)
         # h3 is in maintenance in the CLI's state: refused until it is out
         self.assertIn('maintenance', m.Module.upgrade_start(mod, self.IMG, None, None, None, None, None).exception_str)
 
@@ -774,6 +799,25 @@ class RGWs(unittest.TestCase):
         [(key, val)] = self.written.items()
         self.assertEqual(key, 'cephadm-talos/secrets/user/%s/rgw-server.key' % second['id'])
         self.assertIn('PRIVATE KEY', val)
+
+    def test_the_operators_certificate_in_cephs_newer_spec_form(self):
+        """Ceph 21 moves the bundle into ssl_cert and ssl_key when ssl is set."""
+        from ceph.deployment.service_spec import ServiceSpec
+        mod, _ = self.module()
+        pem = self.operator_pem()
+        spec = ServiceSpec.from_json({'service_type': 'rgw', 'service_id': 'default', 'placement': {'hosts': ['h2']},
+                                      'spec': {'ssl': True, 'rgw_frontend_ssl_certificate': pem}})
+        self.assertEqual(m.Module.add_daemon(mod, spec).exception_str, '')
+        [(_, e)] = mod._ledger.executable()
+        self.assertIn('BEGIN CERTIFICATE', e['cert'])
+        self.assertIn('PRIVATE KEY', list(self.written.values())[0])
+        # a field this backend does not take, and a certificate without its key
+        for bad in ({'ssl': True, 'rgw_exit_timeout_secs': 30}, {'rgw_exit_timeout_secs': 0}, {'rgw_frontend_port': 0}, {'ssl_cert': 'x'}):
+            try:
+                spec = ServiceSpec.from_json({'service_type': 'rgw', 'service_id': 'default', 'placement': {'hosts': ['h1']}, 'spec': bad})
+            except Exception:
+                continue  # an older Ceph refuses it itself
+            self.assertTrue(m.Module.add_daemon(mod, spec).exception_str, bad)
 
     def test_rm_waits_for_the_ingress_to_leave_the_host(self):
         mod, entries = self.module()

@@ -18,19 +18,22 @@ jobs:
   capabilities:
     runs-on: ubuntu-latest
     env:
-      CEPH_TAG: v20.2.4
+      # Ceph v21.2.0 has no git tag: the commit is the release image's CEPH_SHA1 label
+      CEPH_COMMIT: b060042deb05d33e6cc358970cfb8221240bcf3e
     steps:
       - uses: actions/checkout@v4
       - name: Fetch the Ceph sources the matrix is checked against
         run: |
-          git clone --quiet --depth 1 --branch "$CEPH_TAG" --filter=blob:none --sparse https://github.com/ceph/ceph.git ceph
-          git -C ceph sparse-checkout set src/pybind/mgr/orchestrator src/pybind/mgr/cephadm src/python-common/ceph/deployment
+          git init --quiet ceph && cd ceph
+          git sparse-checkout set src/pybind/mgr/orchestrator src/pybind/mgr/cephadm src/python-common/ceph/deployment
+          git fetch --quiet --depth 1 --filter=blob:none https://github.com/ceph/ceph.git "$CEPH_COMMIT"
+          git checkout --quiet FETCH_HEAD
       - run: python3 -I hack/capabilities.py ceph docs/capabilities.md
 
   mgrmodule:
     runs-on: ubuntu-latest
     env:
-      CEPH_TAG: v20.2.4
+      CEPH_COMMIT: b060042deb05d33e6cc358970cfb8221240bcf3e
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -39,6 +42,8 @@ jobs:
       - run: pip install prettytable pyyaml
       - name: Fetch the Ceph mgr sources the module is tested against
         run: |
-          git clone --quiet --depth 1 --branch "$CEPH_TAG" --filter=blob:none --sparse https://github.com/ceph/ceph.git ceph
-          git -C ceph sparse-checkout set src/pybind src/python-common
+          git init --quiet ceph && cd ceph
+          git sparse-checkout set src/pybind src/python-common
+          git fetch --quiet --depth 1 --filter=blob:none https://github.com/ceph/ceph.git "$CEPH_COMMIT"
+          git checkout --quiet FETCH_HEAD
       - run: hack/mgrmodule-test.sh ceph

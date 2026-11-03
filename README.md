@@ -21,7 +21,7 @@ The demo above runs on 3 Talos v1.15.0-alpha.1 nodes created with `--skip-etcd-k
 
 ## Requirements
 
-- Talos nodes, amd64, built from the combined branch of our open Talos PRs until they are released, and the latest Ceph release (today v20.2.4); see [docs/support.md](docs/support.md). Workload isolation must be off until Talos PR #14603 is released.
+- Talos nodes, amd64 with x86-64-v3 CPUs and lowercase hostnames, built from the combined branch of our open Talos PRs until they are released, and the latest Ceph release (today v21.2.0); see [docs/support.md](docs/support.md). Workload isolation must be off until Talos PR #14603 is released.
 - The agent image in a registry the nodes can pull from (`hack/agent-image.sh` builds and pushes it).
 - A talosconfig for the nodes (`--talosconfig`, `$TALOSCONFIG` or `~/.talos/config`). `talosctl` itself is not needed.
 - Free raw disks on the nodes for OSDs. These must not be claimed by any Talos volume.
@@ -60,7 +60,7 @@ AGENT=$(hack/agent-image.sh)
 
 # create the cluster (1 mon + 1 mgr, the agent, the mgr module), then hand it
 # to the agents and the leader
-./cephadm-talos --talosconfig ./.talosconfig bootstrap --mon-node 10.5.0.3 --image quay.io/ceph/ceph:v20.2.4 --agent-image "$AGENT"
+./cephadm-talos --talosconfig ./.talosconfig bootstrap --mon-node 10.5.0.3 --image quay.io/ceph/ceph:v21.2.0 --agent-image "$AGENT"
 ./cephadm-talos handoff
 
 # more nodes: the CLI enrolls each (its agent, no cluster document), then `ceph orch host add`

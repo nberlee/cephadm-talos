@@ -1,6 +1,6 @@
 # Capability matrix
 
-What cephadm-talos provides of the Ceph orchestrator interface, for Ceph v20.2.4 (tag `v20.2.4`, commit `7f793731f1b39eb4f465e960113d2363c311b964`). Status is `implemented`, `milestone N` (planned in that [roadmap](../ROADMAP.md) milestone) or `unsupported`. The `implemented` rows are the read path of [plan 02](plans/02-agents-and-read-path.md) and the write path of [plan 03](plans/03-write-path.md): a mgr module installed as `cephadm` (Ceph accepts only `cephadm`, `rook` and `test_orchestrator` as backend), with the leader in the active mgr's cephadm-talos agent carrying the operations out. A note on an `implemented` row names what of it is supported; anything else of that command is refused. [docs/architecture.md](architecture.md) ("The ledger") lists every accepted form.
+What cephadm-talos provides of the Ceph orchestrator interface, for Ceph v21.2.0 (commit `b060042deb05d33e6cc358970cfb8221240bcf3e` of the `umbrella` branch, the release image's `CEPH_SHA1` label; the release has no git tag). Status is `implemented`, `milestone N` (planned in that [roadmap](../ROADMAP.md) milestone) or `unsupported`. The `implemented` rows are the read path of [plan 02](plans/02-agents-and-read-path.md) and the write path of [plan 03](plans/03-write-path.md): a mgr module installed as `cephadm` (Ceph accepts only `cephadm`, `rook` and `test_orchestrator` as backend), with the leader in the active mgr's cephadm-talos agent carrying the operations out. A note on an `implemented` row names what of it is supported; anything else of that command is refused. [docs/architecture.md](architecture.md) ("The ledger") lists every accepted form.
 
 The first four sections are checked against the Ceph source by `hack/capabilities.py <ceph source>`; the last two are maintained by hand.
 
@@ -13,6 +13,7 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `add_host_label` | milestone 5 |  |
 | `apply` | implemented | write path (plan 03): one keepalived-only ingress (`apply -i`), and host specs of enrolled nodes (to `add_host`); no other service spec |
 | `apply_alertmanager` | milestone 5 |  |
+| `apply_alloy` | milestone 5 |  |
 | `apply_ceph_exporter` | milestone 5 |  |
 | `apply_crash` | milestone 5 |  |
 | `apply_drivegroups` | milestone 5 |  |
@@ -38,9 +39,9 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `available` | implemented | read path (plan 02): the talos mgr module, installed as `cephadm` |
 | `blink_device_light` | milestone 5 | to validate on Talos (lsmcli in a privileged job) |
 | `cancel_completions` | milestone 3 |  |
+| `cert_store_bindings_ls` | milestone 5 |  |
 | `cert_store_cert_check` | milestone 5 |  |
 | `cert_store_cert_ls` | milestone 5 |  |
-| `cert_store_entity_ls` | milestone 5 |  |
 | `cert_store_get_cert` | milestone 5 |  |
 | `cert_store_get_key` | milestone 5 |  |
 | `cert_store_key_ls` | milestone 5 |  |
@@ -62,6 +63,7 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `get_feature_set` | milestone 3 |  |
 | `get_hosts` | implemented | read path (plan 02): the talos mgr module, installed as `cephadm` |
 | `get_inventory` | milestone 5 |  |
+| `get_nvmeof_tls_bundle` | milestone 5 |  |
 | `get_prometheus_access_info` | milestone 5 |  |
 | `get_security_config` | milestone 5 |  |
 | `hardware_light` | milestone 5 | to validate on Talos (node-proxy talks to the BMC over Redfish) |
@@ -85,6 +87,7 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `remove_host_label` | milestone 5 |  |
 | `remove_osds` | implemented | write path (plan 03): with `--zap` and `--force`; not `--replace` or `--no-destroy` |
 | `remove_osds_status` | implemented | write path (plan 03): the phase, without PG counts |
+| `remove_prometheus_remote_write` | milestone 5 |  |
 | `remove_prometheus_target` | milestone 5 |  |
 | `remove_service` | milestone 5 |  |
 | `replace_device` | milestone 5 |  |
@@ -96,6 +99,7 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `set_custom_prometheus_alerts` | milestone 5 |  |
 | `set_osd_spec` | milestone 5 |  |
 | `set_prometheus_access_info` | milestone 5 |  |
+| `set_prometheus_remote_write` | milestone 5 |  |
 | `set_prometheus_target` | milestone 5 |  |
 | `set_unmanaged` | milestone 5 |  |
 | `set_unmanaged_flag` | milestone 5 |  |
@@ -140,13 +144,13 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `orch apply smb` | milestone 5 | needs draft 07 (shared namespaces) |
 | `orch apply snmp-gateway` | milestone 5 |  |
 | `orch cancel` | milestone 3 |  |
+| `orch certmgr bindings ls` | milestone 5 |  |
 | `orch certmgr cert check` | milestone 5 |  |
 | `orch certmgr cert get` | milestone 5 |  |
 | `orch certmgr cert ls` | milestone 5 |  |
 | `orch certmgr cert rm` | milestone 5 |  |
 | `orch certmgr cert set` | milestone 5 |  |
 | `orch certmgr cert-key set` | milestone 5 |  |
-| `orch certmgr entity ls` | milestone 5 |  |
 | `orch certmgr generate-certificates` | milestone 5 |  |
 | `orch certmgr key get` | milestone 5 |  |
 | `orch certmgr key ls` | milestone 5 |  |
@@ -193,9 +197,11 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `orch osd set-spec-affinity` | milestone 5 |  |
 | `orch pause` | milestone 5 |  |
 | `orch prometheus get-credentials` | milestone 5 |  |
+| `orch prometheus remove-remote-write` | milestone 5 |  |
 | `orch prometheus remove-target` | milestone 5 |  |
 | `orch prometheus set-credentials` | milestone 5 |  |
 | `orch prometheus set-custom-alerts` | milestone 5 |  |
+| `orch prometheus set-remote-write` | milestone 5 |  |
 | `orch prometheus set-target` | milestone 5 |  |
 | `orch ps` | implemented | read path (plan 02): the talos mgr module, installed as `cephadm` |
 | `orch resume` | milestone 5 |  |
@@ -227,6 +233,7 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 |---|---|---|
 | `agent` | unsupported | deliberately excluded: the cephadm agent is replaced by the cephadm-talos agent |
 | `alertmanager` | milestone 5 |  |
+| `alloy` | milestone 5 |  |
 | `ceph-exporter` | milestone 5 |  |
 | `cephfs-mirror` | milestone 5 |  |
 | `container` | milestone 5 |  |
@@ -261,17 +268,28 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 
 | Name | Status | Note |
 |---|---|---|
+| `agent.certificate_source` | unsupported | follows its service type |
 | `agent.config` | unsupported | follows its service type |
 | `agent.count` | unsupported | follows its service type |
 | `agent.custom_configs` | unsupported | follows its service type |
+| `agent.custom_sans` | unsupported | follows its service type |
 | `agent.extra_container_args` | unsupported | follows its service type |
 | `agent.extra_entrypoint_args` | unsupported | follows its service type |
+| `agent.ip_addrs` | unsupported | follows its service type |
 | `agent.networks` | unsupported | follows its service type |
 | `agent.placement` | unsupported | follows its service type |
 | `agent.preview_only` | unsupported | follows its service type |
+| `agent.remote_write_allowed_metrics` | unsupported | follows its service type |
+| `agent.remote_write_url` | unsupported | follows its service type |
 | `agent.service_id` | unsupported | follows its service type |
+| `agent.ssl` | unsupported | follows its service type |
+| `agent.ssl_ca_cert` | unsupported | follows its service type |
+| `agent.ssl_cert` | unsupported | follows its service type |
+| `agent.ssl_key` | unsupported | follows its service type |
 | `agent.targets` | unsupported | follows its service type |
+| `agent.termination_grace_period_seconds` | unsupported | follows its service type |
 | `agent.unmanaged` | unsupported | follows its service type |
+| `alertmanager.certificate_source` | milestone 5 |  |
 | `alertmanager.config` | milestone 5 |  |
 | `alertmanager.custom_configs` | milestone 5 |  |
 | `alertmanager.extra_container_args` | milestone 5 |  |
@@ -283,9 +301,26 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `alertmanager.preview_only` | milestone 5 |  |
 | `alertmanager.secure` | milestone 5 |  |
 | `alertmanager.service_id` | milestone 5 |  |
+| `alertmanager.ssl` | milestone 5 |  |
 | `alertmanager.unmanaged` | milestone 5 |  |
 | `alertmanager.user_data` | milestone 5 |  |
+| `alloy.certificate_source` | milestone 5 |  |
+| `alloy.config` | milestone 5 |  |
+| `alloy.custom_configs` | milestone 5 |  |
+| `alloy.extra_container_args` | milestone 5 |  |
+| `alloy.extra_entrypoint_args` | milestone 5 |  |
+| `alloy.networks` | milestone 5 |  |
+| `alloy.placement` | milestone 5 |  |
+| `alloy.port` | milestone 5 |  |
+| `alloy.preview_only` | milestone 5 |  |
+| `alloy.remote_write_allowed_metrics` | milestone 5 |  |
+| `alloy.remote_write_url` | milestone 5 |  |
+| `alloy.service_id` | milestone 5 |  |
+| `alloy.ssl` | milestone 5 |  |
+| `alloy.targets` | milestone 5 |  |
+| `alloy.unmanaged` | milestone 5 |  |
 | `ceph-exporter.addrs` | milestone 5 |  |
+| `ceph-exporter.certificate_source` | milestone 5 |  |
 | `ceph-exporter.extra_container_args` | milestone 5 |  |
 | `ceph-exporter.extra_entrypoint_args` | milestone 5 |  |
 | `ceph-exporter.placement` | milestone 5 |  |
@@ -293,18 +328,29 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `ceph-exporter.preview_only` | milestone 5 |  |
 | `ceph-exporter.prio_limit` | milestone 5 |  |
 | `ceph-exporter.sock_dir` | milestone 5 |  |
+| `ceph-exporter.ssl` | milestone 5 |  |
 | `ceph-exporter.stats_period` | milestone 5 |  |
 | `ceph-exporter.unmanaged` | milestone 5 |  |
+| `cephfs-mirror.certificate_source` | milestone 5 |  |
 | `cephfs-mirror.config` | milestone 5 |  |
 | `cephfs-mirror.count` | milestone 5 |  |
 | `cephfs-mirror.custom_configs` | milestone 5 |  |
+| `cephfs-mirror.custom_sans` | milestone 5 |  |
 | `cephfs-mirror.extra_container_args` | milestone 5 |  |
 | `cephfs-mirror.extra_entrypoint_args` | milestone 5 |  |
+| `cephfs-mirror.ip_addrs` | milestone 5 |  |
 | `cephfs-mirror.networks` | milestone 5 |  |
 | `cephfs-mirror.placement` | milestone 5 |  |
 | `cephfs-mirror.preview_only` | milestone 5 |  |
+| `cephfs-mirror.remote_write_allowed_metrics` | milestone 5 |  |
+| `cephfs-mirror.remote_write_url` | milestone 5 |  |
 | `cephfs-mirror.service_id` | milestone 5 |  |
+| `cephfs-mirror.ssl` | milestone 5 |  |
+| `cephfs-mirror.ssl_ca_cert` | milestone 5 |  |
+| `cephfs-mirror.ssl_cert` | milestone 5 |  |
+| `cephfs-mirror.ssl_key` | milestone 5 |  |
 | `cephfs-mirror.targets` | milestone 5 |  |
+| `cephfs-mirror.termination_grace_period_seconds` | milestone 5 |  |
 | `cephfs-mirror.unmanaged` | milestone 5 |  |
 | `container.args` | milestone 5 |  |
 | `container.bind_mounts` | milestone 5 |  |
@@ -328,16 +374,26 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `container.uid` | milestone 5 |  |
 | `container.unmanaged` | milestone 5 |  |
 | `container.volume_mounts` | milestone 5 |  |
+| `crash.certificate_source` | milestone 5 |  |
 | `crash.config` | milestone 5 |  |
 | `crash.count` | milestone 5 |  |
 | `crash.custom_configs` | milestone 5 |  |
+| `crash.custom_sans` | milestone 5 |  |
 | `crash.extra_container_args` | milestone 5 |  |
 | `crash.extra_entrypoint_args` | milestone 5 |  |
+| `crash.ip_addrs` | milestone 5 |  |
 | `crash.networks` | milestone 5 |  |
 | `crash.placement` | milestone 5 |  |
 | `crash.preview_only` | milestone 5 |  |
+| `crash.remote_write_allowed_metrics` | milestone 5 |  |
+| `crash.remote_write_url` | milestone 5 |  |
 | `crash.service_id` | milestone 5 |  |
+| `crash.ssl` | milestone 5 |  |
+| `crash.ssl_ca_cert` | milestone 5 |  |
+| `crash.ssl_cert` | milestone 5 |  |
+| `crash.ssl_key` | milestone 5 |  |
 | `crash.targets` | milestone 5 |  |
+| `crash.termination_grace_period_seconds` | milestone 5 |  |
 | `crash.unmanaged` | milestone 5 |  |
 | `elasticsearch.config` | milestone 5 |  |
 | `elasticsearch.es_nodes` | milestone 5 |  |
@@ -348,6 +404,7 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `elasticsearch.unmanaged` | milestone 5 |  |
 | `elasticsearch.without_query` | milestone 5 |  |
 | `grafana.anonymous_access` | milestone 5 |  |
+| `grafana.certificate_source` | milestone 5 |  |
 | `grafana.config` | milestone 5 |  |
 | `grafana.custom_configs` | milestone 5 |  |
 | `grafana.extra_container_args` | milestone 5 |  |
@@ -360,21 +417,31 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `grafana.preview_only` | milestone 5 |  |
 | `grafana.protocol` | milestone 5 |  |
 | `grafana.service_id` | milestone 5 |  |
+| `grafana.ssl` | milestone 5 |  |
 | `grafana.unmanaged` | milestone 5 |  |
 | `ingress.backend_service` | implemented | write path (plan 03): `rgw.default` |
+| `ingress.certificate_source` | milestone 5 |  |
 | `ingress.config` | milestone 5 |  |
 | `ingress.custom_configs` | milestone 5 |  |
+| `ingress.custom_sans` | milestone 5 |  |
 | `ingress.enable_haproxy_protocol` | milestone 5 |  |
 | `ingress.enable_stats` | milestone 5 |  |
 | `ingress.extra_container_args` | milestone 5 |  |
 | `ingress.extra_entrypoint_args` | milestone 5 |  |
 | `ingress.first_virtual_router_id` | implemented | write path (plan 03) |
 | `ingress.frontend_port` | milestone 5 |  |
+| `ingress.haproxy_peer_communication_port` | milestone 5 |  |
 | `ingress.health_check_interval` | milestone 5 |  |
 | `ingress.keepalive_only` | implemented | write path (plan 03): `true` |
 | `ingress.keepalived_password` | implemented | write path (plan 03): 1 to 8 letters and digits |
+| `ingress.monitor_cert_source` | milestone 5 |  |
+| `ingress.monitor_ip_addrs` | milestone 5 |  |
+| `ingress.monitor_networks` | milestone 5 |  |
 | `ingress.monitor_password` | milestone 5 |  |
 | `ingress.monitor_port` | milestone 5 |  |
+| `ingress.monitor_ssl` | milestone 5 |  |
+| `ingress.monitor_ssl_cert` | milestone 5 |  |
+| `ingress.monitor_ssl_key` | milestone 5 |  |
 | `ingress.monitor_user` | milestone 5 |  |
 | `ingress.networks` | milestone 5 |  |
 | `ingress.placement` | implemented | write path (plan 03): 1 to 15 named hosts with an RGW |
@@ -387,6 +454,7 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `ingress.ssl_options` | milestone 5 |  |
 | `ingress.unmanaged` | milestone 5 |  |
 | `ingress.use_keepalived_multicast` | milestone 5 |  |
+| `ingress.use_tcp_mode_over_rgw` | milestone 5 |  |
 | `ingress.virtual_interface_networks` | milestone 5 |  |
 | `ingress.virtual_ip` | implemented | write path (plan 03): one IPv4 address with its prefix length |
 | `ingress.virtual_ips_list` | milestone 5 |  |
@@ -395,8 +463,10 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `iscsi.api_port` | milestone 5 | to validate on Talos (configfs, kernel modules) |
 | `iscsi.api_secure` | milestone 5 | to validate on Talos (configfs, kernel modules) |
 | `iscsi.api_user` | milestone 5 | to validate on Talos (configfs, kernel modules) |
+| `iscsi.certificate_source` | milestone 5 | to validate on Talos (configfs, kernel modules) |
 | `iscsi.config` | milestone 5 | to validate on Talos (configfs, kernel modules) |
 | `iscsi.custom_configs` | milestone 5 | to validate on Talos (configfs, kernel modules) |
+| `iscsi.custom_sans` | milestone 5 | to validate on Talos (configfs, kernel modules) |
 | `iscsi.extra_container_args` | milestone 5 | to validate on Talos (configfs, kernel modules) |
 | `iscsi.extra_entrypoint_args` | milestone 5 | to validate on Talos (configfs, kernel modules) |
 | `iscsi.networks` | milestone 5 | to validate on Talos (configfs, kernel modules) |
@@ -404,6 +474,7 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `iscsi.pool` | milestone 5 | to validate on Talos (configfs, kernel modules) |
 | `iscsi.preview_only` | milestone 5 | to validate on Talos (configfs, kernel modules) |
 | `iscsi.service_id` | milestone 5 | to validate on Talos (configfs, kernel modules) |
+| `iscsi.ssl` | milestone 5 | to validate on Talos (configfs, kernel modules) |
 | `iscsi.ssl_cert` | milestone 5 | to validate on Talos (configfs, kernel modules) |
 | `iscsi.ssl_key` | milestone 5 | to validate on Talos (configfs, kernel modules) |
 | `iscsi.trusted_ip_list` | milestone 5 | to validate on Talos (configfs, kernel modules) |
@@ -440,6 +511,7 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `jaeger-tracing.service_id` | milestone 5 |  |
 | `jaeger-tracing.unmanaged` | milestone 5 |  |
 | `jaeger-tracing.without_query` | milestone 5 |  |
+| `loki.certificate_source` | milestone 5 |  |
 | `loki.config` | milestone 5 |  |
 | `loki.custom_configs` | milestone 5 |  |
 | `loki.extra_container_args` | milestone 5 |  |
@@ -448,7 +520,10 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `loki.placement` | milestone 5 |  |
 | `loki.port` | milestone 5 |  |
 | `loki.preview_only` | milestone 5 |  |
+| `loki.remote_write_allowed_metrics` | milestone 5 |  |
+| `loki.remote_write_url` | milestone 5 |  |
 | `loki.service_id` | milestone 5 |  |
+| `loki.ssl` | milestone 5 |  |
 | `loki.targets` | milestone 5 |  |
 | `loki.unmanaged` | milestone 5 |  |
 | `mds.config` | milestone 5 |  |
@@ -459,8 +534,10 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `mds.preview_only` | milestone 5 |  |
 | `mds.service_id` | milestone 5 |  |
 | `mds.unmanaged` | milestone 5 |  |
+| `mgmt-gateway.certificate_source` | milestone 5 |  |
 | `mgmt-gateway.config` | milestone 5 |  |
 | `mgmt-gateway.custom_configs` | milestone 5 |  |
+| `mgmt-gateway.custom_sans` | milestone 5 |  |
 | `mgmt-gateway.enable_auth` | milestone 5 |  |
 | `mgmt-gateway.enable_health_check_endpoint` | milestone 5 |  |
 | `mgmt-gateway.extra_container_args` | milestone 5 |  |
@@ -484,16 +561,26 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `mgmt-gateway.ssl_stapling_verify` | milestone 5 |  |
 | `mgmt-gateway.unmanaged` | milestone 5 |  |
 | `mgmt-gateway.virtual_ip` | milestone 5 |  |
+| `mgr.certificate_source` | milestone 5 |  |
 | `mgr.config` | milestone 5 |  |
 | `mgr.count` | milestone 5 |  |
 | `mgr.custom_configs` | milestone 5 |  |
+| `mgr.custom_sans` | milestone 5 |  |
 | `mgr.extra_container_args` | milestone 5 |  |
 | `mgr.extra_entrypoint_args` | milestone 5 |  |
+| `mgr.ip_addrs` | milestone 5 |  |
 | `mgr.networks` | milestone 5 |  |
 | `mgr.placement` | milestone 5 |  |
 | `mgr.preview_only` | milestone 5 |  |
+| `mgr.remote_write_allowed_metrics` | milestone 5 |  |
+| `mgr.remote_write_url` | milestone 5 |  |
 | `mgr.service_id` | milestone 5 |  |
+| `mgr.ssl` | milestone 5 |  |
+| `mgr.ssl_ca_cert` | milestone 5 |  |
+| `mgr.ssl_cert` | milestone 5 |  |
+| `mgr.ssl_key` | milestone 5 |  |
 | `mgr.targets` | milestone 5 |  |
+| `mgr.termination_grace_period_seconds` | milestone 5 |  |
 | `mgr.unmanaged` | milestone 5 |  |
 | `mon.config` | milestone 5 |  |
 | `mon.count` | milestone 5 |  |
@@ -506,22 +593,41 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `mon.preview_only` | milestone 5 |  |
 | `mon.service_id` | milestone 5 |  |
 | `mon.unmanaged` | milestone 5 |  |
+| `nfs.certificate_source` | milestone 5 |  |
+| `nfs.cluster_qos_config` | milestone 5 |  |
+| `nfs.cluster_qos_port` | milestone 5 |  |
+| `nfs.colocation_ports` | milestone 5 |  |
 | `nfs.config` | milestone 5 |  |
 | `nfs.custom_configs` | milestone 5 |  |
+| `nfs.custom_sans` | milestone 5 |  |
 | `nfs.enable_haproxy_protocol` | milestone 5 |  |
 | `nfs.enable_nfsv3` | milestone 5 |  |
 | `nfs.enable_nlm` | milestone 5 |  |
+| `nfs.enable_rdma` | milestone 5 |  |
 | `nfs.extra_container_args` | milestone 5 |  |
 | `nfs.extra_entrypoint_args` | milestone 5 |  |
 | `nfs.idmap_conf` | milestone 5 |  |
+| `nfs.ip_addrs` | milestone 5 |  |
+| `nfs.monitoring_ip_addrs` | milestone 5 |  |
+| `nfs.monitoring_networks` | milestone 5 |  |
 | `nfs.monitoring_port` | milestone 5 |  |
 | `nfs.networks` | milestone 5 |  |
 | `nfs.placement` | milestone 5 |  |
 | `nfs.port` | milestone 5 |  |
 | `nfs.preview_only` | milestone 5 |  |
+| `nfs.rdma_port` | milestone 5 |  |
 | `nfs.service_id` | milestone 5 |  |
+| `nfs.ssl` | milestone 5 |  |
+| `nfs.ssl_ca_cert` | milestone 5 |  |
+| `nfs.ssl_cert` | milestone 5 |  |
+| `nfs.ssl_key` | milestone 5 |  |
+| `nfs.tls_ciphers` | milestone 5 |  |
+| `nfs.tls_debug` | milestone 5 |  |
+| `nfs.tls_ktls` | milestone 5 |  |
+| `nfs.tls_min_version` | milestone 5 |  |
 | `nfs.unmanaged` | milestone 5 |  |
 | `nfs.virtual_ip` | milestone 5 |  |
+| `node-exporter.certificate_source` | milestone 5 |  |
 | `node-exporter.config` | milestone 5 |  |
 | `node-exporter.custom_configs` | milestone 5 |  |
 | `node-exporter.extra_container_args` | milestone 5 |  |
@@ -530,19 +636,19 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `node-exporter.placement` | milestone 5 |  |
 | `node-exporter.port` | milestone 5 |  |
 | `node-exporter.preview_only` | milestone 5 |  |
+| `node-exporter.remote_write_allowed_metrics` | milestone 5 |  |
+| `node-exporter.remote_write_url` | milestone 5 |  |
 | `node-exporter.service_id` | milestone 5 |  |
+| `node-exporter.ssl` | milestone 5 |  |
 | `node-exporter.targets` | milestone 5 |  |
 | `node-exporter.unmanaged` | milestone 5 |  |
-| `node-proxy.config` | milestone 5 | to validate on Talos (node-proxy talks to the BMC over Redfish) |
-| `node-proxy.count` | milestone 5 | to validate on Talos (node-proxy talks to the BMC over Redfish) |
+| `node-proxy.certificate_source` | milestone 5 | to validate on Talos (node-proxy talks to the BMC over Redfish) |
 | `node-proxy.custom_configs` | milestone 5 | to validate on Talos (node-proxy talks to the BMC over Redfish) |
 | `node-proxy.extra_container_args` | milestone 5 | to validate on Talos (node-proxy talks to the BMC over Redfish) |
 | `node-proxy.extra_entrypoint_args` | milestone 5 | to validate on Talos (node-proxy talks to the BMC over Redfish) |
-| `node-proxy.networks` | milestone 5 | to validate on Talos (node-proxy talks to the BMC over Redfish) |
 | `node-proxy.placement` | milestone 5 | to validate on Talos (node-proxy talks to the BMC over Redfish) |
 | `node-proxy.preview_only` | milestone 5 | to validate on Talos (node-proxy talks to the BMC over Redfish) |
-| `node-proxy.service_id` | milestone 5 | to validate on Talos (node-proxy talks to the BMC over Redfish) |
-| `node-proxy.targets` | milestone 5 | to validate on Talos (node-proxy talks to the BMC over Redfish) |
+| `node-proxy.ssl` | milestone 5 | to validate on Talos (node-proxy talks to the BMC over Redfish) |
 | `node-proxy.unmanaged` | milestone 5 | to validate on Talos (node-proxy talks to the BMC over Redfish) |
 | `nvmeof.abort_discovery_on_errors` | milestone 5 | needs draft 08 (memlock) |
 | `nvmeof.abort_on_errors` | milestone 5 | needs draft 08 (memlock) |
@@ -552,12 +658,18 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `nvmeof.allowed_consecutive_spdk_ping_failures` | milestone 5 | needs draft 08 (memlock) |
 | `nvmeof.bdevs_per_cluster` | milestone 5 | needs draft 08 (memlock) |
 | `nvmeof.break_update_interval_sec` | milestone 5 | needs draft 08 (memlock) |
+| `nvmeof.certificate_source` | milestone 5 | needs draft 08 (memlock) |
 | `nvmeof.client_cert` | milestone 5 | needs draft 08 (memlock) |
 | `nvmeof.client_key` | milestone 5 | needs draft 08 (memlock) |
 | `nvmeof.cluster_connections` | milestone 5 | needs draft 08 (memlock) |
+| `nvmeof.cnc_chunk_blocks` | milestone 5 | needs draft 08 (memlock) |
+| `nvmeof.cnc_enable` | milestone 5 | needs draft 08 (memlock) |
+| `nvmeof.cnc_parallel_chunks` | milestone 5 | needs draft 08 (memlock) |
+| `nvmeof.cnc_rate_limiter_bytes` | milestone 5 | needs draft 08 (memlock) |
 | `nvmeof.config` | milestone 5 | needs draft 08 (memlock) |
 | `nvmeof.conn_retries` | milestone 5 | needs draft 08 (memlock) |
 | `nvmeof.custom_configs` | milestone 5 | needs draft 08 (memlock) |
+| `nvmeof.custom_sans` | milestone 5 | needs draft 08 (memlock) |
 | `nvmeof.degrade_namespace_on_kmip_error` | milestone 5 | needs draft 08 (memlock) |
 | `nvmeof.discovery_addr` | milestone 5 | needs draft 08 (memlock) |
 | `nvmeof.discovery_addr_map` | milestone 5 | needs draft 08 (memlock) |
@@ -605,6 +717,7 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `nvmeof.omap_file_lock_on_read` | milestone 5 | needs draft 08 (memlock) |
 | `nvmeof.omap_file_lock_retries` | milestone 5 | needs draft 08 (memlock) |
 | `nvmeof.omap_file_lock_retry_sleep_interval` | milestone 5 | needs draft 08 (memlock) |
+| `nvmeof.omap_file_update_attempts` | milestone 5 | needs draft 08 (memlock) |
 | `nvmeof.omap_file_update_reloads` | milestone 5 | needs draft 08 (memlock) |
 | `nvmeof.ping_spdk_under_lock` | milestone 5 | needs draft 08 (memlock) |
 | `nvmeof.placement` | milestone 5 | needs draft 08 (memlock) |
@@ -612,6 +725,8 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `nvmeof.port` | milestone 5 | needs draft 08 (memlock) |
 | `nvmeof.preview_only` | milestone 5 | needs draft 08 (memlock) |
 | `nvmeof.prometheus_connection_list_cache_expiration` | milestone 5 | needs draft 08 (memlock) |
+| `nvmeof.prometheus_cycles_to_adjust_speed` | milestone 5 | needs draft 08 (memlock) |
+| `nvmeof.prometheus_frequency_slow_down_factor` | milestone 5 | needs draft 08 (memlock) |
 | `nvmeof.prometheus_port` | milestone 5 | needs draft 08 (memlock) |
 | `nvmeof.prometheus_startup_delay` | milestone 5 | needs draft 08 (memlock) |
 | `nvmeof.prometheus_stats_interval` | milestone 5 | needs draft 08 (memlock) |
@@ -632,6 +747,9 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `nvmeof.spdk_ping_interval_in_seconds` | milestone 5 | needs draft 08 (memlock) |
 | `nvmeof.spdk_protocol_log_level` | milestone 5 | needs draft 08 (memlock) |
 | `nvmeof.spdk_timeout` | milestone 5 | needs draft 08 (memlock) |
+| `nvmeof.ssl` | milestone 5 | needs draft 08 (memlock) |
+| `nvmeof.ssl_cert` | milestone 5 | needs draft 08 (memlock) |
+| `nvmeof.ssl_key` | milestone 5 | needs draft 08 (memlock) |
 | `nvmeof.state_update_interval_sec` | milestone 5 | needs draft 08 (memlock) |
 | `nvmeof.state_update_notify` | milestone 5 | needs draft 08 (memlock) |
 | `nvmeof.subsystem_cache_expiration` | milestone 5 | needs draft 08 (memlock) |
@@ -645,11 +763,14 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `nvmeof.verify_listener_ip` | milestone 5 | needs draft 08 (memlock) |
 | `nvmeof.verify_nqns` | milestone 5 | needs draft 08 (memlock) |
 | `oauth2-proxy.allowlist_domains` | milestone 5 |  |
+| `oauth2-proxy.certificate_source` | milestone 5 |  |
 | `oauth2-proxy.client_id` | milestone 5 |  |
 | `oauth2-proxy.client_secret` | milestone 5 |  |
 | `oauth2-proxy.config` | milestone 5 |  |
 | `oauth2-proxy.cookie_secret` | milestone 5 |  |
 | `oauth2-proxy.custom_configs` | milestone 5 |  |
+| `oauth2-proxy.custom_sans` | milestone 5 |  |
+| `oauth2-proxy.email_domains` | milestone 5 |  |
 | `oauth2-proxy.extra_container_args` | milestone 5 |  |
 | `oauth2-proxy.extra_entrypoint_args` | milestone 5 |  |
 | `oauth2-proxy.https_address` | milestone 5 |  |
@@ -658,8 +779,11 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `oauth2-proxy.placement` | milestone 5 |  |
 | `oauth2-proxy.provider_display_name` | milestone 5 |  |
 | `oauth2-proxy.redirect_url` | milestone 5 |  |
+| `oauth2-proxy.scope` | milestone 5 |  |
 | `oauth2-proxy.service_id` | milestone 5 |  |
+| `oauth2-proxy.ssl` | milestone 5 |  |
 | `oauth2-proxy.ssl_cert` | milestone 5 |  |
+| `oauth2-proxy.ssl_insecure_skip_verify` | milestone 5 |  |
 | `oauth2-proxy.ssl_key` | milestone 5 |  |
 | `oauth2-proxy.unmanaged` | milestone 5 |  |
 | `osd.block_db_size` | milestone 5 |  |
@@ -681,10 +805,12 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `osd.method` | milestone 5 |  |
 | `osd.objectstore` | milestone 5 |  |
 | `osd.osd_id_claims` | milestone 5 |  |
+| `osd.osd_type` | milestone 5 |  |
 | `osd.osds_per_device` | milestone 5 |  |
 | `osd.placement` | milestone 5 |  |
 | `osd.preview_only` | milestone 5 |  |
 | `osd.service_id` | milestone 5 |  |
+| `osd.termination_grace_period_seconds` | milestone 5 |  |
 | `osd.tpm2` | milestone 5 |  |
 | `osd.unmanaged` | milestone 5 |  |
 | `osd.wal_devices` | milestone 5 |  |
@@ -694,6 +820,7 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `placement.host_pattern` | milestone 5 |  |
 | `placement.hosts` | milestone 5 |  |
 | `placement.label` | milestone 5 |  |
+| `prometheus.certificate_source` | milestone 5 |  |
 | `prometheus.config` | milestone 5 |  |
 | `prometheus.custom_configs` | milestone 5 |  |
 | `prometheus.extra_container_args` | milestone 5 |  |
@@ -703,11 +830,15 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `prometheus.placement` | milestone 5 |  |
 | `prometheus.port` | milestone 5 |  |
 | `prometheus.preview_only` | milestone 5 |  |
+| `prometheus.remote_write_allowed_metrics` | milestone 5 |  |
+| `prometheus.remote_write_url` | milestone 5 |  |
 | `prometheus.retention_size` | milestone 5 |  |
 | `prometheus.retention_time` | milestone 5 |  |
 | `prometheus.service_id` | milestone 5 |  |
+| `prometheus.ssl` | milestone 5 |  |
 | `prometheus.targets` | milestone 5 |  |
 | `prometheus.unmanaged` | milestone 5 |  |
+| `promtail.certificate_source` | milestone 5 |  |
 | `promtail.config` | milestone 5 |  |
 | `promtail.custom_configs` | milestone 5 |  |
 | `promtail.extra_container_args` | milestone 5 |  |
@@ -716,22 +847,38 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `promtail.placement` | milestone 5 |  |
 | `promtail.port` | milestone 5 |  |
 | `promtail.preview_only` | milestone 5 |  |
+| `promtail.remote_write_allowed_metrics` | milestone 5 |  |
+| `promtail.remote_write_url` | milestone 5 |  |
 | `promtail.service_id` | milestone 5 |  |
+| `promtail.ssl` | milestone 5 |  |
 | `promtail.targets` | milestone 5 |  |
 | `promtail.unmanaged` | milestone 5 |  |
+| `rbd-mirror.certificate_source` | milestone 5 |  |
 | `rbd-mirror.config` | milestone 5 |  |
 | `rbd-mirror.count` | milestone 5 |  |
 | `rbd-mirror.custom_configs` | milestone 5 |  |
+| `rbd-mirror.custom_sans` | milestone 5 |  |
 | `rbd-mirror.extra_container_args` | milestone 5 |  |
 | `rbd-mirror.extra_entrypoint_args` | milestone 5 |  |
+| `rbd-mirror.ip_addrs` | milestone 5 |  |
 | `rbd-mirror.networks` | milestone 5 |  |
 | `rbd-mirror.placement` | milestone 5 |  |
 | `rbd-mirror.preview_only` | milestone 5 |  |
+| `rbd-mirror.remote_write_allowed_metrics` | milestone 5 |  |
+| `rbd-mirror.remote_write_url` | milestone 5 |  |
 | `rbd-mirror.service_id` | milestone 5 |  |
+| `rbd-mirror.ssl` | milestone 5 |  |
+| `rbd-mirror.ssl_ca_cert` | milestone 5 |  |
+| `rbd-mirror.ssl_cert` | milestone 5 |  |
+| `rbd-mirror.ssl_key` | milestone 5 |  |
 | `rbd-mirror.targets` | milestone 5 |  |
+| `rbd-mirror.termination_grace_period_seconds` | milestone 5 |  |
 | `rbd-mirror.unmanaged` | milestone 5 |  |
+| `rgw.certificate_source` | milestone 5 |  |
 | `rgw.config` | milestone 5 |  |
 | `rgw.custom_configs` | milestone 5 |  |
+| `rgw.custom_sans` | milestone 5 |  |
+| `rgw.d3n_cache` | milestone 5 |  |
 | `rgw.data_pool_attributes` | milestone 5 |  |
 | `rgw.disable_multisite_sync_traffic` | milestone 5 |  |
 | `rgw.extra_container_args` | milestone 5 |  |
@@ -741,6 +888,7 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `rgw.only_bind_port_on_networks` | milestone 5 |  |
 | `rgw.placement` | milestone 5 |  |
 | `rgw.preview_only` | milestone 5 |  |
+| `rgw.qat` | milestone 5 |  |
 | `rgw.rgw_bucket_counters_cache` | milestone 5 |  |
 | `rgw.rgw_bucket_counters_cache_size` | milestone 5 |  |
 | `rgw.rgw_exit_timeout_secs` | milestone 5 |  |
@@ -756,6 +904,8 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `rgw.rgw_zonegroup` | milestone 5 |  |
 | `rgw.service_id` | milestone 5 |  |
 | `rgw.ssl` | implemented | write path (plan 03): an RGW always serves HTTPS; `ssl: false` does not turn TLS off |
+| `rgw.ssl_cert` | milestone 5 |  |
+| `rgw.ssl_key` | milestone 5 |  |
 | `rgw.subcluster` | milestone 5 |  |
 | `rgw.unmanaged` | milestone 5 |  |
 | `rgw.update_endpoints` | milestone 5 |  |
@@ -763,6 +913,7 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `rgw.zone_endpoints` | milestone 5 |  |
 | `rgw.zonegroup_hostnames` | milestone 5 |  |
 | `smb.bind_addrs` | milestone 5 | needs draft 07 (shared namespaces) |
+| `smb.ceph_cluster_configs` | milestone 5 | needs draft 07 (shared namespaces) |
 | `smb.cluster_id` | milestone 5 | needs draft 07 (shared namespaces) |
 | `smb.cluster_lock_uri` | milestone 5 | needs draft 07 (shared namespaces) |
 | `smb.cluster_meta_uri` | milestone 5 | needs draft 07 (shared namespaces) |
@@ -778,6 +929,9 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `smb.features` | milestone 5 | needs draft 07 (shared namespaces) |
 | `smb.include_ceph_users` | milestone 5 | needs draft 07 (shared namespaces) |
 | `smb.join_sources` | milestone 5 | needs draft 07 (shared namespaces) |
+| `smb.keybridge_kmip_ca_cert` | milestone 5 | needs draft 07 (shared namespaces) |
+| `smb.keybridge_kmip_ssl_cert` | milestone 5 | needs draft 07 (shared namespaces) |
+| `smb.keybridge_kmip_ssl_key` | milestone 5 | needs draft 07 (shared namespaces) |
 | `smb.networks` | milestone 5 | needs draft 07 (shared namespaces) |
 | `smb.placement` | milestone 5 | needs draft 07 (shared namespaces) |
 | `smb.preview_only` | milestone 5 | needs draft 07 (shared namespaces) |
@@ -785,6 +939,7 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `smb.remote_control_ssl_cert` | milestone 5 | needs draft 07 (shared namespaces) |
 | `smb.remote_control_ssl_key` | milestone 5 | needs draft 07 (shared namespaces) |
 | `smb.service_id` | milestone 5 | needs draft 07 (shared namespaces) |
+| `smb.tunables` | milestone 5 | needs draft 07 (shared namespaces) |
 | `smb.unmanaged` | milestone 5 | needs draft 07 (shared namespaces) |
 | `smb.user_sources` | milestone 5 | needs draft 07 (shared namespaces) |
 | `snmp-gateway.auth_protocol` | milestone 5 |  |

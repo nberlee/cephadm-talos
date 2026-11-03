@@ -3,8 +3,8 @@
 | Component | Supported | Notes |
 |---|---|---|
 | Talos | the first release with Talos PRs #14775, #14781, #14788 and #14795 | `ContainerConfig` is new in 1.15. While the PRs are unmerged, `pkg/machinery` and the test cluster come from one combined build of their branches (always the same commit for both, as the branches renumber protobuf fields); afterwards the latest pre-release until 1.15.0. |
-| Ceph | the latest release only, today v20.2.4 | The supported version moves with each new Ceph release once it is tested. |
-| Architecture | amd64 | arm64 follows later. |
+| Ceph | the latest release only, today v21.2.0 | The supported version moves with each new Ceph release once it is tested. |
+| Architecture | amd64 with x86-64-v3 CPUs | Ceph 21's official builds need x86-64-v3 (AVX2, BMI2, FMA); a CPU without it crashes the daemons with SIGILL. arm64 follows later. |
 
 ## Workload isolation must be off (temporary)
 
@@ -24,8 +24,8 @@ This weakens isolation node-wide, including for unrelated workloads: CRI contain
 
 Gates run at operation boundaries:
 
-- `host add` needs a supported Talos version on the node.
-- `bootstrap` and `deploy` (mon, mgr, osd, rgw, vip) need a supported Talos version on the target node and a verified supported Ceph image; `deploy` on a cluster whose image is older is refused.
+- `host add` needs a supported Talos version and an x86-64-v3 CPU on the node, and a lowercase hostname (Ceph 21 lowercases host names in its specs).
+- `bootstrap` and `deploy` (mon, mgr, osd, rgw, vip) need a supported Talos version and an x86-64-v3 CPU on the target node and a verified supported Ceph image; `deploy` on a cluster whose image is older is refused.
 - `upgrade` needs a supported current version and a verified supported candidate image. After the handoff, `ceph orch upgrade start` needs an image of the operator's approval; the leader probes it and refuses a downgrade, more than two majors up or another architecture.
 - `rm`, `rm-cluster` (with `--zap` and `--force`), recovery (`host maintenance exit`), `host rm`, `ps`, `logs` and `conf` are not gated.
 - `--skip-version-check` skips the CLI's checks for testing, not the leader's checks of an upgrade. It does not make older releases work, and it is separate from `--dry-run`, which reads the nodes and the cluster state but prints the patches instead of applying them.

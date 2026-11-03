@@ -67,7 +67,8 @@ Every step went through Codex fix-or-refute rounds, each finding fixed or refute
 On the QEMU cluster (3 control planes, no Kubernetes, the combined Talos build v1.15.0-alpha.2-51-g8ee5a247e):
 
 - bootstrap, handoff, enrollment of two nodes with `ceph orch host add`, mons and a standby mgr through `ceph orch`, 4 OSDs through `ceph orch daemon add osd` with the operator's disk approval;
-- rolling upgrades through `ceph orch upgrade start` from v20.2.4 to v20.2.4 by another digest, and from v20.2.4 to v21.2.0 (all daemons on the new release, the orchestrator available after);
+- on v21.2.0: bootstrap, handoff, enrollment, mons, mgrs and 4 OSDs through `ceph orch`, a rolling upgrade through `ceph orch upgrade start` to the release's amd64 digest (every daemon on it), and an unplanned power loss of the whole cluster, after which every daemon came back to HEALTH_OK on its own;
+- earlier rolling upgrades from v20.2.4 to v20.2.4 by another digest, and from v20.2.4 to v21.2.0 (all daemons on the new release, the orchestrator available after);
 - `ceph orch hardware powercycle` of a mon+OSD host (maintenance, Talos reboot, back), and maintenance enter and exit;
 - `suspend` during an OSD preparation (the receipt only after the job ended) and a `ceph orch` command refused while suspended;
 - with one agent removed (its node suspended through Talos) and every mon document removed: `recover mons` back to quorum, `shell` into a mon, `resume` (the agent applied again, every agent re-adopting its node, both mgrs restarted), a new leader incarnation, and a `ceph orch daemon add` that landed;

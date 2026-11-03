@@ -29,7 +29,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import orchestrator
 from ceph.deployment.hostspec import HostSpec
-from ceph.deployment.service_spec import ServiceSpec
+from ceph.deployment.service_spec import PlacementSpec, ServiceSpec
 from mgr_module import CLICommandBase, CommandResult, HandleCommandResult, MgrModule, Option
 from orchestrator import DaemonDescription, DaemonDescriptionStatus, OrchestratorError, handle_orch_error, UpgradeStatusSpec
 
@@ -503,6 +503,35 @@ def tls_context(directory: str = TALOS_DIR) -> ssl.SSLContext:
     return ctx
 
 
+
+# RGW_SPEC_FIELDS are the RGW spec fields this backend takes; Ceph 21 moves an
+# operator's PEM bundle from rgw_frontend_ssl_certificate into ssl_cert and
+# ssl_key (certificate_source inline) when ssl is set, and adds its defaults
+RGW_SPEC_FIELDS = {'rgw_frontend_port', 'ssl', 'rgw_frontend_ssl_certificate', 'ssl_cert', 'ssl_key', 'certificate_source',
+                   'rgw_exit_timeout_secs'}
+
+
+def rgw_spec_pem(spec: Any) -> Optional[str]:
+    """The operator's PEM bundle of an RGW spec ('' for none), or None if the
+    spec has anything this backend does not take."""
+    j = spec.to_json()
+    if set(j) - {'service_type', 'service_id', 'service_name', 'placement', 'spec'}:
+        return None
+    s = dict(j.get('spec') or {})
+    # to_json drops falsy values: a 0 is read from the spec itself
+    if set(s) - RGW_SPEC_FIELDS or getattr(spec, 'rgw_exit_timeout_secs', 120) not in (None, 120) or getattr(spec, 'rgw_frontend_port', None) == 0:
+        return None
+    legacy = s.get('rgw_frontend_ssl_certificate')
+    legacy = '\n'.join(legacy) if isinstance(legacy, list) else (legacy or '')
+    split = (s.get('ssl_cert') or '').strip(), (s.get('ssl_key') or '').strip()
+    if legacy and any(split) or bool(split[0]) != bool(split[1]):
+        return None
+    pem = legacy or ('%s\n%s\n' % split if split[0] else '')
+    if s.get('certificate_source') not in (None, 'cephadm-signed', 'inline') or s.get('certificate_source') == 'inline' and not pem:
+        return None
+    return pem
+
+
 class Module(orchestrator.Orchestrator, MgrModule):
     CLICommand = TalosCLICommand
     MODULE_OPTIONS = [
@@ -607,7 +636,6 @@ class Module(orchestrator.Orchestrator, MgrModule):
     def _add_rgw(self, spec: Any) -> List[str]:
         """One RGW of service default on one host: with a generated certificate,
         or the operator's (`daemon add -i`, rgw_frontend_ssl_certificate)."""
-        from ceph.deployment.service_spec import RGWSpec
         p = spec.placement
         if spec.service_id != 'default':
             raise OrchestratorError('the RGW service is default: daemon add rgw default <host>')
@@ -615,11 +643,8 @@ class Module(orchestrator.Orchestrator, MgrModule):
                 or p.hosts[0].network or p.hosts[0].name:
             raise OrchestratorError('place exactly one RGW on one named host')
         host = p.hosts[0].hostname
-        certs = spec.rgw_frontend_ssl_certificate
-        pem = '\n'.join(certs) if isinstance(certs, list) else (certs or '')
-        want = RGWSpec(service_id='default', placement=p, rgw_frontend_port=spec.rgw_frontend_port, ssl=spec.ssl,
-                       rgw_frontend_ssl_certificate=spec.rgw_frontend_ssl_certificate)
-        if spec.to_json() != want.to_json():
+        pem = rgw_spec_pem(spec)
+        if pem is None:
             raise OrchestratorError('only the port and the operator\'s certificate are supported for an RGW by this backend')
         self._settle()
         _, fold = self._authority()
@@ -814,8 +839,9 @@ class Module(orchestrator.Orchestrator, MgrModule):
         h = p.hosts[0]
         if h.network or h.name:
             raise OrchestratorError('a network or daemon name is not supported by this backend: mon and mgr ids are host names')
-        if spec.config or spec.networks or getattr(spec, 'extra_container_args', None) or getattr(spec, 'extra_entrypoint_args', None) \
-                or getattr(spec, 'custom_configs', None):
+        # exactly the spec `orch daemon add mon|mgr <host>` builds: any other
+        # field, also one a newer Ceph adds, is refused rather than ignored
+        if spec.to_json() != ServiceSpec(spec.service_type, placement=PlacementSpec(hosts=[h.hostname])).to_json():
             raise OrchestratorError('spec options are not supported by this backend')
         _, fold = self._authority()
         if h.hostname not in fold.hosts:
@@ -1022,13 +1048,13 @@ class Module(orchestrator.Orchestrator, MgrModule):
                 raise OrchestratorError('%s runs the active mgr and no standby mgr is available' % hostname)
 
     @handle_orch_error
-    def add_host(self, spec: HostSpec) -> str:
+    def add_host(self, host_spec: HostSpec) -> str:
         """A node the CLI enrolled (cephadm-talos host add): its enrollment record
         gives its address and agent certificates."""
-        host, addr = spec.hostname, spec.addr or spec.hostname
-        if getattr(spec, 'status', None) or getattr(spec, 'location', None) or getattr(spec, 'oob', None):
+        host, addr = host_spec.hostname, host_spec.addr or host_spec.hostname
+        if getattr(host_spec, 'status', None) or getattr(host_spec, 'location', None) or getattr(host_spec, 'oob', None):
             raise OrchestratorError('maintenance status, location and oob are not supported by this backend')
-        labels = list(spec.labels or [])
+        labels = list(host_spec.labels or [])
         if len(labels) > 32 or any(not ledger.LABEL_RE.match(x) for x in labels):
             raise OrchestratorError('labels: at most 32, letters, digits, dots, dashes and underscores')
         self._settle()
@@ -1118,9 +1144,10 @@ class Module(orchestrator.Orchestrator, MgrModule):
 
     @handle_orch_error
     def upgrade_start(self, image: Optional[str], version: Optional[str], daemon_types: Optional[List[str]],
-                      hosts: Optional[str], services: Optional[List[str]], limit: Optional[int]) -> str:
+                      hosts: Optional[str], services: Optional[List[str]], limit: Optional[int],
+                      bucket_type: Optional[str] = None, bucket_name: Optional[str] = None) -> str:
         """Upgrade the cluster to an image the operator approved, daemon by daemon."""
-        if version or daemon_types or hosts or services or limit is not None:
+        if version or daemon_types or hosts or services or limit is not None or bucket_type or bucket_name:
             raise OrchestratorError('only --image is supported by this backend')
         if not isinstance(image, str) or not ledger.IMAGE_RE.match(image):
             raise OrchestratorError('name the image by its digest: <repository>@sha256:<hex>')

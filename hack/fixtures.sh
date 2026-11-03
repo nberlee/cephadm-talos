@@ -10,7 +10,7 @@
 set -euo pipefail
 
 REG=${1:-10.5.0.1:5000}
-SRC=${CEPHADM_TALOS_IMAGE:-quay.io/ceph/ceph:v20.2.4}
+SRC=${CEPHADM_TALOS_IMAGE:-quay.io/ceph/ceph:v21.2.0}
 TALOSCONFIG=${TALOSCONFIG:-.talosconfig}
 NODES=${CEPHADM_TALOS_NODES:-10.5.0.2,10.5.0.3,10.5.0.4}
 

@@ -15,14 +15,14 @@
 
 - Until Talos 1.15.0 is released, always use the latest Talos pre-release (alpha or beta) for `pkg/machinery` and the test cluster. Supported: Talos 1.15 or later.
 - Exception (plan 03, signed off 2026-10-30): while our Talos PRs (#14775, #14781, #14788, #14795) are unmerged, `pkg/machinery` and the test cluster come from one combined build of those branches, always the same commit for both. The supported Talos release becomes the first one containing them.
-- Ceph: only the latest release is supported (today v20.2.4).
+- Ceph: only the latest release is supported (today v21.2.0). Check `crane ls quay.io/ceph/ceph` before relying on the pinned version; a release may have no git tag (v21.2.0), then its source commit is the image's `CEPH_SHA1` label.
 - amd64 only for now; arm64 later.
 - No migration or backwards compatibility is needed before the first tagged release.
 
 ## Codex
 
 - Run it with `node ~/.claude/plugins/cache/openai-codex/codex/<version>/scripts/codex-companion.mjs task --fresh "<prompt>"` in the foreground (timeout up to 600000 ms); tell it not to edit files when reviewing.
-- Codex has no internet. Give it local sources: the Talos source at the pinned commit, Omni and Ceph checkouts (`/home/nicob/repo/ceph`), and excerpts of GitHub issues saved to the session scratchpad.
+- Codex has no internet. Give it local sources: the Talos source at the pinned commit, Omni and Ceph checkouts (`/home/nicob/repo/ceph`, and the supported release's sources in `/home/nicob/repo/ceph-v21.2.0`), and excerpts of GitHub issues saved to the session scratchpad.
 - Pass previous rounds' findings to the next round, and ask it to say "clean" when nothing substantive remains.
 
 ## Writing

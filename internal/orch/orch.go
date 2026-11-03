@@ -30,7 +30,7 @@ import (
 )
 
 // DefaultImage is the Ceph container image used when none is given.
-const DefaultImage = "quay.io/ceph/ceph:v20"
+const DefaultImage = "quay.io/ceph/ceph:v21"
 
 // MinTalos is the minimum Talos version: ContainerConfig (1.14) plus
 // EtcFileConfig and `--namespace taloscontainers` for logs/restart (1.15).
@@ -527,6 +527,67 @@ func (o *Orch) checkTalos(ctx context.Context, node string) error {
 		return fmt.Errorf("node %s runs Talos %s, cephadm-talos needs %s or newer (ContainerConfig, EtcFileConfig)", node, v, MinTalos)
 	}
 
+	return o.checkCPU(ctx, node)
+}
+
+// x86-64-v3 is the CPU level Ceph 21's official builds need (cephadm's
+// UPGRADE_MIN_X86_64_ISA_LEVEL): the flags /proc/cpuinfo shows for the v2
+// and v3 levels (lzcnt as abm). A CPU without them crashes the daemons with
+// SIGILL.
+var x8664v3Flags = []string{"cx16", "lahf_lm", "popcnt", "sse4_1", "sse4_2", "ssse3", "avx", "avx2", "bmi1", "bmi2", "f16c", "fma", "abm", "movbe", "xsave"}
+
+// checkCPU verifies the node's CPU supports x86-64-v3.
+func (o *Orch) checkCPU(ctx context.Context, node string) error {
+	b, err := o.Talos.ReadFile(ctx, node, "/proc/cpuinfo", 1<<20)
+	if err != nil {
+		return fmt.Errorf("node %s: reading its CPU flags: %w", node, err)
+	}
+
+	if missing := missingFlags(string(b), x8664v3Flags); len(missing) > 0 {
+		return fmt.Errorf("node %s's CPU does not support x86-64-v3, which Ceph %s needs (missing %s)", node, SupportedCeph, strings.Join(missing, ", "))
+	}
+
+	return nil
+}
+
+// missingFlags are the flags the first CPU of a /proc/cpuinfo lacks; all of
+// them without a flags line.
+func missingFlags(cpuinfo string, want []string) []string {
+	have := map[string]bool{}
+
+	for _, line := range strings.Split(cpuinfo, "\n") {
+		if k, v, ok := strings.Cut(line, ":"); ok && strings.TrimSpace(k) == "flags" {
+			for _, f := range strings.Fields(v) {
+				have[f] = true
+			}
+
+			break
+		}
+	}
+
+	var out []string
+
+	for _, f := range want {
+		if !have[f] {
+			out = append(out, f)
+		}
+	}
+
+	return out
+}
+
+// hostName checks a node's hostname: a part of its certificate identities
+// (plan 03, item 3), and lowercase, as Ceph 21 lowercases the host names of
+// its specs.
+func hostName(name string) error {
+	if err := pki.ValidName(name); err != nil {
+		return err
+	}
+
+	if name != strings.ToLower(name) {
+		return fmt.Errorf("host name %q is not supported: Ceph uses host names in lowercase; give the node a lowercase hostname", name)
+	}
+
 	return nil
 }
 
@@ -572,8 +633,7 @@ func (o *Orch) addHost(ctx context.Context, addr string, apply bool) (state.Host
 		name = n
 	}
 
-	// the name is part of the host's certificate identities (plan 03, item 3)
-	if err := pki.ValidName(name); err != nil {
+	if err := hostName(name); err != nil {
 		return state.Host{}, err
 	}
 

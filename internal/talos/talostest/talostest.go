@@ -56,6 +56,9 @@ type Node struct {
 	ContainerLogs map[string]string
 	// VersionTag is what Version reports (default v1.15.0-alpha.2)
 	VersionTag string
+	// Files is what Read serves by path (CPUInfo for /proc/cpuinfo when
+	// unset); any other path is unimplemented, as before Read existed
+	Files map[string]string
 	// FailBeforeApply makes the next ApplyConfiguration fail without storing
 	// the config, like a connection lost before the node got it
 	FailBeforeApply error
@@ -295,6 +298,25 @@ func (f *Node) Restart(ctx context.Context, req *machine.RestartRequest) (*machi
 	next.TypedSpec().ContainerID, next.TypedSpec().Generation = cur.TypedSpec().ContainerID, gen
 
 	return &machine.RestartResponse{}, f.St.Create(ctx, next)
+}
+
+// CPUInfo is a /proc/cpuinfo whose CPU supports x86-64-v3.
+const CPUInfo = "processor\t: 0\nflags\t\t: fpu sse sse2 ssse3 cx16 sse4_1 sse4_2 popcnt lahf_lm movbe xsave avx f16c fma abm avx2 bmi1 bmi2\n\n"
+
+// Read serves Files.
+func (f *Node) Read(req *machine.ReadRequest, srv machine.MachineService_ReadServer) error {
+	f.Mu.Lock()
+	body, ok := f.Files[req.Path]
+	if !ok && req.Path == "/proc/cpuinfo" && f.Files == nil {
+		body, ok = CPUInfo, true
+	}
+	f.Mu.Unlock()
+
+	if !ok {
+		return status.Error(codes.Unimplemented, "read "+req.Path)
+	}
+
+	return srv.Send(&common.Data{Bytes: []byte(body)})
 }
 
 func (f *Node) Logs(req *machine.LogsRequest, srv machine.MachineService_LogsServer) error {

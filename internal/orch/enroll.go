@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/nberlee/cephadm-talos/internal/pki"
 	"github.com/nberlee/cephadm-talos/internal/state"
 	"github.com/nberlee/cephadm-talos/internal/store"
 )
@@ -53,8 +52,7 @@ func (o *Orch) Enroll(ctx context.Context, addr string) error {
 		return err
 	}
 
-	// the name is part of the host's certificate identities (plan 03, item 3)
-	if err := pki.ValidName(name); err != nil {
+	if err := hostName(name); err != nil {
 		return err
 	}
 

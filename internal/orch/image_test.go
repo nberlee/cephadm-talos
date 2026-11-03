@@ -8,6 +8,7 @@ import (
 
 	"github.com/nberlee/cephadm-talos/internal/state"
 	"github.com/nberlee/cephadm-talos/internal/talos"
+	"github.com/nberlee/cephadm-talos/internal/talos/talostest"
 )
 
 func TestParseProbe(t *testing.T) {
@@ -62,5 +63,29 @@ func TestReAddingAHostKeepsItsConnection(t *testing.T) {
 
 	if h.Talosconfig != "/x/talosconfig" || h.Context != "other" || !h.Maintenance {
 		t.Errorf("host fields lost: %+v", h)
+	}
+}
+
+func TestANodeNeedsAnX8664V3CPU(t *testing.T) {
+	f := talostest.New(t, images())
+	o := fakeOrch(t, f)
+
+	if err := o.checkTalos(context.Background(), "node"); err != nil {
+		t.Fatalf("an x86-64-v3 CPU: %v", err)
+	}
+
+	// an x86-64-v2 CPU (no AVX2, BMI, FMA)
+	f.Files = map[string]string{"/proc/cpuinfo": "processor\t: 0\nflags\t\t: fpu sse sse2 ssse3 cx16 sse4_1 sse4_2 popcnt lahf_lm\n"}
+
+	if err := o.checkTalos(context.Background(), "node"); err == nil || !strings.Contains(err.Error(), "avx2") {
+		t.Fatalf("an x86-64-v2 CPU: %v", err)
+	}
+}
+
+func TestHostNamesAreLowercase(t *testing.T) {
+	for name, ok := range map[string]bool{"cephadm-talos-controlplane-1": true, "Node4": false, "a_b.c": true, "-x": false} {
+		if err := hostName(name); (err == nil) != ok {
+			t.Errorf("%s: %v", name, err)
+		}
 	}
 }

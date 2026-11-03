@@ -30,7 +30,7 @@ const Prefix = "mgr/cephadm/talos/"
 // outside Prefix: the bridge reads and writes below Prefix only.
 const SecretPrefix = "cephadm-talos/secrets/"
 
-// MaxEntry is the largest value written to one config-key entry. Ceph v20.2.4
+// MaxEntry is the largest value written to one config-key entry. Ceph v21.2.0
 // limits an entry to mon_config_key_max_entry_size (64 KiB by default); chunks
 // leave room for the encoding overhead.
 const MaxEntry = 60 << 10

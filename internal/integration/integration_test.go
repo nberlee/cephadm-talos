@@ -5,8 +5,8 @@
 //	CEPHADM_TALOS_TALOSCONFIG  talosconfig of the cluster (required)
 //	CEPHADM_TALOS_NODES        comma-separated node IPs, at least 3 (required)
 //	CEPHADM_TALOS_DEVICE       spare disk on every node for an OSD (default /dev/sda)
-//	CEPHADM_TALOS_IMAGE        supported Ceph image (default quay.io/ceph/ceph:v20.2.4)
-//	CEPHADM_TALOS_OLD_IMAGE    an unsupported Ceph image for the gate test (default quay.io/ceph/ceph:v20.2.3)
+//	CEPHADM_TALOS_IMAGE        supported Ceph image (default quay.io/ceph/ceph:v21.2.0)
+//	CEPHADM_TALOS_OLD_IMAGE    an unsupported Ceph image for the gate test (default quay.io/ceph/ceph:v20.2.4)
 //	CEPHADM_TALOS_AGENT_IMAGE  the agent image, pinned by digest (required; hack/agent-image.sh)
 //
 // The upgrade tests need two images of the supported release that differ only
@@ -153,7 +153,7 @@ func TestCluster(t *testing.T) {
 	e := setup(t)
 	n1, n2, n3 := e.nodes[0], e.nodes[1], e.nodes[2]
 
-	image := getenv("CEPHADM_TALOS_IMAGE", "quay.io/ceph/ceph:v20.2.4")
+	image := getenv("CEPHADM_TALOS_IMAGE", "quay.io/ceph/ceph:v21.2.0")
 
 	agentImage := os.Getenv("CEPHADM_TALOS_AGENT_IMAGE")
 	if agentImage == "" {
@@ -187,7 +187,7 @@ func TestCluster(t *testing.T) {
 	})
 
 	t.Run("unsupported image refused", func(t *testing.T) {
-		out, err := e.run(t, "bootstrap", "--mon-node", n1, "--image", getenv("CEPHADM_TALOS_OLD_IMAGE", "quay.io/ceph/ceph:v20.2.3"), "--agent-image", agentImage)
+		out, err := e.run(t, "bootstrap", "--mon-node", n1, "--image", getenv("CEPHADM_TALOS_OLD_IMAGE", "quay.io/ceph/ceph:v20.2.4"), "--agent-image", agentImage)
 		if err == nil || !strings.Contains(out, "supports only Ceph") {
 			t.Fatalf("want a version gate error, got %v", err)
 		}
