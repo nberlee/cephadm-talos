@@ -585,6 +585,9 @@ class Module(orchestrator.Orchestrator, MgrModule):
     MODULE_OPTIONS = [
         # as in cephadm: the keepalived image of the ingress (a digest the operator approved)
         Option('container_image_keepalived', type='str', default='', desc='keepalived container image of the ingress, by digest'),
+        # the renewal threshold of the daily certificate check (plan 04, step 1); a
+        # larger value renews earlier, for tests
+        Option('talos_cert_renew_days', type='int', default=30, min=1, desc='renew certificates that expire within this many days'),
     ]
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -1187,6 +1190,8 @@ class Module(orchestrator.Orchestrator, MgrModule):
         hosts, _ = record_from_store(entries, inc, 'hosts')
         daemons, _ = record_from_store(entries, inc, 'daemons')
         by_name = {h['name']: h for h in hosts or []}
+        days = self.get_module_option('talos_cert_renew_days')
+        renew_before = datetime.timedelta(days=int(days)) if days else CERT_RENEW_BEFORE
         checks: Dict[str, Dict[str, Any]] = {}
         alerts: List[str] = []
 
@@ -1199,7 +1204,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
                 continue
             h = by_name[d['host']]
             ends = [cert_not_after(h.get(k)) for k in ('mgr_server_cert', 'mgr_client_cert') if h.get(k)]
-            if not ends or min(ends) - now > CERT_RENEW_BEFORE:
+            if not ends or min(ends) - now > renew_before:
                 continue
             if min(ends) - now <= CERT_ALERT_BEFORE:
                 alerts.append('mgr.%s certificates expire %s' % (h['name'], min(ends).isoformat()))
@@ -1220,7 +1225,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
             served_user = served is not None and any(leaf_der(u) == served for u in user_certs)
             served_end = der_not_after(served) if served is not None else None
             for end, is_user in ((cert_not_after(c.get('cert')) if c and c.get('cert') else None, bool(c and c.get('user'))), (served_end, served_user)):
-                if end is None or end - now > CERT_RENEW_BEFORE:
+                if end is None or end - now > renew_before:
                     continue
                 if is_user:
                     line = 'rgw.%s serves the operator\'s certificate, which expires %s' % (d['host'], end.isoformat())

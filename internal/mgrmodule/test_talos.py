@@ -624,6 +624,8 @@ def cert_until(days):
 class CertCheck(unittest.TestCase):
     """The daily certificate check (plan 04, step 1)."""
 
+    renew_days = None
+
     def module(self, operator_days=None, rgw=None):
         hosts = [{'name': 'h1', 'addr': '10.0.0.1', 'mgr_server_cert': cert_until(10), 'mgr_client_cert': cert_until(1000)},
                  {'name': 'h2', 'addr': '10.0.0.2', 'mgr_server_cert': cert_until(1000), 'mgr_client_cert': cert_until(1000)},
@@ -638,6 +640,7 @@ class CertCheck(unittest.TestCase):
         entries.update(state_entries(inventory(), cluster, hosts=hosts, daemons=daemons))
         mod.get_mgr_id = lambda: 'h2'
         mod._rgw_port = lambda: None
+        mod.get_module_option = lambda name: self.renew_days
         import logging
         mod._logger = logging.getLogger('test')
         self.health = {}
@@ -663,6 +666,10 @@ class CertCheck(unittest.TestCase):
         # again: the unfinished renewals are not accepted twice
         m.Module._check_certs(mod)
         self.assertEqual(len(mod._ledger.executable()), 2)
+        # the threshold setting renews earlier: h2's certificates too
+        self.renew_days = 2000
+        m.Module._check_certs(mod)
+        self.assertIn(('renew_mgr', 'mgr.h2', 'h2'), [(e['kind'], e.get('daemon'), e['host']) for _, e in mod._ledger.executable()])
 
     def test_rgw_renewal_for_generated_certificates_only(self):
         mod, entries = self.module(rgw={'h1': 'issued/op-%016x/%s' % (1, 'ab' * 8), 'h2': 'user/op-%016x' % 2})
