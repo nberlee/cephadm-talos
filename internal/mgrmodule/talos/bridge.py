@@ -403,6 +403,15 @@ ALLOWLIST: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
 }
 
 
+def add_years(t: Any, years: int) -> Any:
+    """t plus calendar years, as Go's AddDate (internal/pki) counts them, so a
+    renewed certificate lasts as long as the CLI's (February 29 becomes March 1)."""
+    try:
+        return t.replace(year=t.year + years)
+    except ValueError:
+        return t.replace(year=t.year + years, month=3, day=1)
+
+
 def authority_key_id(ca: Any) -> Any:
     """The AuthorityKeyIdentifier of a certificate the CA issues: the CA's own
     SubjectKeyIdentifier when it has one (Go derives it from a truncated SHA-256,
@@ -437,7 +446,7 @@ def issue_mgr_certs(ca_cert_pem: bytes, ca_key_pem: bytes, fsid: str, host: str,
         b = (x509.CertificateBuilder()
              .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, of + ' ' + host)]))
              .issuer_name(ca.subject).public_key(key.public_key()).serial_number(x509.random_serial_number())
-             .not_valid_before(now - datetime.timedelta(hours=1)).not_valid_after(now + datetime.timedelta(days=3 * 365))
+             .not_valid_before(now - datetime.timedelta(hours=1)).not_valid_after(add_years(now, 3))
              .add_extension(x509.KeyUsage(digital_signature=True, content_commitment=False, key_encipherment=False, data_encipherment=False,
                                           key_agreement=False, key_cert_sign=False, crl_sign=False, encipher_only=False, decipher_only=False), critical=True)
              .add_extension(x509.ExtendedKeyUsage([usage]), critical=False)

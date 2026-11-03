@@ -739,6 +739,11 @@ class GoCATest(unittest.TestCase):
         chain, _ = b.issue_rgw_cert(ca, key, ['10.0.0.1'], ['h1'])
         self.assertEqual(self.aki(chain), ski)
         self.openssl_verify(ca, chain.split('-----END CERTIFICATE-----')[0] + '-----END CERTIFICATE-----\n', 'sslserver')
+        # three calendar years, as the CLI's (Go's AddDate): a renewal never ends before the certificate it replaces
+        leaf = x509.load_pem_x509_certificate(certs['server_cert'].encode())
+        now = datetime.datetime.now(datetime.timezone.utc)
+        self.assertEqual(leaf.not_valid_after_utc.date(), b.add_years(now, 3).date())
+        self.assertEqual(b.add_years(datetime.datetime(2028, 2, 29), 1), datetime.datetime(2029, 3, 1))
         # the module's own RGW CA has a SubjectKeyIdentifier its certificates name
         rca, rkey = b.new_rgw_ca('f1')
         rchain, _ = b.issue_rgw_cert(rca.encode(), rkey.encode(), ['10.0.0.1'], ['h1'])
