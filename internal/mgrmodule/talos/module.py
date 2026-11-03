@@ -868,7 +868,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
                 read = None
                 try:
                     read = self._read_revoked(bridge_cmds)
-                except revocation.CRLError as e:
+                except Exception as e:  # never the leadership loop's end: no list from it, TALOS_CRL
                     self.log.warning('the revoked set: %s', e)
                 try:
                     inv = self._inventory()

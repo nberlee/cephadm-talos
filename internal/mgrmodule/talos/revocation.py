@@ -118,7 +118,7 @@ def parse_revoked(dump: Dict[str, str], now: datetime.datetime) -> Tuple[Dict[in
             until = parse_iso(json.loads(v)['not_after'])
         except (ValueError, KeyError, TypeError):
             until = now + datetime.timedelta(days=365 * REVOKE_YEARS)
-        if until + PRUNE_AFTER < now:
+        if until < now - PRUNE_AFTER:  # never until + ...: a far date would overflow
             old.append(k)
             continue
         out[int(s)] = until
@@ -293,8 +293,11 @@ class Issuer:
 
     def due(self, revoked: Dict[int, datetime.datetime], now: datetime.datetime) -> bool:
         # daily, or at half the validity when that comes first (a shortened one)
-        every = min(REISSUE, getattr(self, 'valid', REISSUE * 2) / 2)
-        return self.serials is None or set(revoked) != self.serials or self.at is None or now - self.at >= every
+        # the issued list's validity, and at once when the setting changed
+        issued = getattr(self, 'issued_valid', None)
+        every = min(REISSUE, (issued or REISSUE * 2) / 2)
+        return (self.serials is None or set(revoked) != self.serials or self.at is None or now - self.at >= every
+                or issued != getattr(self, 'valid', issued))
 
     def tick(self, mon: Mon, ca_cert: bytes, revoked: Dict[int, datetime.datetime], stale: List[str],
              now: datetime.datetime, valid_minutes: int) -> bool:
@@ -321,6 +324,7 @@ class Issuer:
             number = (self.epoch << 32) + self.counter
             self.der = issue_crl(ca_cert, key[1].encode(), revoked, number, now, self.valid)
             self.number, self.serials, self.at, self.published = number, set(revoked), now, False
+            self.issued_valid = self.valid
             issued = True
         if self.der is None:
             return issued

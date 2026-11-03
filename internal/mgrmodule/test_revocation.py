@@ -89,6 +89,9 @@ class RevokedSetTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 rv.parse_serial(bad)
         self.assertEqual(rv.parse_serial(str((1 << 159) - 1)), (1 << 159) - 1)
+        # a far expiry date does not overflow the pruning
+        revoked, old = rv.parse_revoked({rv.REVOKED_PREFIX + '42': json.dumps({'not_after': '9999-12-31T00:00:00+00:00'})}, NOW)
+        self.assertEqual((list(revoked), old), ([42], []))
         # an entry no list can name is skipped by readers, so it cannot stop issuance
         revoked, _ = rv.parse_revoked({rv.REVOKED_PREFIX + str(1 << 159): json.dumps({'not_after': '2030-01-01T00:00:00+00:00'})}, NOW)
         self.assertEqual(revoked, {})
@@ -160,6 +163,10 @@ class IssuerTest(unittest.TestCase):
         t = NOW + datetime.timedelta(days=1, hours=3)
         self.assertFalse(iss.tick(self.kv, self.cert, {5: until}, [], t + datetime.timedelta(minutes=59), 120))
         self.assertTrue(iss.tick(self.kv, self.cert, {5: until}, [], t + datetime.timedelta(minutes=60), 120))
+        # the setting raised again: reissued at once, not a day after the short list
+        self.assertTrue(iss.tick(self.kv, self.cert, {5: until}, [], t + datetime.timedelta(minutes=60, seconds=30), 10080))
+        c = crl(self.published()[1])
+        self.assertEqual(c.next_update_utc - c.last_update_utc, datetime.timedelta(days=7))
         # the floor: 5 minutes
         iss.tick(self.kv, self.cert, {5: until, 6: until}, [], t + datetime.timedelta(minutes=61), 1)
         c = crl(self.published()[1])
