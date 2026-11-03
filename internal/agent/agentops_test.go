@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"slices"
 	"strconv"
 	"strings"
@@ -731,7 +732,7 @@ func TestASuccessorStartsTheRollbackBeforeQueuedWork(t *testing.T) {
 	// the transition was published, then leadership moved before its first
 	// step; the stop's journal is complete
 	s.changeUpgrade(t, func(u *state.AgentUpgrade) {
-		u.Stopped, u.Image, u.Attempt, u.Pulled, u.Done, u.Step, u.StepAt = agentImage2, agentImage, 1, nil, nil, "", time.Time{}
+		u.Stopped, u.Image, u.Attempt, u.Pulled, u.Done, u.Step, u.StepAt, u.Starting = agentImage2, agentImage, 1, nil, nil, "", time.Now(), true
 	})
 
 	renew := s.accept(KindRenewAgent, "", "h1", 2)
@@ -753,5 +754,33 @@ func TestASuccessorStartsTheRollbackBeforeQueuedWork(t *testing.T) {
 
 	if ran {
 		t.Fatal("the renewal ran before the rollback's first step")
+	}
+}
+
+func TestAResumedRollbackDoesNotHoldQueuedWork(t *testing.T) {
+	s, _ := agentSetup(t)
+	ctx := context.Background()
+
+	startUpgrade(t, s)
+	s.leader.serves = func(string, int, string) bool { return true }
+
+	// a rollback whose first pull paused, resumed: nothing pulled, its done
+	// hosts to check again, and h0's report not readable
+	s.changeUpgrade(t, func(u *state.AgentUpgrade) {
+		u.Stopped, u.Image, u.Attempt, u.Pulled, u.Done, u.Step, u.StepAt = agentImage2, agentImage, 2, nil, []string{"h0"}, "", time.Time{}
+		u.Verify, u.Paused, u.Starting = true, false, false
+	})
+	s.leader.OwnReport = func(context.Context) (wire.NodeReport, error) { return wire.NodeReport{}, errors.New("unreachable") }
+
+	renew := s.accept(KindRenewAgent, "", "h1", 2)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if op := s.op(t, renew.Op.ID); op.State != wire.OpCompleted {
+		t.Fatalf("a queued renewal behind a resumed rollback: %+v", op)
+	}
+
+	// nor does a rollback the stop made more than a step's limit ago
+	if rollbackPending(state.AgentUpgrade{Stopped: agentImage2, Starting: true, StepAt: time.Now().Add(-agentUpgradeWithin - time.Minute)}, time.Now()) {
+		t.Fatal("a stale rollback start keeps its priority")
 	}
 }

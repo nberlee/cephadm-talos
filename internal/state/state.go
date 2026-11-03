@@ -253,6 +253,9 @@ type AgentUpgrade struct {
 	// (plan 04, step 2, item 7)
 	Stopping bool   `json:"stopping,omitempty"`
 	Stopped  string `json:"stopped,omitempty"`
+	// Starting: the rollback a stop just made, until its first step is
+	// recorded or it pauses (StepAt is when it was made)
+	Starting bool `json:"starting,omitempty"`
 }
 
 // ImageOf is the image a daemon runs: its own, else the cluster's.

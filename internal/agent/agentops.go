@@ -448,7 +448,7 @@ func (l *LeaderLoop) agentUpgradeStep(ctx context.Context, b *Bridge, js store.B
 			st.Agent.PreviousImage, st.Agent.Image = au.From, au.Image
 		}
 
-		au.Finished, au.Step, au.StepAt = true, "", time.Time{}
+		au.Finished, au.Step, au.StepAt, au.Starting = true, "", time.Time{}, false
 
 		return nil
 	})
@@ -469,7 +469,7 @@ func (l *LeaderLoop) agentHostStep(ctx context.Context, b *Bridge, js store.Back
 
 		if err := l.changeState(ctx, b, gid, func(st *state.State) error {
 			if au := st.AgentUpgrade; au != nil && au.Op == u.Op && !au.Paused {
-				au.Step, au.StepAt = u.Step, u.StepAt
+				au.Step, au.StepAt, au.Starting = u.Step, u.StepAt, false
 			}
 
 			return nil
@@ -636,7 +636,7 @@ func (l *LeaderLoop) pauseAgentUpgrade(ctx context.Context, b *Bridge, gid int64
 
 	if err := l.changeState(ctx, b, gid, func(st *state.State) error {
 		if au := st.AgentUpgrade; au != nil && au.Op == op && !au.Finished {
-			au.Paused, au.Error, au.Step, au.StepAt = true, cause, "", time.Time{}
+			au.Paused, au.Error, au.Step, au.StepAt, au.Starting = true, cause, "", time.Time{}, false
 		}
 
 		return nil
@@ -673,7 +673,8 @@ func (l *LeaderLoop) rollBack(ctx context.Context, b *Bridge, gid int64, st *sta
 
 		au.Stopped, au.Image, au.Stopping = au.Image, au.From, false
 		au.Attempt, au.Paused, au.Error, au.Verify = au.Attempt+1, false, "", false
-		au.Pulled, au.Done, au.StepAt = nil, done, time.Time{}
+		// its first step runs before queued operations (rollbackPending)
+		au.Pulled, au.Done, au.StepAt, au.Starting = nil, done, l.clock(), true
 
 		return nil
 	}); err != nil {
@@ -758,12 +759,14 @@ func isAgentControl(kind string) bool { return kind == KindAgentResume || kind =
 // rollbackPending reports whether a stopped agent upgrade's rollback has not
 // started its first step yet, from the published record alone (a successor
 // sees it as the leader that made the transition did): stopping without a
-// step in progress, or a rollback not paused, without a step and with no
-// host pulled. It runs before queued operations.
-func rollbackPending(u state.AgentUpgrade) bool {
+// step in progress, or the rollback the stop just made (Starting, cleared
+// once its first step is recorded or it pauses), within agentUpgradeWithin of
+// the transition. It runs before queued operations; a resumed rollback gets
+// no priority beyond its resume, as any upgrade between steps.
+func rollbackPending(u state.AgentUpgrade, now time.Time) bool {
 	if u.Finished || u.Step != "" {
 		return false
 	}
 
-	return u.Stopping || u.Stopped != "" && !u.Paused && len(u.Pulled) == 0
+	return u.Stopping || u.Starting && !u.Paused && now.Sub(u.StepAt) <= agentUpgradeWithin
 }
