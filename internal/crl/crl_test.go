@@ -128,6 +128,30 @@ func TestHolder(t *testing.T) {
 		t.Fatalf("after a restart: %v", err)
 	}
 
+	// two processes: one that loaded 7 installs 9, another that loaded 7 then
+	// installs 8; the file keeps 9 (never a lower list put back)
+	h3 := &Holder{CA: caCert, Persist: path, Now: func() time.Time { return now }}
+	if err := h3.Load(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := h2.Install(must(Issue(caCert, caKey, big.NewInt(9), nil, now, time.Hour))); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := h3.Install(must(Issue(caCert, caKey, big.NewInt(8), nil, now, time.Hour))); err != nil {
+		t.Fatal(err)
+	}
+
+	h4 := &Holder{CA: caCert, Persist: path, Now: func() time.Time { return now }}
+	if err := h4.Load(); err != nil || h4.Current().Number.Int64() != 9 {
+		t.Fatalf("a concurrent lower list replaced the file: %v", err)
+	}
+
+	if m, _ := filepath.Glob(string(path) + ".*.tmp"); len(m) != 0 {
+		t.Fatalf("temporary files left: %v", m)
+	}
+
 	// stale past nextUpdate
 	if h2.Current().Stale(now) || !h2.Current().Stale(now.Add(2*time.Hour)) {
 		t.Fatal("staleness")

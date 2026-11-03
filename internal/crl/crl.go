@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -235,15 +236,55 @@ func (f File) Read() ([]byte, error) {
 	return b, err
 }
 
+// Write replaces the file only with a list of a higher number than the one
+// it holds, under an exclusive lock across processes (concurrent CLI commands
+// must never put back a lower list), through a temporary file of its own.
 func (f File) Write(der []byte) error {
-	if err := os.MkdirAll(filepath.Dir(string(f)), 0o700); err != nil {
+	dir := filepath.Dir(string(f))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
 
-	tmp := string(f) + ".tmp"
-	if err := os.WriteFile(tmp, der, 0o600); err != nil {
+	lock, err := os.OpenFile(string(f)+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		return err
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN) //nolint:errcheck
+
+	nl, err := x509.ParseRevocationList(der)
+	if err != nil {
 		return err
 	}
 
-	return os.Rename(tmp, string(f))
+	// the held list was checked when it was written: its number is enough
+	if old, err := f.Read(); err != nil {
+		return err
+	} else if old != nil {
+		if ol, err := x509.ParseRevocationList(old); err == nil && ol.Number != nil && nl.Number.Cmp(ol.Number) <= 0 {
+			return nil
+		}
+	}
+
+	tmp, err := os.CreateTemp(dir, filepath.Base(string(f))+".*.tmp")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name()) //nolint:errcheck
+
+	if _, err := tmp.Write(der); err != nil {
+		tmp.Close()
+
+		return err
+	}
+
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+
+	return os.Rename(tmp.Name(), string(f))
 }
