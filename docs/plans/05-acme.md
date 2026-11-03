@@ -1,6 +1,6 @@
 # Plan 05: ACME for the RGW serving certificate
 
-Status: draft for sign-off, 2026-11-03. Scope agreed with the user on 2026-11-03 (decisions at the end).
+Status: signed off 2026-11-03. Scope agreed with the user on 2026-11-03 (decisions at the end).
 
 ## Goal
 

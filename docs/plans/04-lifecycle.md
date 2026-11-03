@@ -1,6 +1,6 @@
 # Plan 04: lifecycle of hosts, agents and certificates (roadmap milestone 3, part 3)
 
-Status: draft for sign-off, 2026-11-03. Scope agreed with the user on 2026-11-03 (decisions at the end). ACME for the RGW serving certificate is plan 05.
+Status: signed off 2026-11-03. Scope agreed with the user on 2026-11-03 (decisions at the end). ACME for the RGW serving certificate is plan 05.
 
 ## Goal
 
