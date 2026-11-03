@@ -40,6 +40,14 @@ TalosCLICommand = CLICommandBase.make_registry_subtype("TalosCLICommand")
 TALOS_DIR = '/etc/ceph/talos'
 # journal states after which the leader does nothing more for an operation
 TERMINAL = ('completed', 'nochange', 'failed', 'refused', 'abandoned')
+# certificate renewal (plan 04, step 1): checked once a day, renewed this long
+# before expiry, warned about when renewal keeps failing; the operator's
+# certificate (its public copy, written by the CLI) warned about earlier
+CERT_CHECK_INTERVAL = 24 * 3600.0
+CERT_RENEW_BEFORE = datetime.timedelta(days=30)
+CERT_ALERT_BEFORE = datetime.timedelta(days=7)
+OPERATOR_WARN_BEFORE = datetime.timedelta(days=60)
+OPERATOR_CERT_KEY = 'cephadm-talos/operator.crt'
 INVENTORY_SCHEMA = 1
 RECORD_SCHEMA = 2
 AGENT_PORT = 4721
@@ -532,6 +540,30 @@ def rgw_spec_pem(spec: Any) -> Optional[str]:
     return pem
 
 
+def cert_not_after(pem: Optional[str]) -> Optional[datetime.datetime]:
+    """The notAfter of the first certificate in a PEM text, None if there is none."""
+    from cryptography import x509
+    try:
+        return x509.load_pem_x509_certificate((pem or '').encode()).not_valid_after_utc
+    except ValueError:
+        return None
+
+
+def served_not_after(addr: str, port: int, timeout: float = 5.0) -> Optional[datetime.datetime]:
+    """The notAfter of the certificate a TLS server serves (an RGW), unverified:
+    only its expiry is read. None if it does not answer."""
+    from cryptography import x509
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
+    try:
+        with socket.create_connection((addr, port), timeout=timeout) as raw:
+            with ctx.wrap_socket(raw) as tls:
+                der = tls.getpeercert(binary_form=True)
+        return x509.load_der_x509_certificate(der).not_valid_after_utc if der else None
+    except (OSError, ValueError):
+        return None
+
+
 class Module(orchestrator.Orchestrator, MgrModule):
     CLICommand = TalosCLICommand
     MODULE_OPTIONS = [
@@ -692,7 +724,9 @@ class Module(orchestrator.Orchestrator, MgrModule):
         busy = self._unfinished(daemon, host)
         if busy:
             raise OrchestratorError('%s has operation %s in progress (orch talos operation %s)' % (daemon or host, busy, busy))
-        if kind != 'exit_maintenance':
+        # a mgr's renewal changes its certificates in the state only while its
+        # host is in maintenance; the exit renders them (plan 04, step 1)
+        if kind not in ('exit_maintenance', 'renew_mgr'):
             self._not_in_maintenance(host)
         op_id = op_id or 'op-' + os.urandom(8).hex()
         entry = {'id': op_id, 'kind': kind, 'host': host, **extra, **self._request_fields()}
@@ -758,6 +792,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
                         except ledger.LedgerError as e:
                             self.log.warning('the ledger: %s', e)
                         nonce = self._heartbeat(inv, gid, epoch, nonce)
+                        self._schedule_cert_check()
                 except InventoryError as e:
                     self.log.warning('%s', e)
                 except Exception:  # leadership must survive anything
@@ -1124,6 +1159,102 @@ class Module(orchestrator.Orchestrator, MgrModule):
         except (ValueError, KeyError, TypeError):
             raise OrchestratorError('the newest approval does not decode')
         return [i for i in images if isinstance(i, str)]
+
+    def _check_certs(self, now: Optional[datetime.datetime] = None) -> None:
+        """The daily check (plan 04, step 1): renew the mgr certificates and the
+        generated RGW certificates in use that expire within 30 days, and report
+        what needs the operator in health checks."""
+        now = now or datetime.datetime.now(datetime.timezone.utc)
+        entries = self.get_store_prefix(STORE_PREFIX)
+        inc = choose_incarnation(entries, getattr(self, '_gid', None))
+        cluster, _ = record_from_store(entries, inc, 'cluster')
+        hosts, _ = record_from_store(entries, inc, 'hosts')
+        daemons, _ = record_from_store(entries, inc, 'daemons')
+        by_name = {h['name']: h for h in hosts or []}
+        checks: Dict[str, Dict[str, Any]] = {}
+        alerts: List[str] = []
+
+        def warn(name: str, summary: str, detail: List[str]) -> None:
+            checks[name] = {'severity': 'warning', 'summary': summary, 'count': len(detail), 'detail': detail}
+
+        # the mgrs' certificates
+        for d in daemons or []:
+            if d.get('type') != 'mgr' or d.get('host') not in by_name:
+                continue
+            h = by_name[d['host']]
+            ends = [cert_not_after(h.get(k)) for k in ('mgr_server_cert', 'mgr_client_cert') if h.get(k)]
+            if not ends or min(ends) - now > CERT_RENEW_BEFORE:
+                continue
+            if min(ends) - now <= CERT_ALERT_BEFORE:
+                alerts.append('mgr.%s certificates expire %s' % (h['name'], min(ends).isoformat()))
+            self._accept_renewal(lambda: self._accept('renew_mgr', 'mgr.' + h['name'], h['name']))
+        # the RGW certificates: the ones the daemons name and the ones they serve
+        rgw = (cluster or {}).get('rgw') or {}
+        certs = {c['id']: c for c in rgw.get('certs') or []}
+        due_generated, user = False, []
+        port = self._rgw_port()
+        for d in daemons or []:
+            if d.get('type') != 'rgw' or d.get('host') not in by_name:
+                continue
+            ref = d.get('cert') or 'cli'
+            c = certs.get(ref) if ref != 'cli' else {'id': 'cli', 'cert': rgw.get('cert'), 'user': rgw.get('user_cert')}
+            served = served_not_after(by_name[d['host']]['addr'], port) if port else None
+            for end, is_user in ((cert_not_after(c.get('cert')) if c and c.get('cert') else None, bool(c and c.get('user'))), (served, False)):
+                if end is None or end - now > CERT_RENEW_BEFORE:
+                    continue
+                if is_user:
+                    user.append('rgw.%s serves the operator\'s certificate, which expires %s' % (d['host'], end.isoformat()))
+                    continue
+                due_generated = True
+                if end - now <= CERT_ALERT_BEFORE:
+                    alerts.append('rgw.%s certificate expires %s' % (d['host'], end.isoformat()))
+        if due_generated:
+            self._accept_renewal(lambda: self._accept_rgw_renewal())
+        if user:
+            warn('TALOS_RGW_CERT_EXPIRING', "an operator's RGW certificate expires within 30 days", user)
+        if alerts:
+            warn('TALOS_CERT_RENEWAL', 'certificates expire within 7 days: their renewal keeps failing', alerts)
+        # the operator's certificate, from the public copy the CLI keeps
+        r, out, _ = self.mon_command({'prefix': 'config-key get', 'key': OPERATOR_CERT_KEY})
+        end = cert_not_after(out) if r == 0 and out else None
+        if end is not None and end - now <= OPERATOR_WARN_BEFORE:
+            warn('TALOS_OPERATOR_CERT_EXPIRING', "the operator's certificate expires within 60 days",
+                 ['it expires %s: any cephadm-talos command renews it' % end.isoformat()])
+        self.set_health_checks(checks)
+
+    def _schedule_cert_check(self) -> None:
+        """Run the daily certificate check, at the leader's first tick and then
+        once a day, in a thread of its own (it reads every RGW's certificate)."""
+        led = getattr(self, '_ledger', None)
+        if led is None or not led.ready or time.monotonic() < getattr(self, '_certs_next', 0.0):
+            return
+        self._certs_next = time.monotonic() + CERT_CHECK_INTERVAL
+
+        def run() -> None:
+            try:
+                self._check_certs()
+            except Exception as e:  # the next day tries again
+                self.log.warning('the certificate check: %s', e)
+        threading.Thread(target=run, name='talos-certs', daemon=True).start()
+
+    def _accept_renewal(self, accept: Callable[[], str]) -> None:
+        """Accept a renewal; one that is refused (busy, suspended) waits for the next check."""
+        try:
+            op = accept()
+            self.log.info('certificate renewal accepted: operation %s', op)
+        except OrchestratorError as e:
+            self.log.info('certificate renewal not accepted now: %s', e)
+
+    def _accept_rgw_renewal(self) -> str:
+        """A renewal of the generated RGW certificate, unless one, an ingress
+        apply or an RGW add is unfinished."""
+        led, _ = self._authority()
+        for _, e in led.executable():
+            if e['kind'] in ('renew_rgw_cert', 'apply_ingress') or e['kind'] == 'add_daemon' and e['daemon'].startswith('rgw.'):
+                rec = self._journal(e['id'])
+                if rec is None or rec.get('state') not in TERMINAL:
+                    raise OrchestratorError('operation %s on the RGW certificates is in progress' % e['id'])
+        return self._accept_cluster('renew_rgw_cert')
 
     @_accepting
     def _accept_cluster(self, kind: str, op_id: Optional[str] = None, **fields: Any) -> str:

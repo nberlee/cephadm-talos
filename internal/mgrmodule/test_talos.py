@@ -519,13 +519,14 @@ class IdentityTest(unittest.TestCase):
                 m.cert_identity(bad)
 
 
-def state_entries(inv, cluster, incarnation='cli', seq=1):
-    """The store entries of a published state with an inventory and a cluster record."""
+def state_entries(inv, cluster, incarnation='cli', seq=1, **more):
+    """The store entries of a published state with an inventory and a cluster
+    record (and more records, such as hosts and daemons)."""
     import base64
     import hashlib
     base = 'talos/inc/%s/' % incarnation
     entries, recs = {}, {}
-    for name, obj in (('inventory', inv), ('cluster', cluster)):
+    for name, obj in (('inventory', inv), ('cluster', cluster)) + tuple(more.items()):
         data = json.dumps(obj).encode()
         key = '%srec/%d/%s.0' % (base, seq, name)
         entries[key] = base64.b64encode(data).decode()
@@ -602,6 +603,75 @@ class Acceptance(unittest.TestCase):
             self.assertEqual(len(mod._ledger.executable()), 1 if accepted else 0)
             if answer[0] == 0:
                 self.assertIn(session, res.exception_str)
+
+
+def cert_until(days):
+    """A self-signed certificate (PEM) that expires in days."""
+    import datetime
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+    key = ec.generate_private_key(ec.SECP256R1())
+    now = datetime.datetime.now(datetime.timezone.utc)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, 't')])
+    c = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
+         .serial_number(x509.random_serial_number()).not_valid_before(now - datetime.timedelta(days=1))
+         .not_valid_after(now + datetime.timedelta(days=days)).sign(key, hashes.SHA256()))
+    return c.public_bytes(serialization.Encoding.PEM).decode()
+
+
+class CertCheck(unittest.TestCase):
+    """The daily certificate check (plan 04, step 1)."""
+
+    def module(self, operator_days=None, rgw=None):
+        hosts = [{'name': 'h1', 'addr': '10.0.0.1', 'mgr_server_cert': cert_until(10), 'mgr_client_cert': cert_until(1000)},
+                 {'name': 'h2', 'addr': '10.0.0.2', 'mgr_server_cert': cert_until(1000), 'mgr_client_cert': cert_until(1000)},
+                 {'name': 'h3', 'addr': '10.0.0.3', 'mgr_server_cert': cert_until(5), 'mgr_client_cert': cert_until(1000)}]
+        daemons = [{'type': 'mgr', 'id': h, 'host': h} for h in ('h1', 'h2', 'h3')]
+        daemons += [{'type': 'rgw', 'id': h, 'host': h, 'cert': c} for h, c in (rgw or {}).items()]
+        cluster = {'fsid': 'f', 'sealed': True}
+        if rgw:
+            cluster['rgw'] = {'port': 443, 'certs': [{'id': 'issued/op-%016x/%s' % (1, 'ab' * 8), 'cert': cert_until(20)},
+                                                     {'id': 'user/op-%016x' % 2, 'cert': cert_until(20), 'user': True}]}
+        mod, entries = Acceptance.module(self)
+        entries.update(state_entries(inventory(), cluster, hosts=hosts, daemons=daemons))
+        mod.get_mgr_id = lambda: 'h2'
+        mod._rgw_port = lambda: None
+        import logging
+        mod._logger = logging.getLogger('test')
+        self.health = {}
+        mod.set_health_checks = lambda checks: self.health.update({'now': checks})
+        op_cert = cert_until(operator_days) if operator_days is not None else None
+
+        def mon(cmd):
+            if cmd.get('key') == m.OPERATOR_CERT_KEY and op_cert:
+                return 0, op_cert, ''
+            return -2, '', 'not found'
+        mod.mon_command = mon
+        return mod, entries
+
+    def test_mgr_renewals_and_warnings(self):
+        mod, entries = self.module(operator_days=30)
+        m.Module._check_certs(mod)
+        ops = [(e['kind'], e.get('daemon'), e['host']) for _, e in mod._ledger.executable()]
+        # h1's server certificate within 30 days, h3's within 7 (and h3 in maintenance: renewed in the state)
+        self.assertEqual(sorted(ops), [('renew_mgr', 'mgr.h1', 'h1'), ('renew_mgr', 'mgr.h3', 'h3')])
+        checks = self.health['now']
+        self.assertIn('TALOS_OPERATOR_CERT_EXPIRING', checks)
+        self.assertEqual(checks['TALOS_CERT_RENEWAL']['count'], 1)  # h3's
+        # again: the unfinished renewals are not accepted twice
+        m.Module._check_certs(mod)
+        self.assertEqual(len(mod._ledger.executable()), 2)
+
+    def test_rgw_renewal_for_generated_certificates_only(self):
+        mod, entries = self.module(rgw={'h1': 'issued/op-%016x/%s' % (1, 'ab' * 8), 'h2': 'user/op-%016x' % 2})
+        m.Module._check_certs(mod)
+        kinds = [e['kind'] for _, e in mod._ledger.executable()]
+        self.assertEqual(kinds.count('renew_rgw_cert'), 1)
+        self.assertIn('TALOS_RGW_CERT_EXPIRING', self.health['now'])  # the operator's, not renewed
+        m.Module._check_certs(mod)
+        self.assertEqual([e['kind'] for _, e in mod._ledger.executable()].count('renew_rgw_cert'), 1)
 
 
 class AddAndRemove(unittest.TestCase):

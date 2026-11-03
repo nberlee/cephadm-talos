@@ -824,6 +824,38 @@ class LedgerCallsTest(unittest.TestCase):
             op['daemon'] = daemon
         return self.led.append(op)[1]['id']
 
+    def test_a_mgr_renewal(self):
+        """plan 04, step 1: issued once per renewal, the keys released until a
+        later done retires them, the CLI's host keys deleted by the first done."""
+        self.mons.kv[b.SECRET_PREFIX + 'host/h1/mgr-server.key'] = 'old'
+        self.mons.kv[b.SECRET_PREFIX + 'host/h1/mgr-client.key'] = 'old'
+        self.assertEqual(self.call('mgr cert done', operation=self.accept('restart', 'mgr.h1', 'h1'))[0], 400)
+        r1 = self.accept('renew_mgr', 'mgr.h1', 'h1')
+        self.assertEqual(self.call('mgr cert done', operation=r1)[0], 400)  # nothing issued yet
+        code, reply = self.call('mgr cert', operation=r1)
+        self.assertEqual((code, reply['outcome']), (200, 'done'), reply)
+        first = json.loads(reply['out'])
+        again = json.loads(self.call('mgr cert', operation=r1)[1]['out'])
+        self.assertEqual(again, first)  # a retry gets the same certificates
+        name = 'issued/%s/%s/mgr-server.key' % (r1, first['attempt'])
+        self.assertEqual(self.call('secret get', name=name)[1]['outcome'], 'done')
+        self.assertEqual(self.call('secret get', name='host/h1/mgr-server.key')[1]['outcome'], 'done')
+        code, reply = self.call('mgr cert done', operation=r1)
+        self.assertEqual((code, reply['outcome']), (200, 'done'), reply)
+        self.assertNotIn(b.SECRET_PREFIX + 'host/h1/mgr-server.key', self.mons.kv)
+        self.assertEqual(self.call('secret get', name='host/h1/mgr-server.key')[0], 400)
+        self.assertEqual(self.call('mgr cert done', operation=r1)[1]['outcome'], 'done')  # asked again
+        self.assertEqual(sum(1 for _, e in self.led.executable() if e['kind'] == 'mgr_cert_done'), 1)
+        # a second renewal retires the first one's keys
+        r2 = self.accept('renew_mgr', 'mgr.h1', 'h1')
+        second = json.loads(self.call('mgr cert', operation=r2)[1]['out'])
+        self.assertNotEqual(second['attempt'], first['attempt'])
+        self.assertEqual(self.call('secret get', name=name)[1]['outcome'], 'done')  # still in use until done
+        self.call('mgr cert done', operation=r2)
+        self.assertEqual(self.call('secret get', name=name)[0], 400)
+        self.assertFalse(any(k.startswith(b.SECRET_PREFIX + 'issued/' + r1) for k in self.mons.kv))
+        self.assertEqual(self.call('secret get', name='issued/%s/%s/mgr-server.key' % (r2, second['attempt']))[1]['outcome'], 'done')
+
     def test_a_mgr_from_add_to_retirement(self):
         from cryptography import x509
         from cryptography.x509.oid import ExtendedKeyUsageOID

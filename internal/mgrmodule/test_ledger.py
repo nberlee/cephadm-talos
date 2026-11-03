@@ -295,6 +295,55 @@ class RGWCertFoldTest(unittest.TestCase):
                 lg.check_entry(k, json.dumps(e))
 
 
+class MgrRenewalFoldTest(unittest.TestCase):
+    """A mgr's renewed keys (plan 04, step 1): released from issuance until a
+    later renewal's mgr_cert_done retires them; the add's and the CLI's keys
+    with the first done."""
+    INV = {'hosts': [{'name': 'h1', 'addr': '10.0.0.1'}, {'name': 'h2', 'addr': '10.0.0.2'}],
+           'daemons': [{'daemon_type': 'mgr', 'daemon_id': 'h1', 'host': 'h1'}]}
+
+    def test_two_renewals(self):
+        add = entry(5, 1, 'op-%016x' % 1, kind='add_daemon', daemon='mgr.h2', host='h2')
+        r1 = entry(5, 2, 'op-%016x' % 2, kind='renew_mgr', daemon='mgr.h2', host='h2')
+        c1 = entry(5, 3, 'm-%016x' % 3, kind='mgr_cert', of='op-%016x' % 2, daemon='mgr.h2', host='h2', attempt='ab' * 8)
+        d1 = entry(5, 4, 'm-%016x' % 4, kind='mgr_cert_done', of='op-%016x' % 2, daemon='mgr.h2', host='h2', keep='op-%016x' % 2)
+        r2 = entry(5, 5, 'op-%016x' % 5, kind='renew_mgr', daemon='mgr.h2', host='h2')
+        c2 = entry(5, 6, 'm-%016x' % 6, kind='mgr_cert', of='op-%016x' % 5, daemon='mgr.h2', host='h2', attempt='cd' * 8)
+        d2 = entry(5, 7, 'm-%016x' % 7, kind='mgr_cert_done', of='op-%016x' % 5, daemon='mgr.h2', host='h2', keep='op-%016x' % 5)
+        cli = entry(5, 8, 'op-%016x' % 8, kind='renew_mgr', daemon='mgr.h1', host='h1')
+        cc = entry(5, 9, 'm-%016x' % 9, kind='mgr_cert', of='op-%016x' % 8, daemon='mgr.h1', host='h1', attempt='ef' * 8)
+        cd = entry(5, 10, 'm-%016x' % 10, kind='mgr_cert_done', of='op-%016x' % 8, daemon='mgr.h1', host='h1', keep='op-%016x' % 8)
+        for k, e in (add, r1, c1, d1, r2, c2, d2, cli, cc, cd):
+            lg.check_entry(k, json.dumps(e))
+        f = lg.Fold(self.INV, [add, r1, c1])
+        self.assertTrue(f.mgr_keys_allowed('op-%016x' % 1) and f.mgr_keys_allowed('op-%016x' % 2))
+        self.assertEqual(f.mgr_renewals['mgr.h2']['op-%016x' % 2], 'ab' * 8)
+        # the first done retires the add's keys, keeps the renewal's
+        f = lg.Fold(self.INV, [add, r1, c1, d1, r2])
+        self.assertFalse(f.mgr_keys_allowed('op-%016x' % 1))
+        self.assertTrue(f.mgr_keys_allowed('op-%016x' % 2) and f.mgr_keys_allowed('op-%016x' % 5))
+        # the second renewal's done retires the first renewal's keys
+        f = lg.Fold(self.INV, [add, r1, c1, d1, r2, c2, d2])
+        self.assertFalse(f.mgr_keys_allowed('op-%016x' % 2))
+        self.assertTrue(f.mgr_keys_allowed('op-%016x' % 5))
+        # the CLI's mgr: its host keys until its renewal's done
+        f = lg.Fold(self.INV, [cli, cc])
+        self.assertTrue(f.secret_allowed('host/h1/mgr-server.key', 'h1'))
+        f = lg.Fold(self.INV, [cli, cc, cd])
+        self.assertFalse(f.secret_allowed('host/h1/mgr-server.key', 'h1'))
+        self.assertTrue(f.mgr_keys_allowed('op-%016x' % 8))
+        # a renewal of a mgr that is not in the fold counts for nothing
+        ghost = entry(5, 11, 'op-%016x' % 11, kind='renew_mgr', daemon='mgr.h9', host='h9')
+        self.assertFalse(lg.Fold(self.INV, [ghost]).mgr_keys_allowed('op-%016x' % 11))
+        for bad in (dict(kind='renew_mgr', daemon='mgr.h1', host='h2'), dict(kind='renew_mgr', host='h1'),
+                    dict(kind='renew_mgr', daemon='mgr.h1', host='h1', port=443), dict(kind='renew_rgw_cert', host='h1')):
+            k, e = entry(5, 12, 'op-%016x' % 12, **bad)
+            with self.assertRaises(lg.LedgerError, msg=bad):
+                lg.check_entry(k, json.dumps(e))
+        k, e = entry(5, 13, 'op-%016x' % 13, kind='renew_rgw_cert')
+        lg.check_entry(k, json.dumps(e))
+
+
 class IngressFoldTest(unittest.TestCase):
     IMG = 'quay.io/ceph/keepalived@sha256:' + 'cd' * 32
 

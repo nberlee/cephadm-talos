@@ -19,7 +19,7 @@ later valid takeover entry exists. A void takeover entry sets no cutoffs.
 import json
 import re
 import threading
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 LEDGER_PREFIX = 'cephadm-talos/ledger/'
 ENTRY_VERSION = 1
@@ -27,12 +27,14 @@ KEY_RE = re.compile(r'\A(\d{20})-(\d{10})-(takeover|op-[0-9a-f]{16}|m-[0-9a-f]{1
 OP_RE = re.compile(r'\Aop-[0-9a-f]{16}\Z')
 # kinds an operation entry may have; ADDS and REMOVES change the fold
 KINDS = ('restart', 'redeploy', 'add_daemon', 'remove_daemon', 'remove_host', 'create_osd', 'remove_osd', 'enter_maintenance', 'exit_maintenance', 'powercycle_host',
-         'upgrade_start', 'upgrade_pause', 'upgrade_resume', 'upgrade_stop', 'apply_ingress', 'add_host')
+         'upgrade_start', 'upgrade_pause', 'upgrade_resume', 'upgrade_stop', 'apply_ingress', 'add_host',
+         # renewals the module accepts by itself (plan 04, step 1)
+         'renew_mgr', 'renew_rgw_cert')
 # the upgrade's kinds, operations and module entries: about the cluster, without a host
 UPGRADE_CONTROLS = ('upgrade_pause', 'upgrade_resume', 'upgrade_stop')
 UPGRADE_KINDS = ('upgrade_start',) + UPGRADE_CONTROLS + ('upgrade_done', 'upgrade_refused')
 # entries about the cluster, without a host: the upgrade's and the RGW certificates'
-HOSTLESS = UPGRADE_KINDS + ('rgw_cert', 'rgw_cert_done', 'apply_ingress')
+HOSTLESS = UPGRADE_KINDS + ('rgw_cert', 'rgw_cert_done', 'apply_ingress', 'renew_rgw_cert')
 VIP_RE = re.compile(r'\A(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}/(?:3[0-2]|[12]?\d)\Z')
 IMAGE_RE = re.compile(r'\A[a-z0-9][a-z0-9._/:-]{0,254}@sha256:[0-9a-f]{64}\Z')
 # kinds that are about a whole host: every other operation on it waits for them
@@ -44,7 +46,7 @@ STOPS, STARTS = ('enter_maintenance', 'powercycle_host'), ('exit_maintenance', '
 # the module's own entries (ids m-<hex>), which carry out a removal: close a
 # daemon's generation, retire the daemon, retire a host; end a host's maintenance
 MODULE_KINDS = ('close', 'retire', 'retire_host', 'bind', 'confirm', 'close_create', 'drained', 'maintained', 'upgrade_done', 'upgrade_refused',
-                'rgw_cert', 'rgw_cert_done')
+                'rgw_cert', 'rgw_cert_done', 'mgr_cert', 'mgr_cert_done')
 # an RGW serving certificate's id (internal/state RGWCert): generated, the operator's, the CLI's
 RGW_CERT_RE = re.compile(r'\A(?:issued/op-[0-9a-f]{16}/[0-9a-f]{16}|user/op-[0-9a-f]{16}|cli)\Z')
 DEVICE_RE = re.compile(r'\A/dev/[A-Za-z0-9][A-Za-z0-9._:/-]{0,200}\Z')
@@ -112,6 +114,14 @@ def check_entry(key: str, raw: str) -> Dict[str, Any]:
             raise LedgerError('rgw_cert entry %s' % key)
         if kind == 'rgw_cert_done' and not (isinstance(e.get('keep'), str) and RGW_CERT_RE.match(e['keep'])):
             raise LedgerError('rgw_cert_done entry %s' % key)
+        # a renewed mgr's certificates: issued once per renewal, and the renewal
+        # whose keys the mgr keeps when the others are retired
+        if kind in ('mgr_cert', 'mgr_cert_done') and not (ok_daemon and daemon == 'mgr.' + host):
+            raise LedgerError('%s entry %s' % (kind, key))
+        if kind == 'mgr_cert' and not (isinstance(e.get('attempt'), str) and re.match(r'\A[0-9a-f]{16}\Z', e['attempt'])):
+            raise LedgerError('mgr_cert entry %s' % key)
+        if kind == 'mgr_cert_done' and not (isinstance(e.get('keep'), str) and OP_RE.match(e['keep'])):
+            raise LedgerError('mgr_cert_done entry %s' % key)
         return e
     if kind not in KINDS or (e.get('request') is not None and not (isinstance(e['request'], str) and UUID_RE.match(e['request']))):
         raise LedgerError('operation entry %s' % key)
@@ -132,6 +142,14 @@ def check_entry(key: str, raw: str) -> Dict[str, Any]:
                 and all(isinstance(h, str) and HOST_RE.match(h) for h in hosts)
                 and isinstance(e.get('image'), str) and IMAGE_RE.match(e['image']) and type(e.get('new_password')) is bool) \
                 or set(e) - {'version', 'id', 'kind', 'vip', 'vrid', 'hosts', 'image', 'new_password', 'gid', 'epoch', 'seq', 'request', 'inputs'}:
+            raise LedgerError('operation entry %s' % key)
+        return e
+    if kind == 'renew_rgw_cert':
+        if daemon is not None or set(e) - {'version', 'id', 'kind', 'gid', 'epoch', 'seq'}:
+            raise LedgerError('operation entry %s' % key)
+        return e
+    if kind == 'renew_mgr':
+        if not (ok_daemon and daemon == 'mgr.' + host) or set(e) - {'version', 'id', 'kind', 'daemon', 'host', 'gid', 'epoch', 'seq'}:
             raise LedgerError('operation entry %s' % key)
         return e
     if kind in UPGRADE_CONTROLS:
@@ -247,6 +265,11 @@ class Fold:
         # first if the sealed state has an RGW), with the position they entered
         # at; a retired one is no longer released
         self.rgw_certs: Dict[str, Dict[str, Any]] = {}
+        # a mgr's renewals in its open generation (op id -> attempt, None until
+        # issued), and the operations whose keys are retired: the add's, the
+        # CLI's (by host) or a renewal's, by a later mgr_cert_done
+        self.mgr_renewals: Dict[str, Dict[str, Optional[str]]] = {}
+        self.mgr_retired: Set[str] = set()
         # the CLI's RGW settings, and the ingress VIP (address without prefix)
         self.cli_rgw: Dict[str, Any] = inventory.get('cli_rgw') or {}
         self.vip: Optional[str] = (self.cli_rgw.get('vip') or '').split('/')[0] or None
@@ -272,6 +295,7 @@ class Fold:
             kind = e['kind']
             if kind == 'add_daemon' and e['host'] in self.hosts:
                 self.daemons[e['daemon']], self.generations[e['daemon']] = e['host'], (e['id'], True)
+                self.mgr_renewals.pop(e['daemon'], None)
                 if e.get('cert'):
                     self.rgw_certs['user/' + e['id']] = {'pos': n, 'retired': False}
             elif kind == 'close' and e['daemon'] in self.generations:
@@ -298,6 +322,14 @@ class Fold:
                 for cid, c in self.rgw_certs.items():
                     if cid != e['keep'] and c['pos'] < positions[e['of']]:
                         c['retired'] = True
+            elif kind == 'renew_mgr' and self.open_generation(e['daemon']) is not None:
+                self.mgr_renewals.setdefault(e['daemon'], {})[e['id']] = None
+            elif kind == 'mgr_cert' and e['of'] in self.mgr_renewals.get(e['daemon'], {}):
+                self.mgr_renewals[e['daemon']][e['of']] = e['attempt']
+            elif kind == 'mgr_cert_done' and e['keep'] in self.mgr_renewals.get(e['daemon'], {}):
+                gen = self.open_generation(e['daemon'])
+                self.mgr_retired.update(o for o in self.mgr_renewals[e['daemon']] if o != e['keep'])
+                self.mgr_retired.add(gen if gen != 'cli' else 'cli/' + e['host'])
             elif kind == 'apply_ingress':
                 self.ingress = {'vip': e['vip'], 'vrid': e['vrid'], 'op': e['id'], 'hosts': list(e['hosts'])}
                 self.vip = e['vip'].split('/')[0]
@@ -353,10 +385,21 @@ class Fold:
             return self.has('rgw', entity[len('client.rgw.'):])
         return False  # osd.<n>: on its disk; client.bootstrap-osd: step 6c
 
+    def mgr_keys_allowed(self, op: str) -> bool:
+        """Whether a mgr's issued keys of an operation may be released: its open
+        generation's add or a renewal in it, not retired."""
+        if op in self.mgr_retired:
+            return False
+        for n in self.daemons:
+            gen = self.open_generation(n) if n.startswith('mgr.') else None
+            if gen is not None and (gen == op or op in self.mgr_renewals.get(n, {})):
+                return True
+        return False
+
     def secret_allowed(self, name: str, host: Optional[str]) -> bool:
         """Whether `secret get` may release a secret (host for a host's keys)."""
         if host is not None:
-            return self.has('mgr', host=host)
+            return self.has('mgr', host=host) and 'cli/' + host not in self.mgr_retired
         if name == 'rgw/server.key':
             return self.has('rgw') and not self.rgw_certs.get('cli', {'retired': True})['retired']
         if name.endswith('/rgw-server.key'):

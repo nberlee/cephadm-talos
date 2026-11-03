@@ -359,7 +359,7 @@ READ_PREFIXES = {'auth get', 'config get', 'config-key get', 'config-key ls', 'm
 # calls the module answers itself, for operations of its ledger (ledger.py)
 LOCAL = {'mgr cert', 'retire', 'retire host', 'bind disk', 'confirm osd', 'close create', 'osd out', 'drain', 'mon rm',
          'ok to stop', 'noout set', 'noout unset', 'maintained', 'mgr fail', 'ok to stop daemon', 'upgrade done', 'upgrade refused',
-         'rgw cert', 'rgw cert done', 'retire keepalived'}
+         'rgw cert', 'rgw cert done', 'retire keepalived', 'mgr cert done'}
 
 ALLOWLIST: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     'status': _no_args('status'),
@@ -376,6 +376,7 @@ ALLOWLIST: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     'ledger': _ledger,
     'approval': _approval,
     'mgr cert': _operation,
+    'mgr cert done': _operation,
     'bind disk': _operation_with('serial', 'link', 'job'),
     'confirm osd': _operation_with('osd'),
     'close create': _operation,
@@ -452,7 +453,7 @@ def new_rgw_ca(fsid: str) -> Tuple[str, str]:
 
 
 def issue_rgw_cert(ca_cert_pem: bytes, ca_key_pem: bytes, ips: List[str], names: List[str]) -> Tuple[str, str]:
-    """An RGW serving certificate (P-256, 2 years, server auth) for addresses
+    """An RGW serving certificate (P-256, 1 year, server auth: browsers accept at most 398 days) for addresses
     and names: certificate, key."""
     import datetime
     import ipaddress
@@ -466,7 +467,7 @@ def issue_rgw_cert(ca_cert_pem: bytes, ca_key_pem: bytes, ips: List[str], names:
     cert = (x509.CertificateBuilder()
             .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, 'rgw')]))
             .issuer_name(ca.subject).public_key(key.public_key()).serial_number(x509.random_serial_number())
-            .not_valid_before(now - datetime.timedelta(hours=1)).not_valid_after(now + datetime.timedelta(days=2 * 365))
+            .not_valid_before(now - datetime.timedelta(hours=1)).not_valid_after(now + datetime.timedelta(days=365))
             .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
             .add_extension(x509.SubjectAlternativeName(sans), critical=False)
             .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ca.public_key()), critical=False)  # type: ignore[arg-type]
@@ -824,8 +825,7 @@ class Channel:
                 return 200, self._ledger_page(led, args['after'])
             if call == 'secret get':
                 m = SECRET_RE.match(args['name'])
-                allowed = fold.secret_allowed(args['name'], m.group(1)) if m.group(2) is None else \
-                    any(fold.open_generation(n) == m.group(2) for n in fold.daemons if n.startswith('mgr.'))
+                allowed = fold.secret_allowed(args['name'], m.group(1)) if m.group(2) is None else fold.mgr_keys_allowed(m.group(2))
             elif call == 'auth get-or-create':
                 allowed = True  # checked with its operation under the lock retirement takes (create)
             elif args['entity'] == 'client.bootstrap-osd':
@@ -1015,7 +1015,7 @@ class Channel:
             op = ops.get(op_id)
             try:
                 if call == 'mgr cert':
-                    return self._mgr_cert(fold, op)
+                    return self._mgr_cert(fold, op, led)
                 if call in ('osd out', 'drain') or (call == 'retire' and op is not None and op['kind'] == 'remove_osd'):
                     return self._removal(call, led, fold, ops, op)
                 if call == 'retire':
@@ -1032,6 +1032,8 @@ class Channel:
                     return self._rgw_cert(led, fold, op)
                 if call == 'retire keepalived':
                     return self._retire_keepalived(led, fold, ops, op, (args or {}).get('daemon'))
+                if call == 'mgr cert done':
+                    return self._mgr_cert_done(led, fold, op)
                 if call == 'rgw cert done':
                     return self._rgw_cert_done(led, fold, ops, op, (args or {}).get('keep'))
                 if call in ('bind disk', 'confirm osd', 'close create'):
@@ -1040,7 +1042,9 @@ class Channel:
             except Exception as e:  # a ledger entry without an answer, among others: asked again
                 return 503, {'error': '%s: %s' % (call, e.__class__.__name__)}
 
-    def _mgr_cert(self, fold: Any, op: Optional[Dict[str, Any]]) -> Tuple[int, Dict[str, Any]]:
+    def _mgr_cert(self, fold: Any, op: Optional[Dict[str, Any]], led: Any = None) -> Tuple[int, Dict[str, Any]]:
+        if op is not None and op['kind'] == 'renew_mgr':
+            return self._mgr_renewal_cert(led, fold, op)
         if op is None or op['kind'] != 'add_daemon' or not op['daemon'].startswith('mgr.') \
                 or fold.open_generation(op['daemon']) != op['id'] or op['host'] not in fold.hosts:
             return 400, {'error': 'no add of a mgr in its open generation'}
@@ -1057,6 +1061,60 @@ class Channel:
                 return 503, {'error': 'the key of attempt %s was not written; ask again' % attempt}
         out = {'attempt': attempt, 'server_cert': certs['server_cert'], 'client_cert': certs['client_cert']}
         return 200, {'outcome': 'done', 'r': 0, 'out': json.dumps(out), 'outs': ''}
+
+    def _mgr_renewal_cert(self, led: Any, fold: Any, op: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        """A renewal's mgr certificates (plan 04, step 1): issued once per renewal,
+        recorded with a module entry, the certificates kept beside the keys, so a
+        retry or a successor gets the same ones."""
+        name, host = op['daemon'], op['host']
+        if led is None or op['id'] not in fold.mgr_renewals.get(name, {}) or host not in fold.hosts:
+            return 400, {'error': 'no renewal of a mgr in its open generation'}
+        attempt = fold.mgr_renewals[name][op['id']]
+        if attempt is None:
+            job = self._mon({'prefix': 'config-key get', 'key': SECRET_PREFIX + 'agent-ca.key'})
+            if job is None or job.r != 0 or not self.ca_cert:
+                return 503, {'error': 'the agent CA is not available'}
+            certs = issue_mgr_certs(self.ca_cert, job.outb.encode(), self.fsid, host, fold.hosts[host])
+            attempt = secrets.token_hex(8)
+            for item in ('server_key', 'client_key', 'server_cert', 'client_cert'):
+                role, kind = item.split('_')
+                key = '%sissued/%s/%s/mgr-%s.%s' % (SECRET_PREFIX, op['id'], attempt, role, 'key' if kind == 'key' else 'crt')
+                w = self._mon({'prefix': 'config-key set', 'key': key, 'val': certs[item]}, name)
+                if w is None or w.r != 0:
+                    return 503, {'error': 'the certificates of attempt %s were not written; ask again' % attempt}
+            led.append({'id': 'm-' + secrets.token_hex(8), 'kind': 'mgr_cert', 'of': op['id'], 'daemon': name, 'host': host, 'attempt': attempt})
+        out = {'attempt': attempt}
+        for role in ('server', 'client'):
+            job = self._mon({'prefix': 'config-key get', 'key': '%sissued/%s/%s/mgr-%s.crt' % (SECRET_PREFIX, op['id'], attempt, role)})
+            if job is None or job.r != 0:
+                return 503, {'error': 'the certificates of attempt %s cannot be read; ask again' % attempt}
+            out[role + '_cert'] = job.outb
+        return 200, {'outcome': 'done', 'r': 0, 'out': json.dumps(out), 'outs': ''}
+
+    def _mgr_cert_done(self, led: Any, fold: Any, op: Optional[Dict[str, Any]]) -> Tuple[int, Dict[str, Any]]:
+        """A renewal's end: the mgr keeps the renewal's keys; every other key of
+        that mgr (its add's, the CLI's, earlier renewals') is retired by a module
+        entry first, then deleted. Asked again, it deletes what is left."""
+        if op is None or op['kind'] != 'renew_mgr' or op['id'] not in fold.mgr_renewals.get(op['daemon'], {}):
+            return 400, {'error': 'no renewal of a mgr in its open generation'}
+        name, host = op['daemon'], op['host']
+        if fold.mgr_renewals[name][op['id']] is None:
+            return 400, {'error': 'the renewal issued no certificates'}
+        gen = fold.open_generation(name)
+        if not any(e['kind'] == 'mgr_cert_done' and e['of'] == op['id'] for _, e in led.executable()):
+            led.append({'id': 'm-' + secrets.token_hex(8), 'kind': 'mgr_cert_done', 'of': op['id'], 'daemon': name, 'host': host, 'keep': op['id']})
+        old = ['%sissued/%s/' % (SECRET_PREFIX, o) for o in list(fold.mgr_renewals[name]) + [gen] if o != op['id'] and o != 'cli']
+        if gen == 'cli':
+            old += ['%shost/%s/mgr-server.key' % (SECRET_PREFIX, host), '%shost/%s/mgr-client.key' % (SECRET_PREFIX, host)]
+        keys = self._mon({'prefix': 'config-key ls'}, None, lambda out: json.dumps([k for k in json.loads(out) if any(k.startswith(p) for p in old)]))
+        if keys is None or keys.r != 0 or keys.too_large:
+            return 503, {'error': 'cannot list the secrets; ask again'}
+        for k in json.loads(keys.outb):
+            if any(k.startswith(p) for p in old):
+                rm = self._mon({'prefix': 'config-key rm', 'key': k}, name)
+                if rm is None or rm.r not in (0, -2):
+                    return 503, {'error': 'cannot remove a key of %s; ask again' % name}
+        return 200, {'outcome': 'done', 'r': 0, 'out': '', 'outs': ''}
 
     def _retire(self, led: Any, fold: Any, ops: Dict[str, Dict[str, Any]], op: Optional[Dict[str, Any]]) -> Tuple[int, Dict[str, Any]]:
         if op is None or op['kind'] != 'remove_daemon':
@@ -1089,6 +1147,9 @@ class Channel:
         # go once no RGW renders it (rgw cert done)
         mine = [] if name.startswith('rgw.') else ['%sissued/%s/' % (SECRET_PREFIX, gen)] if gen != 'cli' else \
             ['%shost/%s/mgr-server.key' % (SECRET_PREFIX, op['host']), '%shost/%s/mgr-client.key' % (SECRET_PREFIX, op['host'])]
+        # and the keys of its renewals (plan 04, step 1)
+        if name.startswith('mgr.'):
+            mine += ['%sissued/%s/' % (SECRET_PREFIX, o) for o in fold.mgr_renewals.get(name, {})]
         # the generation's keys only, reduced before the output limit applies
         keys = self._mon({'prefix': 'config-key ls'}, None, lambda out: json.dumps([k for k in json.loads(out) if any(k.startswith(p) for p in mine)]))
         if keys is None or keys.r != 0 or keys.too_large:
@@ -1264,13 +1325,13 @@ class Channel:
         return (cert, key) if w is not None and w.r == 0 else None
 
     def _rgw_cert(self, led: Any, fold: Any, op: Optional[Dict[str, Any]]) -> Tuple[int, Dict[str, Any]]:
-        """A generated RGW serving certificate for an executable RGW add or
-        ingress apply, from the module's RGW CA, for the names the fold gives:
+        """A generated RGW serving certificate for an executable RGW add, ingress
+        apply or renewal (plan 04, step 1), from the module's RGW CA, for the names the fold gives:
         every RGW host's name and address and the VIP. Once per operation: asked
         again, it returns the one it issued."""
         if op is None or not (op['kind'] == 'add_daemon' and op['daemon'].startswith('rgw.') and not op.get('cert')
-                              or op['kind'] == 'apply_ingress'):
-            return 400, {'error': 'no RGW add or ingress that needs a generated certificate'}
+                              or op['kind'] in ('apply_ingress', 'renew_rgw_cert')):
+            return 400, {'error': 'no RGW add, ingress or renewal that needs a generated certificate'}
         done = [cid for cid in fold.rgw_certs if cid.startswith('issued/%s/' % op['id'])]
         if done:
             attempt = done[0].split('/')[2]
