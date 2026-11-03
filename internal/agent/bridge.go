@@ -89,7 +89,7 @@ var intentCalls = map[string]bool{
 	"auth get-or-create": true, "mgr cert": true, "retire": true, "retire host": true, "bind disk": true,
 	"confirm osd": true, "close create": true, "osd out": true, "drain": true, "mon rm": true,
 	"noout set": true, "noout unset": true, "maintained": true, "mgr fail": true, "upgrade done": true,
-	"upgrade refused": true, "rgw cert": true, "rgw cert done": true, "retire keepalived": true,
+	"upgrade refused": true, "rgw cert": true, "rgw cert done": true, "retire keepalived": true, "mgr cert done": true,
 }
 
 // intend records a call's intent before it is made.
@@ -611,7 +611,7 @@ type MgrCerts struct {
 }
 
 // MgrCert asks the module for the certificates of a mgr an accepted add
-// deploys.
+// deploys, or a renewal renews (asked again, a renewal returns the same ones).
 func (b *Bridge) MgrCert(ctx context.Context, op string) (MgrCerts, error) {
 	out, err := b.do(ctx, "mgr cert", map[string]any{"operation": op})
 	if err != nil {
@@ -626,6 +626,14 @@ func (b *Bridge) MgrCert(ctx context.Context, op string) (MgrCerts, error) {
 	return c, nil
 }
 
+// MgrCertDone tells the module that a renewal's mgr certificates are the
+// ones in use: the keys of that mgr's other certificates are removed.
+func (b *Bridge) MgrCertDone(ctx context.Context, op string) error {
+	_, err := b.do(ctx, "mgr cert done", map[string]any{"operation": op})
+
+	return err
+}
+
 // RGWCert is a generated RGW serving certificate the module issued for an
 // operation: its attempt and the certificate chain.
 type RGWCert struct {
@@ -634,7 +642,7 @@ type RGWCert struct {
 }
 
 // RGWCert asks the module for a generated RGW serving certificate for an RGW
-// add or an ingress apply; asked again, it returns the same one.
+// add, an ingress apply or a renewal; asked again, it returns the same one.
 func (b *Bridge) RGWCert(ctx context.Context, op string) (RGWCert, error) {
 	out, err := b.do(ctx, "rgw cert", map[string]any{"operation": op})
 	if err != nil {

@@ -214,6 +214,14 @@ func run() error {
 		return runCommand(ctx, o, cmd, args)
 	}
 
+	// the operator's certificate is renewed on any command, also after the
+	// handoff, and its public copy kept equal to it (plan 04, step 1)
+	if !offline {
+		if err := o.EnsureOperatorCert(ctx); err != nil {
+			fmt.Fprintln(os.Stderr, "warning: the operator certificate:", err)
+		}
+	}
+
 	if cmd == "suspend" {
 		fs := flag.NewFlagSet("suspend", flag.ExitOnError)
 		reboot := fs.Bool("reboot", false, "reboot a node whose unanswering agent's last apply may still land, instead of waiting up to 10 minutes")

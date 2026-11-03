@@ -124,6 +124,66 @@ func TestRGWCertificatesAreForTheirNode(t *testing.T) {
 	}
 }
 
+func TestARetainedRGWDocumentIsNotCheckedAgainstWhatChangedSince(t *testing.T) {
+	pol := &Policy{FSID: testFSID, Host: "h1"}
+	now := time.Now()
+
+	// the node was renamed and renumbered since its RGW's document was admitted
+	node := func() (NodeIdentity, error) { return NodeIdentity{Hostname: "h9", Addrs: []string{"10.5.0.9"}}, nil }
+
+	rgwDoc := func(pemS string) (string, typedDoc) {
+		p := daemons.Params{Name: "ceph-" + testFSID[:8] + "-rgw-h1", Image: testImage, FSID: testFSID, ID: "h1", Addr: "10.5.0.3", Port: 443, TLSPEM: pemS, Keyring: "[client.rgw.h1]\n\tkey = x\n"}
+		td, err := checkDoc(Doc{Kind: "ContainerConfig", Name: p.Name, YAML: mustRender(daemons.RGW(p))})
+		must(t, err)
+
+		return "ContainerConfig/" + p.Name, td
+	}
+
+	vipDoc := func(vip string) (string, typedDoc) {
+		p := daemons.Params{Name: "ceph-" + testFSID[:8] + "-vip-h1", Image: testImage, FSID: testFSID, ID: "h1", Addr: "10.5.0.3", Port: 443, VIP: vip, VRID: 50, Priority: 150, VRRPPass: "abc"}
+		td, err := checkDoc(Doc{Kind: "ContainerConfig", Name: p.Name, YAML: mustRender(daemons.VIP(p, testImage))})
+		must(t, err)
+
+		return "ContainerConfig/" + p.Name, td
+	}
+
+	// expired since its admission
+	expired := servingPEM(t, now.Add(-2*time.Hour), now.Add(-time.Hour), "10.5.0.3", "h1", "10.5.0.200")
+	kr, tr := rgwDoc(expired)
+	kv, tv := vipDoc("10.5.0.200/24")
+
+	// a roll's first revision: keepalived removed, the RGW kept as it is
+	if err := pol.rgwCerts(map[string]typedDoc{kr: tr, kv: tv}, map[string]typedDoc{}, map[string]string{kv: ""}, node, now); err != nil {
+		t.Fatalf("keepalived removed beside a retained RGW: %v", err)
+	}
+
+	// granted again with the same content, it is unchanged too
+	if err := pol.rgwCerts(map[string]typedDoc{kr: tr, kv: tv}, map[string]typedDoc{kr: tr}, map[string]string{kr: tr.hash, kv: ""}, node, now); err != nil {
+		t.Fatalf("the same RGW document granted again: %v", err)
+	}
+
+	// a keepalived for a VIP the retained certificate does not name is refused
+	ko, to := vipDoc("10.5.0.201/24")
+	if err := pol.rgwCerts(map[string]typedDoc{kr: tr}, map[string]typedDoc{ko: to}, map[string]string{ko: to.hash}, node, now); err == nil || !strings.Contains(err.Error(), "10.5.0.201") {
+		t.Fatalf("a new VIP the RGW's certificate does not name: %v", err)
+	}
+
+	// a changed RGW document is checked in full: validity, address, hostname
+	valid := servingPEM(t, now.Add(-time.Hour), now.Add(time.Hour), "10.5.0.3", "h1", "10.5.0.200")
+	kc, tc := rgwDoc(valid)
+
+	if err := pol.rgwCerts(map[string]typedDoc{kr: tr}, map[string]typedDoc{kc: tc}, map[string]string{kc: tc.hash}, node, now); err == nil || !strings.Contains(err.Error(), "not an address of this node") {
+		t.Fatalf("a changed RGW document on a renumbered node: %v", err)
+	}
+
+	same := func() (NodeIdentity, error) { return NodeIdentity{Hostname: "h1", Addrs: []string{"10.5.0.3"}}, nil }
+	kn, tn := rgwDoc(servingPEM(t, now.Add(-3*time.Hour), now.Add(-2*time.Hour), "10.5.0.3", "h1", "10.5.0.200"))
+
+	if err := pol.rgwCerts(map[string]typedDoc{kr: tr}, map[string]typedDoc{kn: tn}, map[string]string{kn: tn.hash}, same, now); err == nil || !strings.Contains(err.Error(), "not valid now") {
+		t.Fatalf("a changed RGW document with an expired certificate: %v", err)
+	}
+}
+
 func TestVRRPStateSinceTheLastStart(t *testing.T) {
 	for logs, want := range map[string]wire.VRRP{
 		"":                        {},

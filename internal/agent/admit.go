@@ -818,9 +818,21 @@ type NodeIdentity struct {
 // within their validity now; a generated one (TLS_USER unset) for the
 // RGW's ADDR, which must be one of the node's own addresses, its hostname,
 // and the VIP of every keepalived of the cluster the node holds. The
-// operator's certificate names what its clients use, its own choice.
+// operator's certificate names what its clients use, its own choice. An RGW
+// document the node keeps unchanged was checked when it was admitted: it is
+// not checked again against what changed since (its certificate's validity,
+// the node's addresses and hostname, plan 04 step 1), only a generated
+// certificate's names against the VIPs the revision changes.
 func (p *Policy) rgwCerts(cur, typed map[string]typedDoc, sent map[string]string, identity func() (NodeIdentity, error), now time.Time) error {
 	touched := false
+
+	// changed: granted with content other than what the node holds
+	changed := func(k string) bool {
+		h, granted := sent[k]
+		td, held := cur[k]
+
+		return granted && h != "" && (!held || td.hash != h)
+	}
 
 	for k := range sent {
 		if name, ok := strings.CutPrefix(k, "ContainerConfig/"+p.prefix()); ok && (strings.HasPrefix(name, "rgw-") || strings.HasPrefix(name, "vip-")) {
@@ -853,7 +865,7 @@ func (p *Policy) rgwCerts(cur, typed map[string]typedDoc, sent map[string]string
 		}
 	}
 
-	var vips []string
+	var vips, newVIPs []string
 
 	rgws := map[string]map[string]string{}
 
@@ -881,6 +893,9 @@ func (p *Policy) rgwCerts(cur, typed map[string]typedDoc, sent map[string]string
 			}
 
 			vips = append(vips, pfx.Addr().String())
+			if changed(k) {
+				newVIPs = append(newVIPs, pfx.Addr().String())
+			}
 		case strings.HasPrefix(name, "rgw-"):
 			rgws[k] = env
 		}
@@ -906,6 +921,20 @@ func (p *Policy) rgwCerts(cur, typed map[string]typedDoc, sent map[string]string
 					return fmt.Errorf("%s: TLS_PEM: not a certificate", k)
 				}
 			}
+		}
+
+		if !changed(k) {
+			if env["TLS_USER"] == "1" {
+				continue
+			}
+
+			for _, name := range newVIPs {
+				if err := cert.VerifyHostname(name); err != nil {
+					return fmt.Errorf("%s: the certificate is not for %s", k, name)
+				}
+			}
+
+			continue
 		}
 
 		if now.Before(cert.NotBefore) || now.After(cert.NotAfter) {

@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/nberlee/cephadm-talos/internal/pki"
 )
@@ -19,9 +20,13 @@ func newCA(fsid string) (certPEM, keyPEM string, err error) {
 	return pki.NewCA("cephadm-talos CA "+fsid[:8], 10)
 }
 
+// rgwCertLifetime is a generated RGW certificate's lifetime: at most a year,
+// as browsers may reach the RGWs (plan 04, A1).
+const rgwCertLifetime = 365 * 24 * time.Hour
+
 // newServerCert issues an RGW server certificate for the given IPs and DNS names.
 func newServerCert(caCertPEM, caKeyPEM string, ips []string, names []string) (certPEM, keyPEM string, err error) {
-	return pki.Issue(caCertPEM, caKeyPEM, pki.Leaf{CommonName: "rgw", IPs: ips, Names: names, Usage: x509.ExtKeyUsageServerAuth, Years: 2})
+	return pki.Issue(caCertPEM, caKeyPEM, pki.Leaf{CommonName: "rgw", IPs: ips, Names: names, Usage: x509.ExtKeyUsageServerAuth, Lifetime: rgwCertLifetime})
 }
 
 // certCovers reports whether a PEM certificate has exactly these SANs.

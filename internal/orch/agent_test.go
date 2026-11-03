@@ -16,6 +16,7 @@ import (
 	"github.com/nberlee/cephadm-talos/internal/pki"
 	"github.com/nberlee/cephadm-talos/internal/spec"
 	"github.com/nberlee/cephadm-talos/internal/state"
+	"github.com/nberlee/cephadm-talos/internal/store"
 	"github.com/nberlee/cephadm-talos/internal/talos"
 	"github.com/nberlee/cephadm-talos/internal/talos/talostest"
 )
@@ -447,5 +448,91 @@ func TestRenewRepairsAKeyThatIsNotItsCertificates(t *testing.T) {
 	got, _ := o.St.Host("h1")
 	if got.AgentCert == stale || !certValid(got.AgentCert, got.AgentKey, o.identity(pki.RoleAgent, "h1"), true, []string{"10.5.0.2"}, []string{"h1"}) {
 		t.Error("a certificate without its key kept")
+	}
+}
+
+// operatorCert issues the CLI an operator certificate that ends after lifetime.
+func operatorCert(t *testing.T, o *Orch, lifetime time.Duration) {
+	t.Helper()
+
+	id := o.identity(pki.RoleOperator, "admin")
+
+	c, k, err := pki.Issue(o.St.Agent.CACert, o.St.Agent.CAKey, pki.Leaf{CommonName: "operator admin", Usage: x509.ExtKeyUsageClientAuth, Lifetime: lifetime, Identity: &id})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	o.St.Agent.OperatorCert, o.St.Agent.OperatorKey = c, k
+}
+
+func publicOperatorCert(t *testing.T, o *Orch) string {
+	t.Helper()
+
+	v, err := o.StoreBackend.Get(context.Background(), OperatorCertKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return string(v)
+}
+
+func TestTheOperatorCertificateIsRenewedAfterTheHandoff(t *testing.T) {
+	o, _, _ := suspendSetup(t)
+	ctx := context.Background()
+
+	// due within 60 days; under a leader the CLI has no secrets but reads the
+	// agent CA's key through exec
+	operatorCert(t, o, 50*24*time.Hour)
+
+	if err := o.secrets.SetMany(ctx, []store.KV{{Key: store.SecretPrefix + state.SecretAgentCA, Value: []byte(o.St.Agent.CAKey)}}); err != nil {
+		t.Fatal(err)
+	}
+
+	due := o.St.Agent.OperatorCert
+	o.St.Agent.CAKey, o.incarnation = "", "42"
+
+	if !o.Managed() {
+		t.Fatal("not managed")
+	}
+
+	if err := o.EnsureOperatorCert(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	cert := o.St.Agent.OperatorCert
+	if end, err := pki.NotAfter(cert); cert == due || err != nil || end.Before(time.Now().AddDate(2, 0, 0)) ||
+		!certValid(cert, o.St.Agent.OperatorKey, o.identity(pki.RoleOperator, "admin"), false, nil, nil) {
+		t.Fatalf("not renewed: ends %v (%v)", end, err)
+	}
+
+	// saved in local.json, and its public copy is the new certificate
+	if st, err := state.Load(o.St.FSID); err != nil || st.Agent == nil || st.Agent.OperatorCert != cert || st.Agent.OperatorKey != o.St.Agent.OperatorKey {
+		t.Fatalf("local.json: %v", err)
+	}
+
+	if publicOperatorCert(t, o) != cert {
+		t.Fatal("the public copy is not the renewed certificate")
+	}
+}
+
+func TestThePublicOperatorCertificateFollowsTheCLIs(t *testing.T) {
+	o, _, _ := suspendSetup(t)
+	ctx := context.Background()
+
+	// not due: kept, and its public copy written
+	operatorCert(t, o, 90*24*time.Hour)
+	cert := o.St.Agent.OperatorCert
+
+	if err := o.EnsureOperatorCert(ctx); err != nil || o.St.Agent.OperatorCert != cert || publicOperatorCert(t, o) != cert {
+		t.Fatalf("not due: %v", err)
+	}
+
+	// a copy a failed write left behind is corrected by the next command
+	if err := o.StoreBackend.SetMany(ctx, []store.KV{{Key: OperatorCertKey, Value: []byte("stale")}}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := o.EnsureOperatorCert(ctx); err != nil || publicOperatorCert(t, o) != cert {
+		t.Fatalf("stale copy kept: %v", err)
 	}
 }

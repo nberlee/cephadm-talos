@@ -62,8 +62,8 @@ func certCovers(chain string, names ...string) bool {
 	return true
 }
 
-// servesCert reports whether an RGW answers a TLS handshake with the leaf of
-// a certificate chain (LeaderLoop.serves replaces it in tests).
+// servesCert reports whether an RGW, or a mgr module, answers a TLS handshake
+// with the leaf of a certificate chain (LeaderLoop.serves replaces it in tests).
 func (l *LeaderLoop) servesCert(addr string, port int, chain string) bool {
 	if l.serves != nil {
 		return l.serves(addr, port, chain)
@@ -76,7 +76,12 @@ func (l *LeaderLoop) servesCert(addr string, port int, chain string) bool {
 
 	d := &net.Dialer{Timeout: 5 * time.Second}
 
-	conn, err := tls.DialWithDialer(d, "tcp", net.JoinHostPort(addr, strconv.Itoa(port)), &tls.Config{InsecureSkipVerify: true}) //nolint:gosec // the leaf is compared below
+	cfg := &tls.Config{InsecureSkipVerify: true} //nolint:gosec // the leaf is compared below
+	if l.ClientTLS != nil {
+		cfg.Certificates = l.ClientTLS.Certificates // the module asks for the agent's; an RGW for none
+	}
+
+	conn, err := tls.DialWithDialer(d, "tcp", net.JoinHostPort(addr, strconv.Itoa(port)), cfg)
 	if err != nil {
 		return false
 	}
@@ -167,7 +172,10 @@ func (l *LeaderLoop) restoring(ctx context.Context, b *Bridge, js store.Backend,
 
 // vipOff takes a host's keepalived off before its RGW restarts (phase
 // base.vip): their start markers recorded, the documents removed, the
-// instances gone, so the VIP is on a peer. Done reports that they are off.
+// instances gone, so the VIP is on a peer. The grant removes the keepalived
+// documents only: the RGW's stays as the agent holds it (admission takes it as
+// retained, also with a certificate that expired since). Done reports that
+// they are off.
 func (l *LeaderLoop) vipOff(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, base string, h state.Host, vips []string) (bool, error) {
 	if len(vips) == 0 {
 		return true, nil
@@ -198,7 +206,7 @@ func (l *LeaderLoop) vipOff(ctx context.Context, b *Bridge, js store.Backend, gi
 		}
 	}
 
-	done, ok, err := l.step(ctx, b, js, gid, epoch, base+".vip", h.Name, revisionMode{stop: stopKeys(vips)})
+	done, ok, err := l.step(ctx, b, js, gid, epoch, base+".vip", h.Name, revisionMode{only: stopKeys(vips)})
 	if err != nil || !done {
 		return false, err
 	}
@@ -392,8 +400,10 @@ func (l *LeaderLoop) addRGW(ctx context.Context, b *Bridge, js store.Backend, gi
 // earlier roll): its keepalived off (vipOff), the RGW's
 // record set to the certificate and its host's revision granted, the RGW
 // running a newer instance and answering a TLS handshake with that
-// certificate, then its keepalived back (vipBack). The leader holds every
-// revision request meanwhile. Done reports that every RGW renders it.
+// certificate, then its keepalived back (vipBack). An RGW on a host in
+// maintenance is not visited: its record is set to the certificate, which the
+// exit renders. The leader holds every revision request meanwhile. Done
+// reports that every RGW renders it.
 func (l *LeaderLoop) rollRGW(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, op LedgerOp, target, ns string) (bool, error) {
 	l.holding = holdAll
 
@@ -428,6 +438,17 @@ func (l *LeaderLoop) rollRGW(ctx context.Context, b *Bridge, js store.Backend, g
 		}
 
 		if rec.Done {
+			continue
+		}
+
+		// a host in maintenance renders no RGW now: its exit renders the certificate
+		if h.Maintenance {
+			if d.Cert != target {
+				if err := l.setRGWCert(ctx, b, gid, d.ID, target); err != nil {
+					return false, err
+				}
+			}
+
 			continue
 		}
 
@@ -493,15 +514,7 @@ func (l *LeaderLoop) rollRGW(ctx context.Context, b *Bridge, js store.Backend, g
 				return false, err
 			}
 
-			if err := l.changeState(ctx, b, gid, func(st *state.State) error {
-				x, ok := st.Find(state.TypeRGW + "." + d.ID)
-				if ok {
-					x.Cert = target
-					st.AddDaemon(x)
-				}
-
-				return nil
-			}); err != nil {
+			if err := l.setRGWCert(ctx, b, gid, d.ID, target); err != nil {
 				return false, err
 			}
 		}
@@ -555,6 +568,19 @@ func (l *LeaderLoop) rollRGW(ctx context.Context, b *Bridge, js store.Backend, g
 	}
 
 	return true, nil
+}
+
+// setRGWCert sets the certificate an RGW renders in the state.
+func (l *LeaderLoop) setRGWCert(ctx context.Context, b *Bridge, gid int64, id, target string) error {
+	return l.changeState(ctx, b, gid, func(st *state.State) error {
+		x, ok := st.Find(state.TypeRGW + "." + id)
+		if ok {
+			x.Cert = target
+			st.AddDaemon(x)
+		}
+
+		return nil
+	})
 }
 
 // rgwRestart restarts or redeploys an RGW on a host with a keepalived, the

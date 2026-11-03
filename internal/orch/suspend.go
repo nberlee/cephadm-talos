@@ -240,8 +240,15 @@ func (o *Orch) memberHosts(ctx context.Context) ([]state.Host, error) {
 }
 
 // suspendHosts suspends each host: its agent, or the node itself when the
-// agent does not answer.
+// agent does not answer, or when the CLI's operator certificate has expired
+// (every agent would refuse it; read from its notAfter, never from a TLS
+// error).
 func (o *Orch) suspendHosts(ctx context.Context, hosts []state.Host, rec *state.Recovery, opts SuspendOptions) error {
+	expired := o.operatorExpired(time.Now())
+	if expired {
+		o.printf("the operator certificate has expired: suspending every node through Talos\n")
+	}
+
 	for _, h := range hosts {
 		hr := rec.Host(h.Name)
 
@@ -251,11 +258,11 @@ func (o *Orch) suspendHosts(ctx context.Context, hosts []state.Host, rec *state.
 		)
 
 		// an agent whose removal is not confirmed may answer again: asked first
-		if !hr.AgentRemoved {
+		if !hr.AgentRemoved && !expired {
 			receipt, err = o.suspendAgent(ctx, h, rec.Session)
 		}
 
-		if hr.AgentRemoved || errors.Is(err, errUnreachable) {
+		if hr.AgentRemoved || expired || errors.Is(err, errUnreachable) {
 			if err != nil {
 				o.printf("%s: %v: suspending the node through Talos\n", h.Name, err)
 			}

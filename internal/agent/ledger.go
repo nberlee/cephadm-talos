@@ -50,6 +50,8 @@ const (
 	KindRemoveHost   = "remove_host"
 	KindCreateOSD    = "create_osd"
 	KindRemoveOSD    = "remove_osd"
+	KindRenewMgr     = "renew_mgr"
+	KindRenewRGW     = "renew_rgw_cert"
 )
 
 // errWait is a step that waits as long as it takes (a drain), which does not
@@ -124,7 +126,7 @@ func (l *LeaderLoop) ledgerOps(ctx context.Context, b *Bridge, js store.Backend,
 				l.holding = ""
 
 				switch {
-				case st.Upgrade != nil, strings.HasPrefix(e.Op.Daemon, "rgw."), e.Op.Kind == KindIngress:
+				case st.Upgrade != nil, strings.HasPrefix(e.Op.Daemon, "rgw."), e.Op.Kind == KindIngress, e.Op.Kind == KindRenewRGW:
 					l.holding = holdAll // a step may be in progress, or an RGW's VIP moved
 				case e.Op.Kind == KindEnterMaint || e.Op.Kind == KindExitMaint || e.Op.Kind == KindPowercycle:
 					l.holding = e.Op.Host
@@ -247,8 +249,8 @@ func (l *LeaderLoop) ledgerOp(ctx context.Context, b *Bridge, js store.Backend, 
 
 	known := map[string]bool{KindRestart: true, KindRedeploy: true, KindAddDaemon: true, KindRemoveDaemon: true, KindRemoveHost: true, KindCreateOSD: true, KindRemoveOSD: true,
 		KindEnterMaint: true, KindExitMaint: true, KindPowercycle: true, KindUpgrade: true, KindUpPause: true, KindUpResume: true, KindUpStop: true,
-		KindIngress: true, KindAddHost: true}
-	cluster := op.Kind == KindUpgrade || isControl(op.Kind) || op.Kind == KindIngress
+		KindIngress: true, KindAddHost: true, KindRenewMgr: true, KindRenewRGW: true}
+	cluster := op.Kind == KindUpgrade || isControl(op.Kind) || op.Kind == KindIngress || op.Kind == KindRenewRGW
 	noDaemon := cluster || op.Kind == KindRemoveHost || op.Kind == KindAddHost || op.Kind == KindCreateOSD || op.Kind == KindEnterMaint || op.Kind == KindExitMaint || op.Kind == KindPowercycle
 	if !ledgerIDRe.MatchString(op.ID) || cluster != (op.Host == "") || !cluster && pki.ValidName(op.Host) != nil || !known[op.Kind] ||
 		(op.Kind == KindUpgrade || op.Kind == KindIngress) != (op.Image != "") || (op.Kind == KindIngress) != (op.VIP != "") || isControl(op.Kind) != ledgerIDRe.MatchString(op.Upgrade) ||
@@ -263,6 +265,16 @@ func (l *LeaderLoop) ledgerOp(ctx context.Context, b *Bridge, js store.Backend, 
 	}
 
 	switch op.Kind {
+	case KindRenewRGW:
+		// keepalived the roll took off come back
+		restore := func() error { return l.restoreVIPs(ctx, b, js, gid, epoch, op) }
+		if err := l.unstick(ctx, js, opKey, opKey, op, restore, l.renewRGWCert(ctx, b, js, gid, epoch, op)); err != nil {
+			return false, err
+		}
+
+		s, err = l.journalState(ctx, b, js, gid, op.ID)
+
+		return err == nil && terminal(s), err
 	case KindIngress:
 		// keepalived a certificate roll took off come back first, then the
 		// added ones never granted leave the state
@@ -313,10 +325,12 @@ func (l *LeaderLoop) ledgerOp(ctx context.Context, b *Bridge, js store.Backend, 
 		s, err = l.journalState(ctx, b, js, gid, op.ID)
 
 		return err == nil && terminal(s), err
-	case KindAddDaemon, KindRemoveDaemon, KindRemoveHost, KindCreateOSD, KindRemoveOSD, KindEnterMaint, KindExitMaint, KindPowercycle, KindAddHost:
+	case KindAddDaemon, KindRemoveDaemon, KindRemoveHost, KindCreateOSD, KindRemoveOSD, KindEnterMaint, KindExitMaint, KindPowercycle, KindAddHost, KindRenewMgr:
 		var phase func() error
 
 		switch op.Kind {
+		case KindRenewMgr:
+			phase = func() error { return l.renewMgr(ctx, b, js, gid, epoch, op) }
 		case KindAddHost:
 			phase = func() error { return l.addHost(ctx, b, js, gid, epoch, op) }
 		case KindPowercycle:
@@ -348,6 +362,10 @@ func (l *LeaderLoop) ledgerOp(ctx context.Context, b *Bridge, js store.Backend, 
 
 		if op.Kind == KindEnterMaint {
 			onFail = func() error { return l.unmark(ctx, b, js, gid, op.Host, op.ID) }
+		}
+
+		if op.Kind == KindRenewMgr {
+			onFail = func() error { return l.renewMgrFailed(ctx, b, js, gid, op) }
 		}
 
 		if op.Kind == KindPowercycle {

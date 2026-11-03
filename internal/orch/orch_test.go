@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nberlee/cephadm-talos/internal/pki"
 	"github.com/nberlee/cephadm-talos/internal/spec"
@@ -110,6 +111,15 @@ func TestCertCovers(t *testing.T) {
 
 	if certCovers(cert, []string{"10.5.0.2", "10.5.0.200", "10.5.0.3"}, []string{"localhost", "node-1"}) {
 		t.Fatal("a new host must trigger a reissue")
+	}
+
+	// a year at most, as browsers may reach the RGWs; the CA keeps its 10 years
+	if end, err := pki.NotAfter(cert); err != nil || end.After(time.Now().Add(366*24*time.Hour)) || end.Before(time.Now().Add(364*24*time.Hour)) {
+		t.Fatalf("the certificate ends %v (%v)", end, err)
+	}
+
+	if end, err := pki.NotAfter(ca); err != nil || end.Before(time.Now().AddDate(9, 0, 0)) {
+		t.Fatalf("the CA ends %v (%v)", end, err)
 	}
 }
 

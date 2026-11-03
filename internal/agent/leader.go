@@ -1037,6 +1037,9 @@ type revisionMode struct {
 	stop  []string
 	hold  []string
 	strip bool
+	// only grants nothing but the removal of these documents, without the
+	// rendering: what else the node holds stays as it is
+	only []string
 	// add are documents granted besides the rendering (a job); ack
 	// acknowledges a job's result in the same grant
 	add []Doc
@@ -1098,6 +1101,9 @@ func (l *LeaderLoop) revision(ctx context.Context, b *Bridge, js store.Backend, 
 			r.remove = append(r.remove, k)
 		}
 
+		sort.Strings(r.remove)
+	} else if len(mode.only) > 0 {
+		r.remove = slices.Clone(mode.only)
 		sort.Strings(r.remove)
 	} else {
 		if r, err = l.renderHost(ctx, b, st, h); errors.Is(err, errRetry) {

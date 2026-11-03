@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"reflect"
 	"slices"
@@ -14,6 +15,7 @@ import (
 	"github.com/nberlee/cephadm-talos/internal/pki"
 	"github.com/nberlee/cephadm-talos/internal/spec"
 	"github.com/nberlee/cephadm-talos/internal/state"
+	"github.com/nberlee/cephadm-talos/internal/store"
 )
 
 // Agent certificate lifetimes and renewal, cephadm's defaults: root CA 10
@@ -221,6 +223,111 @@ func (o *Orch) imageRepos() []string {
 	return repos
 }
 
+// operatorRenewal is how long before its expiry the CLI renews its operator
+// certificate; the module warns from then on (plan 04, step 1).
+const operatorRenewal = 60 * 24 * time.Hour
+
+// OperatorCertKey is the public copy of the CLI's operator certificate in
+// config-key, from which the module warns before it expires. It is outside
+// mgr/, where the bridge cannot write.
+const OperatorCertKey = "cephadm-talos/operator.crt"
+
+// operatorDue reports whether the CLI's operator certificate is renewed: not
+// this cluster's operator's with its key, or within operatorRenewal of its end.
+func (o *Orch) operatorDue(now time.Time) bool {
+	a := o.St.Agent
+	if !certValid(a.OperatorCert, a.OperatorKey, o.identity(pki.RoleOperator, "admin"), false, nil, nil) {
+		return true
+	}
+
+	t, err := pki.NotAfter(a.OperatorCert)
+
+	return err != nil || t.Sub(now) <= operatorRenewal
+}
+
+// operatorExpired reports whether the CLI's operator certificate has expired,
+// from its notAfter: an agent's TLS error says nothing about it.
+func (o *Orch) operatorExpired(now time.Time) bool {
+	t, err := pki.NotAfter(o.St.Agent.OperatorCert)
+
+	return err != nil || !now.Before(t)
+}
+
+// EnsureOperatorCert renews the CLI's operator certificate when it is due, on
+// any command, also after the handoff (plan 04, step 1): the agent CA's key
+// from the secrets through exec, as enrollment reads it, the certificate
+// issued and saved in local.json. Then the public copy in config-key is made
+// equal to the CLI's certificate, renewed or not, so a copy a failed write
+// left behind is corrected by the next command.
+func (o *Orch) EnsureOperatorCert(ctx context.Context) error {
+	if o.St.Agent == nil || o.Talos.DryRun {
+		return nil
+	}
+
+	if o.operatorDue(time.Now()) {
+		if o.St.Agent.CAKey == "" {
+			adm, err := o.confirmedAdminHost()
+			if err != nil {
+				return err
+			}
+
+			if err := o.openSecrets(ctx, adm.Addr); err != nil {
+				return err
+			}
+
+			v, err := o.secrets.Get(ctx, store.SecretPrefix+state.SecretAgentCA)
+			if err != nil || len(v) == 0 {
+				return fmt.Errorf("the agent CA's key: %w", errors.Join(err, errors.New("not readable")))
+			}
+
+			o.St.Agent.CAKey = string(v)
+		}
+
+		if err := o.issueOperatorCert(); err != nil {
+			return err
+		}
+
+		o.printf("renewed the operator certificate\n")
+
+		if err := o.KeepLocal(); err != nil {
+			return err
+		}
+	}
+
+	return o.publishOperatorCert(ctx)
+}
+
+// publishOperatorCert makes the public copy of the operator certificate in
+// config-key equal to the CLI's: written only when it differs.
+func (o *Orch) publishOperatorCert(ctx context.Context) error {
+	keys := o.StoreBackend
+
+	if keys == nil {
+		adm, err := o.confirmedAdminHost()
+		if err != nil {
+			return err
+		}
+
+		snap, err := o.configKeys(ctx, adm.Addr, OperatorCertKey)
+		if err != nil {
+			return err
+		}
+
+		keys = snap
+	}
+
+	cur, err := keys.Get(ctx, OperatorCertKey)
+	if err == nil && string(cur) == o.St.Agent.OperatorCert {
+		return nil
+	}
+
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
+
+	return keys.SetMany(ctx, []store.KV{{Key: OperatorCertKey, Value: []byte(o.St.Agent.OperatorCert)}})
+}
+
 // expiresSoon reports whether a certificate is due for renewal.
 func expiresSoon(certPEM string, now time.Time) bool {
 	t, err := pki.NotAfter(certPEM)
@@ -228,9 +335,10 @@ func expiresSoon(certPEM string, now time.Time) bool {
 	return err != nil || t.Sub(now) <= agentRenewal
 }
 
-// RenewAgentCerts reissues agent, mgr and operator certificates with 30 days or less
-// left and pushes them like ceph.conf, so a failed push is retried by the next
-// command. Until plan 03, this only happens when the CLI runs.
+// RenewAgentCerts reissues agent and mgr certificates with 30 days or less
+// left, and the operator's when it is due (operatorDue), and pushes them like
+// ceph.conf, so a failed push is retried by the next command. Until plan 03,
+// this only happens when the CLI runs.
 func (o *Orch) RenewAgentCerts(ctx context.Context) error {
 	if o.St.Agent == nil || o.Talos.DryRun {
 		return nil
@@ -280,7 +388,7 @@ func (o *Orch) RenewAgentCerts(ctx context.Context) error {
 		}
 	}
 
-	if !certValid(o.St.Agent.OperatorCert, o.St.Agent.OperatorKey, o.identity(pki.RoleOperator, "admin"), false, nil, nil) || expiresSoon(o.St.Agent.OperatorCert, now) {
+	if o.operatorDue(now) {
 		if err := o.issueOperatorCert(); err != nil {
 			return err
 		}

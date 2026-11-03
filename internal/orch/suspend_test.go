@@ -453,3 +453,21 @@ func TestADryRunLeavesAnInterruptedRemovalAlone(t *testing.T) {
 		t.Fatalf("the dry run journaled a step: %+v %v", got, err)
 	}
 }
+
+func TestAnExpiredOperatorCertificateSuspendsThroughTalos(t *testing.T) {
+	o, _, a := suspendSetup(t)
+
+	// expired: every agent would refuse it, so none is asked
+	operatorCert(t, o, time.Millisecond)
+	time.Sleep(5 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// the node's agent is removed through Talos; its records job does not run here
+	rec, _ := o.Suspend(ctx, SuspendOptions{})
+
+	if a.posts != 0 || rec == nil || !rec.Hosts["h1"].AgentRemoved {
+		t.Fatalf("%d suspensions asked of the agent, journal %+v", a.posts, rec)
+	}
+}

@@ -120,6 +120,11 @@ func (o *Orch) Handoff(ctx context.Context) error {
 		return fmt.Errorf("the approval: %w (not sealed: run `cephadm-talos handoff` again)", err)
 	}
 
+	// the module warns from the public copy before the operator's certificate expires
+	if err := o.publishOperatorCert(ctx); err != nil {
+		return fmt.Errorf("the operator certificate's public copy: %w (not sealed: run `cephadm-talos handoff` again)", err)
+	}
+
 	o.St.Sealed = true
 
 	if err := o.save(); err != nil {
