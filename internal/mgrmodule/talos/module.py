@@ -44,6 +44,8 @@ TERMINAL = ('completed', 'nochange', 'failed', 'refused', 'abandoned')
 # before expiry, warned about when renewal keeps failing; the operator's
 # certificate (its public copy, written by the CLI) warned about earlier
 CERT_CHECK_INTERVAL = 24 * 3600.0
+# the check again soon while a renewal that is due was refused (its host busy)
+CERT_RETRY_INTERVAL = 600.0
 CERT_RENEW_BEFORE = datetime.timedelta(days=30)
 CERT_ALERT_BEFORE = datetime.timedelta(days=7)
 OPERATOR_WARN_BEFORE = datetime.timedelta(days=60)
@@ -1272,17 +1274,20 @@ class Module(orchestrator.Orchestrator, MgrModule):
         def run() -> None:
             try:
                 self._check_certs()
-            except Exception as e:  # the next day tries again
+            except Exception as e:  # tried again soon
                 self.log.warning('the certificate check: %s', e)
+                self._certs_next = min(self._certs_next, time.monotonic() + CERT_RETRY_INTERVAL)
         threading.Thread(target=run, name='talos-certs', daemon=True).start()
 
     def _accept_renewal(self, accept: Callable[[], str]) -> None:
-        """Accept a renewal; one that is refused (busy, suspended) waits for the next check."""
+        """Accept a renewal; one that is refused (its host busy, suspended) is
+        tried again by a check soon, not the next day's."""
         try:
             op = accept()
             self.log.info('certificate renewal accepted: operation %s', op)
         except OrchestratorError as e:
-            self.log.info('certificate renewal not accepted now: %s', e)
+            self.log.info('certificate renewal not accepted now, tried again in %d minutes: %s', CERT_RETRY_INTERVAL // 60, e)
+            self._certs_next = min(getattr(self, '_certs_next', 0.0) or float('inf'), time.monotonic() + CERT_RETRY_INTERVAL)
 
     def _accept_rgw_renewal(self) -> str:
         """A renewal of the generated RGW certificate, unless one, an ingress

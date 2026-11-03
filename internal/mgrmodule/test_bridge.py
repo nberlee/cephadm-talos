@@ -689,6 +689,63 @@ class ServerTest(unittest.TestCase):
                 self.get('/v1/bridge/' + 'ab' * 8, port)
 
 
+class GoCATest(unittest.TestCase):
+    """Certificates the module issues chain to a CA the CLI (Go) made, for
+    OpenSSL too: Go derives a CA's SubjectKeyIdentifier from a truncated
+    SHA-256, and the issued AuthorityKeyIdentifier must be that one (found live:
+    the mgr refused a renewed agent's client certificate, unknown CA)."""
+
+    def go_ca(self):
+        import hashlib
+        key = ec.generate_private_key(ec.SECP256R1())
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, 'cephadm-talos agent CA f1')])
+        spki = key.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+        ski = hashlib.sha256(spki).digest()[:20]  # not the SHA-1 cryptography would compute
+        now = datetime.datetime.now(datetime.timezone.utc)
+        cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
+                .serial_number(x509.random_serial_number()).not_valid_before(now - datetime.timedelta(hours=1))
+                .not_valid_after(now + datetime.timedelta(days=3650))
+                .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+                .add_extension(x509.KeyUsage(digital_signature=True, content_commitment=False, key_encipherment=False, data_encipherment=False,
+                                             key_agreement=False, key_cert_sign=True, crl_sign=True, encipher_only=False, decipher_only=False), critical=True)
+                .add_extension(x509.SubjectKeyIdentifier(ski), critical=False)
+                .sign(key, hashes.SHA256()))
+        return (cert.public_bytes(serialization.Encoding.PEM),
+                key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()), ski)
+
+    def openssl_verify(self, ca_pem, leaf_pem, purpose):
+        import shutil
+        import subprocess
+        if not shutil.which('openssl'):
+            return
+        with tempfile.TemporaryDirectory() as d:
+            ca, leaf = os.path.join(d, 'ca.crt'), os.path.join(d, 'leaf.crt')
+            open(ca, 'wb').write(ca_pem)
+            open(leaf, 'w').write(leaf_pem)
+            r = subprocess.run(['openssl', 'verify', '-purpose', purpose, '-CAfile', ca, leaf], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def aki(self, pem):
+        cert = x509.load_pem_x509_certificate(pem.encode())
+        return cert.extensions.get_extension_for_class(x509.AuthorityKeyIdentifier).value.key_identifier
+
+    def test_mgr_agent_and_rgw_certificates(self):
+        ca, key, ski = self.go_ca()
+        for of in ('mgr', 'agent'):
+            certs = b.issue_mgr_certs(ca, key, 'f1', 'h1', '10.0.0.1', of)
+            for role, purpose in (('server', 'sslserver'), ('client', 'sslclient')):
+                self.assertEqual(self.aki(certs[role + '_cert']), ski, (of, role))
+                self.openssl_verify(ca, certs[role + '_cert'], purpose)
+        chain, _ = b.issue_rgw_cert(ca, key, ['10.0.0.1'], ['h1'])
+        self.assertEqual(self.aki(chain), ski)
+        self.openssl_verify(ca, chain.split('-----END CERTIFICATE-----')[0] + '-----END CERTIFICATE-----\n', 'sslserver')
+        # the module's own RGW CA has a SubjectKeyIdentifier its certificates name
+        rca, rkey = b.new_rgw_ca('f1')
+        rchain, _ = b.issue_rgw_cert(rca.encode(), rkey.encode(), ['10.0.0.1'], ['h1'])
+        rski = x509.load_pem_x509_certificate(rca.encode()).extensions.get_extension_for_class(x509.SubjectKeyIdentifier).value.digest
+        self.assertEqual(self.aki(rchain), rski)
+
+
 class ReloadTest(ServerTest):
     """The module loads a renewed server certificate without a restart (plan 04, step 1)."""
 

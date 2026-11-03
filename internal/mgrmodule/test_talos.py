@@ -723,6 +723,13 @@ class AgentRenewalAndUpgrade(unittest.TestCase):
         mod, _ = self.module()
         m.Module._check_certs(mod)
         self.assertEqual([(e['kind'], e['host']) for _, e in mod._ledger.executable()], [('renew_agent', 'h1')])
+        self.assertFalse(hasattr(mod, '_certs_next'))  # nothing refused: the next check is the daily one
+        # refused while its host is busy (here, its own renewal unfinished): checked again in 10 minutes, not the next day
+        import time
+        mod._certs_next = time.monotonic() + m.CERT_CHECK_INTERVAL
+        m.Module._check_certs(mod)
+        self.assertLessEqual(mod._certs_next, time.monotonic() + m.CERT_RETRY_INTERVAL)
+        self.assertEqual(len(mod._ledger.executable()), 1)
 
     def test_the_upgrade_command(self):
         mod, entries = self.module()

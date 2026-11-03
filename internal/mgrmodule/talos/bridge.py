@@ -403,6 +403,19 @@ ALLOWLIST: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
 }
 
 
+def authority_key_id(ca: Any) -> Any:
+    """The AuthorityKeyIdentifier of a certificate the CA issues: the CA's own
+    SubjectKeyIdentifier when it has one (Go derives it from a truncated SHA-256,
+    not the SHA-1 cryptography's from_issuer_public_key computes, and OpenSSL
+    builds the chain by it), else one from its public key."""
+    from cryptography import x509
+    try:
+        ski = ca.extensions.get_extension_for_class(x509.SubjectKeyIdentifier).value
+    except x509.ExtensionNotFound:
+        return x509.AuthorityKeyIdentifier.from_issuer_public_key(ca.public_key())
+    return x509.AuthorityKeyIdentifier.from_issuer_subject_key_identifier(ski)
+
+
 def issue_mgr_certs(ca_cert_pem: bytes, ca_key_pem: bytes, fsid: str, host: str, addr: str, of: str = 'mgr') -> Dict[str, str]:
     """A mgr's (or with of 'agent' an agent's) server certificate (for its
     host's address and name) and client certificate, as internal/pki issues
@@ -429,7 +442,7 @@ def issue_mgr_certs(ca_cert_pem: bytes, ca_key_pem: bytes, fsid: str, host: str,
                                           key_agreement=False, key_cert_sign=False, crl_sign=False, encipher_only=False, decipher_only=False), critical=True)
              .add_extension(x509.ExtendedKeyUsage([usage]), critical=False)
              .add_extension(x509.SubjectAlternativeName(sans), critical=False)
-             .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ca.public_key()), critical=False))  # type: ignore[arg-type]
+             .add_extension(authority_key_id(ca), critical=False))  # type: ignore[arg-type]
         cert = b.sign(ca_key, hashes.SHA256())  # type: ignore[arg-type]
         out[role + '_cert'] = cert.public_bytes(serialization.Encoding.PEM).decode()
         out[role + '_key'] = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL,
@@ -449,6 +462,7 @@ def new_rgw_ca(fsid: str) -> Tuple[str, str]:
             .serial_number(x509.random_serial_number()).not_valid_before(now - datetime.timedelta(hours=1))
             .not_valid_after(now + datetime.timedelta(days=10 * 365))
             .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+            .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
             .add_extension(x509.KeyUsage(digital_signature=True, content_commitment=False, key_encipherment=False, data_encipherment=False,
                                          key_agreement=False, key_cert_sign=True, crl_sign=True, encipher_only=False, decipher_only=False), critical=True)
             .sign(key, hashes.SHA256()))
@@ -474,7 +488,7 @@ def issue_rgw_cert(ca_cert_pem: bytes, ca_key_pem: bytes, ips: List[str], names:
             .not_valid_before(now - datetime.timedelta(hours=1)).not_valid_after(now + datetime.timedelta(days=365))
             .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
             .add_extension(x509.SubjectAlternativeName(sans), critical=False)
-            .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ca.public_key()), critical=False)  # type: ignore[arg-type]
+            .add_extension(authority_key_id(ca), critical=False)  # type: ignore[arg-type]
             .sign(ca_key, hashes.SHA256()))  # type: ignore[arg-type]
     return (cert.public_bytes(serialization.Encoding.PEM).decode() + ca.public_bytes(serialization.Encoding.PEM).decode(),
             key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption()).decode())
