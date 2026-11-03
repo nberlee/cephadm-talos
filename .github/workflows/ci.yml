@@ -39,7 +39,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install prettytable pyyaml
+      - run: pip install prettytable pyyaml cryptography
       - name: Fetch the Ceph mgr sources the module is tested against
         run: |
           git init --quiet ceph && cd ceph
