@@ -1548,12 +1548,19 @@ class Module(orchestrator.Orchestrator, MgrModule):
         image's repository; no other agent or Ceph upgrade unfinished."""
         self._settle()
         led, fold = self._authority()
+        entries = self.get_store_prefix(STORE_PREFIX)
+        cluster, _ = record_from_store(entries, choose_incarnation(entries, getattr(self, '_gid', None)), 'cluster')
+        # in progress: the leader's record of an agent upgrade until it is finished,
+        # an accepted one before the leader recorded it, or a Ceph upgrade
+        rec_up = (cluster or {}).get('agent_upgrade') or {}
         running = None
         for _, e in led.executable():
-            if e['kind'] in ('upgrade_agent', 'upgrade_start'):
+            if e['kind'] == 'upgrade_agent':
                 rec = self._journal(e['id'])
-                if rec is None or rec.get('state') not in TERMINAL:
+                if rec_up.get('op') == e['id'] and not rec_up.get('finished') or rec_up.get('op') != e['id'] and (rec is None or rec.get('state') not in TERMINAL):
                     running = e
+        if running is None and fold.upgrade is not None:
+            running = {'id': fold.upgrade['op'], 'kind': 'upgrade_start'}
         if resume:
             if image or running is None or running['kind'] != 'upgrade_agent':
                 raise OrchestratorError('--resume takes no image, and needs an agent upgrade in progress')
@@ -1563,8 +1570,6 @@ class Module(orchestrator.Orchestrator, MgrModule):
             raise OrchestratorError('operation %s (%s) is in progress' % (running['id'], running['kind']))
         if not isinstance(image, str) or not ledger.IMAGE_RE.match(image):
             raise OrchestratorError('name the image by its digest: <repository>@sha256:<hex>')
-        entries = self.get_store_prefix(STORE_PREFIX)
-        cluster, _ = record_from_store(entries, choose_incarnation(entries, getattr(self, '_gid', None)), 'cluster')
         current = ((cluster or {}).get('agent') or {}).get('image') or ''
         if image.split('@')[0] != current.split('@')[0]:
             raise OrchestratorError('the agents run images of %s' % current.split('@')[0])

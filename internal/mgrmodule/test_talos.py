@@ -738,7 +738,13 @@ class AgentRenewalAndUpgrade(unittest.TestCase):
         res = m.Module._agent_upgrade(mod, None, True)
         self.assertEqual(res.retval, 0, res.stderr)
         self.assertEqual(mod._ledger.executable()[-1][1]['upgrade'], up['id'])
+        # the leader recorded it and finished its operation: in progress until its record is finished
         entries['talos/inc/20/journal/op/' + up['id']] = json.dumps({'state': 'completed'})
+        entries.update(state_entries(inventory(), {'fsid': 'f', 'sealed': True, 'agent': {'image': 'registry/agent@sha256:' + 'cd' * 32},
+                                                   'agent_upgrade': {'op': up['id'], 'image': self.IMG, 'finished': False}}, hosts=[], daemons=[]))
+        self.assertEqual(m.Module._agent_upgrade(mod, None, True).retval, 0)
+        entries.update(state_entries(inventory(), {'fsid': 'f', 'sealed': True, 'agent': {'image': self.IMG},
+                                                   'agent_upgrade': {'op': up['id'], 'image': self.IMG, 'finished': True}}, hosts=[], daemons=[]))
         self.assertNotEqual(m.Module._agent_upgrade(mod, None, True).retval, 0)  # nothing to resume
 
 

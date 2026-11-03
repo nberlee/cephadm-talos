@@ -1315,7 +1315,8 @@ class Channel:
         The active mgr respawns, so the answer may never come; done also when
         that gid is no longer the active one."""
         done = {'outcome': 'done', 'r': 0, 'out': '', 'outs': ''}
-        upgrading = op is not None and op['kind'] == 'upgrade_start' and (fold.upgrade or {}).get('op') == op['id']
+        upgrading = op is not None and (op['kind'] == 'upgrade_start' and (fold.upgrade or {}).get('op') == op['id']
+                                        or op['kind'] == 'upgrade_agent' and fold.agent_upgrade == op['id'])
         if not upgrading and (op is None or op['kind'] not in ledger.STOPS or op['host'] not in fold.maintenance):
             return 400, {'error': 'no operation that must stop the active mgr'}
         job = self._mon({'prefix': 'mgr dump', 'format': 'json'})
