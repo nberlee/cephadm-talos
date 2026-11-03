@@ -754,3 +754,16 @@ func (l *LeaderLoop) agentResumeAhead(ctx context.Context, b *Bridge, js store.B
 
 // isAgentControl reports whether a kind is one of an agent upgrade's controls.
 func isAgentControl(kind string) bool { return kind == KindAgentResume || kind == KindAgentStop }
+
+// rollbackPending reports whether a stopped agent upgrade's rollback has not
+// started its first step yet, from the published record alone (a successor
+// sees it as the leader that made the transition did): stopping without a
+// step in progress, or a rollback not paused, without a step and with no
+// host pulled. It runs before queued operations.
+func rollbackPending(u state.AgentUpgrade) bool {
+	if u.Finished || u.Step != "" {
+		return false
+	}
+
+	return u.Stopping || u.Stopped != "" && !u.Paused && len(u.Pulled) == 0
+}

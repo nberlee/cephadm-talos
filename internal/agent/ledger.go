@@ -140,9 +140,12 @@ func (l *LeaderLoop) ledgerOps(ctx context.Context, b *Bridge, js store.Backend,
 					return err
 				}
 
-				if u := cur.AgentUpgrade; u != nil && !u.Finished && u.Stopping && u.Step == "" {
-					if err := l.agentUpgradeStep(ctx, b, js, gid, epoch); err != nil && !errors.Is(err, errRetry) {
-						return err
+				if u := cur.AgentUpgrade; u != nil && rollbackPending(*u) {
+					// the transition, if it is still to make; then the first step
+					if u.Stopping {
+						if err := l.agentUpgradeStep(ctx, b, js, gid, epoch); err != nil && !errors.Is(err, errRetry) {
+							return err
+						}
 					}
 
 					return l.agentUpgradeStep(ctx, b, js, gid, epoch)

@@ -720,3 +720,38 @@ func TestAStopDuringAStepRollsBackBeforeQueuedWork(t *testing.T) {
 		t.Fatal("the renewal ran before the rollback")
 	}
 }
+
+func TestASuccessorStartsTheRollbackBeforeQueuedWork(t *testing.T) {
+	s, _ := agentSetup(t)
+	ctx := context.Background()
+
+	up := startUpgrade(t, s)
+	s.leader.serves = func(string, int, string) bool { return false } // a renewal that stalls
+
+	// the transition was published, then leadership moved before its first
+	// step; the stop's journal is complete
+	s.changeUpgrade(t, func(u *state.AgentUpgrade) {
+		u.Stopped, u.Image, u.Attempt, u.Pulled, u.Done, u.Step, u.StepAt = agentImage2, agentImage, 1, nil, nil, "", time.Time{}
+	})
+
+	renew := s.accept(KindRenewAgent, "", "h1", 2)
+
+	l := s.successor(t, "h0", 30, 9)
+	l.serves = s.leader.serves
+	must(t, l.Tick(ctx, 30, 9))
+
+	st, _, err := l.clusterState(ctx, l.bridge())
+	must(t, err)
+
+	if u := st.AgentUpgrade; u.Step == "" || u.Stopped != agentImage2 || u.Op != up.Op.ID {
+		t.Fatalf("the successor's rollback %+v", u)
+	}
+
+	s.module.mu.Lock()
+	_, ran := s.module.kv[JournalPrefix(30)+"op/"+renew.Op.ID+".self"]
+	s.module.mu.Unlock()
+
+	if ran {
+		t.Fatal("the renewal ran before the rollback's first step")
+	}
+}
