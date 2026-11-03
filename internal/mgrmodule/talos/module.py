@@ -1200,6 +1200,9 @@ class Module(orchestrator.Orchestrator, MgrModule):
         def warn(name: str, summary: str, detail: List[str]) -> None:
             checks[name] = {'severity': 'warning', 'summary': summary, 'count': len(detail), 'detail': detail}
 
+        # host renewals due, the earliest expiry first: a host takes one at a time
+        # (its other renewal refused, tried again soon), so the most urgent goes first
+        due: List[Tuple[datetime.datetime, Callable[[], str]]] = []
         # the mgrs' certificates
         for d in daemons or []:
             if d.get('type') != 'mgr' or d.get('host') not in by_name:
@@ -1212,7 +1215,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
             if min(ends) - now <= CERT_ALERT_BEFORE:
                 alerts.append('mgr.%s certificates expire %s' % (h['name'], min(ends).isoformat()))
             if min(ends) - now <= renew_before:
-                self._accept_renewal(lambda name=h['name']: self._accept('renew_mgr', 'mgr.' + name, name))
+                due.append((min(ends), lambda name=h['name']: self._accept('renew_mgr', 'mgr.' + name, name)))
         # every host's agent certificates (plan 04, step 2)
         for h in hosts or []:
             ends = [cert_not_after(h.get(k)) for k in ('agent_cert', 'agent_client_cert') if h.get(k)]
@@ -1221,7 +1224,9 @@ class Module(orchestrator.Orchestrator, MgrModule):
             if min(ends) - now <= CERT_ALERT_BEFORE:
                 alerts.append('the agent of %s: certificates expire %s' % (h['name'], min(ends).isoformat()))
             if min(ends) - now <= renew_before:
-                self._accept_renewal(lambda name=h['name']: self._accept('renew_agent', None, name))
+                due.append((min(ends), lambda name=h['name']: self._accept('renew_agent', None, name)))
+        for _, accept in sorted(due, key=lambda d: d[0]):
+            self._accept_renewal(accept)
         # the RGW certificates: the ones the daemons name and the ones they serve
         rgw = (cluster or {}).get('rgw') or {}
         certs = {c['id']: c for c in rgw.get('certs') or []}

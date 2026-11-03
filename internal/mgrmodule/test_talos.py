@@ -731,6 +731,18 @@ class AgentRenewalAndUpgrade(unittest.TestCase):
         self.assertLessEqual(mod._certs_next, time.monotonic() + m.CERT_RETRY_INTERVAL)
         self.assertEqual(len(mod._ledger.executable()), 1)
 
+    def test_the_earliest_expiry_goes_first_on_a_host(self):
+        # h1's mgr and agent certificates both due, the one expiring first goes first: an agent renewal
+        # (a host's) waits for any unfinished operation on its host, a mgr renewal only for its mgr's
+        for mgr_days, agent_days, accepted in ((20, 10, ['renew_agent', 'renew_mgr']), (10, 20, ['renew_mgr'])):
+            mod, entries = self.module()
+            hosts, _ = m.record_from_store(entries, 'cli', 'hosts')
+            hosts[0].update(mgr_server_cert=cert_until(mgr_days), mgr_client_cert=cert_until(1000), agent_cert=cert_until(agent_days))
+            entries.update(state_entries(inventory(), {'fsid': 'f', 'sealed': True, 'agent': {'image': 'registry/agent@sha256:' + 'cd' * 32}},
+                                         hosts=hosts, daemons=[{'type': 'mgr', 'id': 'h1', 'host': 'h1'}]))
+            m.Module._check_certs(mod)
+            self.assertEqual([e['kind'] for _, e in mod._ledger.executable()], accepted)
+
     def test_the_upgrade_command(self):
         mod, entries = self.module()
         for image in ('registry/agent:latest', 'other/agent@sha256:' + 'ab' * 32, 'registry/agent@sha256:' + 'cd' * 32, self.IMG):
