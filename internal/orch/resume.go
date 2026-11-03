@@ -98,6 +98,16 @@ func (o *Orch) Resume(ctx context.Context) error {
 		}
 	}
 
+	// an apply of an agent's documents (agent restore, an earlier resumption)
+	// whose outcome is not known yet refuses, before the phase moves on
+	for _, h := range hosts {
+		if hr := rec.Hosts[h.Name]; hr.AgentApply != nil && hr.Readopt == nil {
+			if _, err := o.agentApplied(ctx, rec, h); err != nil {
+				return fmt.Errorf("%s: %w", h.Name, err)
+			}
+		}
+	}
+
 	if rec.Phase != state.PhaseResuming {
 		rec.Phase = state.PhaseResuming
 		if err := rec.Save(); err != nil {
@@ -120,6 +130,14 @@ func (o *Orch) Resume(ctx context.Context) error {
 	}
 
 	for _, h := range hosts {
+		// an apply that landed is finished as it was rendered (an agent
+		// restore's image), not rendered again
+		if hr := rec.Hosts[h.Name]; hr.AgentApply != nil && hr.Readopt == nil {
+			if err := o.agentReturn(ctx, rec, h, nil); err != nil {
+				return fmt.Errorf("%s: %w", h.Name, err)
+			}
+		}
+
 		if hr := rec.Hosts[h.Name]; hr.RemovingAgent && !hr.AgentRestored && hr.Readopt == nil {
 			if err := o.restoreAgent(ctx, rec, h); err != nil {
 				return fmt.Errorf("%s: %w", h.Name, err)
@@ -257,17 +275,8 @@ func (o *Orch) restoreAgent(ctx context.Context, rec *state.Recovery, h state.Ho
 		docs = o.agentDocsWith(ah, o.St.Agent.Image, hr.AgentRepos, hr.AgentApprovalKey)
 	}
 
-	if err := o.apply(ctx, h.Addr, docs...); err != nil {
-		return err
-	}
-
-	if err := o.awaitSuspended(ctx, rec, h); err != nil {
-		return err
-	}
-
-	rec.Hosts[h.Name].AgentRestored = true
-
-	return rec.Save()
+	// journaled, and an interrupted self-update settled, as agent restore does
+	return o.agentReturn(ctx, rec, h, docs)
 }
 
 // awaitSuspended waits until an agent applied again answers suspended for the

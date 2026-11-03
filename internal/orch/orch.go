@@ -19,6 +19,7 @@ import (
 
 	"github.com/siderolabs/talos/pkg/machinery/resources/containers"
 
+	"github.com/nberlee/cephadm-talos/internal/agent"
 	"github.com/nberlee/cephadm-talos/internal/cephx"
 	"github.com/nberlee/cephadm-talos/internal/daemons"
 	"github.com/nberlee/cephadm-talos/internal/pki"
@@ -52,6 +53,8 @@ type Orch struct {
 	opened bool
 	// inspectMon replaces the inspection job of a mon's store in tests
 	inspectMon func(h state.Host) (string, error)
+	// settleSelf replaces the records job that settles a self-update in tests
+	settleSelf func(h state.Host) (agent.RecordsReport, error)
 
 	// incarnation is the one the state was read from: "cli", or a leader's
 	incarnation string

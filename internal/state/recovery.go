@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/nberlee/cephadm-talos/internal/wire"
 )
@@ -125,10 +126,25 @@ type RecoveryHost struct {
 	// AgentRestored: the resumption applied the removed agent again and it
 	// answered suspended
 	AgentRestored bool `json:"agent_restored,omitempty"`
+	// AgentApply is an apply of the agent's documents by the recovery (`agent
+	// restore`, the resumption), journaled before it is sent (plan 04, step 2)
+	AgentApply *AgentApply `json:"agent_apply,omitempty"`
 	// Readopt is the agent's re-adoption receipt, Activated once its
 	// suspension ended
 	Readopt   *wire.ReadoptReceipt `json:"readopt,omitempty"`
 	Activated bool                 `json:"activated,omitempty"`
+}
+
+// AgentApply is an apply of a host's agent documents: their hashes as the
+// agent computes them, and the boot and time it was sent, to decide it from
+// the node's config (applied once the node holds them; not, on another boot
+// or after the agent's ApplySettle); Applied once decided so, until the agent
+// answered suspended.
+type AgentApply struct {
+	Hashes  map[string]string `json:"hashes"`
+	BootID  string            `json:"boot_id"`
+	At      time.Time         `json:"at"`
+	Applied bool              `json:"applied,omitempty"`
 }
 
 // Applying is what a document the recovery applies must be: its hash as the

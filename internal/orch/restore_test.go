@@ -10,6 +10,7 @@ import (
 
 	"github.com/siderolabs/talos/pkg/machinery/resources/containers"
 
+	"github.com/nberlee/cephadm-talos/internal/agent"
 	"github.com/nberlee/cephadm-talos/internal/state"
 	"github.com/nberlee/cephadm-talos/internal/store"
 )
@@ -200,5 +201,142 @@ func TestARemovedRenewedHostsKeysAreFoundByItsCertificate(t *testing.T) {
 	ah, err := o.agentHost(ctx, renewed, &state.RecoveryHost{AgentCert: renewed.AgentCert, AgentClientCert: renewed.AgentClientCert})
 	if err != nil || ah.AgentKey != renewed.AgentKey || ah.AgentClientKey != renewed.AgentClientKey {
 		t.Fatalf("agent host: %v", err)
+	}
+}
+
+// suspended suspends restoreSetup's session and returns its journal.
+func suspended(t *testing.T, o *Orch) *state.Recovery {
+	t.Helper()
+
+	if _, err := o.Suspend(context.Background(), SuspendOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	rec, err := state.LoadRecovery(o.St.FSID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return rec
+}
+
+func TestAnAgentApplyThatMayStillLandRefusesRestoreAndResume(t *testing.T) {
+	o, h, _ := restoreSetup(t)
+	ctx := context.Background()
+
+	rec := suspended(t, o)
+
+	// a restore stopped after journaling its apply: not on the node, not settled
+	boot, err := o.Talos.BootID(ctx, h.Addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec.Hosts["h1"].AgentApply = &state.AgentApply{Hashes: map[string]string{"ContainerConfig/" + o.agentDocName(h): "elsewhere"}, BootID: boot, At: time.Now()}
+	if err := rec.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := o.RestoreAgent(ctx, "h1", false); err == nil || !strings.Contains(err.Error(), "may still land") {
+		t.Fatalf("restore: %v", err)
+	}
+
+	if err := o.Resume(ctx); err == nil || !strings.Contains(err.Error(), "may still land") {
+		t.Fatalf("resume: %v", err)
+	}
+
+	if rec, _ := state.LoadRecovery(o.St.FSID); rec.Phase != state.PhaseSuspended {
+		t.Fatalf("the refusal moved the session on: %s", rec.Phase)
+	}
+
+	// once it settled it did not happen: the restore applies, decides and clears it
+	rec, _ = state.LoadRecovery(o.St.FSID)
+	rec.Hosts["h1"].AgentApply.At = time.Now().Add(-agent.ApplySettle)
+	if err := rec.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := o.RestoreAgent(ctx, "h1", false); err != nil {
+		t.Fatal(err)
+	}
+
+	if rec, _ := state.LoadRecovery(o.St.FSID); rec.Hosts["h1"].AgentApply != nil {
+		t.Fatalf("the apply stayed journaled: %+v", rec.Hosts["h1"].AgentApply)
+	}
+}
+
+func TestAResumptionFinishesALandedRestoreAsRendered(t *testing.T) {
+	o, h, _ := restoreSetup(t)
+	ctx := context.Background()
+
+	rec := suspended(t, o)
+	hr := rec.Hosts["h1"]
+	hr.RemovingAgent, hr.AgentRemoved = true, true
+
+	// `agent restore --previous` applied its documents and stopped
+	ah, err := o.agentHost(ctx, h, hr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	previous := "docker.io/registry/agent@sha256:" + strings.Repeat("bb", 32)
+	docs := o.agentDocsWith(ah, previous, o.imageRepos(), o.St.Agent.ApprovalKey)
+
+	hashes, err := docHashes(docs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hr.AgentApply = &state.AgentApply{Hashes: hashes, BootID: "boot-1", At: time.Now()}
+	if err := o.apply(ctx, h.Addr, docs...); err != nil {
+		t.Fatal(err)
+	}
+
+	// what the resumption does first: finished, not rendered with the state's image
+	if err := o.agentReturn(ctx, rec, h, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	if hr.AgentApply != nil || !hr.AgentRestored {
+		t.Fatalf("journal %+v", hr)
+	}
+
+	cur, err := o.configuredDocs(ctx, h.Addr, o.agentDocName(h))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if d := cur[o.agentDocName(h)]; d.image != previous {
+		t.Fatalf("rendered again: %s", d.image)
+	}
+}
+
+func TestTheResumptionsRestoreSettlesASelfUpdate(t *testing.T) {
+	o, h, _ := restoreSetup(t)
+	ctx := context.Background()
+
+	rec := suspended(t, o)
+	hr := rec.Hosts["h1"]
+	hr.RemovingAgent, hr.AgentRemoved = true, true
+	hr.Receipt.ApplyPending = true // an interrupted renewal's self-update intent
+
+	settled := 0
+	o.settleSelf = func(state.Host) (agent.RecordsReport, error) {
+		settled++
+
+		// once the restored documents are in the node's config
+		if a := rec.Hosts["h1"].AgentApply; a == nil || !a.Applied {
+			t.Error("settled before the documents were in the node's config")
+		}
+
+		return agent.RecordsReport{Settled: "op-1.self"}, nil
+	}
+
+	if err := o.restoreAgent(ctx, rec, h); err != nil {
+		t.Fatal(err)
+	}
+
+	if settled != 1 || !hr.AgentRestored || hr.AgentApply != nil {
+		t.Fatalf("settled %d times, journal %+v", settled, hr)
 	}
 }

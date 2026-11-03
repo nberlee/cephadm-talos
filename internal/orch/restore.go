@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"strings"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/nberlee/cephadm-talos/internal/agent"
 	"github.com/nberlee/cephadm-talos/internal/daemons"
 	"github.com/nberlee/cephadm-talos/internal/pki"
+	"github.com/nberlee/cephadm-talos/internal/spec"
 	"github.com/nberlee/cephadm-talos/internal/state"
 	"github.com/nberlee/cephadm-talos/internal/store"
 )
@@ -113,33 +115,8 @@ func (o *Orch) RestoreAgent(ctx context.Context, name string, previous bool) err
 
 	o.printf("%s: restoring its agent with %s\n", name, image)
 
-	if err := o.apply(ctx, h.Addr, o.agentDocsWith(ah, image, repos, approvalKey)...); err != nil {
-		return err
-	}
-
-	// an apply intent the suspension could not decide: settled if it is a
-	// self-update's, now that the restored documents are in the config
-	if hr.Receipt.ApplyPending {
-		rep, err := o.settleJob(ctx, h, rec)
-		if err != nil {
-			return fmt.Errorf("%s: settling its agent's self-update: %w", name, err)
-		}
-
-		if rep.Settled != "" {
-			o.printf("%s: its agent's self-update %s is settled as failed\n", name, rep.Settled)
-		}
-	}
-
-	if err := o.awaitSuspended(ctx, rec, h); err != nil {
+	if err := o.agentReturn(ctx, rec, h, o.agentDocsWith(ah, image, repos, approvalKey)); err != nil {
 		return fmt.Errorf("%s: %w", name, err)
-	}
-
-	if hr.RemovingAgent {
-		hr.AgentRestored = true
-	}
-
-	if err := rec.Save(); err != nil {
-		return err
 	}
 
 	// it answers, but on what: the intended image and the state's certificate
@@ -160,6 +137,149 @@ func (o *Orch) RestoreAgent(ctx context.Context, name string, previous bool) err
 	o.printf("%s: its agent is restored and suspended; `cephadm-talos resume` ends the session\n", name)
 
 	return nil
+}
+
+// agentReturn brings a suspended host's agent back with its documents (`agent
+// restore`, the resumption; plan 04, step 2): the apply journaled first
+// (AgentApply) and decided from the node's config, as the recovery's mon
+// documents are; then, if the receipt has an apply intent the agent could not
+// decide, a records job settles it if it is a self-update's, which neither
+// rendering may match and which would block the re-adoption; then the agent
+// must answer suspended for the session. An apply journaled before (a stop,
+// a retry) is decided first: while it may still land, nothing is applied.
+// Without docs, only a journaled apply that landed is finished.
+func (o *Orch) agentReturn(ctx context.Context, rec *state.Recovery, h state.Host, docs []any) error {
+	hr := rec.Hosts[h.Name]
+
+	applied, err := o.agentApplied(ctx, rec, h)
+	if err != nil {
+		return err
+	}
+
+	if docs != nil {
+		want, err := docHashes(docs)
+		if err != nil {
+			return err
+		}
+
+		// a journaled apply of another rendering (a retry with another image)
+		// is replaced
+		if !applied || !maps.Equal(hr.AgentApply.Hashes, want) {
+			if err := o.applyAgentDocs(ctx, rec, h, want, docs); err != nil {
+				return err
+			}
+		}
+	} else if !applied {
+		return nil
+	}
+
+	if hr.Receipt.ApplyPending {
+		rep, err := o.settleJob(ctx, h, rec)
+		if err != nil {
+			return fmt.Errorf("settling its agent's self-update: %w", err)
+		}
+
+		if rep.Settled != "" {
+			o.printf("%s: its agent's self-update %s is settled as failed\n", h.Name, rep.Settled)
+		}
+	}
+
+	if err := o.awaitSuspended(ctx, rec, h); err != nil {
+		return err
+	}
+
+	hr.AgentApply = nil
+	if hr.RemovingAgent {
+		hr.AgentRestored = true
+	}
+
+	return rec.Save()
+}
+
+// docHashes are documents' hashes as the agent computes them.
+func docHashes(docs []any) (map[string]string, error) {
+	b, err := spec.Render(docs...)
+	if err != nil {
+		return nil, err
+	}
+
+	return agent.DocHashes(string(b))
+}
+
+// applyAgentDocs applies a host's agent documents, journaled before they are
+// sent; the node must hold them afterwards.
+func (o *Orch) applyAgentDocs(ctx context.Context, rec *state.Recovery, h state.Host, hashes map[string]string, docs []any) error {
+	boot, err := o.Talos.BootID(ctx, h.Addr)
+	if err != nil {
+		return err
+	}
+
+	rec.Hosts[h.Name].AgentApply = &state.AgentApply{Hashes: hashes, BootID: boot, At: time.Now().UTC()}
+	if err := rec.Save(); err != nil {
+		return err
+	}
+
+	if err := o.apply(ctx, h.Addr, docs...); err != nil {
+		return err
+	}
+
+	applied, err := o.agentApplied(ctx, rec, h)
+	if err == nil && !applied {
+		err = errors.New("its agent's documents are not in the node's config after their apply")
+	}
+
+	return err
+}
+
+// agentApplied decides a journaled apply of a host's agent documents from the
+// node's config: applied once the node holds every one (recorded); not, on
+// another boot or once the apply settled (the journal entry goes); else its
+// outcome is unknown, an error. Without one it reports false.
+func (o *Orch) agentApplied(ctx context.Context, rec *state.Recovery, h state.Host) (bool, error) {
+	hr := rec.Hosts[h.Name]
+
+	a := hr.AgentApply
+	if a == nil {
+		return false, nil
+	}
+
+	if a.Applied {
+		return true, nil
+	}
+
+	// settlement first: the config read after it shows an apply still handled then
+	boot, err := o.Talos.BootID(ctx, h.Addr)
+	if err != nil {
+		return false, err
+	}
+
+	settled := boot != a.BootID || time.Since(a.At) >= agent.ApplySettle
+
+	cfg, err := o.Talos.MachineConfig(ctx, h.Addr)
+	if err != nil {
+		return false, err
+	}
+
+	cur, err := agent.DocHashes(cfg)
+	if err != nil {
+		return false, err
+	}
+
+	held := true
+	for k, v := range a.Hashes {
+		held = held && cur[k] == v
+	}
+
+	switch {
+	case held:
+		a.Applied = true
+	case settled:
+		hr.AgentApply = nil
+	default:
+		return false, fmt.Errorf("the apply of its agent's documents may still land: run again after %s", a.At.Add(agent.ApplySettle).Local().Format(time.TimeOnly))
+	}
+
+	return held, rec.Save()
 }
 
 // agentKeyNames are the secret names of a host's agent keys, for a host the
@@ -205,6 +325,10 @@ func (o *Orch) agentKeyNames(ctx context.Context, host, certPEM string) (server,
 // apply intent, under a new id of the session's journal (a job replays its
 // result under the same id).
 func (o *Orch) settleJob(ctx context.Context, h state.Host, rec *state.Recovery) (agent.RecordsReport, error) {
+	if o.settleSelf != nil {
+		return o.settleSelf(h)
+	}
+
 	var (
 		purpose string
 		j       *state.RecoveryJob
