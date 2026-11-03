@@ -297,7 +297,7 @@ func (o *Orch) EnsureOperatorCert(ctx context.Context) error {
 			o.St.Agent.CAKey = string(v)
 		}
 
-		old := o.St.Agent.OperatorCert
+		old, oldKey, pending := o.St.Agent.OperatorCert, o.St.Agent.OperatorKey, len(o.St.Agent.OperatorRevoke)
 		if err := o.issueOperatorCert(); err != nil {
 			return err
 		}
@@ -305,11 +305,16 @@ func (o *Orch) EnsureOperatorCert(ctx context.Context) error {
 		// its predecessor is revoked by later commands, saved with it (plan 04, step 3)
 		o.pendingRevoke(old)
 
-		o.printf("renewed the operator certificate\n")
-
 		if err := o.KeepLocal(); err != nil {
+			// not saved: the old certificate stays the one in use and is not
+			// revoked, as the new one would be lost with this process
+			o.St.Agent.OperatorCert, o.St.Agent.OperatorKey = old, oldKey
+			o.St.Agent.OperatorRevoke = o.St.Agent.OperatorRevoke[:pending]
+
 			return err
 		}
+
+		o.printf("renewed the operator certificate\n")
 	}
 
 	return o.publishOperatorCert(ctx)

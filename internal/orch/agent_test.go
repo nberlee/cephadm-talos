@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/x509"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -512,6 +514,43 @@ func TestTheOperatorCertificateIsRenewedAfterTheHandoff(t *testing.T) {
 
 	if publicOperatorCert(t, o) != cert {
 		t.Fatal("the public copy is not the renewed certificate")
+	}
+}
+
+func TestAnUnsavedOperatorRenewalRevokesNothing(t *testing.T) {
+	o, _, _ := suspendSetup(t)
+	ctx := context.Background()
+
+	operatorCert(t, o, 50*24*time.Hour)
+
+	if err := o.KeepLocal(); err != nil {
+		t.Fatal(err)
+	}
+
+	due, dueKey := o.St.Agent.OperatorCert, o.St.Agent.OperatorKey
+	o.incarnation = "42"
+
+	// local.json cannot be written: the renewal fails and the certificate in
+	// use stays the saved one, with no revocation of it pending
+	dir := filepath.Join(state.Root(), o.St.FSID)
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(dir, 0o700) //nolint:errcheck
+
+	if err := o.EnsureOperatorCert(ctx); err == nil {
+		t.Fatal("no error without a saved renewal")
+	}
+
+	if o.St.Agent.OperatorCert != due || o.St.Agent.OperatorKey != dueKey || len(o.St.Agent.OperatorRevoke) != 0 {
+		t.Fatal("an unsaved renewal replaced the certificate or queued its predecessor's revocation")
+	}
+
+	revoked := false
+	o.RevokeCert = func(context.Context, string, time.Time) error { revoked = true; return nil }
+
+	if err := o.RevokePending(ctx); err != nil || revoked {
+		t.Fatalf("revoked the only saved certificate: %v", err)
 	}
 }
 
