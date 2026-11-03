@@ -2,8 +2,10 @@ package agent
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +13,7 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/resources/containers"
 
 	"github.com/nberlee/cephadm-talos/internal/daemons"
+	"github.com/nberlee/cephadm-talos/internal/pki"
 	"github.com/nberlee/cephadm-talos/internal/state"
 	"github.com/nberlee/cephadm-talos/internal/wire"
 )
@@ -169,6 +172,13 @@ func TestAgentOperationsOfTheWrongShapeFail(t *testing.T) {
 	}
 }
 
+// ownRunning is the leader's own node report (h0) with its agent on an image.
+func ownRunning(s *leaderSetup, image string) func(context.Context) (wire.NodeReport, error) {
+	return func(context.Context) (wire.NodeReport, error) {
+		return wire.NodeReport{Running: map[string]string{s.st.DocName(state.Daemon{Type: "agent", ID: "h0"}): digestOf(image)}}, nil
+	}
+}
+
 // agentRunning makes h1's agent container run an image's digest.
 func agentRunning(t *testing.T, s *leaderSetup, image string) {
 	t.Helper()
@@ -179,9 +189,8 @@ func agentRunning(t *testing.T, s *leaderSetup, image string) {
 	cs := containers.NewContainerStatus(containers.NamespaceName, name)
 	cs.TypedSpec().State, cs.TypedSpec().Image = containers.ContainerStateRunning, digestOf(image)
 
-	if err := s.agent.fake.St.Create(ctx, cs); err != nil {
-		must(t, s.agent.fake.St.Update(ctx, cs))
-	}
+	_ = s.agent.fake.St.Destroy(ctx, cs.Metadata()) // a status of before goes
+	must(t, s.agent.fake.St.Create(ctx, cs))
 }
 
 func (s *leaderSetup) agentUpgrade(t *testing.T) state.AgentUpgrade {
@@ -228,7 +237,7 @@ func startUpgrade(t *testing.T, s *leaderSetup) LedgerEntry {
 		t.Fatalf("upgrade %+v", op)
 	}
 
-	s.changeUpgrade(t, func(u *state.AgentUpgrade) { u.Pulled = []string{"h0"} })
+	s.changeUpgrade(t, func(u *state.AgentUpgrade) { u.Pulled, u.Step = []string{"h0"}, "" })
 
 	// h1 pulls first, then updates itself
 	must(t, s.leader.Tick(ctx, 42, 5))
@@ -293,9 +302,29 @@ func TestAnAgentUpgradeGoesHostByHostAndTheLeadersLast(t *testing.T) {
 		t.Fatalf("while failing over %+v", u)
 	}
 
-	// the successor upgrades the old leader's host like any other
+	// the successor upgrades the old leader's host like any other; the
+	// target is the agents' image once every host runs it
 	s.changeUpgrade(t, func(u *state.AgentUpgrade) { u.Done, u.Step = append(u.Done, "h0"), "" })
+	s.leader.OwnReport = ownRunning(s, agentImage2)
+
+	// a recovery restored h1's agent on the earlier image meanwhile: it is
+	// upgraded again, with a new attempt, before the upgrade finishes
+	agentRunning(t, s, agentImage)
 	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if u := s.agentUpgrade(t); u.Finished || !slices.Equal(u.Done, []string{"h0"}) || u.Attempt != 1 {
+		t.Fatalf("after the check %+v", u)
+	}
+
+	must(t, s.leader.Tick(ctx, 42, 5)) // h1's self-update again, waiting for it on the target
+
+	if op := s.op(t, up.Op.ID+".self.h1.1"); op.State != wire.OpCompleted {
+		t.Fatalf("h1 again %+v", op)
+	}
+
+	agentRunning(t, s, agentImage2)
+	must(t, s.leader.Tick(ctx, 42, 5)) // h1 done
+	must(t, s.leader.Tick(ctx, 42, 5)) // every host runs the target
 
 	st, _, err := s.leader.clusterState(ctx, s.leader.bridge())
 	must(t, err)
@@ -342,6 +371,7 @@ func TestAnAgentThatDoesNotComeBackPausesTheUpgrade(t *testing.T) {
 	agentRunning(t, s, agentImage2)
 
 	res := s.acceptOp(KindAgentResume, 3, func(op *LedgerOp) { op.Upgrade = up.Op.ID })
+	must(t, s.leader.Tick(ctx, 42, 5)) // the resume, then the hosts done checked
 	must(t, s.leader.Tick(ctx, 42, 5))
 
 	if op := s.op(t, res.Op.ID); op.State != wire.OpCompleted {
@@ -382,5 +412,156 @@ func TestAnAgentUpgradeStepHoldsTheOperationsBehindIt(t *testing.T) {
 
 	if u := s.agentUpgrade(t); !slices.Equal(u.Done, []string{"h1"}) {
 		t.Fatalf("after h1 %+v", u)
+	}
+}
+
+// successor makes incarnation gid (epoch) on host the module's and the h1
+// agent's active one: a leader loop on host, the module's bridge serving it.
+func (s *leaderSetup) successor(t *testing.T, host string, gid, epoch int64) *LeaderLoop {
+	t.Helper()
+
+	l := s.leader
+
+	if host != "h0" {
+		cc, ck := s.ca.pair(pki.RoleAgent, host, x509.ExtKeyUsageClientAuth, testFSID)
+		clientTLS, err := ClientTLSConfig([]byte(s.ca.cert), []byte(cc), []byte(ck))
+		must(t, err)
+
+		ch, err := NewChannel(pki.Identity{FSID: testFSID, Role: pki.RoleAgent, Name: host})
+		must(t, err)
+
+		// the module on the successor's host, over the same store
+		_, port := s.module.serve(t, s.ca, host)
+		bridgePort, dialPort = func() string { return port }, func() string { return port }
+
+		l = &LeaderLoop{
+			Self: pki.Identity{FSID: testFSID, Role: pki.RoleAgent, Name: host}, Channel: ch, ClientTLS: clientTLS,
+			Repos: s.leader.Repos, CACert: s.leader.CACert, bridgeAddr: s.leader.bridgeAddr, agentURL: s.leader.agentURL, logf: t.Logf,
+			ApprovalKey: testApprovalPub,
+		}
+	}
+
+	l.Channel.mu.Lock()
+	l.Channel.leader = &Leader{Mgr: host, GID: gid, Epoch: epoch, At: time.Now()}
+	l.Channel.mu.Unlock()
+
+	s.module.mu.Lock()
+	s.module.own = strconv.FormatInt(gid, 10)
+	s.module.mu.Unlock()
+
+	s.agent.gid, s.agent.epoch = gid, epoch
+
+	return l
+}
+
+func TestASuccessorContinuesTheRecordedStep(t *testing.T) {
+	s, _ := agentSetup(t)
+	ctx := context.Background()
+
+	up := s.acceptOp(KindAgentUpgrade, 1, func(op *LedgerOp) { op.Image = agentImage2 })
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	// the predecessor began h1's pull, which the host order would not choose
+	// now (h0 comes first)
+	s.changeUpgrade(t, func(u *state.AgentUpgrade) { u.Step, u.StepAt = "pull/h1", time.Now() })
+
+	l := s.successor(t, "h0", 30, 9)
+	must(t, l.Tick(ctx, 30, 9))
+
+	st, _, err := l.clusterState(ctx, l.bridge())
+	must(t, err)
+
+	if u := st.AgentUpgrade; !slices.Equal(u.Pulled, []string{"h1"}) || u.Step != "" {
+		t.Fatalf("the successor's step %+v", u)
+	}
+
+	s.module.mu.Lock()
+	_, pulled := s.module.kv[JournalPrefix(30)+"op/"+up.Op.ID+".pull.h1.0"]
+	_, other := s.module.kv[JournalPrefix(30)+"op/"+up.Op.ID+".pull.h0.0"]
+	s.module.mu.Unlock()
+
+	if !pulled || other {
+		t.Fatalf("the successor's grants: h1 %v, h0 %v", pulled, other)
+	}
+}
+
+func TestTheSuccessorOfAFailoverUpgradesTheOldLeadersHost(t *testing.T) {
+	s, _ := agentSetup(t)
+	ctx := context.Background()
+
+	s.acceptOp(KindAgentUpgrade, 1, func(op *LedgerOp) { op.Image = agentImage2 })
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	// the old leader on h0 failed its mgr over, every other host done
+	s.changeUpgrade(t, func(u *state.AgentUpgrade) {
+		u.Pulled, u.Done, u.Step, u.StepAt = []string{"h0", "h1"}, []string{"h1"}, "fail/h0", time.Now()
+	})
+
+	s.module.mu.Lock()
+	s.module.active, s.module.standbys, s.module.retired = "h1", []string{"h0"}, nil
+	s.module.mu.Unlock()
+
+	l := s.successor(t, "h1", 30, 9)
+	must(t, l.Tick(ctx, 30, 9))
+
+	st, _, err := l.clusterState(ctx, l.bridge())
+	must(t, err)
+
+	// h0's self-update, not another failover
+	if u := st.AgentUpgrade; u.Step != "self/h0" || u.Finished {
+		t.Fatalf("the successor's step %+v", u)
+	}
+
+	if calls := s.calls(); slices.ContainsFunc(calls, func(c string) bool { return strings.HasPrefix(c, "mgr fail") }) {
+		t.Fatalf("calls %v", calls)
+	}
+}
+
+func TestTheCephAndTheAgentUpgradeExcludeEachOther(t *testing.T) {
+	s, _ := agentSetup(t)
+	ctx := context.Background()
+	b := s.leader.bridge()
+
+	set := func(change func(*state.State)) {
+		t.Helper()
+
+		must(t, s.leader.changeState(ctx, b, 42, func(st *state.State) error { change(st); return nil }))
+	}
+
+	// a Ceph upgrade does not start beside an unfinished agent upgrade
+	set(func(st *state.State) {
+		st.AgentUpgrade = &state.AgentUpgrade{Op: "op-00000000000000aa", From: agentImage, Image: agentImage2, Paused: true}
+	})
+
+	start := s.acceptOp(KindUpgrade, 1, func(op *LedgerOp) { op.Image = testImage })
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if op := s.op(t, start.Op.ID); op.State != JournalFailed || !strings.Contains(op.Error, "agent upgrade") {
+		t.Fatalf("a Ceph upgrade beside an agent upgrade: %+v", op)
+	}
+
+	// the agent upgrade's step does not start beside the Ceph upgrade's step
+	set(func(st *state.State) {
+		st.AgentUpgrade.Paused = false
+		st.Upgrade = &state.Upgrade{Op: "op-00000000000000bb", Image: testImage, Step: "ceph-x-mon-h1"}
+	})
+	must(t, s.leader.agentUpgradeStep(ctx, b, nil, 42, 5))
+
+	if u := s.agentUpgrade(t); u.Step != "" {
+		t.Fatalf("an agent step beside a Ceph step: %+v", u)
+	}
+
+	// nor the Ceph upgrade's beside the agent upgrade's
+	set(func(st *state.State) {
+		st.AgentUpgrade.Step, st.AgentUpgrade.StepAt = "pull/h1", time.Now()
+		st.Upgrade.Step = ""
+	})
+	_ = s.leader.upgradeStep(ctx, b, nil, 42, 5)
+
+	st, _, err := s.leader.clusterState(ctx, b)
+	must(t, err)
+
+	if st.Upgrade.Step != "" {
+		t.Fatalf("a Ceph step beside an agent step: %+v", st.Upgrade)
 	}
 }

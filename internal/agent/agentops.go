@@ -347,6 +347,37 @@ func (l *LeaderLoop) agentUpgradeStep(ctx context.Context, b *Bridge, js store.B
 		return nil
 	}
 
+	// a step in progress is continued as recorded, whoever leads now (a
+	// successor, the leader's restarted agent): the order chooses the next
+	// step only
+	if kind, host, ok := strings.Cut(u.Step, "/"); ok {
+		switch {
+		case kind == "fail" && host != l.Self.Name:
+			// failed over: this successor upgrades the old leader's host
+			return l.agentHostStep(ctx, b, js, gid, epoch, st, *u, "self", host)
+		case kind == "fail":
+			_, agid, _, err := b.MgrMap(ctx)
+			if err != nil {
+				return err
+			}
+
+			return l.agentHostStep(ctx, b, js, gid, epoch, st, *u, "fail", host, agid)
+		default:
+			return l.agentHostStep(ctx, b, js, gid, epoch, st, *u, kind, host)
+		}
+	}
+
+	// beside the Ceph upgrade's step in progress no step starts
+	if st.Upgrade != nil && st.Upgrade.Step != "" {
+		return nil
+	}
+
+	// after a resume, the hosts done are checked again: a restore may have
+	// put one back on an earlier image
+	if u.Verify {
+		return l.verifyDone(ctx, b, gid, st, *u)
+	}
+
 	var hosts []string
 	for _, h := range st.Hosts {
 		hosts = append(hosts, h.Name)
@@ -394,6 +425,11 @@ func (l *LeaderLoop) agentUpgradeStep(ctx context.Context, b *Bridge, js store.B
 		}
 
 		return l.agentHostStep(ctx, b, js, gid, epoch, st, *u, "self", name)
+	}
+
+	// the target is the agents' image only once every host runs it
+	if err := l.verifyDone(ctx, b, gid, st, *u); err != nil {
+		return err
 	}
 
 	return l.changeState(ctx, b, gid, func(st *state.State) error {
@@ -481,12 +517,12 @@ func (l *LeaderLoop) agentHostStep(ctx context.Context, b *Bridge, js store.Back
 	if kind == "self" {
 		h, _ := st.Host(host)
 
-		var rep wire.NodeReport
-		if _, err := l.call(ctx, h, http.MethodGet, "/v1/node", nil, &rep); err != nil {
+		rep, err := l.nodeReport(ctx, h)
+		if err != nil {
 			return wait(err)
 		}
 
-		if doc := st.DocName(state.Daemon{Type: "agent", ID: host}); rep.Running[doc] != digestOf(u.Image) {
+		if !runsAgent(st, rep, host, u.Image) {
 			return wait(fmt.Errorf("the agent of %s does not run %s yet", host, u.Image))
 		}
 	}
@@ -513,6 +549,75 @@ func (l *LeaderLoop) agentHostStep(ctx context.Context, b *Bridge, js store.Back
 	}
 
 	return fmt.Errorf("%w: %s done", errRetry, step)
+}
+
+// runsAgent reports whether a node report shows a host's agent container
+// running an image's digest.
+func runsAgent(st *state.State, rep wire.NodeReport, host, image string) bool {
+	return rep.Running[st.DocName(state.Daemon{Type: "agent", ID: host})] == digestOf(image)
+}
+
+// nodeReport is a host's node report: the leader's own agent's from its node
+// directly when it has it (OwnReport), any other through the agent.
+func (l *LeaderLoop) nodeReport(ctx context.Context, h state.Host) (wire.NodeReport, error) {
+	if h.Name == l.Self.Name && l.OwnReport != nil {
+		return l.OwnReport(ctx)
+	}
+
+	var rep wire.NodeReport
+	_, err := l.call(ctx, h, http.MethodGet, "/v1/node", nil, &rep)
+
+	return rep, err
+}
+
+// verifyDone checks that every host an agent upgrade did still runs the
+// target (a recovery or `agent restore` may have restored an earlier image)
+// and takes those that do not out of Done, so they are upgraded again; it
+// clears the record's Verify. A host whose report cannot be read is retried.
+func (l *LeaderLoop) verifyDone(ctx context.Context, b *Bridge, gid int64, st *state.State, u state.AgentUpgrade) error {
+	var drop []string
+
+	for _, name := range u.Done {
+		h, ok := st.Host(name)
+		if !ok {
+			continue // left the cluster: nothing to upgrade
+		}
+
+		rep, err := l.nodeReport(ctx, h)
+		if err != nil {
+			return fmt.Errorf("%w: checking the agent of %s: %w", errRetry, name, err)
+		}
+
+		if !runsAgent(st, rep, name, u.Image) {
+			drop = append(drop, name)
+		}
+	}
+
+	if len(drop) == 0 && !u.Verify {
+		return nil
+	}
+
+	if err := l.changeState(ctx, b, gid, func(st *state.State) error {
+		if au := st.AgentUpgrade; au != nil && au.Op == u.Op && !au.Finished {
+			au.Done = slices.DeleteFunc(au.Done, func(h string) bool { return slices.Contains(drop, h) })
+			au.Verify = false
+
+			// a new attempt: their grants of before completed
+			if len(drop) > 0 {
+				au.Attempt++
+			}
+		}
+
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	if len(drop) > 0 {
+		l.log("agent upgrade %s: %v no longer run the target, upgraded again", u.Op, drop)
+	}
+
+	return fmt.Errorf("%w: the hosts done are checked", errRetry)
 }
 
 // pauseAgentUpgrade pauses an agent upgrade with its cause; its step ends, so
@@ -546,7 +651,7 @@ func (l *LeaderLoop) agentUpgradeResume(ctx context.Context, b *Bridge, js store
 		}
 
 		au.Paused, au.Error, au.Step, au.StepAt = false, "", "", time.Time{}
-		au.Attempt++
+		au.Attempt, au.Verify = au.Attempt+1, true
 
 		return nil
 	}); err != nil {

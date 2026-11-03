@@ -149,6 +149,9 @@ type LeaderLoop struct {
 	// slice D)
 	Records   *records.Store
 	Suspended func() bool
+	// OwnReport is the node report of the leader's own agent, read from its
+	// node directly (nil: through the agent, as any other)
+	OwnReport func(context.Context) (wire.NodeReport, error)
 	// Boundary is the mgr map epoch of the last resumption's boundary: a
 	// heartbeat of that epoch or before is from a process the resumption
 	// replaced, and makes no tick (plan 03, step 7 slice D, item 10)

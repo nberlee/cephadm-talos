@@ -164,3 +164,41 @@ func TestASuspensionJournalsTheRemovedAgentsInputs(t *testing.T) {
 		t.Fatalf("agent host: %v", err)
 	}
 }
+
+func TestARemovedRenewedHostsKeysAreFoundByItsCertificate(t *testing.T) {
+	o, h, _ := suspendSetup(t)
+	ctx := context.Background()
+
+	// h9 left the state after a module renewal: its keys are the renewal's,
+	// its certificate beside them; the CLI's were deleted
+	renewed := state.Host{Name: "h9", Addr: "127.0.0.9"}
+	if err := o.ensureAgentCert(&renewed); err != nil {
+		t.Fatal(err)
+	}
+
+	ref := "op-0000000000000003/0000000000000007"
+	if err := o.StoreBackend.SetMany(ctx, []store.KV{
+		{Key: store.SecretPrefix + state.SecretIssued(ref, "agent-server.crt"), Value: []byte(renewed.AgentCert)},
+		{Key: store.SecretPrefix + state.SecretIssued(ref, state.SecretAgentServer), Value: []byte(renewed.AgentKey)},
+		{Key: store.SecretPrefix + state.SecretIssued(ref, state.SecretAgentClient), Value: []byte(renewed.AgentClientKey)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	server, client, err := o.agentKeyNames(ctx, "h9", renewed.AgentCert)
+	if err != nil || server != state.SecretIssued(ref, state.SecretAgentServer) || client != state.SecretIssued(ref, state.SecretAgentClient) {
+		t.Fatalf("by the renewed certificate: %q %q %v", server, client, err)
+	}
+
+	// another certificate: the CLI's names
+	if server, _, err := o.agentKeyNames(ctx, "h9", h.AgentCert); err != nil || server != state.SecretHost("h9", state.SecretAgentServer) {
+		t.Fatalf("by another certificate: %q %v", server, err)
+	}
+
+	// a journal without the names (the secrets were not readable at the
+	// suspension): the resumption finds them by the certificate
+	ah, err := o.agentHost(ctx, renewed, &state.RecoveryHost{AgentCert: renewed.AgentCert, AgentClientCert: renewed.AgentClientCert})
+	if err != nil || ah.AgentKey != renewed.AgentKey || ah.AgentClientKey != renewed.AgentClientKey {
+		t.Fatalf("agent host: %v", err)
+	}
+}

@@ -230,8 +230,8 @@ type Upgrade struct {
 // target, the hosts that pulled the target and those done, the host left for
 // last (the leader's when it started), whether it is paused (and why), the
 // attempt its steps' grants carry (a resume starts a new one), the step in
-// progress ("pull/<host>" or "self/<host>") and when it began; Finished once
-// the target is the agents' image.
+// progress ("pull/<host>", "self/<host>" or "fail/<host>") and when it
+// began; Finished once every host runs the target and it is the agents' image.
 type AgentUpgrade struct {
 	Op       string    `json:"op"`
 	From     string    `json:"from"`
@@ -245,6 +245,9 @@ type AgentUpgrade struct {
 	Step     string    `json:"step,omitempty"`
 	StepAt   time.Time `json:"step_at,omitzero"`
 	Finished bool      `json:"finished,omitempty"`
+	// Verify: resumed; the hosts done are checked to run the target again
+	// before the next step (a restore may have put one back on an earlier image)
+	Verify bool `json:"verify,omitempty"`
 }
 
 // ImageOf is the image a daemon runs: its own, else the cluster's.

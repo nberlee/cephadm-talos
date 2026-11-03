@@ -322,6 +322,8 @@ func (o *Orch) agentHost(ctx context.Context, h state.Host, hr *state.RecoveryHo
 
 		if hr.AgentServerKey != "" && hr.AgentClientKey != "" {
 			serverKey, clientKey = hr.AgentServerKey, hr.AgentClientKey
+		} else if serverKey, clientKey, err = o.agentKeyNames(ctx, h.Name, hr.AgentCert); err != nil {
+			return state.Host{}, err
 		}
 	} else {
 		recs, err := o.enrollments(ctx, adm.Addr)

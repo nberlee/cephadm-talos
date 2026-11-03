@@ -475,12 +475,18 @@ func (o *Orch) suspendNode(ctx context.Context, h state.Host, rec *state.Recover
 					hr.AgentPinned, hr.AgentRepos, hr.AgentApprovalKey = true, strings.Fields(d.env[daemons.EnvImageRepos]), d.env[daemons.EnvApprovalKey]
 				}
 
-				keys := state.Host{Name: h.Name}
+				// the state's AgentKeys; for a host the state does not have, the
+				// renewal whose certificate the agent's document has, if the
+				// secrets can be read (else the resumption finds them)
 				if sh, ok := o.St.Host(h.Name); ok && sh.Name == h.Name {
-					keys = sh
+					hr.AgentServerKey, hr.AgentClientKey = sh.AgentKeySecret(state.SecretAgentServer), sh.AgentKeySecret(state.SecretAgentClient)
+				} else if hr.AgentCert != "" {
+					if server, client, err := o.agentKeyNames(ctx, h.Name, hr.AgentCert); err == nil {
+						hr.AgentServerKey, hr.AgentClientKey = server, client
+					} else {
+						o.printf("%s: the secrets of its agent's keys are not known yet: %v\n", h.Name, err)
+					}
 				}
-
-				hr.AgentServerKey, hr.AgentClientKey = keys.AgentKeySecret(state.SecretAgentServer), keys.AgentKeySecret(state.SecretAgentClient)
 			}
 
 			hr.RemovingAgent = true

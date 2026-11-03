@@ -16,6 +16,7 @@ import (
 	"github.com/nberlee/cephadm-talos/internal/daemons"
 	"github.com/nberlee/cephadm-talos/internal/pki"
 	"github.com/nberlee/cephadm-talos/internal/state"
+	"github.com/nberlee/cephadm-talos/internal/store"
 )
 
 // RestoreAgent applies a host's agent documents (the CLI's own) inside a
@@ -159,6 +160,45 @@ func (o *Orch) RestoreAgent(ctx context.Context, name string, previous bool) err
 	o.printf("%s: its agent is restored and suspended; `cephadm-talos resume` ends the session\n", name)
 
 	return nil
+}
+
+// agentKeyNames are the secret names of a host's agent keys, for a host the
+// state does not have (plan 04, step 2): those of the module's renewal whose
+// server certificate, kept beside its key (issued/<op>/<attempt>/
+// agent-server.crt), is the given one, else the CLI's (host/<host>/). The
+// secrets are read through exec, as the CLI reads them.
+func (o *Orch) agentKeyNames(ctx context.Context, host, certPEM string) (server, client string, err error) {
+	adm, err := o.confirmedAdminHost()
+	if err != nil {
+		return "", "", err
+	}
+
+	if err := o.openSecrets(ctx, adm.Addr); err != nil {
+		return "", "", err
+	}
+
+	keys, err := o.secrets.List(ctx, store.SecretPrefix+"issued/")
+	if err != nil {
+		return "", "", err
+	}
+
+	for _, k := range keys {
+		ref, ok := strings.CutSuffix(strings.TrimPrefix(k, store.SecretPrefix+"issued/"), "/agent-server.crt")
+		if !ok {
+			continue
+		}
+
+		v, err := o.secrets.Get(ctx, k)
+		if err != nil {
+			return "", "", err
+		}
+
+		if strings.TrimSpace(string(v)) == strings.TrimSpace(certPEM) {
+			return state.SecretIssued(ref, state.SecretAgentServer), state.SecretIssued(ref, state.SecretAgentClient), nil
+		}
+	}
+
+	return state.SecretHost(host, state.SecretAgentServer), state.SecretHost(host, state.SecretAgentClient), nil
 }
 
 // settleJob runs the records job that settles an interrupted self-update's

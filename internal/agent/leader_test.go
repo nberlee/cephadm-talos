@@ -32,6 +32,8 @@ type leaderSetup struct {
 	st     *state.State
 	// onRequest sees every request to the agent first
 	onRequest func(*http.Request)
+	// ca issued the module's, the leader's and the agent's certificates
+	ca testCA
 }
 
 func newLeaderSetup(t *testing.T) *leaderSetup {
@@ -62,7 +64,7 @@ func newLeaderSetup(t *testing.T) *leaderSetup {
 	srvTLS, err := TLSConfig([]byte(ca.cert), []byte(sc), []byte(sk))
 	must(t, err)
 
-	setup := &leaderSetup{agent: tg}
+	setup := &leaderSetup{agent: tg, ca: ca}
 	h := (&Agent{Granter: tg.Granter}).Handler()
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if setup.onRequest != nil {

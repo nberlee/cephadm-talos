@@ -2070,6 +2070,11 @@ func (l *LeaderLoop) upgradeStart(ctx context.Context, b *Bridge, js store.Backe
 		}
 	}
 
+	// an agent upgrade and a Ceph upgrade exclude each other
+	if au := st.AgentUpgrade; au != nil && !au.Finished {
+		return refuse(fmt.Errorf("agent upgrade %s is in progress", au.Op))
+	}
+
 	if l.appr == nil || !l.appr.Image(op.Image) {
 		return refuse(fmt.Errorf("the operator has not approved %s", op.Image))
 	}
@@ -2316,7 +2321,8 @@ func (l *LeaderLoop) upgradeStep(ctx context.Context, b *Bridge, js store.Backen
 			})
 		}
 
-		if u.Paused {
+		// nor beside an agent upgrade's step in progress
+		if u.Paused || st.AgentUpgrade != nil && !st.AgentUpgrade.Finished && st.AgentUpgrade.Step != "" {
 			return nil
 		}
 
