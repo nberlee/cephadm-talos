@@ -189,6 +189,11 @@ func (o *Orch) recoverMon(ctx context.Context, rec *state.Recovery, h state.Host
 		}
 	}
 
+	// a recovery apply of the node's agent with no known outcome reserves it
+	if err := o.agentReserved(ctx, rec, h); err != nil {
+		return err
+	}
+
 	if err := reservedMon(rec, h.Name, doc); err != nil {
 		return err
 	}
@@ -343,6 +348,10 @@ func (o *Orch) journalHash(ctx context.Context, rec *state.Recovery, h state.Hos
 // uncertain reserves the node like any apply; a bridge intent, on whichever
 // host the leader made it, reserves its daemon, or with no daemon its host.
 func reservedMon(rec *state.Recovery, host, doc string) error {
+	if hr := rec.Hosts[host]; hr != nil && hr.AgentApply != nil && !hr.AgentApply.Applied {
+		return errors.New("an apply of the node's agent documents by the recovery has no known outcome: the node is reserved")
+	}
+
 	if hr := rec.Hosts[host]; hr != nil && hr.Receipt != nil {
 		if hr.Receipt.ApplyPending {
 			return errors.New("an apply of the node's agent has no known outcome: the node is reserved")

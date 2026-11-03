@@ -136,14 +136,16 @@ type RecoveryHost struct {
 }
 
 // AgentApply is an apply of a host's agent documents: their hashes as the
-// agent computes them, and the boot and time it was sent, to decide it from
-// the node's config (applied once the node holds them; not, on another boot
-// or after the agent's ApplySettle); Applied once decided so, until the agent
-// answered suspended.
+// agent computes them, the boot and time it was journaled and the deadline
+// after which it is not sent, to decide it from the node's config (applied
+// once the node holds them; not, on another boot or the agent's ApplySettle
+// after Before); Applied once decided so, or found so without a dispatch,
+// until the agent answered suspended. Until then it reserves the node.
 type AgentApply struct {
 	Hashes  map[string]string `json:"hashes"`
 	BootID  string            `json:"boot_id"`
 	At      time.Time         `json:"at"`
+	Before  time.Time         `json:"before"`
 	Applied bool              `json:"applied,omitempty"`
 }
 

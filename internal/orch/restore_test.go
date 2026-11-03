@@ -3,6 +3,7 @@ package orch
 import (
 	"context"
 	"encoding/json"
+	"maps"
 	"slices"
 	"strings"
 	"testing"
@@ -13,6 +14,7 @@ import (
 	"github.com/nberlee/cephadm-talos/internal/agent"
 	"github.com/nberlee/cephadm-talos/internal/state"
 	"github.com/nberlee/cephadm-talos/internal/store"
+	"github.com/nberlee/cephadm-talos/internal/wire"
 )
 
 // restoreSetup is a suspended session of h1, whose agent answered, its
@@ -338,5 +340,190 @@ func TestTheResumptionsRestoreSettlesASelfUpdate(t *testing.T) {
 
 	if settled != 1 || !hr.AgentRestored || hr.AgentApply != nil {
 		t.Fatalf("settled %d times, journal %+v", settled, hr)
+	}
+}
+
+// pendingApply journals an apply of h1's agent documents that the node does
+// not hold, sent at sent.
+func pendingApply(t *testing.T, o *Orch, h state.Host, rec *state.Recovery, sent time.Time) {
+	t.Helper()
+
+	boot, err := o.Talos.BootID(context.Background(), h.Addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec.Hosts["h1"].AgentApply = &state.AgentApply{Hashes: map[string]string{"ContainerConfig/" + o.agentDocName(h): "elsewhere"}, BootID: boot, At: sent, Before: sent}
+	if err := rec.Save(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAPendingAgentApplyReservesTheNode(t *testing.T) {
+	o, h, _ := restoreSetup(t)
+	ctx := context.Background()
+
+	rec := suspended(t, o)
+	pendingApply(t, o, h, rec, time.Now())
+
+	// recover mons: by the journal, and through the node
+	if err := reservedMon(rec, "h1", "doc"); err == nil {
+		t.Fatal("a mon on a node with a pending agent apply")
+	}
+
+	if err := o.agentReserved(ctx, rec, h); err == nil || !strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("agent reserved: %v", err)
+	}
+
+	// rm-cluster refuses before it removes anything
+	if err := o.RemoveCluster(ctx, false, SuspendOptions{}); err == nil || !strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("rm-cluster: %v", err)
+	}
+
+	if rec, _ := state.LoadRecovery(o.St.FSID); rec.Phase != state.PhaseSuspended || rec.Removal != nil {
+		t.Fatalf("rm-cluster went on: %+v", rec)
+	}
+
+	cfg, err := o.Talos.MachineConfig(ctx, h.Addr)
+	if err != nil || !strings.Contains(cfg, o.agentDocName(h)) {
+		t.Fatalf("documents removed: %v", err)
+	}
+
+	// once settled it no longer reserves: decided and cleared
+	rec, _ = state.LoadRecovery(o.St.FSID)
+	pendingApply(t, o, h, rec, time.Now().Add(-agent.ApplySettle))
+
+	if err := o.agentReserved(ctx, rec, h); err != nil || rec.Hosts["h1"].AgentApply != nil {
+		t.Fatalf("a settled apply: %v %+v", err, rec.Hosts["h1"].AgentApply)
+	}
+}
+
+func TestAnAgentApplyIsDecidedFromItsDispatchDeadline(t *testing.T) {
+	o, h, _ := restoreSetup(t)
+	ctx := context.Background()
+
+	rec := suspended(t, o)
+
+	// journaled long ago, but its dispatch may have been sent until Before
+	pendingApply(t, o, h, rec, time.Now().Add(-agent.ApplySettle))
+	rec.Hosts["h1"].AgentApply.Before = time.Now()
+
+	if _, err := o.agentApplied(ctx, rec, h); err == nil {
+		t.Fatal("settled counting from its journaling, not its dispatch deadline")
+	}
+
+	// an apply journals the deadline of its dispatch
+	ah, err := o.agentHost(ctx, h, rec.Hosts["h1"])
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	docs := o.agentDocsWith(ah, "docker.io/registry/agent@sha256:"+strings.Repeat("bb", 32), o.imageRepos(), o.St.Agent.ApprovalKey)
+
+	hashes, err := docHashes(docs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := o.applyAgentDocs(ctx, rec, h, hashes, docs); err != nil {
+		t.Fatal(err)
+	}
+
+	if a := rec.Hosts["h1"].AgentApply; !a.Applied || !a.Before.Equal(a.At.Add(agentApplyWithin)) {
+		t.Fatalf("journaled %+v", a)
+	}
+}
+
+func TestDocumentsTheNodeHoldsAreNotSentAgain(t *testing.T) {
+	o, h, a := restoreSetup(t)
+	ctx := context.Background()
+
+	rec := suspended(t, o)
+
+	// the node holds the state's agent already (restoreSetup applied it)
+	ah, err := o.agentHost(ctx, h, rec.Hosts["h1"])
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	docs := o.agentDocs(ah)
+
+	hashes, err := docHashes(docs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	a.node.Mu.Lock()
+	before := len(a.node.Applied)
+	a.node.Mu.Unlock()
+
+	if err := o.applyAgentDocs(ctx, rec, h, hashes, docs); err != nil {
+		t.Fatal(err)
+	}
+
+	a.node.Mu.Lock()
+	after := len(a.node.Applied)
+	a.node.Mu.Unlock()
+
+	if ap := rec.Hosts["h1"].AgentApply; after != before || !ap.Applied || ap.BootID != "" {
+		t.Fatalf("%d applies, journaled %+v", after-before, ap)
+	}
+}
+
+func TestAgentRestoreRunsWhileResumingUntilAnAgentIsReadopted(t *testing.T) {
+	o, h, _ := restoreSetup(t)
+	ctx := context.Background()
+
+	// the resumption applied the state's image, which does not start: its
+	// apply landed, the agent did not answer
+	rec := suspended(t, o)
+	rec.Phase = state.PhaseResuming
+	hr := rec.Hosts["h1"]
+	hr.RemovingAgent, hr.AgentRemoved = true, true
+
+	hashes, err := docHashes(o.agentDocs(h))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hr.AgentApply = &state.AgentApply{Hashes: hashes, Applied: true}
+	if err := rec.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	// rolled back with --previous: applied and decided, the agent back; the
+	// image check fails here, the fake node's status keeps the image of before
+	previous := "docker.io/registry/agent@sha256:" + strings.Repeat("bb", 32)
+	o.St.Agent.PreviousImage = previous
+
+	if err := o.RestoreAgent(ctx, "h1", true); err == nil || !strings.Contains(err.Error(), "does not run") {
+		t.Fatalf("restore while resuming: %v", err)
+	}
+
+	rec, _ = state.LoadRecovery(o.St.FSID)
+	if hr := rec.Hosts["h1"]; !hr.AgentRestored || hr.AgentApply != nil {
+		t.Fatalf("journal %+v", hr)
+	}
+
+	// a later resumption does not render the state's image over it
+	for _, k := range slices.Sorted(maps.Keys(rec.Hosts)) {
+		if hr := rec.Hosts[k]; hr.RemovingAgent && !hr.AgentRestored {
+			t.Fatalf("%s would be applied again", k)
+		}
+	}
+
+	cur, err := o.configuredDocs(ctx, h.Addr, o.agentDocName(h))
+	if err != nil || cur[o.agentDocName(h)].image != previous {
+		t.Fatalf("restored %+v %v", cur[o.agentDocName(h)], err)
+	}
+
+	// once an agent was re-adopted, no more
+	rec.Hosts["h1"].Readopt = &wire.ReadoptReceipt{Version: wire.Version}
+	if err := rec.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := o.RestoreAgent(ctx, "h1", true); err == nil || !strings.Contains(err.Error(), "resuming") {
+		t.Fatalf("after a re-adoption: %v", err)
 	}
 }

@@ -802,6 +802,15 @@ func (o *Orch) RemoveCluster(ctx context.Context, zap bool, opts SuspendOptions)
 		return fmt.Errorf("recovery session %s is %s", rec.Session, rec.Phase)
 	}
 
+	// a recovery apply of an agent with no known outcome reserves its node
+	if rec != nil && !removing {
+		for _, h := range journaledHosts(rec) {
+			if err := o.agentReserved(ctx, rec, h); err != nil {
+				return fmt.Errorf("%s: %w", h.Name, err)
+			}
+		}
+	}
+
 	removal := &state.Removal{Zap: zap, Image: o.St.Image}
 
 	switch {

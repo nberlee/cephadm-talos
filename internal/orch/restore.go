@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"maps"
 	"net"
+	"slices"
 	"strings"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/nberlee/cephadm-talos/internal/spec"
 	"github.com/nberlee/cephadm-talos/internal/state"
 	"github.com/nberlee/cephadm-talos/internal/store"
+	"github.com/nberlee/cephadm-talos/internal/talos"
 )
 
 // RestoreAgent applies a host's agent documents (the CLI's own) inside a
@@ -58,8 +60,11 @@ func (o *Orch) RestoreAgent(ctx context.Context, name string, previous bool) err
 		return errors.New("agent restore runs in a recovery session: run `cephadm-talos suspend` first")
 	}
 
-	if rec.Phase != state.PhaseSuspended && rec.Phase != state.PhaseRecovering {
-		return fmt.Errorf("recovery session %s is %s: agent restore runs while it is suspended", rec.Session, rec.Phase)
+	// also while resuming, until the resumption re-adopted or activated an
+	// agent: a restore it applied that cannot start is rolled back so
+	resumed := slices.ContainsFunc(slices.Collect(maps.Values(rec.Hosts)), func(hr *state.RecoveryHost) bool { return hr.Readopt != nil || hr.Activated })
+	if rec.Phase != state.PhaseSuspended && rec.Phase != state.PhaseRecovering && (rec.Phase != state.PhaseResuming || resumed) {
+		return fmt.Errorf("recovery session %s is %s: agent restore runs while it is suspended, or resuming before any agent was re-adopted", rec.Session, rec.Phase)
 	}
 
 	hr := rec.Hosts[name]
@@ -206,20 +211,51 @@ func docHashes(docs []any) (map[string]string, error) {
 	return agent.DocHashes(string(b))
 }
 
-// applyAgentDocs applies a host's agent documents, journaled before they are
-// sent; the node must hold them afterwards.
+// agentApplyWithin bounds the dispatch of a journaled apply of an agent's
+// documents: it is not sent after it, and its settlement counts from then.
+const agentApplyWithin = 2 * time.Minute
+
+// applyAgentDocs applies a host's agent documents, unless the node holds them
+// already (recorded applied, nothing sent); else journaled first with the
+// deadline of its dispatch. The node must hold them afterwards.
 func (o *Orch) applyAgentDocs(ctx context.Context, rec *state.Recovery, h state.Host, hashes map[string]string, docs []any) error {
+	hr := rec.Hosts[h.Name]
+
+	held, err := o.holdsDocs(ctx, h, hashes)
+	if err != nil {
+		return err
+	}
+
+	if held {
+		hr.AgentApply = &state.AgentApply{Hashes: hashes, At: time.Now().UTC(), Applied: true}
+
+		return rec.Save()
+	}
+
 	boot, err := o.Talos.BootID(ctx, h.Addr)
 	if err != nil {
 		return err
 	}
 
-	rec.Hosts[h.Name].AgentApply = &state.AgentApply{Hashes: hashes, BootID: boot, At: time.Now().UTC()}
+	at := time.Now().UTC()
+	hr.AgentApply = &state.AgentApply{Hashes: hashes, BootID: boot, At: at, Before: at.Add(agentApplyWithin)}
+
 	if err := rec.Save(); err != nil {
 		return err
 	}
 
-	if err := o.apply(ctx, h.Addr, docs...); err != nil {
+	actx, cancel := context.WithDeadline(ctx, hr.AgentApply.Before)
+	defer cancel()
+
+	if err := o.apply(talos.WithApplyBefore(actx, hr.AgentApply.Before), h.Addr, docs...); errors.Is(err, talos.ErrApplyDeadline) {
+		// nothing was sent: the journal entry goes
+		hr.AgentApply = nil
+		if serr := rec.Save(); serr != nil {
+			return serr
+		}
+
+		return err
+	} else if err != nil {
 		return err
 	}
 
@@ -229,6 +265,42 @@ func (o *Orch) applyAgentDocs(ctx context.Context, rec *state.Recovery, h state.
 	}
 
 	return err
+}
+
+// holdsDocs reports whether a node's config holds documents with these hashes.
+func (o *Orch) holdsDocs(ctx context.Context, h state.Host, hashes map[string]string) (bool, error) {
+	cfg, err := o.Talos.MachineConfig(ctx, h.Addr)
+	if err != nil {
+		return false, err
+	}
+
+	cur, err := agent.DocHashes(cfg)
+	if err != nil {
+		return false, err
+	}
+
+	for k, v := range hashes {
+		if cur[k] != v {
+			return false, nil
+		}
+	}
+
+	return true, nil
+}
+
+// agentReserved refuses a node whose agent's documents a recovery apply
+// journaled with no known outcome: decided first from the node's config, so
+// one that settled no longer reserves it. Every writer of the recovery asks.
+func (o *Orch) agentReserved(ctx context.Context, rec *state.Recovery, h state.Host) error {
+	if rec == nil || rec.Hosts[h.Name] == nil || rec.Hosts[h.Name].AgentApply == nil {
+		return nil
+	}
+
+	if _, err := o.agentApplied(ctx, rec, h); err != nil {
+		return fmt.Errorf("the node is reserved: %w", err)
+	}
+
+	return nil
 }
 
 // agentApplied decides a journaled apply of a host's agent documents from the
@@ -247,27 +319,23 @@ func (o *Orch) agentApplied(ctx context.Context, rec *state.Recovery, h state.Ho
 		return true, nil
 	}
 
-	// settlement first: the config read after it shows an apply still handled then
+	// settlement first: the config read after it shows an apply still handled
+	// then; it counts from the dispatch's deadline
 	boot, err := o.Talos.BootID(ctx, h.Addr)
 	if err != nil {
 		return false, err
 	}
 
-	settled := boot != a.BootID || time.Since(a.At) >= agent.ApplySettle
-
-	cfg, err := o.Talos.MachineConfig(ctx, h.Addr)
-	if err != nil {
-		return false, err
+	sent := a.Before
+	if sent.IsZero() {
+		sent = a.At
 	}
 
-	cur, err := agent.DocHashes(cfg)
+	settled := boot != a.BootID || time.Since(sent) >= agent.ApplySettle
+
+	held, err := o.holdsDocs(ctx, h, a.Hashes)
 	if err != nil {
 		return false, err
-	}
-
-	held := true
-	for k, v := range a.Hashes {
-		held = held && cur[k] == v
 	}
 
 	switch {
@@ -276,7 +344,7 @@ func (o *Orch) agentApplied(ctx context.Context, rec *state.Recovery, h state.Ho
 	case settled:
 		hr.AgentApply = nil
 	default:
-		return false, fmt.Errorf("the apply of its agent's documents may still land: run again after %s", a.At.Add(agent.ApplySettle).Local().Format(time.TimeOnly))
+		return false, fmt.Errorf("the apply of its agent's documents may still land: run again after %s", sent.Add(agent.ApplySettle).Local().Format(time.TimeOnly))
 	}
 
 	return held, rec.Save()
