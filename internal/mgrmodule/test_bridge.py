@@ -56,6 +56,12 @@ class Log:
     def exception(self, *a):
         pass
 
+    def warning(self, *a):
+        pass
+
+    def info(self, *a):
+        pass
+
 
 class Mons:
     """A fake send_command. Answers mgr dump from `maps` (the last repeats; None:
@@ -681,6 +687,53 @@ class ServerTest(unittest.TestCase):
         for port in (self.port, self.bridge_port):
             with self.assertRaises(OSError):
                 self.get('/v1/bridge/' + 'ab' * 8, port)
+
+
+class ReloadTest(ServerTest):
+    """The module loads a renewed server certificate without a restart (plan 04, step 1)."""
+
+    def served(self):
+        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=self.files['ca.crt'])
+        ctx.check_hostname = False
+        ctx.load_cert_chain(self.files['cli.crt'], self.files['cli.key'])
+        with socket.create_connection(('127.0.0.1', self.port), timeout=5) as raw:
+            with ctx.wrap_socket(raw) as tls:
+                return tls.getpeercert(binary_form=True)
+
+    def renew(self):
+        certs = b.issue_mgr_certs(b.read(self.files['ca.crt']), b.read(self.files['ca.key']), 'f1', 'h1', '127.0.0.1')
+        for name, key in (('srv.crt', 'server_cert'), ('srv.key', 'server_key')):
+            with open(self.files[name], 'w') as f:
+                f.write(certs[key])
+        return certs
+
+    def test_a_renewed_certificate_is_served_and_signs(self):
+        before = self.served()
+        args = (self.files['ca.crt'], self.files['srv.crt'], self.files['srv.key'])
+        self.ch.reload(*args)  # the test channel was built without the files' digest
+        self.assertFalse(self.ch.reload(*args))  # unchanged: nothing loaded
+        old = self.ch.credentials()
+        certs = self.renew()
+        self.assertTrue(self.ch.reload(*args))
+        self.assertNotEqual(self.served(), before)
+        # a connection accepted before the swap still signs with its own key
+        code, reply = self.ch.confirm(challenge(), old)
+        self.assertEqual(code, 200)
+        payload, sig = base64.b64decode(reply['payload']), base64.b64decode(reply['signature'])
+        new_pub = x509.load_pem_x509_certificate(certs['server_cert'].encode()).public_key()
+        with self.assertRaises(Exception):
+            new_pub.verify(sig, payload, ec.ECDSA(hashes.SHA256()))  # not the new key
+        code, reply = self.ch.confirm(challenge())
+        new_pub.verify(base64.b64decode(reply['signature']), base64.b64decode(reply['payload']), ec.ECDSA(hashes.SHA256()))
+
+    def test_a_key_that_does_not_match_keeps_the_old_certificate(self):
+        before = self.served()
+        self.ch.reload(self.files['ca.crt'], self.files['srv.crt'], self.files['srv.key'])
+        certs = b.issue_mgr_certs(b.read(self.files['ca.crt']), b.read(self.files['ca.key']), 'f1', 'h1', '127.0.0.1')
+        with open(self.files['srv.crt'], 'w') as f:
+            f.write(certs['server_cert'])  # the key file stays the old one
+        self.assertFalse(self.ch.reload(self.files['ca.crt'], self.files['srv.crt'], self.files['srv.key']))
+        self.assertEqual(self.served(), before)
 
 
 class ServerCloseTest(unittest.TestCase):

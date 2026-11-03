@@ -20,11 +20,13 @@ import base64
 import hashlib
 import http.client
 import json
+import os
 import queue
 import re
 import secrets
 import socket
 import ssl
+import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -574,6 +576,49 @@ class Record:
         return self.job is not None and self.job.ev.is_set()
 
 
+class Credentials:
+    """The module's server identity: the TLS context, the confirmation signing
+    key and the agent CA certificate it issues from, built from one read of
+    their files, so the key always matches the certificate of the context."""
+
+    def __init__(self, ctx: Optional[ssl.SSLContext], server_key: bytes, ca_cert: bytes, digest: str = '') -> None:
+        self.ctx = ctx
+        self.server_key = server_key
+        self.ca_cert = ca_cert
+        self.digest = digest
+
+
+def files_digest(*paths: str) -> str:
+    h = hashlib.sha256()
+    for path in paths:
+        b = read(path)
+        h.update(len(b).to_bytes(8, 'big') + b)
+    return h.hexdigest()
+
+
+def load_credentials(ca_file: str, cert_file: str, key_file: str) -> Credentials:
+    """The credentials of one read of the three files; raises unless the
+    certificate and the key load and match."""
+    ca, cert, key = read(ca_file), read(cert_file), read(key_file)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.load_verify_locations(cadata=ca.decode())
+    # load_cert_chain reads files: the bytes just read go through a private
+    # temporary file, so context and signing key come from the same read
+    with tempfile.TemporaryDirectory() as d:
+        cp, kp = os.path.join(d, 'c'), os.path.join(d, 'k')
+        for path, data in ((cp, cert), (kp, key)):
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, 'wb') as f:
+                f.write(data)
+        ctx.load_cert_chain(cp, kp)  # raises on a key that does not match
+    h = hashlib.sha256()
+    for b in (ca, cert, key):
+        h.update(len(b).to_bytes(8, 'big') + b)
+    return Credentials(ctx, key, ca, h.hexdigest())
+
+
 class Server(ThreadingHTTPServer):
     """One request per connection; the TLS handshake happens in the connection's
     own thread, within the connection's absolute deadline, and connections are
@@ -581,9 +626,11 @@ class Server(ThreadingHTTPServer):
 
     daemon_threads = True
 
-    def __init__(self, addr: Tuple[str, int], handler: Any, ctx: ssl.SSLContext) -> None:
+    def __init__(self, addr: Tuple[str, int], handler: Any, ctx: Any) -> None:
         super().__init__(addr, handler)
-        self.ctx = ctx
+        # a TLS context, or a function returning the current Credentials,
+        # which each connection captures when it is accepted
+        self.credentials: Callable[[], Credentials] = ctx if callable(ctx) else (lambda c=Credentials(ctx, b'', b''): c)
         self.admit = threading.BoundedSemaphore(MAX_CONNECTIONS)
         self.closed = threading.Event()
         self.lock = threading.Lock()
@@ -633,7 +680,9 @@ class Server(ThreadingHTTPServer):
         timer.start()
         try:
             conn.settimeout(REQUEST_DEADLINE)
-            tls = self.ctx.wrap_socket(conn, server_side=True)
+            creds = self.credentials()
+            tls = creds.ctx.wrap_socket(conn, server_side=True)  # type: ignore[union-attr]
+            tls.credentials = creds  # type: ignore[attr-defined]  # what this connection's confirmations are signed with
             self.finish_request(tls, client_address)
         except Exception:
             pass
@@ -686,9 +735,9 @@ class Channel:
     def __init__(self, fsid: str, mgr_id: str, leadership: Leadership, bridge_commands: Commands,
                  server_ctx: Optional[ssl.SSLContext], server_key: bytes,
                  require_identity: Callable[..., str], log: Any, authority: Callable[[], Any],
-                 ca_cert: bytes = b'') -> None:
+                 ca_cert: bytes = b'', digest: str = '') -> None:
         self.fsid = fsid
-        self.ca_cert = ca_cert  # the agent CA's certificate, for mgr certificates
+        # the server identity, replaced as a whole by reload
         # mutations sent for a daemon's generation, which a removal waits for
         self.inflight: Dict[str, List[Job]] = {}
         self.local_lock = threading.Lock()
@@ -697,10 +746,9 @@ class Channel:
         self.mgr_id = mgr_id
         self.leadership = leadership
         self.commands = bridge_commands
-        self.server_key = server_key
         self.require_identity = require_identity
         self.log = log
-        self.ctx = server_ctx
+        self.creds = Credentials(server_ctx, server_key, ca_cert, digest)
         self.lock = threading.Lock()
         self.records: Dict[str, Record] = {}
         # the record of the local handler running on this thread, which _mon
@@ -709,9 +757,32 @@ class Channel:
         self.server: Optional[Server] = None
         self.bridge_server: Optional[Server] = None
 
+    def credentials(self) -> Credentials:
+        return self.creds
+
+    @property
+    def ca_cert(self) -> bytes:
+        return self.creds.ca_cert
+
+    def reload(self, ca_file: str, cert_file: str, key_file: str) -> bool:
+        """Load the server identity again when its files changed (plan 04,
+        step 1); a load that fails keeps the current one. True on a swap."""
+        try:
+            if files_digest(ca_file, cert_file, key_file) == self.creds.digest:
+                return False
+            creds = load_credentials(ca_file, cert_file, key_file)
+        except Exception as e:
+            self.log.warning('the server certificate was not reloaded: %s', e)
+            return False
+        if creds.digest == self.creds.digest:
+            return False
+        self.creds = creds  # one assignment: a connection sees the old or the new object whole
+        self.log.info('server certificate reloaded')
+        return True
+
     # --- confirmation -------------------------------------------------------
 
-    def confirm(self, req: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+    def confirm(self, req: Dict[str, Any], creds: Optional[Credentials] = None) -> Tuple[int, Dict[str, Any]]:
         cap = self.leadership.captured()
         if cap is None:
             return 503, {'error': 'no captured incarnation'}
@@ -722,7 +793,7 @@ class Channel:
             'session': req['session'], 'host': req['host'], 'revision': req['revision'],
             'operation': req['operation'], 'inputs_hash': req['inputs_hash'], 'challenge': req['challenge'],
         }, sort_keys=True, separators=(',', ':')).encode()
-        sig = sign(self.server_key, payload)
+        sig = sign((creds or self.creds).server_key, payload)
         return 200, {'payload': base64.b64encode(payload).decode(), 'signature': base64.b64encode(sig).decode()}
 
     # --- bridge -------------------------------------------------------------
@@ -1507,7 +1578,7 @@ class Channel:
                         except ValueError as e:
                             self.reply(400, {'error': str(e)})
                             return
-                        self.reply(*channel.confirm(req))
+                        self.reply(*channel.confirm(req, getattr(self.connection, 'credentials', None)))
                     elif self.path == '/v1/bridge' and local:
                         if name != channel.mgr_id:  # only the local agent, the leader
                             self.reply(403, {'error': 'the bridge serves the local agent only'})
@@ -1542,11 +1613,11 @@ class Channel:
     def start(self, port: int = CONFIRM_PORT, bridge_port: int = BRIDGE_PORT) -> None:
         """Serve confirmations on all interfaces and the bridge on loopback,
         both with the same TLS context and client certificate checks."""
-        if self.ctx is None:
+        if self.creds.ctx is None:
             raise ValueError('no TLS context')
-        srv = Server(('', port), self.handler(), self.ctx)
+        srv = Server(('', port), self.handler(), self.credentials)
         try:
-            local = Server((BRIDGE_ADDR, bridge_port), self.handler(local=True), self.ctx)
+            local = Server((BRIDGE_ADDR, bridge_port), self.handler(local=True), self.credentials)
         except Exception:
             srv.server_close()
             raise

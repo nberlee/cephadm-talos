@@ -733,14 +733,17 @@ class Module(orchestrator.Orchestrator, MgrModule):
                 try:
                     inv = self._inventory()
                     if channel is None:
+                        creds = bridge.load_credentials(os.path.join(TALOS_DIR, 'agent-ca.crt'), os.path.join(TALOS_DIR, 'mgr-server.crt'),
+                                                        os.path.join(TALOS_DIR, 'mgr-server.key'))
                         c = bridge.Channel(
-                            inv['fsid'], self.get_mgr_id(), leadership, bridge_cmds,
-                            bridge.server_context(os.path.join(TALOS_DIR, 'agent-ca.crt'), os.path.join(TALOS_DIR, 'mgr-server.crt'),
-                                                  os.path.join(TALOS_DIR, 'mgr-server.key')),
-                            bridge.read(os.path.join(TALOS_DIR, 'mgr-server.key')), require_identity, self.log, self._authority,
-                            bridge.read(os.path.join(TALOS_DIR, 'agent-ca.crt')))
+                            inv['fsid'], self.get_mgr_id(), leadership, bridge_cmds, creds.ctx, creds.server_key,
+                            require_identity, self.log, self._authority, creds.ca_cert, creds.digest)
                         c.start()
                         channel = c  # only a started channel; a failed start is retried
+                    else:
+                        # a renewed server certificate, once the leader granted its files
+                        channel.reload(os.path.join(TALOS_DIR, 'agent-ca.crt'), os.path.join(TALOS_DIR, 'mgr-server.crt'),
+                                       os.path.join(TALOS_DIR, 'mgr-server.key'))
                     if leadership.capture():
                         gid, epoch = leadership.captured() or (0, 0)
                         self._gid = gid  # this incarnation's state, once its leader published it
