@@ -549,18 +549,34 @@ def cert_not_after(pem: Optional[str]) -> Optional[datetime.datetime]:
         return None
 
 
-def served_not_after(addr: str, port: int, timeout: float = 5.0) -> Optional[datetime.datetime]:
-    """The notAfter of the certificate a TLS server serves (an RGW), unverified:
-    only its expiry is read. None if it does not answer."""
-    from cryptography import x509
+def served_leaf(addr: str, port: int, timeout: float = 5.0) -> Optional[bytes]:
+    """The leaf certificate (DER) a TLS server serves (an RGW), unverified: only
+    which one it is and its expiry are read. None if it does not answer."""
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
     try:
         with socket.create_connection((addr, port), timeout=timeout) as raw:
             with ctx.wrap_socket(raw) as tls:
-                der = tls.getpeercert(binary_form=True)
-        return x509.load_der_x509_certificate(der).not_valid_after_utc if der else None
-    except (OSError, ValueError):
+                return tls.getpeercert(binary_form=True) or None
+    except OSError:
+        return None
+
+
+def leaf_der(pem: Optional[str]) -> Optional[bytes]:
+    """The first certificate of a PEM chain, as DER; None if there is none."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import serialization
+    try:
+        return x509.load_pem_x509_certificate((pem or '').encode()).public_bytes(serialization.Encoding.DER)
+    except ValueError:
+        return None
+
+
+def der_not_after(der: bytes) -> Optional[datetime.datetime]:
+    from cryptography import x509
+    try:
+        return x509.load_der_x509_certificate(der).not_valid_after_utc
+    except ValueError:
         return None
 
 
@@ -1193,17 +1209,23 @@ class Module(orchestrator.Orchestrator, MgrModule):
         certs = {c['id']: c for c in rgw.get('certs') or []}
         due_generated, user = False, []
         port = self._rgw_port()
+        user_certs = [c['cert'] for c in certs.values() if c.get('user')] + ([rgw['cert']] if rgw.get('user_cert') and rgw.get('cert') else [])
         for d in daemons or []:
             if d.get('type') != 'rgw' or d.get('host') not in by_name:
                 continue
             ref = d.get('cert') or 'cli'
             c = certs.get(ref) if ref != 'cli' else {'id': 'cli', 'cert': rgw.get('cert'), 'user': rgw.get('user_cert')}
-            served = served_not_after(by_name[d['host']]['addr'], port) if port else None
-            for end, is_user in ((cert_not_after(c.get('cert')) if c and c.get('cert') else None, bool(c and c.get('user'))), (served, False)):
+            served = served_leaf(by_name[d['host']]['addr'], port) if port else None
+            # an RGW serving an operator's certificate (named or not) is the operator's to renew
+            served_user = served is not None and any(leaf_der(u) == served for u in user_certs)
+            served_end = der_not_after(served) if served is not None else None
+            for end, is_user in ((cert_not_after(c.get('cert')) if c and c.get('cert') else None, bool(c and c.get('user'))), (served_end, served_user)):
                 if end is None or end - now > CERT_RENEW_BEFORE:
                     continue
                 if is_user:
-                    user.append('rgw.%s serves the operator\'s certificate, which expires %s' % (d['host'], end.isoformat()))
+                    line = 'rgw.%s serves the operator\'s certificate, which expires %s' % (d['host'], end.isoformat())
+                    if line not in user:
+                        user.append(line)
                     continue
                 due_generated = True
                 if end - now <= CERT_ALERT_BEFORE:

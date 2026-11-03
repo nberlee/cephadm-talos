@@ -673,6 +673,18 @@ class CertCheck(unittest.TestCase):
         m.Module._check_certs(mod)
         self.assertEqual([e['kind'] for _, e in mod._ledger.executable()].count('renew_rgw_cert'), 1)
 
+    def test_an_rgw_serving_the_operators_certificate_is_not_renewed(self):
+        mod, entries = self.module(rgw={'h2': 'user/op-%016x' % 2})
+        cluster_user = next(c for c in m.record_from_store(entries, 'cli', 'cluster')[0]['rgw']['certs'] if c.get('user'))['cert']
+        mod._rgw_port = lambda: 443
+        old = m.served_leaf
+        m.served_leaf = lambda addr, port, timeout=5.0: m.leaf_der(cluster_user)
+        self.addCleanup(setattr, m, 'served_leaf', old)
+        m.Module._check_certs(mod)
+        self.assertNotIn('renew_rgw_cert', [e['kind'] for _, e in mod._ledger.executable()])
+        self.assertFalse(any('rgw' in d for d in self.health['now'].get('TALOS_CERT_RENEWAL', {}).get('detail', [])))
+        self.assertEqual(self.health['now']['TALOS_RGW_CERT_EXPIRING']['count'], 1)
+
 
 class AddAndRemove(unittest.TestCase):
     def module(self, inv=None):

@@ -1100,11 +1100,15 @@ class Channel:
         name, host = op['daemon'], op['host']
         if fold.mgr_renewals[name][op['id']] is None:
             return 400, {'error': 'the renewal issued no certificates'}
-        gen = fold.open_generation(name)
         if not any(e['kind'] == 'mgr_cert_done' and e['of'] == op['id'] for _, e in led.executable()):
             led.append({'id': 'm-' + secrets.token_hex(8), 'kind': 'mgr_cert_done', 'of': op['id'], 'daemon': name, 'host': host, 'keep': op['id']})
-        old = ['%sissued/%s/' % (SECRET_PREFIX, o) for o in list(fold.mgr_renewals[name]) + [gen] if o != op['id'] and o != 'cli']
-        if gen == 'cli':
+        # only what the fold retired: a later renewal's keys stay, also when an
+        # earlier renewal's done is asked again
+        _, after = self.authority()
+        gen = after.open_generation(name)
+        old = ['%sissued/%s/' % (SECRET_PREFIX, o) for o in list(after.mgr_renewals.get(name, {})) + [gen]
+               if o not in (None, 'cli') and o in after.mgr_retired]
+        if gen == 'cli' and 'cli/' + host in after.mgr_retired:
             old += ['%shost/%s/mgr-server.key' % (SECRET_PREFIX, host), '%shost/%s/mgr-client.key' % (SECRET_PREFIX, host)]
         keys = self._mon({'prefix': 'config-key ls'}, None, lambda out: json.dumps([k for k in json.loads(out) if any(k.startswith(p) for p in old)]))
         if keys is None or keys.r != 0 or keys.too_large:
