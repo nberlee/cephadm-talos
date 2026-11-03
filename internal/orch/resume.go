@@ -251,10 +251,29 @@ func (o *Orch) restoreAgent(ctx context.Context, rec *state.Recovery, h state.Ho
 
 	o.printf("%s: applying its agent again\n", h.Name)
 
-	if err := o.apply(ctx, h.Addr, o.agentDocs(ah)...); err != nil {
+	// with the pinned inputs its document had, if the suspension read them
+	docs := o.agentDocs(ah)
+	if hr := rec.Hosts[h.Name]; hr.AgentPinned {
+		docs = o.agentDocsWith(ah, o.St.Agent.Image, hr.AgentRepos, hr.AgentApprovalKey)
+	}
+
+	if err := o.apply(ctx, h.Addr, docs...); err != nil {
 		return err
 	}
 
+	if err := o.awaitSuspended(ctx, rec, h); err != nil {
+		return err
+	}
+
+	rec.Hosts[h.Name].AgentRestored = true
+
+	return rec.Save()
+}
+
+// awaitSuspended waits until an agent applied again answers suspended for the
+// session (it starts from its records), at the revision of its receipt or of
+// an unresolved operation of it that it reconciled, and keeps its receipt.
+func (o *Orch) awaitSuspended(ctx context.Context, rec *state.Recovery, h state.Host) error {
 	ctx, cancel := context.WithTimeout(ctx, agentStartTimeout)
 	defer cancel()
 
@@ -268,17 +287,13 @@ func (o *Orch) restoreAgent(ctx context.Context, rec *state.Recovery, h state.Ho
 			// its own receipt, after it reconciled what its records left open
 			rec.Hosts[h.Name].Receipt = r
 
-			break
+			return nil
 		}
 
 		if !errors.Is(err, errUnreachable) || ctx.Err() != nil {
 			return err
 		}
 	}
-
-	rec.Hosts[h.Name].AgentRestored = true
-
-	return rec.Save()
 }
 
 // advanced reports whether a restored agent's revision is one an unresolved
@@ -287,18 +302,27 @@ func advanced(receipt *wire.SuspendReceipt, revision int64) bool {
 	return slices.ContainsFunc(receipt.Unresolved, func(op wire.Operation) bool { return op.Revision == revision })
 }
 
-// agentHost is a host with its agent's certificates (the state's, or an
-// enrollment record's) and keys (the cluster's secrets).
+// agentHost is a host with its agent's certificates and keys: the state's
+// (its keys through AgentKeys), else the ones the suspension read from the
+// agent's document before it removed it (a host the leader removed), else an
+// enrollment record's; the keys from the cluster's secrets.
 func (o *Orch) agentHost(ctx context.Context, h state.Host, hr *state.RecoveryHost) (state.Host, error) {
 	adm, err := o.confirmedAdminHost()
 	if err != nil {
 		return state.Host{}, err
 	}
 
-	// the certificates: the state's, an enrollment record's, else the ones
-	// the suspension read from the agent's document before it removed it
+	serverKey, clientKey := state.SecretHost(h.Name, state.SecretAgentServer), state.SecretHost(h.Name, state.SecretAgentClient)
+
 	if sh, ok := o.St.Host(h.Name); ok {
 		h = sh
+		serverKey, clientKey = h.AgentKeySecret(state.SecretAgentServer), h.AgentKeySecret(state.SecretAgentClient)
+	} else if hr != nil && hr.AgentCert != "" {
+		h.AgentCert, h.AgentClientCert = hr.AgentCert, hr.AgentClientCert
+
+		if hr.AgentServerKey != "" && hr.AgentClientKey != "" {
+			serverKey, clientKey = hr.AgentServerKey, hr.AgentClientKey
+		}
 	} else {
 		recs, err := o.enrollments(ctx, adm.Addr)
 		if err != nil {
@@ -315,9 +339,7 @@ func (o *Orch) agentHost(ctx context.Context, h state.Host, hr *state.RecoveryHo
 			}
 
 			h.AgentCert, h.AgentClientCert = e.AgentCert, e.AgentClientCert
-		case errors.Is(err, store.ErrNotFound):
-			h.AgentCert, h.AgentClientCert = hr.AgentCert, hr.AgentClientCert
-		default:
+		case !errors.Is(err, store.ErrNotFound):
 			return state.Host{}, fmt.Errorf("its enrollment record: %w", err)
 		}
 	}
@@ -330,10 +352,10 @@ func (o *Orch) agentHost(ctx context.Context, h state.Host, hr *state.RecoveryHo
 		return state.Host{}, err
 	}
 
-	for name, dst := range map[string]*string{state.SecretAgentServer: &h.AgentKey, state.SecretAgentClient: &h.AgentClientKey} {
-		v, err := o.secrets.Get(ctx, store.SecretPrefix+state.SecretHost(h.Name, name))
+	for name, dst := range map[string]*string{serverKey: &h.AgentKey, clientKey: &h.AgentClientKey} {
+		v, err := o.secrets.Get(ctx, store.SecretPrefix+name)
 		if err != nil {
-			return state.Host{}, fmt.Errorf("its agent's %s key: %w", name, err)
+			return state.Host{}, fmt.Errorf("its agent's key %s: %w", name, err)
 		}
 
 		*dst = string(v)

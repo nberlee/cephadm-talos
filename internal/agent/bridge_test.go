@@ -62,6 +62,8 @@ type fakeBridge struct {
 	osds []OSD
 	// rgwCert answers rgw cert (JSON: attempt and cert)
 	rgwCert string
+	// standbys are the standby mgrs mgr dump lists
+	standbys []string
 }
 
 func (m *fakeBridge) run(req wire.BridgeRequest) map[string]any {
@@ -122,6 +124,32 @@ func (m *fakeBridge) run(req wire.BridgeRequest) map[string]any {
 		b, _ := json.Marshal(out)
 
 		return map[string]any{"outcome": "done", "r": 0, "out": string(b)}
+	case "agent cert":
+		// once per operation: asked again, the same certificates
+		op := str("operation")
+		if prev, ok := m.kv["agent-cert/"+op]; ok {
+			return map[string]any{"outcome": "done", "r": 0, "out": prev}
+		}
+
+		m.retired = append(m.retired, req.Call+" "+op)
+		attempt := fmt.Sprintf("%016x", len(m.calls))
+		out := map[string]string{"attempt": attempt}
+
+		for _, role := range []string{"server", "client"} {
+			usage := x509.ExtKeyUsageClientAuth
+			if role == "server" {
+				usage = x509.ExtKeyUsageServerAuth
+			}
+
+			cert, key := m.ca.pair(pki.RoleAgent, "h1", usage, m.fsid)
+			out[role+"_cert"] = cert
+			m.kv[store.SecretPrefix+"issued/"+op+"/"+attempt+"/agent-"+role+".key"] = key
+		}
+
+		b, _ := json.Marshal(out)
+		m.kv["agent-cert/"+op] = string(b)
+
+		return map[string]any{"outcome": "done", "r": 0, "out": string(b)}
 	case "bind disk", "confirm osd", "close create", "osd out", "drain":
 		m.retired = append(m.retired, req.Call+" "+str("operation"))
 
@@ -130,7 +158,7 @@ func (m *fakeBridge) run(req wire.BridgeRequest) map[string]any {
 		b, _ := json.Marshal(m.osds)
 
 		return map[string]any{"outcome": "done", "r": 0, "out": string(b)}
-	case "retire", "retire host", "mon rm", "ok to stop", "noout set", "noout unset", "maintained", "upgrade done", "upgrade refused", "ok to stop daemon", "retire keepalived", "mgr cert done":
+	case "retire", "retire host", "mon rm", "ok to stop", "noout set", "noout unset", "maintained", "upgrade done", "upgrade refused", "ok to stop daemon", "retire keepalived", "mgr cert done", "agent cert done":
 		m.retired = append(m.retired, req.Call+" "+str("operation"))
 
 		return map[string]any{"outcome": "done", "r": 0, "out": ""}
@@ -154,7 +182,12 @@ func (m *fakeBridge) run(req wire.BridgeRequest) map[string]any {
 
 		return map[string]any{"outcome": "done", "r": 0, "out": string(b)}
 	case "mgr dump":
-		b, _ := json.Marshal(map[string]any{"active_name": m.active, "active_gid": 42})
+		standbys := []map[string]string{}
+		for _, n := range m.standbys {
+			standbys = append(standbys, map[string]string{"name": n})
+		}
+
+		b, _ := json.Marshal(map[string]any{"active_name": m.active, "active_gid": 42, "standbys": standbys})
 
 		return map[string]any{"outcome": "done", "r": 0, "out": string(b)}
 	case "auth get-or-create":

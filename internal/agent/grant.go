@@ -131,8 +131,10 @@ func (g *Granter) checkGrant(gr wire.Grant, leader string) error {
 		return errors.New("the grant's mgr is not the sender's host")
 	case pki.ValidName(gr.Mgr) != nil || gr.GID <= 0 || gr.Epoch <= 0 || gr.Revision <= 0 || !operationRe.MatchString(gr.Operation):
 		return errors.New("malformed grant")
-	case len(gr.Docs) == 0 && gr.Restart == nil && gr.Ack == nil && !gr.Reboot:
+	case len(gr.Docs) == 0 && gr.Restart == nil && gr.Ack == nil && !gr.Reboot && gr.SelfUpdate == nil && gr.Pull == "":
 		return errors.New("a grant without documents")
+	case (gr.SelfUpdate != nil || gr.Pull != "") && (len(gr.Docs) > 0 || gr.Restart != nil || gr.Ack != nil || gr.Reboot || gr.SelfUpdate != nil && gr.Pull != ""):
+		return errors.New("a self-update or a pull with anything else")
 	case len(gr.Docs) > 0 && gr.Restart != nil:
 		return errors.New("a grant with documents and a restart")
 	case gr.Reboot && (len(gr.Docs) > 0 || gr.Restart != nil || gr.Ack != nil):
@@ -406,6 +408,44 @@ func (g *Granter) reconcile(ctx context.Context) error {
 			continue
 		}
 
+		// a self-update is decided by its intent, else by the record its
+		// decision left; without either it stopped before its intent
+		if op.Self {
+			switch {
+			case outcome == "uncertain":
+				continue // the node cannot tell yet, or another apply is open
+			case outcome != "" && op.Revision == rev:
+				op.State, op.Error = outcome, "reconciled from the node's config"
+			default:
+				rec, found, err := g.Node.selfDecided()
+				if err != nil {
+					return err
+				}
+
+				if found && rec.Operation == op.Operation {
+					op.State, op.Error = rec.Outcome, rec.Error
+				} else {
+					op.State, op.Error = wire.OpRefused, "reconciled: the self-update did not start"
+				}
+			}
+
+			if err := g.writeOp(op); err != nil {
+				return err
+			}
+
+			continue
+		}
+
+		// a pull a stop interrupted did not finish; it changed no document
+		if op.Pull {
+			op.State, op.Error = wire.OpRefused, "reconciled: the pull did not finish"
+			if err := g.writeOp(op); err != nil {
+				return err
+			}
+
+			continue
+		}
+
 		// a restart changed no document: its instance tells
 		if op.Instance != "" {
 			out, err := g.Node.RestartOutcome(ctx, op.Instance, op.BootID, time.Unix(0, op.At))
@@ -560,6 +600,14 @@ func (g *Granter) grant(ctx context.Context, gr wire.Grant) (wire.Operation, err
 
 	if gr.Reboot {
 		return g.reboot(ctx, gr, op, until)
+	}
+
+	if gr.SelfUpdate != nil {
+		return g.selfUpdate(ctx, gr, op, until)
+	}
+
+	if gr.Pull != "" {
+		return g.pull(ctx, gr, op, until)
 	}
 
 	// an acknowledgement alone changes no document; its revision is fenced like

@@ -52,6 +52,9 @@ const (
 	KindRemoveOSD    = "remove_osd"
 	KindRenewMgr     = "renew_mgr"
 	KindRenewRGW     = "renew_rgw_cert"
+	KindRenewAgent   = "renew_agent"
+	KindAgentUpgrade = "upgrade_agent"
+	KindAgentResume  = "upgrade_agent_resume"
 )
 
 // errWait is a step that waits as long as it takes (a drain), which does not
@@ -121,6 +124,22 @@ func (l *LeaderLoop) ledgerOps(ctx context.Context, b *Bridge, js store.Backend,
 				}
 			}
 
+			// so does an agent upgrade's step in progress, beside its resumes
+			if au := st.AgentUpgrade; au != nil && !au.Finished && e.Op.Kind != KindAgentResume {
+				cur, _, err := l.clusterState(ctx, b)
+				if err != nil {
+					return err
+				}
+
+				if u := cur.AgentUpgrade; u != nil && !u.Finished && u.Step != "" {
+					if err := l.agentResumeAhead(ctx, b, js, gid, epoch, after, u.Op); err != nil {
+						return err
+					}
+
+					return l.agentUpgradeStep(ctx, b, js, gid, epoch)
+				}
+			}
+
 			done, err := l.ledgerOp(ctx, b, js, gid, epoch, e)
 			if err != nil || !done {
 				l.holding = ""
@@ -128,7 +147,9 @@ func (l *LeaderLoop) ledgerOps(ctx context.Context, b *Bridge, js store.Backend,
 				switch {
 				case st.Upgrade != nil, strings.HasPrefix(e.Op.Daemon, "rgw."), e.Op.Kind == KindIngress, e.Op.Kind == KindRenewRGW:
 					l.holding = holdAll // a step may be in progress, or an RGW's VIP moved
-				case e.Op.Kind == KindEnterMaint || e.Op.Kind == KindExitMaint || e.Op.Kind == KindPowercycle:
+				case st.AgentUpgrade != nil && st.AgentUpgrade.Step != "":
+					l.holding = holdAll // an agent upgrade's step may be in progress
+				case e.Op.Kind == KindEnterMaint || e.Op.Kind == KindExitMaint || e.Op.Kind == KindPowercycle || e.Op.Kind == KindRenewAgent:
 					l.holding = e.Op.Host
 				}
 
@@ -144,8 +165,13 @@ func (l *LeaderLoop) ledgerOps(ctx context.Context, b *Bridge, js store.Backend,
 
 		if !more || len(entries) == 0 {
 			// between ledger operations: the upgrade's next step, which releases
-			// the hold once it read that no step is in progress
-			return l.upgradeStep(ctx, b, js, gid, epoch)
+			// the hold once it read that no step is in progress, then the agent
+			// upgrade's
+			if err := l.upgradeStep(ctx, b, js, gid, epoch); err != nil {
+				return err
+			}
+
+			return l.agentUpgradeStep(ctx, b, js, gid, epoch)
 		}
 	}
 }
@@ -249,11 +275,13 @@ func (l *LeaderLoop) ledgerOp(ctx context.Context, b *Bridge, js store.Backend, 
 
 	known := map[string]bool{KindRestart: true, KindRedeploy: true, KindAddDaemon: true, KindRemoveDaemon: true, KindRemoveHost: true, KindCreateOSD: true, KindRemoveOSD: true,
 		KindEnterMaint: true, KindExitMaint: true, KindPowercycle: true, KindUpgrade: true, KindUpPause: true, KindUpResume: true, KindUpStop: true,
-		KindIngress: true, KindAddHost: true, KindRenewMgr: true, KindRenewRGW: true}
-	cluster := op.Kind == KindUpgrade || isControl(op.Kind) || op.Kind == KindIngress || op.Kind == KindRenewRGW
-	noDaemon := cluster || op.Kind == KindRemoveHost || op.Kind == KindAddHost || op.Kind == KindCreateOSD || op.Kind == KindEnterMaint || op.Kind == KindExitMaint || op.Kind == KindPowercycle
+		KindIngress: true, KindAddHost: true, KindRenewMgr: true, KindRenewRGW: true, KindRenewAgent: true, KindAgentUpgrade: true, KindAgentResume: true}
+	cluster := op.Kind == KindUpgrade || isControl(op.Kind) || op.Kind == KindIngress || op.Kind == KindRenewRGW || op.Kind == KindAgentUpgrade || op.Kind == KindAgentResume
+	noDaemon := cluster || op.Kind == KindRemoveHost || op.Kind == KindAddHost || op.Kind == KindCreateOSD || op.Kind == KindEnterMaint || op.Kind == KindExitMaint || op.Kind == KindPowercycle ||
+		op.Kind == KindRenewAgent
+	bound := isControl(op.Kind) || op.Kind == KindAgentResume
 	if !ledgerIDRe.MatchString(op.ID) || cluster != (op.Host == "") || !cluster && pki.ValidName(op.Host) != nil || !known[op.Kind] ||
-		(op.Kind == KindUpgrade || op.Kind == KindIngress) != (op.Image != "") || (op.Kind == KindIngress) != (op.VIP != "") || isControl(op.Kind) != ledgerIDRe.MatchString(op.Upgrade) ||
+		(op.Kind == KindUpgrade || op.Kind == KindIngress || op.Kind == KindAgentUpgrade) != (op.Image != "") || (op.Kind == KindIngress) != (op.VIP != "") || bound != ledgerIDRe.MatchString(op.Upgrade) ||
 		noDaemon != (op.Daemon == "") || (op.Daemon != "" && !ledgerDaemonRe.MatchString(op.Daemon)) ||
 		(op.Kind == KindCreateOSD) != strings.HasPrefix(op.Device, "/dev/") {
 		return true, writeJSONKey(ctx, js, opKey, JournalOp{Version: journalVersion, Kind: op.Kind, Host: op.Host, State: JournalFailed, Error: "unknown or malformed operation"})
@@ -265,6 +293,19 @@ func (l *LeaderLoop) ledgerOp(ctx context.Context, b *Bridge, js store.Backend, 
 	}
 
 	switch op.Kind {
+	case KindAgentUpgrade, KindAgentResume:
+		phase := func() error { return l.agentUpgradeResume(ctx, b, js, gid, op) }
+		if op.Kind == KindAgentUpgrade {
+			phase = func() error { return l.upgradeAgent(ctx, b, js, gid, op) }
+		}
+
+		if err := l.unstick(ctx, js, opKey, opKey, op, nil, phase()); err != nil {
+			return false, err
+		}
+
+		s, err = l.journalState(ctx, b, js, gid, op.ID)
+
+		return err == nil && terminal(s), err
 	case KindRenewRGW:
 		// keepalived the roll took off come back
 		restore := func() error { return l.restoreVIPs(ctx, b, js, gid, epoch, op) }
@@ -325,10 +366,12 @@ func (l *LeaderLoop) ledgerOp(ctx context.Context, b *Bridge, js store.Backend, 
 		s, err = l.journalState(ctx, b, js, gid, op.ID)
 
 		return err == nil && terminal(s), err
-	case KindAddDaemon, KindRemoveDaemon, KindRemoveHost, KindCreateOSD, KindRemoveOSD, KindEnterMaint, KindExitMaint, KindPowercycle, KindAddHost, KindRenewMgr:
+	case KindAddDaemon, KindRemoveDaemon, KindRemoveHost, KindCreateOSD, KindRemoveOSD, KindEnterMaint, KindExitMaint, KindPowercycle, KindAddHost, KindRenewMgr, KindRenewAgent:
 		var phase func() error
 
 		switch op.Kind {
+		case KindRenewAgent:
+			phase = func() error { return l.renewAgent(ctx, b, js, gid, epoch, op) }
 		case KindRenewMgr:
 			phase = func() error { return l.renewMgr(ctx, b, js, gid, epoch, op) }
 		case KindAddHost:
@@ -366,6 +409,10 @@ func (l *LeaderLoop) ledgerOp(ctx context.Context, b *Bridge, js store.Backend, 
 
 		if op.Kind == KindRenewMgr {
 			onFail = func() error { return l.renewMgrFailed(ctx, b, js, gid, op) }
+		}
+
+		if op.Kind == KindRenewAgent {
+			onFail = func() error { return l.renewAgentFailed(ctx, b, js, gid, op) }
 		}
 
 		if op.Kind == KindPowercycle {

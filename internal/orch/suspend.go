@@ -462,7 +462,8 @@ func (o *Orch) suspendNode(ctx context.Context, h state.Host, rec *state.Recover
 		// recorded before the removal, so the resumption applies the agent
 		// again whatever happened; confirmed once its instances are gone
 		if !hr.RemovingAgent {
-			// its certificates, from its document while it is there
+			// its certificates and pinned inputs, from its document while it
+			// is there, and the secrets of its keys (plan 04, step 2)
 			if hr.AgentCert == "" {
 				docs, err := o.configuredDocs(ctx, h.Addr, doc)
 				if err != nil {
@@ -471,7 +472,15 @@ func (o *Orch) suspendNode(ctx context.Context, h state.Host, rec *state.Recover
 
 				if d, ok := docs[doc]; ok {
 					hr.AgentCert, hr.AgentClientCert = unb64(d.env[daemons.EnvCert]), unb64(d.env[daemons.EnvClientCert])
+					hr.AgentPinned, hr.AgentRepos, hr.AgentApprovalKey = true, strings.Fields(d.env[daemons.EnvImageRepos]), d.env[daemons.EnvApprovalKey]
 				}
+
+				keys := state.Host{Name: h.Name}
+				if sh, ok := o.St.Host(h.Name); ok && sh.Name == h.Name {
+					keys = sh
+				}
+
+				hr.AgentServerKey, hr.AgentClientKey = keys.AgentKeySecret(state.SecretAgentServer), keys.AgentKeySecret(state.SecretAgentClient)
 			}
 
 			hr.RemovingAgent = true

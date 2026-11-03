@@ -323,6 +323,16 @@ func RecordsJob(name, image, fsid, job, inputs, session string) *spec.ContainerC
 	return c
 }
 
+// RecordsSettleJob is RecordsJob that first settles an interrupted
+// self-update's apply intent (`agent restore`, plan 04 step 2): the agent's
+// records only, nothing on the node.
+func RecordsSettleJob(name, image, fsid, job, inputs string) *spec.ContainerConfig {
+	c := RecordsJob(name, image, fsid, job, inputs, "")
+	c.ContainerEntrypoint = append(c.ContainerEntrypoint, "--settle-self")
+
+	return c
+}
+
 // Probe renders a container that prints the Ceph version and architecture of
 // an image and exits, read back from its log. Unlike a Job it needs nothing from
 // a cluster (no records volume, no ceph.conf), so it runs before bootstrap.

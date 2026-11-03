@@ -41,8 +41,9 @@ func TestRecordsRoundTripWithoutLocalParts(t *testing.T) {
 	st := New("eb8dac3e-0ba7-4795-8feb-a80e8593331f")
 	st.Image = "img"
 	st.Talosconfig = "/home/op/talosconfig"
-	st.Agent = &Agent{Image: "agent", CACert: "ca", CAKey: "cakey", OperatorCert: "opcert", OperatorKey: "opkey"}
-	st.Hosts = []Host{{Name: "h1", Addr: "10.0.0.1", Talosconfig: "/tc", Context: "c", AgentCert: "ac"}}
+	st.Agent = &Agent{Image: "agent", PreviousImage: "agent0", CACert: "ca", CAKey: "cakey", OperatorCert: "opcert", OperatorKey: "opkey"}
+	st.Hosts = []Host{{Name: "h1", Addr: "10.0.0.1", Talosconfig: "/tc", Context: "c", AgentCert: "ac", AgentKeys: "op-1/a"}}
+	st.AgentUpgrade = &AgentUpgrade{Op: "op-2", From: "agent", Image: "agent2", Done: []string{"h1"}, Last: "h1", Paused: true}
 	st.Daemons = []Daemon{{Type: TypeMon, ID: "h1", Host: "h1"}}
 	st.Keys["client.admin"], st.Keys["mon."] = "adminkey", "monkey"
 
@@ -86,6 +87,16 @@ func TestRecordsRoundTripWithoutLocalParts(t *testing.T) {
 	if back.Image != "img" || h.Talosconfig != "/tc" || h.AgentCert != "ac" || back.Agent.OperatorKey != "opkey" || back.Agent.CAKey != "cakey" ||
 		back.Keys["client.admin"] != "adminkey" || back.Keys["mon."] != "" || len(back.Daemons) != 1 {
 		t.Errorf("round trip: %+v %+v %+v", back, h, back.Agent)
+	}
+
+	// an agent renewal's keys and the agent upgrade (plan 04, step 2)
+	if back.Agent.PreviousImage != "agent0" || h.AgentKeySecret(SecretAgentServer) != "issued/op-1/a/agent-server.key" ||
+		back.AgentUpgrade == nil || back.AgentUpgrade.Image != "agent2" || !back.AgentUpgrade.Paused || back.AgentUpgrade.Last != "h1" {
+		t.Errorf("round trip: %+v %+v", back.Agent, back.AgentUpgrade)
+	}
+
+	if (Host{Name: "h2"}).AgentKeySecret(SecretAgentClient) != "host/h2/agent-client.key" {
+		t.Error("the CLI's agent keys")
 	}
 }
 

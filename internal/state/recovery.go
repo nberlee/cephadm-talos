@@ -101,6 +101,16 @@ type RecoveryHost struct {
 	// record has them (a host removed through the leader)
 	AgentCert       string `json:"agent_cert,omitempty"`
 	AgentClientCert string `json:"agent_client_cert,omitempty"`
+	// AgentPinned: the removed agent's pinned inputs, its repositories and
+	// approval key, were read from its document before the removal (plan 04,
+	// step 2); the resumption and `agent restore` render it with them
+	AgentPinned      bool     `json:"agent_pinned,omitempty"`
+	AgentRepos       []string `json:"agent_repos,omitempty"`
+	AgentApprovalKey string   `json:"agent_approval_key,omitempty"`
+	// AgentServerKey and AgentClientKey are the secret names of the removed
+	// agent's keys (Host.AgentKeySecret), journaled with its certificates
+	AgentServerKey string `json:"agent_server_key,omitempty"`
+	AgentClientKey string `json:"agent_client_key,omitempty"`
 	// Changes are the cluster documents the recovery applied ("<kind>/<name>"
 	// -> the hash the node has, ChangePending before it is known) or removed
 	// (""): what the re-adoption expects besides the agent's ownership

@@ -189,6 +189,17 @@ func (o *Orch) recordsInitDocName(h state.Host) string {
 
 // agentDocs are the agent of a host and its records-init, if the cluster has agents.
 func (o *Orch) agentDocs(h state.Host) []any {
+	if o.St.Agent == nil {
+		return nil
+	}
+
+	return o.agentDocsWith(h, o.St.Agent.Image, o.imageRepos(), o.St.Agent.ApprovalKey)
+}
+
+// agentDocsWith are a host's agent documents with an image and pinned inputs
+// (repositories, approval key) given: a restored agent keeps the ones its
+// document had (plan 04, step 2).
+func (o *Orch) agentDocsWith(h state.Host, image string, repos []string, approvalKey string) []any {
 	if o.St.Agent == nil || h.AgentCert == "" {
 		return nil
 	}
@@ -197,8 +208,8 @@ func (o *Orch) agentDocs(h state.Host) []any {
 
 	return []any{
 		spec.RecordsVolume(),
-		daemons.RecordsInit(init, o.St.Agent.Image),
-		daemons.Agent(o.agentDocName(h), init, o.St.Agent.Image, o.imageRepos(), o.St.Agent.ApprovalKey, o.St.Agent.CACert, h.AgentCert, h.AgentKey, h.AgentClientCert, h.AgentClientKey),
+		daemons.RecordsInit(init, image),
+		daemons.Agent(o.agentDocName(h), init, image, repos, approvalKey, o.St.Agent.CACert, h.AgentCert, h.AgentKey, h.AgentClientCert, h.AgentClientKey),
 	}
 }
 

@@ -90,6 +90,7 @@ var intentCalls = map[string]bool{
 	"confirm osd": true, "close create": true, "osd out": true, "drain": true, "mon rm": true,
 	"noout set": true, "noout unset": true, "maintained": true, "mgr fail": true, "upgrade done": true,
 	"upgrade refused": true, "rgw cert": true, "rgw cert done": true, "retire keepalived": true, "mgr cert done": true,
+	"agent cert": true, "agent cert done": true,
 }
 
 // intend records a call's intent before it is made.
@@ -499,8 +500,9 @@ func (b *Bridge) AuthGet(ctx context.Context, entity string) (string, bool, erro
 }
 
 // Secret returns one of the cluster's secrets the leader renders into a
-// document (a mgr host's TLS keys, the RGW serving key, the VRRP password);
-// the module releases no other, never the CA keys or agent keys.
+// document (a mgr host's TLS keys, the RGW serving key, the VRRP password),
+// or an agent's keys for the renewal of its certificates it carries out; the
+// module releases no other, never the CA keys.
 func (b *Bridge) Secret(ctx context.Context, name string) (string, error) {
 	id, err := NewDispatchID()
 	if err != nil {
@@ -630,6 +632,38 @@ func (b *Bridge) MgrCert(ctx context.Context, op string) (MgrCerts, error) {
 // ones in use: the keys of that mgr's other certificates are removed.
 func (b *Bridge) MgrCertDone(ctx context.Context, op string) error {
 	_, err := b.do(ctx, "mgr cert done", map[string]any{"operation": op})
+
+	return err
+}
+
+// AgentCerts are an agent's certificates the module issued for its renewal
+// (plan 04, step 2); their keys are secrets of the attempt.
+type AgentCerts struct {
+	Attempt    string `json:"attempt"`
+	ServerCert string `json:"server_cert"`
+	ClientCert string `json:"client_cert"`
+}
+
+// AgentCert asks the module for the certificates of an agent its renewal
+// renews; asked again, it returns the same ones.
+func (b *Bridge) AgentCert(ctx context.Context, op string) (AgentCerts, error) {
+	out, err := b.do(ctx, "agent cert", map[string]any{"operation": op})
+	if err != nil {
+		return AgentCerts{}, err
+	}
+
+	var c AgentCerts
+	if err := json.Unmarshal([]byte(out), &c); err != nil || c.Attempt == "" || c.ServerCert == "" || c.ClientCert == "" {
+		return AgentCerts{}, errors.New("bridge: agent cert: malformed answer")
+	}
+
+	return c, nil
+}
+
+// AgentCertDone tells the module that a renewal's agent certificates are the
+// ones in use: the keys of that agent's other certificates are removed.
+func (b *Bridge) AgentCertDone(ctx context.Context, op string) error {
+	_, err := b.do(ctx, "agent cert done", map[string]any{"operation": op})
 
 	return err
 }

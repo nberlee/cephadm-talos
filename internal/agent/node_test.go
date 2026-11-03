@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/siderolabs/talos/pkg/machinery/api/machine"
 	"github.com/siderolabs/talos/pkg/machinery/client"
 	"github.com/siderolabs/talos/pkg/machinery/config/types/runtime"
 
@@ -37,11 +38,12 @@ func testNode(t *testing.T) (*Node, *talos.Client) {
 	return n, tc
 }
 
-// testNodeFake is testNode with the fake Talos node behind it.
-func testNodeFake(t *testing.T) (*Node, *talos.Client, *talostest.Node) {
+// testNodeFake is testNode with the fake Talos node behind it, and its image
+// service if one is given.
+func testNodeFake(t *testing.T, images ...machine.ImageServiceServer) (*Node, *talos.Client, *talostest.Node) {
 	t.Helper()
 
-	f := talostest.New(t)
+	f := talostest.New(t, images...)
 	tc := &talos.Client{Dial: func(ctx context.Context, _ talos.Conn) (*client.Client, error) { return f.Dial(ctx) }}
 	t.Cleanup(func() { tc.Close() }) //nolint:errcheck
 

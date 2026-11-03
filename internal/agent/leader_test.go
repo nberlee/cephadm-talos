@@ -19,6 +19,7 @@ import (
 	"github.com/nberlee/cephadm-talos/internal/pki"
 	"github.com/nberlee/cephadm-talos/internal/state"
 	"github.com/nberlee/cephadm-talos/internal/store"
+	"github.com/nberlee/cephadm-talos/internal/talos/talostest"
 	"github.com/nberlee/cephadm-talos/internal/wire"
 )
 
@@ -54,8 +55,9 @@ func newLeaderSetup(t *testing.T) *leaderSetup {
 	ch, err := NewChannel(pki.Identity{FSID: testFSID, Role: pki.RoleAgent, Name: "h0"})
 	must(t, err)
 
-	// the agent of h1, served over TLS with its server certificate
-	tg := newTestGranter(t)
+	// the agent of h1, served over TLS with its server certificate, its node
+	// pulling images
+	tg := newTestGranter(t, &talostest.ImageService{Cache: map[string]string{}, Remote: map[string]string{}})
 	sc, sk := ca.pair(pki.RoleAgent, "h1", x509.ExtKeyUsageServerAuth, testFSID)
 	srvTLS, err := TLSConfig([]byte(ca.cert), []byte(sc), []byte(sk))
 	must(t, err)

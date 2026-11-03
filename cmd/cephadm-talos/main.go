@@ -56,6 +56,7 @@ Commands:
   suspend [--reboot] [--force]             suspend the agents and the leader for a recovery session
   recover mons [--image REF]               bring the mons of a suspended cluster back on their stores
   resume                                   end the recovery session: agents re-adopt their nodes, a new leader takes over
+  agent restore <host> [--previous]        in a recovery session: apply a suspended host's agent again (--previous: the known good image)
   approve [--image REF] [--prepare H:DISK] [--zap H:DISK] [--drop H:SERIAL:ACTION] [--show]
                                            sign and publish the operator's approval of images and disks
   rm-cluster [--zap] [--reboot] [--force] --yes-i-really-mean-it
@@ -98,7 +99,7 @@ func run() error {
 	defer cancel()
 
 	// the agent runs in a container on every Ceph node and needs no cluster state
-	if args[0] == "agent" {
+	if args[0] == "agent" && len(args) == 1 {
 		return agent.Main(ctx)
 	}
 
@@ -235,6 +236,29 @@ func run() error {
 
 	if cmd == "resume" {
 		return o.Resume(ctx)
+	}
+
+	// part of a recovery session, with the host's agent suspended (plan 04, step 2)
+	if cmd == "agent" {
+		if len(args) == 0 || args[0] != "restore" {
+			return errors.New("agent restore <host> [--previous]")
+		}
+
+		fs := flag.NewFlagSet("agent restore", flag.ExitOnError)
+		previous := fs.Bool("previous", false, "the known good image: an unfinished agent upgrade's from-image, else the one the last upgrade upgraded from")
+		_ = fs.Parse(args[1:])
+
+		// the flag before or after the host
+		host := fs.Arg(0)
+		if fs.NArg() > 0 {
+			_ = fs.Parse(fs.Args()[1:])
+		}
+
+		if host == "" || fs.NArg() != 0 {
+			return errors.New("agent restore <host> [--previous]")
+		}
+
+		return o.RestoreAgent(ctx, host, *previous)
 	}
 
 	// once a leader owns the cluster state the CLI reads it and changes
@@ -578,6 +602,7 @@ func recordsJob(args []string) error {
 	job := fs.String("job", "", "job id")
 	inputs := fs.String("inputs", "", "job inputs")
 	session := fs.String("session", "", "record the suspension for this recovery session")
+	settle := fs.Bool("settle-self", false, "first settle an interrupted self-update's apply intent as failed (agent restore)")
 	_ = fs.Parse(args)
 
 	jobs := filepath.Join(records.Mount, records.JobsDir)
@@ -594,7 +619,15 @@ func recordsJob(args []string) error {
 	if _, err = os.Stat(dir); err != nil {
 		err = fmt.Errorf("no records of cluster %s on the node: %w", *fsid, err)
 	} else {
-		rep, err = agent.InspectRecords(&records.Store{Dir: dir}, *session)
+		recs, settled := &records.Store{Dir: dir}, ""
+		if *settle {
+			settled, err = agent.SettleSelfUpdate(recs)
+		}
+
+		if err == nil {
+			rep, err = agent.InspectRecords(recs, *session)
+			rep.Settled = settled
+		}
 	}
 
 	if err != nil {

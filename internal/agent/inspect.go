@@ -34,6 +34,10 @@ type RecordsReport struct {
 	// (UnixNano), empty without one
 	ApplyBoot string `json:"apply_boot,omitempty"`
 	ApplyAt   int64  `json:"apply_at,omitempty"`
+	// ApplySelf is the operation of an apply intent marked as a self-update
+	// (plan 04, step 2); Settled the self-update a settling job settled
+	ApplySelf string `json:"apply_self,omitempty"`
+	Settled   string `json:"settled,omitempty"`
 }
 
 // InspectRecords reads an agent's records; with session it first records the
@@ -82,6 +86,9 @@ func InspectRecords(recs *records.Store, session string) (RecordsReport, error) 
 		return RecordsReport{}, err
 	} else if pending {
 		rep.ApplyBoot, rep.ApplyAt = intent.BootID, intent.At.UnixNano()
+		if intent.Self {
+			rep.ApplySelf = intent.Operation
+		}
 	}
 
 	names, err := recs.List("op-")

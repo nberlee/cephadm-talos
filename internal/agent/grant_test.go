@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"github.com/nberlee/cephadm-talos/internal/render"
 	"github.com/nberlee/cephadm-talos/internal/state"
+	"github.com/siderolabs/talos/pkg/machinery/api/machine"
 	"github.com/siderolabs/talos/pkg/machinery/resources/containers"
 	"net/http"
 	"net/http/httptest"
@@ -39,10 +40,10 @@ type testGranter struct {
 	calls   int
 }
 
-func newTestGranter(t *testing.T) *testGranter {
+func newTestGranter(t *testing.T, images ...machine.ImageServiceServer) *testGranter {
 	t.Helper()
 
-	n, tc, f := testNodeFake(t)
+	n, tc, f := testNodeFake(t, images...)
 
 	_, err := n.Adopt(context.Background(), 1)
 	must(t, err)

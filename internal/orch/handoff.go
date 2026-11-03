@@ -103,14 +103,19 @@ func (o *Orch) Handoff(ctx context.Context) error {
 		}
 	}
 
-	// the operator's first approval: the cluster's images, no disks (plan 03,
-	// step 6c); without it the agents admit no image from the leader
+	// the operator's first approval: the cluster's images and the agents'
+	// image (plan 04, step 2), no disks (plan 03, step 6c); without it the
+	// agents admit no image from the leader
 	if last, _, err := o.lastApproval(); err != nil {
 		return err
 	} else if last == nil {
 		imgs := []string{o.St.Image}
 		if o.St.RGW != nil && o.St.RGW.KeepalivedImage != "" {
 			imgs = append(imgs, o.St.RGW.KeepalivedImage)
+		}
+
+		if o.St.Agent != nil && o.St.Agent.Image != "" {
+			imgs = append(imgs, o.St.Agent.Image)
 		}
 
 		if _, err := o.Approve(ctx, ApprovalChange{AddImages: imgs}); err != nil {

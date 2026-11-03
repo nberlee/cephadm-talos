@@ -427,7 +427,8 @@ func TestApprovals(t *testing.T) {
 		return a
 	}
 
-	if a := read(1); !a.Image(o.St.Image) || len(a.Disks) != 0 {
+	// the agents' image too: a self-update admits no other new one
+	if a := read(1); !a.Image(o.St.Image) || !a.Image(o.St.Agent.Image) || len(a.Disks) != 0 {
 		t.Fatalf("first approval %+v", a)
 	}
 

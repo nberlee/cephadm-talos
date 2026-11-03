@@ -124,6 +124,24 @@ type Grant struct {
 	// Ack acknowledges a job's recorded result; a grant that removes a job
 	// document whose result is not acknowledged needs it
 	Ack *JobAck `json:"ack,omitempty"`
+	// SelfUpdate, instead of documents, has the agent render and apply its
+	// own documents with these variable fields (plan 04, step 2)
+	SelfUpdate *SelfUpdate `json:"self_update,omitempty"`
+	// Pull, instead of documents, has the agent pull this image (by digest)
+	// on its own node
+	Pull string `json:"pull,omitempty"`
+}
+
+// SelfUpdate is what a self-update changes in the agent's own documents: its
+// image, or its server and client certificates with their keys (all four or
+// none); what it omits stays as the agent's current document has it. The
+// pinned inputs (the agent CA, repositories, approval key) never change.
+type SelfUpdate struct {
+	Image      string `json:"image,omitempty"`
+	Cert       string `json:"cert,omitempty"`
+	Key        string `json:"key,omitempty"`
+	ClientCert string `json:"client_cert,omitempty"`
+	ClientKey  string `json:"client_key,omitempty"`
 }
 
 // JobAck names a job's result the leader stored: the job, its inputs and its
@@ -174,7 +192,9 @@ func GrantInputs(g Grant) string {
 		Reboot    bool             `json:"reboot,omitempty"`
 		Approval  *approval.Signed `json:"approval,omitempty"`
 		Ack       *JobAck          `json:"ack,omitempty"`
-	}{g.FSID, g.Host, g.Revision, g.Operation, g.Docs, g.Restart, g.Reboot, g.Approval, g.Ack})
+		Self      *SelfUpdate      `json:"self_update,omitempty"`
+		Pull      string           `json:"pull,omitempty"`
+	}{g.FSID, g.Host, g.Revision, g.Operation, g.Docs, g.Restart, g.Reboot, g.Approval, g.Ack, g.SelfUpdate, g.Pull})
 
 	sum := sha256.Sum256(b)
 
@@ -220,6 +240,12 @@ type Operation struct {
 	// Reboot: the grant reboots the node; recorded with the boot before the
 	// call, completed once the node runs another boot
 	Reboot bool `json:"reboot,omitempty"`
+	// Self: the grant updates the agent's own documents; decided from its
+	// apply intent, or the self-update record it leaves
+	Self bool `json:"self,omitempty"`
+	// Pull: the grant pulls an image; one the agent's stop interrupted did
+	// not finish
+	Pull bool `json:"pull,omitempty"`
 	// a job's grant: the job, its result once read, and whether the leader
 	// acknowledged it (until then the record is kept)
 	Job    *JobRef    `json:"job,omitempty"`

@@ -55,6 +55,10 @@ type Host struct {
 	AgentKey        string `json:"-"`
 	AgentClientCert string `json:"agent_client_cert,omitempty"`
 	AgentClientKey  string `json:"-"`
+	// AgentKeys, set for agent certificates the mgr module issued (plan 04,
+	// step 2), names the secrets of their keys, "<operation>/<attempt>"
+	// (SecretIssued); without it the keys are the CLI's (SecretHost)
+	AgentKeys string `json:"agent_keys,omitempty"`
 	// MgrServerCert, MgrClientCert and their keys are the certificates of the
 	// mgr on this host (agent CA, identity mgr/<host>), set while it has one
 	MgrServerCert string `json:"mgr_server_cert,omitempty"`
@@ -81,11 +85,14 @@ type Published struct {
 
 // Agent holds the agent CA, the operator's client certificate and the agent image.
 type Agent struct {
-	Image        string `json:"image"` // digest reference
-	CACert       string `json:"ca_cert"`
-	CAKey        string `json:"-"` // a secret (Secrets)
-	OperatorCert string `json:"operator_cert"`
-	OperatorKey  string `json:"operator_key"`
+	Image string `json:"image"` // digest reference
+	// PreviousImage is the image an agent upgrade upgraded from, the known
+	// good for `agent restore --previous` (plan 04, step 2)
+	PreviousImage string `json:"previous_image,omitempty"`
+	CACert        string `json:"ca_cert"`
+	CAKey         string `json:"-"` // a secret (Secrets)
+	OperatorCert  string `json:"operator_cert"`
+	OperatorKey   string `json:"operator_key"`
 	// ApprovalKey is the public key every agent pins (internal/approval);
 	// ApprovalPriv, its private key, and Approval, the last approval the CLI
 	// signed (JSON of approval.Signed), stay on the workstation only
@@ -218,6 +225,28 @@ type Upgrade struct {
 	Done   []string `json:"done,omitempty"`
 }
 
+// AgentUpgrade is an agent upgrade in progress (plan 04, step 2), recorded
+// before its first step: its operation, the image it upgrades from and the
+// target, the hosts that pulled the target and those done, the host left for
+// last (the leader's when it started), whether it is paused (and why), the
+// attempt its steps' grants carry (a resume starts a new one), the step in
+// progress ("pull/<host>" or "self/<host>") and when it began; Finished once
+// the target is the agents' image.
+type AgentUpgrade struct {
+	Op       string    `json:"op"`
+	From     string    `json:"from"`
+	Image    string    `json:"image"`
+	Pulled   []string  `json:"pulled,omitempty"`
+	Done     []string  `json:"done,omitempty"`
+	Last     string    `json:"last,omitempty"`
+	Paused   bool      `json:"paused,omitempty"`
+	Error    string    `json:"error,omitempty"`
+	Attempt  int       `json:"attempt,omitempty"`
+	Step     string    `json:"step,omitempty"`
+	StepAt   time.Time `json:"step_at,omitzero"`
+	Finished bool      `json:"finished,omitempty"`
+}
+
 // ImageOf is the image a daemon runs: its own, else the cluster's.
 func (s *State) ImageOf(d Daemon) string {
 	if d.Image != "" {
@@ -293,6 +322,8 @@ type State struct {
 	LedgerApplied string `json:"-"`
 	// Upgrade is the upgrade in progress, nil without one
 	Upgrade *Upgrade `json:"-"`
+	// AgentUpgrade is the agent upgrade in progress or the last one finished
+	AgentUpgrade *AgentUpgrade `json:"-"`
 	// Inventory is the revision of the mgr module's inventory record: bumped,
 	// with its time, only when its content changes
 	Inventory InventoryRevision `json:"-"`
@@ -587,6 +618,8 @@ type cluster struct {
 	LedgerApplied string `json:"ledger_applied,omitempty"`
 	// Upgrade is the upgrade in progress
 	Upgrade *Upgrade `json:"upgrade,omitempty"`
+	// AgentUpgrade is the agent upgrade in progress or the last one finished
+	AgentUpgrade *AgentUpgrade `json:"agent_upgrade,omitempty"`
 }
 
 // Secret names: config-key entries below store.SecretPrefix, one per secret.
@@ -607,13 +640,24 @@ const (
 func SecretHost(host, key string) string { return "host/" + host + "/" + key }
 
 // SecretIssued is the secret name of a key the mgr module issued for a mgr
-// (Host.MgrKeys "<operation>/<attempt>", key SecretMgrServer or SecretMgrClient).
+// (Host.MgrKeys "<operation>/<attempt>", key SecretMgrServer or SecretMgrClient)
+// or an agent (Host.AgentKeys, key SecretAgentServer or SecretAgentClient).
 func SecretIssued(ref, key string) string { return "issued/" + ref + "/" + key }
 
 // MgrKeySecret is the secret name of one of a host's mgr keys.
 func (h Host) MgrKeySecret(key string) string {
 	if h.MgrKeys != "" {
 		return SecretIssued(h.MgrKeys, key)
+	}
+
+	return SecretHost(h.Name, key)
+}
+
+// AgentKeySecret is the secret name of one of a host's agent keys
+// (SecretAgentServer or SecretAgentClient).
+func (h Host) AgentKeySecret(key string) string {
+	if h.AgentKeys != "" {
+		return SecretIssued(h.AgentKeys, key)
 	}
 
 	return SecretHost(h.Name, key)
@@ -679,7 +723,7 @@ func (s *State) Records() (map[string][]byte, error) {
 	c := cluster{
 		Schema: SchemaVersion, FSID: s.FSID, Image: s.Image, CephVersion: s.CephVersion, Arch: s.Arch,
 		RGW: s.RGW, Published: s.Published, ConfPending: s.ConfPending, RGWPending: s.RGWPending, Inventory: s.Inventory,
-		HandingOver: s.HandingOver, Sealed: s.Sealed, LedgerApplied: s.LedgerApplied, Upgrade: s.Upgrade,
+		HandingOver: s.HandingOver, Sealed: s.Sealed, LedgerApplied: s.LedgerApplied, Upgrade: s.Upgrade, AgentUpgrade: s.AgentUpgrade,
 	}
 
 	if s.Agent != nil {
@@ -766,6 +810,7 @@ func (s *State) ApplyRecords(recs map[string][]byte) error {
 	s.Image, s.CephVersion, s.Arch, s.RGW, s.Published = c.Image, c.CephVersion, c.Arch, c.RGW, c.Published
 	s.ConfPending, s.RGWPending, s.Hosts, s.Daemons = c.ConfPending, c.RGWPending, hosts, daemons
 	s.Inventory, s.HandingOver, s.Sealed, s.LedgerApplied, s.Upgrade = c.Inventory, c.HandingOver, c.Sealed, c.LedgerApplied, c.Upgrade
+	s.AgentUpgrade = c.AgentUpgrade
 	s.Agent = c.Agent
 
 	if s.Agent != nil && operator != nil {

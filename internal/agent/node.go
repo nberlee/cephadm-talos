@@ -84,6 +84,11 @@ type applyIntent struct {
 	// ApplySettle, an apply that is not visible will not become visible
 	BootID string    `json:"boot_id"`
 	At     time.Time `json:"at"`
+	// Self marks a self-update (plan 04, step 2): Before and Sent are the
+	// agent's own documents, which the ownership never holds, and Operation
+	// is the grant's, for the self-update record that decides it
+	Self      bool   `json:"self,omitempty"`
+	Operation string `json:"operation,omitempty"`
 }
 
 // ApplySettle is how long after an apply was sent its absence from the config
@@ -130,6 +135,7 @@ type Node struct {
 		Hostname(ctx context.Context, node string) (string, error)
 		Addresses(ctx context.Context, node string) ([]string, error)
 		Logs(ctx context.Context, node, name string) (string, error)
+		PullImage(ctx context.Context, node, ref string, refresh bool) (string, error)
 	}
 	Records *records.Store
 	// JobsDir is where the node's jobs write their claims and results (the
@@ -795,6 +801,13 @@ func (n *Node) Reconcile(ctx context.Context) (outcome string, rev, owned int64,
 	cur, err := parseDocs(cfg)
 	if err != nil {
 		return "", 0, 0, err
+	}
+
+	// a self-update compares the agent's own documents; the ownership stays
+	if intent.Self {
+		outcome, err := n.reconcileSelf(intent, cur, settled)
+
+		return outcome, intent.Revision, 0, err
 	}
 
 	next := Ownership{Schema: ownershipSchema, Revision: intent.Revision, Docs: map[string]string{}}
