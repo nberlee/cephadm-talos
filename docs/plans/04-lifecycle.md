@@ -136,6 +136,8 @@ Codex round 2 of this design (2026-11-03), fixed: a restore settles an interrupt
 
 Live check: an agent certificate renewed by the module on every host, the leader's included, without a lost grant; an agent upgrade to a new build across all hosts with a failover, a bad image (one that does not start) paused and restored with `agent restore --previous`.
 
+Live check done (2026-11-03), all passed, after fixes it found: the module's certificates named the CA's key identifier as SHA-1 of the key while Go's CAs use a truncated SHA-256 (OpenSSL refused a renewed agent client certificate); a refused renewal waited a day (now 10 minutes) and a host's renewals now go the earliest expiry first; the module's 3 years matched the CLI's calendar years. `--stop`: an upgrade stopped after its first host rolled back in 46 seconds; a bad image paused, stopped, its agent restored in a suspension, the rollback finished without a second pause; a new upgrade then ran to the end.
+
 ## Tests
 
 - Unit: renewal and the ledger operations it accepts, key release bound to them; the module's credential reload; the operator certificate's warning and the expired-certificate suspension path; CRL issue, ordering, delivery by status polls, persistence, refusal; agent document admission against the agent's own policy; self-upgrade order and restore; remote intents in receipts, serialization, settlement; snapshot chunking, reads by key, backpressure; journal import skipping compacted operations; `resolve` refusing while the job could run; drain steps and stop; the going-down report, the unplanned stop in the fold and clearing only its own noout; member classification; the replacement protocol.
