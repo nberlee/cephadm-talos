@@ -657,3 +657,66 @@ func TestAStopOfAPausedUpgradeRollsBackAndAResumeContinuesIt(t *testing.T) {
 		t.Fatalf("after the resume %+v", u)
 	}
 }
+
+func TestAStopRunsAheadOfAStalledOperation(t *testing.T) {
+	s, _ := agentSetup(t)
+	ctx := context.Background()
+
+	up := startUpgrade(t, s)
+	s.leader.OwnReport = ownRunning(s, agentImage)
+	s.leader.serves = func(string, int, string) bool { return false } // a renewal that stalls
+
+	// paused: no step in progress
+	s.changeUpgrade(t, func(u *state.AgentUpgrade) { u.StepAt = time.Now().Add(-agentUpgradeWithin - time.Minute) })
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if u := s.agentUpgrade(t); !u.Paused || u.Step != "" {
+		t.Fatalf("not paused %+v", u)
+	}
+
+	renew := s.accept(KindRenewAgent, "", "h1", 2)
+	stop := s.acceptOp(KindAgentStop, 3, func(op *LedgerOp) { op.Upgrade = up.Op.ID })
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	// the stop ran ahead, the rollback and its first step before the renewal
+	if op := s.op(t, stop.Op.ID); op.State != wire.OpCompleted {
+		t.Fatalf("stop %+v", op)
+	}
+
+	if u := s.agentUpgrade(t); u.Stopped != agentImage2 || u.Paused || u.Step == "" {
+		t.Fatalf("the rollback %+v", u)
+	}
+
+	if s.ended(renew.Op.ID) || s.ended(renew.Op.ID+".self") {
+		t.Fatal("the renewal ran before the rollback's step")
+	}
+}
+
+func TestAStopDuringAStepRollsBackBeforeQueuedWork(t *testing.T) {
+	s, _ := agentSetup(t)
+	ctx := context.Background()
+
+	up := startUpgrade(t, s) // h1's step in progress
+	s.leader.OwnReport = ownRunning(s, agentImage)
+	s.leader.serves = func(string, int, string) bool { return false }
+
+	renew := s.accept(KindRenewAgent, "", "h1", 2)
+	s.acceptOp(KindAgentStop, 3, func(op *LedgerOp) { op.Upgrade = up.Op.ID })
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if u := s.agentUpgrade(t); !u.Stopping || u.Step != "self/h1" {
+		t.Fatalf("while the step ends %+v", u)
+	}
+
+	agentRunning(t, s, agentImage2)
+	must(t, s.leader.Tick(ctx, 42, 5)) // the step ends
+	must(t, s.leader.Tick(ctx, 42, 5)) // the rollback and its first step, ahead of the renewal
+
+	if u := s.agentUpgrade(t); u.Stopping || u.Stopped != agentImage2 || u.Step == "" {
+		t.Fatalf("the rollback %+v", u)
+	}
+
+	if s.ended(renew.Op.ID + ".self") {
+		t.Fatal("the renewal ran before the rollback")
+	}
+}

@@ -125,18 +125,30 @@ func (l *LeaderLoop) ledgerOps(ctx context.Context, b *Bridge, js store.Backend,
 				}
 			}
 
-			// so does an agent upgrade's step in progress, beside its resumes
+			// an unfinished agent upgrade's controls (resumes, stops) run ahead of
+			// queued operations, with a step in progress or not; then a step in
+			// progress holds the slot, and a stop turns into its rollback and that
+			// rollback's first step before queued work. A paused upgrade without
+			// a control holds nothing
 			if au := st.AgentUpgrade; au != nil && !au.Finished && !isAgentControl(e.Op.Kind) {
+				if err := l.agentResumeAhead(ctx, b, js, gid, epoch, after, au.Op); err != nil {
+					return err
+				}
+
 				cur, _, err := l.clusterState(ctx, b)
 				if err != nil {
 					return err
 				}
 
-				if u := cur.AgentUpgrade; u != nil && !u.Finished && u.Step != "" {
-					if err := l.agentResumeAhead(ctx, b, js, gid, epoch, after, u.Op); err != nil {
+				if u := cur.AgentUpgrade; u != nil && !u.Finished && u.Stopping && u.Step == "" {
+					if err := l.agentUpgradeStep(ctx, b, js, gid, epoch); err != nil && !errors.Is(err, errRetry) {
 						return err
 					}
 
+					return l.agentUpgradeStep(ctx, b, js, gid, epoch)
+				}
+
+				if u := cur.AgentUpgrade; u != nil && !u.Finished && u.Step != "" {
 					return l.agentUpgradeStep(ctx, b, js, gid, epoch)
 				}
 			}
