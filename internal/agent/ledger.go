@@ -940,6 +940,30 @@ func removalOf(op LedgerOp) removal {
 	return removal{op: op, id: op.ID, daemon: op.Daemon, uuid: op.UUID, zap: op.Zap}
 }
 
+// markRetiring records in the state that a daemon's removal is about to take
+// its first step that cannot be undone (an OSD's retirement and purge, a mon's
+// `mon rm`, a mgr or RGW leaving the state): a drain's stop never abandons it
+// from then on (plan 04, step 5). A daemon absent from the state is left so.
+func (l *LeaderLoop) markRetiring(ctx context.Context, b *Bridge, gid int64, daemon string) error {
+	st, _, err := l.clusterState(ctx, b)
+	if err != nil {
+		return err
+	}
+
+	if x, ok := daemonOf(st, daemon); !ok || x.Retiring {
+		return nil
+	}
+
+	return l.changeState(ctx, b, gid, func(st *state.State) error {
+		if x, ok := daemonOf(st, daemon); ok && !x.Retiring {
+			x.Retiring = true
+			st.AddDaemon(x)
+		}
+
+		return nil
+	})
+}
+
 // started is the journal id the removal began under.
 func (r removal) started() string {
 	if r.base != "" {
@@ -1015,8 +1039,13 @@ func (l *LeaderLoop) removeDaemonAs(ctx context.Context, b *Bridge, js store.Bac
 	}
 
 	// the module checks the quorum without it and takes it out of the monmap
-	// (done once it is out), before its document goes
+	// (done once it is out), before its document goes; marked retiring first,
+	// as `mon rm` is the removal's first step that cannot be undone
 	if typ == state.TypeMon && !terminal(rs) {
+		if err := l.markRetiring(ctx, b, gid, r.daemon); err != nil {
+			return err
+		}
+
 		if err := r.call(ctx, b, "mon rm"); err != nil {
 			return err
 		}
@@ -1051,6 +1080,12 @@ func (l *LeaderLoop) removeDaemonAs(ctx context.Context, b *Bridge, js store.Bac
 					return err
 				}
 			}
+		}
+
+		// marked retiring before it leaves the state (the removal's first step
+		// that cannot be undone for a mgr or an RGW)
+		if err := l.markRetiring(ctx, b, gid, r.daemon); err != nil {
+			return err
 		}
 
 		if err := l.changeState(ctx, b, gid, func(st *state.State) error {
@@ -1571,14 +1606,7 @@ func (l *LeaderLoop) removeOSDAs(ctx context.Context, b *Bridge, js store.Backen
 	// finished (the purge, its zap, the state's entry) also after a drain's
 	// stop, whether or not the module's purge is known to have happened
 	if !d.Retiring && !d.Purged {
-		if err := l.changeState(ctx, b, gid, func(st *state.State) error {
-			if x, ok := daemonOf(st, r.daemon); ok && !x.Retiring {
-				x.Retiring = true
-				st.AddDaemon(x)
-			}
-
-			return nil
-		}); err != nil {
+		if err := l.markRetiring(ctx, b, gid, r.daemon); err != nil {
 			return err
 		}
 	}

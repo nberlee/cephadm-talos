@@ -228,9 +228,10 @@ type Daemon struct {
 	// Leaving: an OSD the leader is removing: not rendered, its identity kept
 	// until it is purged and, if asked, zapped
 	Leaving bool `json:"leaving,omitempty"`
-	// Retiring: the leader is about to ask the module to retire (purge) this
-	// leaving OSD; recorded first, so a drain's stop never abandons a removal
-	// whose purge may have happened (plan 04, step 5)
+	// Retiring: the leader's removal of this daemon is about to take its first
+	// step that cannot be undone (an OSD's purge, a mon's `mon rm`, a mgr or
+	// RGW leaving the state); recorded first, so a drain's stop never abandons
+	// it (plan 04, step 5)
 	Retiring bool `json:"retiring,omitempty"`
 	// Joining: a mon the leader deployed that has not joined the quorum yet;
 	// ceph.conf does not name it until it has

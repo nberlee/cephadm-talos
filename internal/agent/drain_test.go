@@ -610,3 +610,65 @@ func TestAStopFinishesAnOSDRemovalWhoseRetirementWasAsked(t *testing.T) {
 		t.Fatalf("after: record %+v, osd %t, calls %v", h.Drain, osd, s.calls())
 	}
 }
+
+func TestAStopFinishesAMonRemovalPastItsMonRm(t *testing.T) {
+	s, _ := drainSetup(t)
+	ctx := context.Background()
+
+	drain := s.accept(KindDrain, "", "h1", 2)
+	for range 3 { // the OSDs out, the OSD, the mgr
+		must(t, s.leader.Tick(ctx, 42, 5))
+	}
+
+	if d := s.drain(t); d == nil || d.Step != "" || d.Attempt != 3 {
+		t.Fatalf("record before the mon: %+v", d)
+	}
+
+	// `mon rm` takes effect, its answer never comes: the mon was marked first
+	s.module.mu.Lock()
+	s.module.hang = "mon rm"
+	s.module.mu.Unlock()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	st, _, err := s.leader.clusterState(ctx, s.leader.bridge())
+	must(t, err)
+
+	if x, ok := st.Find("mon.h1"); !ok || !x.Retiring {
+		t.Fatalf("the mon before its removal went on: %+v", x)
+	}
+
+	s.leader.failing[drain.Op.ID+".d4"] = time.Now().Add(-stuckAfter - time.Minute)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if d := s.drain(t); d == nil || !d.Paused || d.Step != "mon.h1" {
+		t.Fatalf("record: %+v", d)
+	}
+
+	// stopped: the removal is kept and finished (document, ceph.conf, retirement)
+	stop := s.accept(KindDrainStop, "", "h1", 3)
+	stop.Op.Drain = drain.Op.ID
+	s.module.mu.Lock()
+	s.module.ledger[len(s.module.ledger)-1] = stop
+	s.module.hang, s.module.retired = "", nil
+	s.module.mu.Unlock()
+
+	for range 2 {
+		must(t, s.leader.Tick(ctx, 42, 5))
+	}
+
+	// retried under a new attempt, not given up
+	if r := s.op(t, drain.Op.ID+".d5"); r.State != "completed" {
+		t.Fatalf("retried step: %+v", r)
+	}
+
+	st, _, err = s.leader.clusterState(ctx, s.leader.bridge())
+	must(t, err)
+
+	h, _ := st.Host("h1")
+	_, mon := st.Find("mon.h1")
+
+	if h.Drain != nil || mon || !slices.Contains(s.calls(), "retire "+drain.Op.ID+" mon.h1") || !slices.Contains(s.calls(), "drain done "+drain.Op.ID) {
+		t.Fatalf("after: record %+v, mon %t, calls %v", h.Drain, mon, s.calls())
+	}
+}
