@@ -614,6 +614,8 @@ class Module(orchestrator.Orchestrator, MgrModule):
         Option('container_image_keepalived', type='str', default='', desc='keepalived container image of the ingress, by digest'),
         # the renewal threshold of the daily certificate check (plan 04, step 1); a
         # larger value renews earlier, for tests
+        Option('talos_compact_after', type='int', default=ledger.COMPACT_AFTER, min=10, max=ledger.COMPACT_AFTER,
+               desc='compact the ledger once more entries than this follow its snapshot (lower for tests)'),
         Option('talos_cert_renew_days', type='int', default=30, min=1, desc='renew certificates that expire within this many days'),
         # the validity of the agent CA's revocation list (plan 04, step 3): at
         # most 7 days, the agents' limit; a lower value is for tests
@@ -926,7 +928,12 @@ class Module(orchestrator.Orchestrator, MgrModule):
             if led.delete(now, active, self._prune_journals):
                 self.log.info('ledger: removed what snapshot %s covers', led.snapshot_key)
                 self._deleted, self._pruned_next = led.snapshot_key, mono + COMPACT_EVERY
-        if len(led.entries) <= ledger.COMPACT_AFTER or mono < self.__dict__.get('_cut_next', 0.0):
+        try:
+            after = self.get_module_option('talos_compact_after')
+        except Exception:  # a test double without options
+            after = None
+        after = after if isinstance(after, int) and after > 0 else ledger.COMPACT_AFTER
+        if len(led.entries) <= after or mono < self.__dict__.get('_cut_next', 0.0):
             return
         store = self.get_store_prefix(STORE_PREFIX)
         states = {k: v.get('state') for k, v in self._journal_index().items()}
