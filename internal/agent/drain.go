@@ -124,6 +124,10 @@ func (l *LeaderLoop) drainControl(ctx context.Context, b *Bridge, js store.Backe
 		}
 
 		switch {
+		case op.Kind == KindDrainStop && h.Drain.Paused && mustFinish(st, *h.Drain):
+			// a removal whose daemon left the state is finished first: retried
+			h.Drain.Stopped, h.Drain.Paused, h.Drain.Error = true, false, ""
+			h.Drain.Attempt++
 		case op.Kind == KindDrainStop && h.Drain.Paused:
 			// the failed step is given up: the drain ends
 			h.Drain.Stopped, h.Drain.Paused, h.Drain.Step = true, false, ""
@@ -170,6 +174,22 @@ func (l *LeaderLoop) drainControlsAhead(ctx context.Context, b *Bridge, js store
 			return nil
 		}
 	}
+}
+
+// mustFinish reports whether a drain's step is a removal that has taken its
+// daemon out of the state already (a mgr's, an RGW's or a mon's: removeDaemon
+// drops it before the revision and the retirement): it is finished before the
+// drain record goes, also after a stop. An OSD leaves the state last, so one
+// absent is removed; a daemon still in the state may be abandoned by a stop.
+func mustFinish(st *state.State, d state.Drain) bool {
+	typ, _, _ := strings.Cut(d.Step, ".")
+	if d.Step == "" || d.Step == drainStepOut || typ == state.TypeOSD {
+		return false
+	}
+
+	x, ok := st.Find(d.Step)
+
+	return !ok || x.Host != strings.TrimPrefix(d.Step, typ+".")
 }
 
 // drainNext is a drain's next step on its host: the OSDs out, each OSD (the
@@ -304,8 +324,9 @@ func (l *LeaderLoop) drainStep(ctx context.Context, b *Bridge, js store.Backend,
 			return nil
 		}
 
-		if !ok && !x.Drain.Stopped {
-			// the step stays: a resume continues its removal first
+		if !ok && (!x.Drain.Stopped || mustFinish(st, *x.Drain)) {
+			// the step stays: a resume continues its removal first; a stop
+			// does not give up a removal whose daemon left the state
 			x.Drain.Paused, x.Drain.Error = true, fmt.Sprintf("%s: %s %s", d.Step, s, rec.Error)
 			st.AddHost(x)
 

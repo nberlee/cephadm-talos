@@ -387,3 +387,101 @@ func TestAResumedDrainFinishesTheRemovalItPausedIn(t *testing.T) {
 		t.Fatalf("calls %v", got)
 	}
 }
+
+func TestAStopFinishesARemovalWhoseDaemonLeftTheState(t *testing.T) {
+	s, _ := drainSetup(t)
+	ctx := context.Background()
+
+	drain := s.accept(KindDrain, "", "h1", 2)
+	must(t, s.leader.Tick(ctx, 42, 5)) // the OSDs out
+	must(t, s.leader.Tick(ctx, 42, 5)) // the OSD removed
+
+	// the mgr leaves the state, its retirement keeps failing: paused
+	s.module.mu.Lock()
+	s.module.refuse = "retire"
+	s.module.mu.Unlock()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+	s.leader.failing[drain.Op.ID+".d3"] = time.Now().Add(-stuckAfter - time.Minute)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	// stopped: the record stays, stopping with that removal, retried
+	stop := s.accept(KindDrainStop, "", "h1", 3)
+	stop.Op.Drain = drain.Op.ID
+	s.module.mu.Lock()
+	s.module.ledger[len(s.module.ledger)-1] = stop
+	s.module.mu.Unlock()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if d := s.drain(t); d == nil || !d.Stopped || d.Paused || d.Step != "mgr.h1" || d.Attempt != 4 {
+		t.Fatalf("record after the stop: %+v", d)
+	}
+
+	// failing again, it pauses again, not given up
+	s.leader.failing[drain.Op.ID+".d4"] = time.Now().Add(-stuckAfter - time.Minute)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if d := s.drain(t); d == nil || !d.Stopped || !d.Paused || d.Step != "mgr.h1" {
+		t.Fatalf("record after the second failure: %+v", d)
+	}
+
+	// resumed (host drain again): the retirement goes through, then the drain
+	// ends without another step (the mon stays)
+	resume := s.accept(KindDrainResume, "", "h1", 4)
+	resume.Op.Drain = drain.Op.ID
+	s.module.mu.Lock()
+	s.module.ledger[len(s.module.ledger)-1] = resume
+	s.module.refuse, s.module.retired = "", nil
+	s.module.mu.Unlock()
+
+	for range 2 {
+		must(t, s.leader.Tick(ctx, 42, 5))
+	}
+
+	if got := s.calls(); !slices.Equal(got, []string{"retire " + drain.Op.ID + " mgr.h1", "drain done " + drain.Op.ID}) {
+		t.Fatalf("calls %v", got)
+	}
+
+	st, _, err := s.leader.clusterState(ctx, s.leader.bridge())
+	must(t, err)
+
+	if h, _ := st.Host("h1"); h.Drain != nil {
+		t.Fatalf("record: %+v", h.Drain)
+	}
+
+	if _, ok := st.Find("mon.h1"); !ok {
+		t.Fatal("the stopped drain removed the mon")
+	}
+}
+
+func TestAStopGivesUpAFailedStepWhoseDaemonStays(t *testing.T) {
+	s, _ := drainSetup(t)
+	ctx := context.Background()
+
+	s.module.mu.Lock()
+	s.module.refuse = "retire" // osd.3 stays in the state until its retirement
+	s.module.mu.Unlock()
+
+	drain := s.accept(KindDrain, "", "h1", 2)
+	must(t, s.leader.Tick(ctx, 42, 5))
+	must(t, s.leader.Tick(ctx, 42, 5))
+	s.leader.failing[drain.Op.ID+".d2"] = time.Now().Add(-stuckAfter - time.Minute)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if d := s.drain(t); d == nil || !d.Paused || d.Step != "osd.3" {
+		t.Fatalf("record: %+v", d)
+	}
+
+	stop := s.accept(KindDrainStop, "", "h1", 3)
+	stop.Op.Drain = drain.Op.ID
+	s.module.mu.Lock()
+	s.module.ledger[len(s.module.ledger)-1] = stop
+	s.module.mu.Unlock()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if d := s.drain(t); d != nil {
+		t.Fatalf("record after the stop: %+v", d)
+	}
+}

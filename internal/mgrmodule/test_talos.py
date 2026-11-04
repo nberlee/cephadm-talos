@@ -1504,6 +1504,12 @@ class Drain(unittest.TestCase):
         self.assertEqual(mod._authority()[1].draining, {})
         self.assertTrue(m.Module.daemon_action(mod, 'restart', 'mon.h1').exception_str)
         self.assertTrue(m.Module.stop_drain_host(mod, 'h1').exception_str)
+        # a stopped drain paused in a removal it must finish: drain again resumes it
+        self.record(entries, inv, op=drain['id'], step='mgr.h1', stopped=True, paused=True, error='retire refused')
+        self.assertEqual(m.Module.drain_host(mod, 'h1').exception_str, '')
+        resume = mod._ledger.executable()[-1][1]
+        self.assertEqual((resume['kind'], resume['drain']), ('drain_resume', drain['id']))
+        self.assertTrue(m.Module.drain_host(mod, 'h2').exception_str)  # h1 still draining
         # the record cleared: h1 takes operations again
         entries.update(state_entries(inv, {'fsid': 'f', 'sealed': True}, incarnation='20', seq=2))
         self.assertEqual(m.Module.daemon_action(mod, 'restart', 'mon.h1').exception_str, '')

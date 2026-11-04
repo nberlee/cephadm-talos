@@ -1543,6 +1543,11 @@ class Module(orchestrator.Orchestrator, MgrModule):
                 raise OrchestratorError('the drain of %s was accepted %s --zap-osd-devices' % (hostname, 'with' if d['zap'] else 'without'))
             op_id = self._accept_control('drain_resume', hostname, drain=d['op'])
             return 'Scheduled to resume the drain of host %s (operation %s)' % (hostname, op_id)
+        rec = self._drain_record(hostname)
+        if rec.get('stopped') and rec.get('paused'):
+            # a stopped drain paused in a removal it must finish: again resumes it
+            op_id = self._accept_control('drain_resume', hostname, drain=str(rec.get('op')))
+            return 'Scheduled to resume the removal the stopped drain of host %s paused in (operation %s)' % (hostname, op_id)
         others = self._drains(fold)
         if others:
             raise OrchestratorError('%s is draining' % ', '.join(sorted(others)))
