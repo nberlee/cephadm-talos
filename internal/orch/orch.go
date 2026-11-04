@@ -958,7 +958,8 @@ func (o *Orch) Bootstrap(ctx context.Context, addr, image, agentImage string, re
 		return err
 	}
 
-	if err := o.apply(ctx, h.Addr, append(docs, monDoc, mgrDoc)...); err != nil {
+	// the mgr with its guard (plan 04, step 5, item 2b)
+	if err := o.apply(ctx, h.Addr, append(docs, monDoc, mgrDoc, render.MgrGuard(o.St, mgr, image))...); err != nil {
 		return err
 	}
 
@@ -1179,7 +1180,7 @@ func (o *Orch) deployMgr(ctx context.Context, h state.Host) error {
 		return err
 	}
 
-	if err := o.apply(ctx, h.Addr, append(mgrFiles, doc)...); err != nil {
+	if err := o.apply(ctx, h.Addr, append(mgrFiles, doc, render.MgrGuard(o.St, d, o.St.Image))...); err != nil {
 		return err
 	}
 

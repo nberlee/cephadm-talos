@@ -203,6 +203,23 @@ func Daemon(s *state.State, h state.Host, d state.Daemon, image string, key Key,
 	return nil, fmt.Errorf("unknown daemon type %q", d.Type)
 }
 
+// TypeMgrGuard is the document type of a mgr's guard (daemons.MgrGuard): not
+// a daemon of the state, rendered with its mgr.
+const TypeMgrGuard = "mgr-guard"
+
+// MgrGuardName is the document of a mgr's guard.
+func MgrGuardName(s *state.State, mgr state.Daemon) string {
+	return s.DocName(state.Daemon{Type: TypeMgrGuard, ID: mgr.ID})
+}
+
+// MgrGuard renders the guard of a mgr of the state (plan 04, step 5, item 2b),
+// on the mgr's image, depending on the mgr's document: every rendering of a
+// host's mgr carries it, and a mgr's removal removes it with the mgr (Talos
+// refuses a config naming a container it does not have).
+func MgrGuard(s *state.State, mgr state.Daemon, image string) *spec.ContainerConfig {
+	return daemons.MgrGuard(MgrGuardName(s, mgr), image, s.FSID, mgr.ID, s.DocName(mgr))
+}
+
 // vipParams sets a keepalived's VRRP parameters: priority by placement order
 // (the first is preferred), the other VIP hosts' keepalived as unicast peers,
 // each at the address it runs on (DaemonAddr).

@@ -154,6 +154,29 @@ func Mgr(p Params, moduleFiles ...string) *spec.ContainerConfig {
 	return c
 }
 
+// MgrGuardDelay is how long a mgr's guard holds its mgr up after its host's
+// stop began (mgr-guard.sh).
+const MgrGuardDelay = 4 * time.Second
+
+// MgrGuard renders the guard of a host's mgr (plan 04, step 5, item 2b): it
+// depends on the mgr running, so Talos's reverse dependsOn shutdown order
+// stops it first on its host's stop and the mgr only after it exited, which it
+// does MgrGuardDelay after SIGTERM: the agent's going-down report reaches its
+// own host's module, which records host_down and fails over. ceph-mgr itself
+// exits at once on SIGTERM. The Ceph image, no capabilities, no mounts, no
+// network: it only sleeps. A restart or redeploy of the mgr alone does not
+// touch it.
+func MgrGuard(name, image, fsid, id, mgr string) *spec.ContainerConfig {
+	c := spec.Container(name, image)
+	c.ContainerEntrypoint = []string{"/bin/bash", "-c", rawScript("mgr-guard")}
+	c.ContainerEnvironment = []string{"FSID=" + fsid, "ID=" + id}
+	c.SecurityConfig = spec.Restricted()
+	c.RestartConfig = spec.RestartBackoff(RestartDelay, RestartMaxDelay)
+	c.DependsOnConfig = &container.ContainerDependsOn{ContainersConfig: running([]string{mgr})}
+
+	return c
+}
+
 // OSD renders a ceph-osd container on a raw block device.
 //
 // It has to be privileged: ceph-volume reads and labels the device, mounts a

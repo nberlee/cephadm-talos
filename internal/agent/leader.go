@@ -1024,6 +1024,12 @@ func (l *LeaderLoop) renderHost(ctx context.Context, b *Bridge, st *state.State,
 		}
 
 		objs = append(objs, c)
+
+		// a mgr with its guard, which holds it up on its host's stop (plan
+		// 04, step 5, item 2b)
+		if d.Type == state.TypeMgr {
+			objs = append(objs, render.MgrGuard(st, d, st.ImageOf(d)))
+		}
 	}
 
 	r := rendered{hashes: map[string]string{}}
@@ -1141,6 +1147,17 @@ func (l *LeaderLoop) revision(ctx context.Context, b *Bridge, js store.Backend, 
 
 		r.remove = append(r.remove, mode.extra...)
 
+		// a guard whose mgr is not rendered goes with it (in the same apply:
+		// Talos refuses a config naming a container it does not have)
+		guards := "ContainerConfig/ceph-" + st.Short() + "-" + render.TypeMgrGuard + "-"
+		for k := range rep.Owned {
+			if _, ok := r.hashes[k]; strings.HasPrefix(k, guards) && !ok && !slices.Contains(r.remove, k) {
+				r.remove = append(r.remove, k)
+			}
+		}
+
+		sort.Strings(r.remove)
+
 		// a host in maintenance keeps its daemons in the state with their
 		// documents removed (renderHost renders none); stop takes documents
 		// off before the rest (keepalived before maintenance)
@@ -1179,6 +1196,9 @@ func (l *LeaderLoop) revision(ctx context.Context, b *Bridge, js store.Backend, 
 
 			sort.Strings(r.remove)
 		}
+
+		// a removal named twice (a guard of a host in maintenance) once
+		r.remove = slices.Compact(r.remove)
 
 		for _, d := range mode.add {
 			td, err := checkDoc(d)

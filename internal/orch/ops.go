@@ -754,6 +754,11 @@ func (o *Orch) removeDoc(ctx context.Context, h state.Host, d state.Daemon) erro
 		}
 	}
 
+	// a mgr's guard names it: removed in the same apply (plan 04, step 5, item 2b)
+	if d.Type == state.TypeMgr {
+		return o.apply(ctx, h.Addr, spec.Delete("ContainerConfig", render.MgrGuardName(o.St, d)), spec.Delete("ContainerConfig", o.St.DocName(d)))
+	}
+
 	if len(vips) == 0 {
 		return o.remove(ctx, h.Addr, o.St.DocName(d))
 	}
