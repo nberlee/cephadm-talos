@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/netip"
 	"slices"
 	"strings"
@@ -439,4 +440,255 @@ func (s *leaderSetup) findDaemon(t *testing.T, name string) (state.Daemon, bool)
 	must(t, err)
 
 	return st.Find(name)
+}
+
+// A move's roll keeps its namespace and its peers' records across its step's
+// attempts: a peer whose certificate an earlier attempt set but whose
+// revision failed is rolled to its end under the next attempt, not skipped
+// (Codex round 1 of part B).
+func TestAResumedRollFinishesAPeerItBegan(t *testing.T) {
+	s, rgw, vip := rgwSetup(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	addInstance(t, s.agent.fake, rgw, 1)
+
+	op := LedgerOp{Version: 1, ID: "op-00000000000000bf", Kind: KindSetAddr, Host: "h0", Addr: "10.5.0.9"}
+	target := "issued/" + op.ID + "/0123456789abcdef"
+	cert, key := splitPEM(servingPEM(t, now.Add(-time.Hour), now.Add(24*time.Hour), "10.5.0.3", "h1", "10.5.0.200"))
+
+	s.module.mu.Lock()
+	s.module.kv[store.SecretPrefix+target+"/rgw-server.key"] = key
+	// the first attempt's revision of the peer failed
+	s.module.kv[JournalPrefix(42)+"op/"+op.ID+".roll.h1.t1.rev"] = `{"version":1,"kind":"revision","host":"h1","state":"failed"}`
+	s.module.mu.Unlock()
+
+	must(t, s.leader.changeState(ctx, s.leader.bridge(), 42, func(st *state.State) error {
+		st.RGW.Certs = append(st.RGW.Certs, state.RGWCert{ID: target, Cert: cert})
+
+		return nil
+	}))
+
+	s.leader.serves = func(_ string, _ int, chain string) bool { return chain == cert }
+
+	js, err := s.leader.bridge().Store(ctx, JournalPrefix(42))
+	must(t, err)
+
+	roll := func(try string) (bool, error) {
+		done, err := s.leader.rollRGWTry(ctx, s.leader.bridge(), js, 42, 5, op, target, "roll", try)
+		if errors.Is(err, errRetry) {
+			return false, nil
+		}
+
+		return done, err
+	}
+
+	// the first attempt: keepalived off, the certificate set, the revision failed
+	var last error
+	for range 3 {
+		if _, last = roll(".t1"); last != nil {
+			break
+		}
+	}
+
+	if last == nil || !strings.Contains(last.Error(), "did not apply") {
+		t.Fatalf("the first attempt: %v", last)
+	}
+
+	if d, _ := s.findDaemon(t, "rgw.h1"); d.Cert != target || owned(t, s, vip) {
+		t.Fatalf("after the first attempt: %q, keepalived owned %v", d.Cert, owned(t, s, vip))
+	}
+
+	// the next attempt finishes the peer: its revision, its keepalived back
+	addInstance(t, s.agent.fake, rgw, 2)
+
+	for range 3 {
+		if _, err := roll(".t2"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	keepalivedLog(s, vip, "2", "MASTER")
+
+	done, err := roll(".t2")
+	if err != nil || !done || !owned(t, s, vip) {
+		t.Fatalf("the second attempt: %v %v", done, err)
+	}
+
+	if r := s.op(t, op.ID+".roll.h1.t2.rev"); r.State != wire.OpCompleted {
+		t.Fatalf("the peer's revision under the second attempt: %+v", r)
+	}
+}
+
+// A move's RGW step holds queued operations until it ends (Codex round 1).
+func TestAMovesRGWStepHoldsQueuedOperations(t *testing.T) {
+	s, rgw, vip := rgwSetup(t)
+	ctx := context.Background()
+
+	addInstance(t, s.agent.fake, rgw, 1)
+	nodeAddr(t, s, "10.5.0.9/24")
+
+	mv := s.acceptMove("10.5.0.9", 1)
+	cert, key := splitPEM(servingPEM(t, time.Now().Add(-time.Hour), time.Now().Add(365*24*time.Hour), "10.5.0.9", "h1", "10.5.0.200"))
+	out, _ := json.Marshal(map[string]string{"attempt": "0123456789abcdef", "cert": cert})
+
+	s.module.mu.Lock()
+	s.module.rgwCert = string(out)
+	s.module.kv[store.SecretPrefix+"issued/"+mv.Op.ID+"/0123456789abcdef/rgw-server.key"] = key
+	s.module.mu.Unlock()
+
+	served := false
+	s.leader.serves = func(addr string, _ int, chain string) bool { return served && chain == cert }
+
+	for range 2 {
+		must(t, s.leader.Tick(ctx, 42, 5))
+	}
+
+	if m := s.move(t); m == nil || m.Step != moveRGW {
+		t.Fatalf("record %+v", m)
+	}
+
+	queued := s.accept(KindRestart, "mon.h1", "h1", 2)
+
+	for range 2 {
+		must(t, s.leader.Tick(ctx, 42, 5))
+	}
+
+	if s.ended(queued.Op.ID) {
+		t.Fatal("a queued operation ran during the move's RGW step")
+	}
+
+	addInstance(t, s.agent.fake, rgw, 2)
+	served = true
+
+	for range 2 {
+		must(t, s.leader.Tick(ctx, 42, 5))
+	}
+
+	keepalivedLog(s, vip, "2", "MASTER")
+
+	for range 3 {
+		must(t, s.leader.Tick(ctx, 42, 5))
+	}
+
+	if m := s.move(t); m == nil || !slices.Contains(m.Done, moveRGW) {
+		t.Fatalf("record %+v", m)
+	}
+
+	if !s.ended(queued.Op.ID) {
+		t.Fatal("the queued operation did not run after the RGW step")
+	}
+}
+
+// A moved mgr that comes back as the active one is done when the mgr map
+// shows it at the new address, else failed over again (Codex round 1).
+func TestAMovedMgrBackAsTheActiveOne(t *testing.T) {
+	s, _ := moveSetup(t)
+	ctx := context.Background()
+
+	mv := s.acceptMove("10.5.0.9", 2)
+	op := mv.Op.ID
+
+	must(t, s.leader.Tick(ctx, 42, 5)) // confirmed
+	must(t, s.leader.Tick(ctx, 42, 5)) // the active mgr failed over
+
+	s.module.mu.Lock()
+	s.module.active, s.module.standbys = "h0", []string{"h1"}
+	s.module.mu.Unlock()
+
+	must(t, s.leader.Tick(ctx, 42, 5)) // moved, its revision granted
+
+	// it restarted and became the active one, still advertising the old address
+	s.module.mu.Lock()
+	s.module.active, s.module.standbys, s.module.activeAddr = "h1", []string{"h0"}, "10.5.0.3:6800/77"
+	s.module.retired = nil
+	s.module.mu.Unlock()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if got := s.calls(); !slices.Equal(got, []string{"mgr fail " + op + " 42"}) || slices.Contains(s.move(t).Done, moveMgr) {
+		t.Fatalf("calls %v, record %+v", got, s.move(t))
+	}
+
+	// at the new address: done
+	s.module.mu.Lock()
+	s.module.activeAddr = "10.5.0.9:6800/78"
+	s.module.mu.Unlock()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if m := s.move(t); !slices.Contains(m.Done, moveMgr) {
+		t.Fatalf("record %+v", m)
+	}
+}
+
+// A resumed certificates step grants anew after a failed grant, with the
+// issuance and the certificates before kept (Codex round 1).
+func TestAResumedCertsStepGrantsAnew(t *testing.T) {
+	s, before := agentSetup(t)
+	ctx := context.Background()
+
+	nodeAddr(t, s, "10.5.0.9/24")
+	s.leader.serves = func(string, int, string) bool { return true }
+
+	must(t, s.leader.changeState(ctx, s.leader.bridge(), 42, func(st *state.State) error {
+		st.Daemons = slices.DeleteFunc(st.Daemons, func(d state.Daemon) bool { return d.Host == "h1" })
+		st.AddDaemon(state.Daemon{Type: state.TypeMon, ID: "h0", Host: "h0", DeployID: "0123456789abcdef"})
+
+		h0, _ := st.Host("h0")
+		h0.Maintenance = true
+		st.AddHost(h0)
+
+		return nil
+	}))
+
+	mv := s.acceptMove("10.5.0.9", 1)
+	op := mv.Op.ID
+
+	// the certificates step is the third: its first self-update fails
+	s.module.mu.Lock()
+	s.module.kv[JournalPrefix(42)+"op/"+op+".m3.magent.self"] = `{"version":1,"kind":"self_update","host":"h1","state":"failed"}`
+	s.module.mu.Unlock()
+
+	for range 4 {
+		must(t, s.leader.Tick(ctx, 42, 5))
+	}
+
+	m := s.move(t)
+	if m == nil || !m.Paused || m.Step != moveCerts {
+		t.Fatalf("record %+v", m)
+	}
+
+	// the certificates before are back in the state until the step runs again
+	if h := s.host(t, "h1"); h.AgentCert != before.AgentCert {
+		t.Fatal("the failed renewal kept its certificates")
+	}
+
+	resume := s.accept(KindMoveResume, "", "h1", 2)
+
+	s.module.mu.Lock()
+	s.module.ledger[len(s.module.ledger)-1].Op.Move = op
+	s.module.mu.Unlock()
+
+	for range 4 {
+		must(t, s.leader.Tick(ctx, 42, 5))
+	}
+
+	if r := s.op(t, resume.Op.ID); r.State != wire.OpCompleted {
+		t.Fatalf("resume %+v", r)
+	}
+
+	if r := s.op(t, op+".m4.magent.self"); r.State != wire.OpCompleted {
+		t.Fatalf("the second self-update %+v", r)
+	}
+
+	h := s.host(t, "h1")
+	if h.Move != nil || h.AgentCert == before.AgentCert || !strings.HasPrefix(h.AgentKeys, op+"/") {
+		t.Fatalf("after the resumed move: %+v", h.Move)
+	}
+
+	// one issuance: the same certificates asked again
+	if n := strings.Count(strings.Join(s.calls(), "\n"), "agent cert "+op+"\n"); n != 1 {
+		t.Fatalf("issued %d times: %v", n, s.calls())
+	}
 }

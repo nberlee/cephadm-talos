@@ -38,16 +38,18 @@ func (l *LeaderLoop) renewMgr(ctx context.Context, b *Bridge, js store.Backend, 
 
 // renewing is what a renewal runs under: the operation the module issues its
 // certificates for (a renewal, or a host's move: plan 04, step 5), the
-// journal base of its records and phases, and how it ends.
+// journal base of its records (the certificates before it), the journal base
+// of its grants (a move's attempt grants anew), and how it ends.
 type renewing struct {
-	op   LedgerOp
-	base string
-	end  func(state string, err error) error
+	op    LedgerOp
+	base  string
+	grant string
+	end   func(state string, err error) error
 }
 
 // renewingOf is a renewal operation as it runs on its own.
 func renewingOf(ctx context.Context, js store.Backend, gid int64, op LedgerOp) renewing {
-	return renewing{op: op, base: op.ID, end: func(s string, err error) error { return finish(ctx, js, gid, op, s, err) }}
+	return renewing{op: op, base: op.ID, grant: op.ID, end: func(s string, err error) error { return finish(ctx, js, gid, op, s, err) }}
 }
 
 // renewMgrAs is renewMgr under a renewing (a move's step among them).
@@ -105,7 +107,7 @@ func (l *LeaderLoop) renewMgrAs(ctx context.Context, b *Bridge, js store.Backend
 		}
 
 		if !h.Maintenance {
-			done, ok, err := l.step(ctx, b, js, gid, epoch, r.base+".rev", h.Name, revisionMode{})
+			done, ok, err := l.step(ctx, b, js, gid, epoch, r.grant+".rev", h.Name, revisionMode{})
 			if err != nil || !done {
 				return err
 			}

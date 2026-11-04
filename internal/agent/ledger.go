@@ -180,10 +180,24 @@ func (l *LeaderLoop) ledgerOps(ctx context.Context, b *Bridge, js store.Backend,
 				}
 			}
 
-			// as a move's resume does
+			// as a move's resume does; a move's RGW step in progress holds the
+			// slot, as RGW work does: no queued operation (a renewal's roll, an
+			// RGW's restart) takes an ingress peer down while the moving
+			// host's keepalived is off
 			if moving(st) && !isMoveControl(e.Op.Kind) {
 				if err := l.controlsAheadOf(ctx, b, js, gid, epoch, after, isMoveControl); err != nil {
 					return err
+				}
+
+				cur, _, err := l.clusterState(ctx, b)
+				if err != nil {
+					return err
+				}
+
+				if slices.ContainsFunc(cur.Hosts, func(h state.Host) bool { return h.Move != nil && h.Move.Step == moveRGW && !h.Move.Paused }) {
+					l.holding = holdAll
+
+					return l.moveStep(ctx, b, js, gid, epoch)
 				}
 			}
 

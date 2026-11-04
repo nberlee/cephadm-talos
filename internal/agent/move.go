@@ -464,8 +464,12 @@ func (l *LeaderLoop) moveRGWStep(ctx context.Context, b *Bridge, js store.Backen
 		m.VIPOff = true
 	}
 
+	// the host's keepalived record (its start markers before) is the move's,
+	// its grants the attempt's
+	vipRec := mv.op.ID + ".mvip"
+
 	if m.VIPOff {
-		if done, err := l.vipOff(ctx, b, js, gid, epoch, mv.id, h, vips); err != nil || !done {
+		if done, err := l.vipOffAs(ctx, b, js, gid, epoch, vipRec, mv.id, h, vips); err != nil || !done {
 			return err
 		}
 	}
@@ -556,7 +560,9 @@ func (l *LeaderLoop) moveRGWStep(ctx context.Context, b *Bridge, js store.Backen
 		rolled := map[string]bool{}
 
 		if target != "" {
-			if done, err := l.rollRGW(ctx, b, js, gid, epoch, mv.op, target, "roll"+strconv.Itoa(attemptOf(mv.id))); err != nil || !done {
+			// one roll per move: a peer whose roll began in an earlier attempt
+			// is finished, its grants anew under this attempt
+			if done, err := l.rollRGWTry(ctx, b, js, gid, epoch, mv.op, target, "roll", ".t"+strconv.Itoa(attemptOf(mv.id))); err != nil || !done {
 				return err
 			}
 
@@ -577,17 +583,17 @@ func (l *LeaderLoop) moveRGWStep(ctx context.Context, b *Bridge, js store.Backen
 				continue
 			}
 
-			base := mv.id + ".peers." + o.Name
+			base, grant := mv.op.ID+".mpeers."+o.Name, mv.id+".peers."+o.Name
 
-			if back, err := l.restoring(ctx, b, js, gid, base); err != nil {
+			if back, err := l.restoring(ctx, b, js, gid, grant); err != nil {
 				return err
 			} else if !back {
-				if done, err := l.vipOff(ctx, b, js, gid, epoch, base, o, ovips); err != nil || !done {
+				if done, err := l.vipOffAs(ctx, b, js, gid, epoch, base, grant, o, ovips); err != nil || !done {
 					return err
 				}
 			}
 
-			if done, err := l.vipBack(ctx, b, js, gid, epoch, base, o, ovips); err != nil || !done {
+			if done, err := l.vipBackAs(ctx, b, js, gid, epoch, base, grant, o, ovips); err != nil || !done {
 				return err
 			}
 		}
@@ -602,7 +608,7 @@ func (l *LeaderLoop) moveRGWStep(ctx context.Context, b *Bridge, js store.Backen
 	}
 
 	// the host's keepalived last, with its new source address
-	if done, err := l.vipBack(ctx, b, js, gid, epoch, mv.id, h, vips); err != nil || !done {
+	if done, err := l.vipBackAs(ctx, b, js, gid, epoch, vipRec, mv.id, h, vips); err != nil || !done {
 		return err
 	}
 
@@ -680,11 +686,35 @@ func (l *LeaderLoop) moveMgrStep(ctx context.Context, b *Bridge, js store.Backen
 		return err
 	}
 
-	if g, ok := standbys[h.Name]; !ok || strconv.FormatInt(g, 10) == m.Before {
-		return fmt.Errorf("%w: mgr.%s is not back as a standby yet", errRetry, h.Name)
+	if g, ok := standbys[h.Name]; ok && strconv.FormatInt(g, 10) != m.Before {
+		return mv.finish(ctx, js, gid, wire.OpCompleted, nil)
 	}
 
-	return mv.finish(ctx, js, gid, wire.OpCompleted, nil)
+	// back as the active one (another mgr failed meanwhile): done when the
+	// mgr map shows it at the new address, else failed over again and
+	// awaited as a standby
+	active, agid, addr, err := b.ActiveMgrAddr(ctx)
+	if err != nil {
+		return err
+	}
+
+	if active == h.Name && strconv.FormatInt(agid, 10) != m.Before {
+		if addr == m.To {
+			return mv.finish(ctx, js, gid, wire.OpCompleted, nil)
+		}
+
+		if err := writeJSONKey(ctx, js, JournalPrefix(gid)+"op/"+mv.id+".fail", JournalOp{Version: journalVersion, Kind: "mgr_fail", Host: h.Name, State: wire.OpStarted, MgrGID: agid}); err != nil {
+			return err
+		}
+
+		if err := b.MgrFail(ctx, mv.op.ID, agid, h.Name, h.Name); err != nil {
+			return fmt.Errorf("%w: failing the active mgr on %s over: %w", errRetry, h.Name, err)
+		}
+
+		return fmt.Errorf("%w: mgr.%s is active at %s, not %s: failing it over", errRetry, h.Name, addr, m.To)
+	}
+
+	return fmt.Errorf("%w: mgr.%s is not back as a standby yet", errRetry, h.Name)
 }
 
 // moveOSDStep moves the host's OSDs together, as maintenance stops them,
@@ -852,7 +882,9 @@ func (l *LeaderLoop) moveCertsStep(ctx context.Context, b *Bridge, js store.Back
 	if !slices.Contains(m.Done, "certs.agent") {
 		var ended string
 
-		r := renewing{op: mv.op, base: mv.op.ID + ".magent", end: func(s string, err error) error { ended = s; return fail(s, err) }}
+		// the issuance and the certificates before are the move's, the
+		// grant the attempt's: a resume after a failed grant grants anew
+		r := renewing{op: mv.op, base: mv.op.ID + ".magent", grant: mv.id + ".magent", end: func(s string, err error) error { ended = s; return fail(s, err) }}
 		if err := l.renewAgentAs(ctx, b, js, gid, epoch, r); err != nil || ended != wire.OpCompleted {
 			return err
 		}
@@ -867,7 +899,7 @@ func (l *LeaderLoop) moveCertsStep(ctx context.Context, b *Bridge, js store.Back
 
 		op := mv.op
 		op.Daemon = state.TypeMgr + "." + h.Name
-		r := renewing{op: op, base: mv.op.ID + ".mmgr", end: func(s string, err error) error { ended = s; return fail(s, err) }}
+		r := renewing{op: op, base: mv.op.ID + ".mmgr", grant: mv.id + ".mmgr", end: func(s string, err error) error { ended = s; return fail(s, err) }}
 
 		if err := l.renewMgrAs(ctx, b, js, gid, epoch, r); err != nil || ended != wire.OpCompleted {
 			return err

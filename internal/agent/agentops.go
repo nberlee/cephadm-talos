@@ -189,7 +189,7 @@ func (l *LeaderLoop) renewAgentAs(ctx context.Context, b *Bridge, js store.Backe
 
 		// the keys only for the grant, through the bridge, which releases them
 		// for this renewal
-		done, ok, err := l.agentGrant(ctx, b, js, gid, epoch, r.base+".self", h.Name, "self_update", func(g *wire.Grant) error {
+		done, ok, err := l.agentGrant(ctx, b, js, gid, epoch, r.grant+".self", h.Name, "self_update", func(g *wire.Grant) error {
 			su := &wire.SelfUpdate{Cert: h.AgentCert, ClientCert: h.AgentClientCert}
 
 			var err error

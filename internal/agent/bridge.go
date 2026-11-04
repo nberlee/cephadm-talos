@@ -944,23 +944,48 @@ type standby struct {
 	GID  int64  `json:"gid"`
 }
 
+type mgrMap struct {
+	ActiveName string    `json:"active_name"`
+	ActiveGID  int64     `json:"active_gid"`
+	ActiveAddr string    `json:"active_addr"`
+	Standbys   []standby `json:"standbys"`
+}
+
 func (b *Bridge) mgrDump(ctx context.Context) (string, int64, []standby, error) {
+	m, err := b.mgrMap(ctx)
+
+	return m.ActiveName, m.ActiveGID, m.Standbys, err
+}
+
+func (b *Bridge) mgrMap(ctx context.Context) (mgrMap, error) {
 	out, err := b.do(ctx, "mgr dump", map[string]any{})
 	if err != nil {
-		return "", 0, nil, err
+		return mgrMap{}, err
 	}
 
-	var m struct {
-		ActiveName string    `json:"active_name"`
-		ActiveGID  int64     `json:"active_gid"`
-		Standbys   []standby `json:"standbys"`
-	}
-
+	var m mgrMap
 	if err := json.Unmarshal([]byte(out), &m); err != nil || m.ActiveName == "" {
-		return "", 0, nil, errors.New("bridge: mgr dump: no active mgr")
+		return mgrMap{}, errors.New("bridge: mgr dump: no active mgr")
 	}
 
-	return m.ActiveName, m.ActiveGID, m.Standbys, nil
+	return m, nil
+}
+
+// ActiveMgrAddr returns the active mgr's name, gid and the IP it advertises
+// (the mgr map shows an address for the active mgr only).
+func (b *Bridge) ActiveMgrAddr(ctx context.Context) (string, int64, string, error) {
+	m, err := b.mgrMap(ctx)
+	if err != nil {
+		return "", 0, "", err
+	}
+
+	// "<ip>:<port>/<nonce>", an IPv6 address in brackets
+	addr, _, _ := strings.Cut(m.ActiveAddr, "/")
+	if i := strings.LastIndex(addr, ":"); i >= 0 {
+		addr = addr[:i]
+	}
+
+	return m.ActiveName, m.ActiveGID, strings.Trim(addr, "[]"), nil
 }
 
 // OKToStop asks the module for Ceph's check that one daemon of an upgrade's

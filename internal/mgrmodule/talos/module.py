@@ -891,6 +891,9 @@ class Module(orchestrator.Orchestrator, MgrModule):
         name = 'rgw.' + host
         if name in fold.daemons:
             raise OrchestratorError('%s exists already' % name)
+        # an RGW add rolls the RGWs' certificate: not during a host's move
+        if self._moves(fold):
+            raise OrchestratorError('host addresses changing: %s' % ', '.join(sorted(self._moves(fold))))
         current = self._rgw_port()
         port = spec.rgw_frontend_port or current or 443
         if current is not None and port != current:
@@ -1680,6 +1683,9 @@ class Module(orchestrator.Orchestrator, MgrModule):
         for _, e in led.executable():
             if e['kind'] == 'apply_ingress' and not self._finished(index, e['id']):
                 raise OrchestratorError('ingress operation %s is in progress' % e['id'])
+            # the RGWs' certificate rolls: one at a time
+            if (e['kind'] == 'renew_rgw_cert' or e['kind'] == 'add_daemon' and e['daemon'].startswith('rgw.')) and not self._finished(index, e['id']):
+                raise OrchestratorError('operation %s on the RGW certificates is in progress' % e['id'])
         taken = sorted(h for h, a in fold.hosts.items() if h != host and a == addr)
         if taken:
             raise OrchestratorError('%s has the address %s' % (taken[0], addr))
@@ -1970,8 +1976,11 @@ class Module(orchestrator.Orchestrator, MgrModule):
 
     def _accept_rgw_renewal(self) -> str:
         """A renewal of the generated RGW certificate, unless one, an ingress
-        apply or an RGW add is unfinished."""
-        led, _ = self._authority()
+        apply, an RGW add or a host's move (it rolls the RGWs and holds a
+        keepalived off, plan 04 step 5) is unfinished."""
+        led, fold = self._authority()
+        if self._moves(fold):
+            raise OrchestratorError('host addresses changing: %s' % ', '.join(sorted(self._moves(fold))))
         index = self._journal_index()
         for _, e in led.executable():
             if e['kind'] in ('renew_rgw_cert', 'apply_ingress') or e['kind'] == 'add_daemon' and e['daemon'].startswith('rgw.'):

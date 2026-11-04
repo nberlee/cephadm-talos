@@ -177,11 +177,18 @@ func (l *LeaderLoop) restoring(ctx context.Context, b *Bridge, js store.Backend,
 // retained, also with a certificate that expired since). Done reports that
 // they are off.
 func (l *LeaderLoop) vipOff(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, base string, h state.Host, vips []string) (bool, error) {
+	return l.vipOffAs(ctx, b, js, gid, epoch, base, base, h, vips)
+}
+
+// vipOffAs is vipOff with the host's step record below base and its grants
+// below grant: a later attempt of a step (a move's, plan 04 step 5) grants
+// anew and keeps the start markers recorded before.
+func (l *LeaderLoop) vipOffAs(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, base, grant string, h state.Host, vips []string) (bool, error) {
 	if len(vips) == 0 {
 		return true, nil
 	}
 
-	if back, err := l.restoring(ctx, b, js, gid, base); err != nil || back {
+	if back, err := l.restoring(ctx, b, js, gid, grant); err != nil || back {
 		return back, err // off before; coming back now
 	}
 
@@ -206,7 +213,7 @@ func (l *LeaderLoop) vipOff(ctx context.Context, b *Bridge, js store.Backend, gi
 		}
 	}
 
-	done, ok, err := l.step(ctx, b, js, gid, epoch, base+".vip", h.Name, revisionMode{only: stopKeys(vips)})
+	done, ok, err := l.step(ctx, b, js, gid, epoch, grant+".vip", h.Name, revisionMode{only: stopKeys(vips)})
 	if err != nil || !done {
 		return false, err
 	}
@@ -222,11 +229,16 @@ func (l *LeaderLoop) vipOff(ctx context.Context, b *Bridge, js store.Backend, gi
 // each is ready: running with a start marker other than before (any, without
 // a record of one), in MASTER or BACKUP.
 func (l *LeaderLoop) vipBack(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, base string, h state.Host, vips []string) (bool, error) {
+	return l.vipBackAs(ctx, b, js, gid, epoch, base, base, h, vips)
+}
+
+// vipBackAs is vipBack with the step record below base and the grant below grant.
+func (l *LeaderLoop) vipBackAs(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, base, grant string, h state.Host, vips []string) (bool, error) {
 	if len(vips) == 0 {
 		return true, nil
 	}
 
-	done, ok, err := l.step(ctx, b, js, gid, epoch, base+".back", h.Name, revisionMode{})
+	done, ok, err := l.step(ctx, b, js, gid, epoch, grant+".back", h.Name, revisionMode{})
 	if err != nil || !done {
 		return false, err
 	}
@@ -405,6 +417,14 @@ func (l *LeaderLoop) addRGW(ctx context.Context, b *Bridge, js store.Backend, gi
 // exit renders. The leader holds every revision request meanwhile. Done
 // reports that every RGW renders it.
 func (l *LeaderLoop) rollRGW(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, op LedgerOp, target, ns string) (bool, error) {
+	return l.rollRGWTry(ctx, b, js, gid, epoch, op, target, ns, "")
+}
+
+// rollRGWTry is rollRGW whose grants carry try after each host's base: a
+// move's roll keeps one namespace and its hosts' records across its step's
+// attempts (a peer whose record began is rolled to its end, not skipped),
+// and each attempt grants anew (plan 04, step 5).
+func (l *LeaderLoop) rollRGWTry(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, op LedgerOp, target, ns, try string) (bool, error) {
 	l.holding = holdAll
 
 	if err := l.notFailing(ctx, b, js, gid, op); err != nil {
@@ -474,13 +494,15 @@ func (l *LeaderLoop) rollRGW(ctx context.Context, b *Bridge, js store.Backend, g
 		vips := vipDocs(st, h.Name)
 
 		// keepalived already coming back: the RGW was checked before
-		back, err := l.restoring(ctx, b, js, gid, base)
+		grant := base + try
+
+		back, err := l.restoring(ctx, b, js, gid, grant)
 		if err != nil {
 			return false, err
 		}
 
 		if back {
-			if done, err := l.vipBack(ctx, b, js, gid, epoch, base, h, vips); err != nil || !done {
+			if done, err := l.vipBackAs(ctx, b, js, gid, epoch, base, grant, h, vips); err != nil || !done {
 				return false, err
 			}
 
@@ -494,7 +516,7 @@ func (l *LeaderLoop) rollRGW(ctx context.Context, b *Bridge, js store.Backend, g
 			continue
 		}
 
-		if done, err := l.vipOff(ctx, b, js, gid, epoch, base, h, vips); err != nil || !done {
+		if done, err := l.vipOffAs(ctx, b, js, gid, epoch, base, grant, h, vips); err != nil || !done {
 			return false, err
 		}
 
@@ -519,7 +541,7 @@ func (l *LeaderLoop) rollRGW(ctx context.Context, b *Bridge, js store.Backend, g
 			}
 		}
 
-		done, ok, err := l.step(ctx, b, js, gid, epoch, base+".rev", h.Name, revisionMode{stop: stopKeys(vips)})
+		done, ok, err := l.step(ctx, b, js, gid, epoch, grant+".rev", h.Name, revisionMode{stop: stopKeys(vips)})
 		if err != nil || !done {
 			return false, err
 		}
@@ -540,7 +562,7 @@ func (l *LeaderLoop) rollRGW(ctx context.Context, b *Bridge, js store.Backend, g
 
 		// a revision that changed nothing (the same certificate under a new id)
 		// starts no new instance: serving the certificate is enough
-		rs, err := l.journalState(ctx, b, js, gid, base+".rev")
+		rs, err := l.journalState(ctx, b, js, gid, grant+".rev")
 		if err != nil {
 			return false, err
 		}
@@ -551,7 +573,7 @@ func (l *LeaderLoop) rollRGW(ctx context.Context, b *Bridge, js store.Backend, g
 			return false, fmt.Errorf("%w: %s does not serve the new certificate yet", errRetry, doc)
 		}
 
-		if done, err := l.vipBack(ctx, b, js, gid, epoch, base, h, vips); err != nil || !done {
+		if done, err := l.vipBackAs(ctx, b, js, gid, epoch, base, grant, h, vips); err != nil || !done {
 			return false, err
 		}
 

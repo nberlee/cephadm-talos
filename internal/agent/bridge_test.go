@@ -67,6 +67,8 @@ type fakeBridge struct {
 	// standbys are the standby mgrs mgr dump lists, gids their gids (100 if unset)
 	standbys []string
 	gids     map[string]int64
+	// activeAddr is the active mgr's address mgr dump shows
+	activeAddr string
 	// certs are the certificates to revoke each call carried, by "<call> <operation>"
 	certs map[string][]string
 }
@@ -217,7 +219,7 @@ func (m *fakeBridge) run(req wire.BridgeRequest) map[string]any {
 			standbys = append(standbys, map[string]any{"name": n, "gid": g})
 		}
 
-		b, _ := json.Marshal(map[string]any{"active_name": m.active, "active_gid": 42, "standbys": standbys})
+		b, _ := json.Marshal(map[string]any{"active_name": m.active, "active_gid": 42, "active_addr": m.activeAddr, "standbys": standbys})
 
 		return map[string]any{"outcome": "done", "r": 0, "out": string(b)}
 	case "auth get-or-create":

@@ -1699,3 +1699,17 @@ class Move(unittest.TestCase):
         mod._poller = types.SimpleNamespace(snapshot=lambda: {})
         m.Module._noout_tick(mod)
         self.assertIn('ceph orch host set-addr h2 10.5.0.9', checks['TALOS_HOST_MOVE_PAUSED']['detail'][0])
+
+    def test_rgw_certificate_work_and_a_move_exclude_each_other(self):
+        """Codex round 1 of part B: no RGW certificate renewal or RGW add while
+        a move is unfinished, and no move while one of them is."""
+        inv = drain_inventory()
+        del inv['hosts'][4]['maintenance']
+        mod, entries = self.module(inv)
+        self.assertEqual(m.Module.update_host_addr(mod, 'h2', '10.5.0.9').exception_str, '')
+        with self.assertRaisesRegex(m.OrchestratorError, 'changing'):
+            m.Module._accept_rgw_renewal(mod)
+        self.assertIn('changing', m.Module.add_daemon(mod, RGWs.spec(self, 'h3')).exception_str)
+        mod, _ = self.module(inv)
+        mod._ledger.append({'id': 'op-%016x' % 5, 'kind': 'renew_rgw_cert'})
+        self.assertIn('RGW certificates', m.Module.update_host_addr(mod, 'h2', '10.5.0.9').exception_str)
