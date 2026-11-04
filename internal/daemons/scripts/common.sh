@@ -27,7 +27,7 @@ mkdir -p /var/run/ceph /var/log/ceph
 # exits by itself. (A wait in PID 1, interrupted by its own handlers, can lose
 # the status in bash.)
 run_delayed() {
-	local delay=$1 daemon="" sub status stop=0 forwarded=0
+	local delay=$1 daemon="" sub status stop=0 forwarded=0 pending=""
 	shift
 	rm -f /dev/shm/run_delayed.$$.pid /dev/shm/run_delayed.$$.rc
 	forward() {
@@ -37,7 +37,8 @@ run_delayed() {
 			(sleep "$delay"; kill -TERM "$daemon" 2>/dev/null) &
 		fi
 	}
-	pass() { if [ -n "$daemon" ]; then kill "-$1" "$daemon" 2>/dev/null || true; fi; }
+	# before the daemon's pid is known, a signal waits in pending
+	pass() { if [ -n "$daemon" ]; then kill "-$1" "$daemon" 2>/dev/null || true; else pending="$pending $1"; fi; }
 	trap 'stop=1; forward' TERM
 	trap 'pass HUP' HUP
 	trap 'pass USR1' USR1
@@ -54,7 +55,8 @@ run_delayed() {
 		sleep 0.05
 	done
 	daemon=$(cat /dev/shm/run_delayed.$$.pid 2>/dev/null || true)
-	# a SIGTERM before the daemon's pid was known
+	# signals that came before the daemon's pid was known
+	for sig in $pending; do pass "$sig"; done
 	if [ "$stop" = 1 ]; then forward; fi
 	while kill -0 "$sub" 2>/dev/null; do
 		wait "$sub" || true
