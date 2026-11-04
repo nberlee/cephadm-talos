@@ -90,7 +90,7 @@ var (
 
 // containerKinds are the ContainerConfig kinds a grant can carry, by the type in
 // their name; longer types first, as "osd-prepare" begins like "osd".
-var containerKinds = []string{"osd-prepare", "mgrguard", "mon", "mgr", "osd", "rgw", "vip", "probe", "job"}
+var containerKinds = []string{"osd-prepare", "mgr-guard", "mon", "mgr", "osd", "rgw", "vip", "probe", "job"}
 
 // Check runs the policy over a revision's documents as Apply does, against
 // the node's disks and the ContainerConfig names it has; removals pass. The
@@ -392,9 +392,9 @@ func (p *Policy) admitContainer(d Doc, td typedDoc, f facts) error {
 
 	// a mgr's guard (plan 04, step 5, item 2b): exactly its rendering, the
 	// cluster's, depending on the mgr of its id
-	if kind == "mgrguard" {
+	if kind == "mgr-guard" {
 		if env["FSID"] != p.FSID || !daemonIDRe.MatchString(env["ID"]) {
-			return errors.New("mgrguard: not the cluster's, or not a daemon id")
+			return errors.New("mgr-guard: not the cluster's, or not a daemon id")
 		}
 
 		return same(td, daemons.MgrGuard(d.Name, c.ContainerImage, p.FSID, env["ID"], p.docName("mgr", env["ID"])))

@@ -174,16 +174,15 @@ func TestParseJobResult(t *testing.T) {
 	}
 }
 
-// A mgr's guard (mgrguard-<host>, no ceph.conf, keyring or host network)
-// is never a target, and a mgr of a host named like a guard ("guard-h1")
-// still is: their names cannot collide.
+// A mgr's guard shares the mgr's name prefix but has no ceph.conf, keyring
+// or host network: Ceph commands never run in it.
 func TestExecTargetsSkipAMgrsGuard(t *testing.T) {
 	f := talostest.New(t)
 	o := fakeOrch(t, f)
 	ctx := context.Background()
 
 	prefix := "ceph-" + o.St.Short() + "-"
-	for _, name := range []string{prefix + "mgrguard-h1", prefix + "mgr-guard-h1", prefix + "mon-h1"} {
+	for _, name := range []string{prefix + "mgr-guard-h1", prefix + "mgr-h1", prefix + "mon-h1"} {
 		cs := containers.NewContainerStatus(containers.NamespaceName, name)
 		cs.TypedSpec().State = containers.ContainerStateRunning
 
@@ -197,7 +196,7 @@ func TestExecTargetsSkipAMgrsGuard(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if want := []string{prefix + "mgr-guard-h1", prefix + "mon-h1"}; !slices.Equal(targets, want) {
+	if want := []string{prefix + "mgr-h1", prefix + "mon-h1"}; !slices.Equal(targets, want) {
 		t.Fatalf("targets %v, want %v", targets, want)
 	}
 }
