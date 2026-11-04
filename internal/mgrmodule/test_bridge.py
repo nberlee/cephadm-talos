@@ -1382,6 +1382,36 @@ class NooutTest(unittest.TestCase):
         self.assertEqual(self.sets()[-1], ('osd set-group', ['h1']))
         self.assertEqual(self.ch.authority()[1].noout['h1']['reasons'], ['maintenance'])
 
+    def test_a_removed_hosts_noout_goes_with_it(self):
+        self.fold('mon.h1@h1', 'osd.3@h1')
+        # an unplanned stop of h2 whose end never came: its reason holds the flag
+        self.assertEqual(self.report('h2')[0], 200)
+        self.assertIsNone(self.ch.noout_reconcile('h2', True))
+        self.assertEqual(self.sets(), [('osd set-group', ['h2'])])
+        rm = self.accept('remove_host', None, 'h2')
+        # not without leadership: no command, the host stays
+        active = self.ch.leadership.still_active
+        self.ch.leadership.still_active = lambda *a: False
+        self.assertEqual(self.call('retire host', operation=rm)[0], 409)  # the bridge's own check
+        self.assertEqual(self.ch.local('retire host', rm)[0], 503)  # and the handler's, before any noout command
+        self.assertIn('h2', self.ch.authority()[1].hosts)
+        self.assertEqual(self.sets(), [('osd set-group', ['h2'])])
+        self.ch.leadership.still_active = active
+        self.assertEqual(self.call('retire host', operation=rm)[1]['outcome'], 'done')
+        f = self.ch.authority()[1]
+        self.assertEqual((self.sets()[-1], 'h2' in f.hosts, f.noout), (('osd unset-group', ['h2']), False, {}))
+        kinds = [e['kind'] for _, e in self.led.executable()]
+        self.assertLess(kinds.index('noout_intent'), kinds.index('retire_host'))
+
+    def test_a_removed_hosts_operator_noout_stays(self):
+        self.fold('mon.h1@h1', 'osd.3@h1')
+        self.mons.flags = {'h2': ['noout']}
+        self.assertEqual(self.report('h2')[0], 200)
+        self.assertIsNone(self.ch.noout_reconcile('h2', True))
+        rm = self.accept('remove_host', None, 'h2')
+        self.assertEqual(self.call('retire host', operation=rm)[1]['outcome'], 'done')
+        self.assertEqual((self.sets(), self.mons.flags, 'h2' in self.ch.authority()[1].hosts), ([], {'h2': ['noout']}, False))
+
     def test_going_down_reports(self):
         self.fold('mon.h1@h1', 'osd.3@h1')
         # an agent reports only its own host, of this cluster, and well formed

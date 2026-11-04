@@ -1939,7 +1939,21 @@ class Channel:
             return 200, done
         if any(h == op['host'] for h in fold.daemons.values()):
             return 400, {'error': '%s still has daemons' % op['host']}
-        led.append({'id': 'm-' + secrets.token_hex(8), 'kind': 'retire_host', 'of': op['id'], 'host': op['host']})
+        # the host's noout ownership goes with it (plan 04, step 5): an intent
+        # is completed and every reason dropped first, so a flag the module set
+        # is unset (an operator's stays) before the fold forgets the host
+        host = op['host']
+        for _ in range(8):
+            st = self.authority()[1].noout.get(host)
+            if st is None:
+                break
+            reason, on = (st['intent']['reason'], st['intent']['on']) if st['intent'] else (st['reasons'][0], False)
+            why = self._noout_change(led, host, reason, on, op['id'])
+            if why is not None:
+                return 503, {'error': 'the noout of %s: %s; ask again' % (host, why)}
+        else:
+            return 503, {'error': 'the noout of %s did not settle; ask again' % host}
+        led.append({'id': 'm-' + secrets.token_hex(8), 'kind': 'retire_host', 'of': op['id'], 'host': host})
         return 200, done
 
     def approval(self) -> Tuple[int, Dict[str, Any]]:
