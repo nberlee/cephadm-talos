@@ -39,7 +39,13 @@ TalosCLICommand = CLICommandBase.make_registry_subtype("TalosCLICommand")
 
 TALOS_DIR = '/etc/ceph/talos'
 # journal states after which the leader does nothing more for an operation
-TERMINAL = ('completed', 'nochange', 'failed', 'refused', 'abandoned')
+TERMINAL = ledger.TERMINAL
+# no new operation is accepted while more than this many are unfinished (plan 04, step 4)
+MAX_UNFINISHED = 500
+# compaction (plan 04, step 4): checked this often by the leadership loop; a
+# snapshot at most hourly, the delayed deletion and journal pruning hourly
+COMPACT_CHECK = 600.0
+COMPACT_EVERY = 3600.0
 # certificate renewal (plan 04, step 1): checked once a day, renewed this long
 # before expiry, warned about when renewal keeps failing; the operator's
 # certificate (its public copy, written by the CLI) warned about earlier
@@ -705,27 +711,45 @@ class Module(orchestrator.Orchestrator, MgrModule):
         led = getattr(self, '_ledger', None)
         if led is None or not led.ready:
             raise OrchestratorError('this mgr has not opened the ledger: it is not the leader yet')
-        return led, ledger.Fold(cli_baseline(self.get_store_prefix(STORE_PREFIX)), led.executable())
+        return led, led.fold(cli_baseline(self.get_store_prefix(STORE_PREFIX)))
 
-    def _journal(self, op_id: str) -> Optional[Dict[str, Any]]:
-        """The leader's journal record of an operation, from any incarnation (shown
-        to the operator; it authorizes nothing)."""
-        best: Optional[Dict[str, Any]] = None
+    def _journal_index(self) -> Dict[str, Dict[str, Any]]:
+        """The leader's journal records of the operations, from every incarnation,
+        in one scan: a terminal state wins (shown to the operator and counted
+        as finished; it authorizes nothing)."""
+        best: Dict[str, Dict[str, Any]] = {}
         for k, v in self.get_store_prefix(STORE_PREFIX).items():
-            if k.endswith('/journal/op/' + op_id):
-                try:
-                    rec = json.loads(v)
-                except ValueError:
-                    continue
-                if isinstance(rec, dict) and (best is None or rec.get('state') in TERMINAL):
-                    best = rec
+            _, sep, op_id = k.partition('/journal/op/')
+            if not sep or '/' in op_id or not ledger.OP_RE.match(op_id):
+                continue
+            try:
+                rec = json.loads(v)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and (op_id not in best or rec.get('state') in TERMINAL):
+                best[op_id] = rec
         return best
 
-    def _unfinished(self, daemon: Optional[str], host: str) -> Optional[str]:
+    def _journal(self, op_id: str) -> Optional[Dict[str, Any]]:
+        """The leader's journal record of an operation, from any incarnation."""
+        return self._journal_index().get(op_id)
+
+    def _finished(self, index: Dict[str, Dict[str, Any]], op_id: str) -> bool:
+        return (index.get(op_id) or {}).get('state') in TERMINAL
+
+    def _not_backlogged(self, led: ledger.Ledger, index: Dict[str, Dict[str, Any]]) -> None:
+        """Backpressure (plan 04, step 4): no new operation while more than
+        MAX_UNFINISHED are unfinished; the controls are not refused."""
+        n = sum(1 for _, e in led.executable() if not e['id'].startswith('m-') and not self._finished(index, e['id']))
+        if n > MAX_UNFINISHED:
+            raise OrchestratorError('%d operations are unfinished (more than %d): nothing new is accepted until the leader catches up' % (n, MAX_UNFINISHED))
+
+    def _unfinished(self, daemon: Optional[str], host: str, index: Optional[Dict[str, Dict[str, Any]]] = None) -> Optional[str]:
         """An accepted operation that conflicts and that the leader's journal does
         not show finished: for a daemon, one on that daemon or the removal of its
         host; for a host (daemon None), any on that host."""
         led, _ = self._authority()
+        index = self._journal_index() if index is None else index
         for _, e in led.executable():
             if e['id'].startswith('m-'):
                 continue
@@ -735,8 +759,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
                 continue
             if daemon is None and e.get('host') != host:
                 continue
-            rec = self._journal(e['id'])
-            if rec is None or rec.get('state') not in TERMINAL:
+            if not self._finished(index, e['id']):
                 return e['id']
         return None
 
@@ -754,11 +777,10 @@ class Module(orchestrator.Orchestrator, MgrModule):
             raise OrchestratorError('%s is in maintenance (ceph orch host maintenance exit %s)' % (host, host))
 
     def _rgw_port(self) -> Optional[int]:
-        """The RGWs' port: the newest RGW add's, else the CLI's, None before any."""
-        led, _ = self._authority()
-        for _, e in reversed(led.executable()):
-            if e['kind'] == 'add_daemon' and e['daemon'].startswith('rgw.'):
-                return int(e['port'])
+        """The RGWs' port: the newest RGW add's (fold state), else the CLI's, None before any."""
+        _, fold = self._authority()
+        if fold.rgw_port is not None:
+            return int(fold.rgw_port)
         try:
             cluster, _ = record_from_store(self.get_store_prefix(STORE_PREFIX), INCARNATION, 'cluster')
             return int(((cluster or {}).get('rgw') or {}).get('port')) or None
@@ -821,7 +843,9 @@ class Module(orchestrator.Orchestrator, MgrModule):
             raise OrchestratorError('an earlier operation is not settled yet (%s); try again' % e)
         # one operation at a time per daemon (per host for a host's removal): a
         # lying journal can only refuse commands
-        busy = self._unfinished(daemon, host)
+        index = self._journal_index()
+        self._not_backlogged(led, index)
+        busy = self._unfinished(daemon, host, index)
         if busy:
             raise OrchestratorError('%s has operation %s in progress (orch talos operation %s)' % (daemon or host, busy, busy))
         # a mgr's renewal changes its certificates in the state only while its
@@ -849,6 +873,137 @@ class Module(orchestrator.Orchestrator, MgrModule):
                 return -27, '', 'output too large'  # EFBIG
             return job.r, job.outb, job.outs
         return mon
+
+    def _ledger_batch(self, cmds: bridge.Commands) -> Callable[[List[Dict[str, Any]], float], List[Optional[Tuple[int, str, str]]]]:
+        """Mon commands sent together (the ledger's reads by key and its
+        removals): at most what the pool takes at once, the rest after those
+        answered; None for one without an answer."""
+        def batch(items: List[Dict[str, Any]], deadline: float) -> List[Optional[Tuple[int, str, str]]]:
+            out: List[Optional[Tuple[int, str, str]]] = [None] * len(items)
+            jobs: List[Tuple[int, Any]] = []
+            for i, c in enumerate(items):
+                job = cmds.submit(c)
+                if job is None:  # the pool is full: after the ones sent
+                    for _, j in jobs:
+                        j.ev.wait(deadline)
+                    job = cmds.submit(c)
+                if job is not None:
+                    jobs.append((i, job))
+            end = time.monotonic() + deadline
+            for i, job in jobs:
+                if job.ev.wait(max(0.0, end - time.monotonic())):
+                    out[i] = (-27, '', 'output too large') if job.too_large else (job.r, job.outb, job.outs)
+            return out
+        return batch
+
+    def _maybe_compact(self, cmds: bridge.Commands, leadership: Any) -> None:
+        """Start a compaction run (plan 04, step 4) when one is due, apart from
+        the leadership loop so its heartbeats keep going; one at a time."""
+        led = getattr(self, '_ledger', None)
+        if led is None or not led.ready or time.monotonic() < self.__dict__.get('_compact_next', 0.0):
+            return
+        run = self.__dict__.get('_compact_thread')
+        if run is not None and run.is_alive():
+            return
+        self._compact_next = time.monotonic() + COMPACT_CHECK
+        t = threading.Thread(target=self._compact_logged, args=(led, cmds, leadership), name='talos-compact', daemon=True)
+        self._compact_thread = t
+        t.start()
+
+    def _compact_logged(self, led: ledger.Ledger, cmds: bridge.Commands, leadership: Any) -> None:
+        try:
+            self._compact(led, lambda: leadership.still_active(cmds))
+        except Exception as e:  # tried again at the next check
+            self.log.warning('ledger compaction: %s', e)
+
+    def _compact(self, led: ledger.Ledger, active: Callable[[], bool], now: Optional[datetime.datetime] = None) -> None:
+        """One compaction run: the delayed deletion of what the newest snapshot
+        covers (with the journal records it makes redundant), then a new
+        snapshot when more than COMPACT_AFTER entries follow it, at most hourly."""
+        now = now or utcnow()
+        mono = time.monotonic()
+        if led.snapshot is not None and (led.snapshot_key != self.__dict__.get('_deleted') or mono >= self.__dict__.get('_pruned_next', 0.0)):
+            if led.delete(now, active, self._prune_journals):
+                self.log.info('ledger: removed what snapshot %s covers', led.snapshot_key)
+                self._deleted, self._pruned_next = led.snapshot_key, mono + COMPACT_EVERY
+        if len(led.entries) <= ledger.COMPACT_AFTER or mono < self.__dict__.get('_cut_next', 0.0):
+            return
+        store = self.get_store_prefix(STORE_PREFIX)
+        states = {k: v.get('state') for k, v in self._journal_index().items()}
+        try:
+            cluster = record_from_store(store, choose_incarnation(store, getattr(self, '_gid', None)), 'cluster')[0] or {}
+        except InventoryError:
+            return
+        # an upgrade's start until its record is finished: its steps read it,
+        # and the bridge authorizes the upgrade by it
+        pinned = {u['op'] for u in (cluster.get('upgrade'), cluster.get('agent_upgrade')) if u and u.get('op') and not u.get('finished')}
+        fold = led.fold(cli_baseline(store))
+        if fold.upgrade is not None:
+            pinned.add(fold.upgrade['op'])
+        got = led.cut(cli_baseline(store), states, cluster.get('ledger_applied') or '', pinned, now)
+        self._cut_next = mono + COMPACT_EVERY
+        if got is None or not active():
+            return
+        if led.publish(got[0], got[1], now):
+            self.log.info('ledger: snapshot %s published (%d entries follow it)', got[0], len(led.entries))
+            # its deletion, once DELETE_AFTER passed
+            self._compact_next = mono + ledger.DELETE_AFTER.total_seconds() + 1
+
+    def _prune_journals(self, covered: Callable[[str], bool]) -> None:
+        """Remove, in every incarnation, the journal records of the operations
+        the snapshot covers (plan 04, step 4), except what is still read: an
+        RGW roll's records while a certificate of its operation is not
+        retired, a renewal's until its done entry, a removal's certificates
+        until its retire, and this incarnation's grants whose outcome is not
+        known. An earlier incarnation's journal goes whole (its takeover
+        record last) once nothing else is left in it and a later incarnation
+        published its state."""
+        store = self.get_store_prefix(STORE_PREFIX)
+        _, fold = self._authority()
+        live = {cid.split('/')[1] for cid, c in fold.rgw_certs.items() if cid != 'cli' and not c['retired']}
+        own = str(getattr(self, '_gid', ''))
+        names: Dict[str, List[str]] = {}
+        epochs: Dict[str, int] = {}
+        published: Set[str] = set()
+        for k, v in store.items():
+            inc, _, rest = k[len(STORE_PREFIX):].partition('/')
+            if rest.startswith('manifest/'):
+                published.add(inc)
+            if not inc.isdigit() or not rest.startswith('journal/'):
+                continue
+            names.setdefault(inc, []).append(rest[len('journal/'):])
+            if rest == 'journal/takeover':
+                try:
+                    epochs[inc] = int(json.loads(v)['epoch'])
+                except (ValueError, KeyError, TypeError):
+                    pass
+        gone: List[str] = []
+        for inc, recs in names.items():
+            left = []
+            for name in recs:
+                kind, _, rest = name.partition('/')
+                base, _, suffix = rest.partition('.')
+                prunable = False
+                if kind == 'op' and covered(base):
+                    try:
+                        state = json.loads(store[STORE_PREFIX + inc + '/journal/' + name]).get('state')
+                    except (ValueError, AttributeError):
+                        state = None
+                    # a grant this incarnation still asks the agent about
+                    prunable = not (inc == own and state in ('granting', 'uncertain'))
+                elif kind == 'roll' and covered(base) and base not in live:
+                    step = suffix.split('.')[0]
+                    prunable = (step != 'renew' or base in fold.renewals_done) and (step != 'certs' or base in fold.retired_by)
+                if prunable:
+                    gone.append(MODULE_PREFIX + STORE_PREFIX + inc + '/journal/' + name)
+                else:
+                    left.append(name)
+            later = any(p != inc and p in epochs and epochs[p] > epochs.get(inc, -1) for p in published)
+            if inc != own and set(left) <= {'takeover'} and later:
+                gone.extend(MODULE_PREFIX + STORE_PREFIX + inc + '/journal/' + n for n in left)
+        led = self._ledger
+        led.remove_keys([k for k in gone if not k.endswith('/journal/takeover')])
+        led.remove_keys([k for k in gone if k.endswith('/journal/takeover')])
 
     def _send_mon(self, result: Any, cmd: str) -> None:
         self.send_command(result, 'mon', '', cmd, '')
@@ -889,7 +1044,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
                         self._gid = gid  # this incarnation's state, once its leader published it
                         self._leadership = leadership
                         if getattr(self, '_ledger', None) is None:
-                            self._ledger = ledger.Ledger(self._ledger_mon(bridge_cmds), gid, epoch)
+                            self._ledger = ledger.Ledger(self._ledger_mon(bridge_cmds), gid, epoch, self._ledger_batch(bridge_cmds))
                         try:
                             if not self._ledger.ready:
                                 self._ledger.open()  # its takeover entry, before anything is accepted
@@ -897,6 +1052,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
                                 self._ledger.settle()  # an append the mons did not answer
                         except ledger.LedgerError as e:
                             self.log.warning('the ledger: %s', e)
+                        self._maybe_compact(bridge_cmds, leadership)
                         # the list, before and independent of the heartbeat: a
                         # fail-closed agent may refuse it until it has a new list
                         issuer = self._issue_crl(bridge_cmds, issuer, epoch, channel, read)
@@ -1111,11 +1267,12 @@ class Module(orchestrator.Orchestrator, MgrModule):
             led.settle()
         except ledger.LedgerError as e:
             raise OrchestratorError('an earlier operation is not settled yet (%s); try again' % e)
+        index = self._journal_index()
+        self._not_backlogged(led, index)
         for _, e in led.executable():
             if e['id'].startswith('m-') or e.get('host') != host or not (e['kind'] in ledger.HOST_KINDS or e.get('device') == device):
                 continue
-            rec = self._journal(e['id'])
-            if rec is None or rec.get('state') not in TERMINAL:
+            if not self._finished(index, e['id']):
                 raise OrchestratorError('%s has operation %s in progress (orch talos operation %s)' % (host, e['id'], e['id']))
         self._not_in_maintenance(host)
         op_id = 'op-' + os.urandom(8).hex()
@@ -1163,6 +1320,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
             led.settle()
         except ledger.LedgerError as e:
             raise OrchestratorError('an earlier operation is not settled yet (%s); try again' % e)
+        self._not_backlogged(led, self._journal_index())
         op_id = 'op-' + os.urandom(8).hex()
         try:
             led.append({'id': op_id, 'kind': 'remove_osd', 'daemon': name, 'host': host, 'uuid': uuid, 'zap': bool(zap), 'force': bool(force),
@@ -1178,11 +1336,12 @@ class Module(orchestrator.Orchestrator, MgrModule):
         """The OSD removals not finished: from the ledger, with the leader's phase."""
         led, fold = self._authority()
         entries = led.executable()
+        index = self._journal_index()
         out = []
         for _, e in entries:
             if e['kind'] != 'remove_osd':
                 continue
-            rec = self._journal(e['id'])
+            rec = index.get(e['id'])
             if rec is not None and rec.get('state') in TERMINAL:
                 continue
             drained = any(x['kind'] == 'drained' and x.get('of') == e['id'] for _, x in entries)
@@ -1217,10 +1376,10 @@ class Module(orchestrator.Orchestrator, MgrModule):
         if fold.upgrade is not None:
             raise OrchestratorError('an upgrade is in progress (operation %s)' % fold.upgrade['op'])
         led, _ = self._authority()
+        index = self._journal_index()
         for _, e in led.executable():
             if e['kind'] == 'apply_ingress' and hostname in e['hosts'] + ((fold.ingress or {}).get('hosts') or []):
-                rec = self._journal(e['id'])
-                if rec is None or rec.get('state') not in TERMINAL:
+                if not self._finished(index, e['id']):
                     raise OrchestratorError('ingress operation %s on %s is in progress' % (e['id'], hostname))
         if len(fold.hosts) < 2:
             raise OrchestratorError('maintenance is not supported on single node clusters')
@@ -1425,10 +1584,10 @@ class Module(orchestrator.Orchestrator, MgrModule):
         """A renewal of the generated RGW certificate, unless one, an ingress
         apply or an RGW add is unfinished."""
         led, _ = self._authority()
+        index = self._journal_index()
         for _, e in led.executable():
             if e['kind'] in ('renew_rgw_cert', 'apply_ingress') or e['kind'] == 'add_daemon' and e['daemon'].startswith('rgw.'):
-                rec = self._journal(e['id'])
-                if rec is None or rec.get('state') not in TERMINAL:
+                if not self._finished(index, e['id']):
                     raise OrchestratorError('operation %s on the RGW certificates is in progress' % e['id'])
         return self._accept_cluster('renew_rgw_cert')
 
@@ -1443,6 +1602,9 @@ class Module(orchestrator.Orchestrator, MgrModule):
             led.settle()
         except ledger.LedgerError as e:
             raise OrchestratorError('an earlier operation is not settled yet (%s); try again' % e)
+        # the controls of an upgrade in progress are not refused by backpressure
+        if kind not in ledger.UPGRADE_CONTROLS + ('upgrade_agent_resume', 'upgrade_agent_stop'):
+            self._not_backlogged(led, self._journal_index())
         op_id = op_id or 'op-' + os.urandom(8).hex()
         try:
             led.append({'id': op_id, 'kind': kind, **fields, **self._request_fields()})
@@ -1649,6 +1811,10 @@ class Module(orchestrator.Orchestrator, MgrModule):
             except OrchestratorError as e:
                 return HandleCommandResult(retval=-11, stderr=str(e))  # EAGAIN
             done = [e for _, e in led.executable() if e.get('request') == request]
+            # a compacted operation: the snapshot's lookup table, for 30 days (plan 04, step 4)
+            row = None if done else led.lookup(request=request)
+            if row is not None:
+                done = [row]
             if done:
                 if done[0].get('inputs') != inputs:
                     return HandleCommandResult(retval=-17, stderr='request %s was another command' % request)  # EEXIST
@@ -1721,9 +1887,10 @@ class Module(orchestrator.Orchestrator, MgrModule):
             cluster = None
         rec_up = (cluster or {}).get('agent_upgrade') or {}
         running = None
+        index = self._journal_index()
         for _, e in led.executable():
             if e['kind'] == 'upgrade_agent':
-                rec = self._journal(e['id'])
+                rec = index.get(e['id'])
                 if rec_up.get('op') == e['id'] and not rec_up.get('finished') or rec_up.get('op') != e['id'] and (rec is None or rec.get('state') not in TERMINAL):
                     running = e
         return running
@@ -1773,8 +1940,9 @@ class Module(orchestrator.Orchestrator, MgrModule):
                 raise OrchestratorError('--stop takes no image, and needs an agent upgrade in progress')
             rec = self._agent_upgrade_record()
             ours = rec.get('op') == running['id']
+            index = self._journal_index()
             for _, e in led.executable():
-                if e['kind'] == 'upgrade_agent_stop' and e['upgrade'] == running['id'] and ((self._journal(e['id']) or {}).get('state') not in TERMINAL or not ours):
+                if e['kind'] == 'upgrade_agent_stop' and e['upgrade'] == running['id'] and (not self._finished(index, e['id']) or not ours):
                     raise OrchestratorError('agent upgrade %s is stopping already (operation %s)' % (running['id'], e['id']))
             if ours and (rec.get('stopping') or rec.get('stopped')):
                 raise OrchestratorError('agent upgrade %s is stopping already' % running['id'])
@@ -1814,7 +1982,13 @@ class Module(orchestrator.Orchestrator, MgrModule):
             return HandleCommandResult(retval=-11, stderr=str(e))  # EAGAIN
         entry = [e for _, e in led.executable() if e['id'] == id]
         if not entry:
-            return HandleCommandResult(retval=-2, stderr='no accepted operation %s' % id)  # ENOENT
+            # compacted: the snapshot's lookup table keeps it for 30 days (plan 04, step 4)
+            row = led.lookup(ident=id)
+            if row is None:
+                return HandleCommandResult(retval=-2, stderr='no accepted operation %s' % id)  # ENOENT
+            state = row.pop('state', None)
+            return HandleCommandResult(stdout=json.dumps({'accepted': row, 'compacted': led.snapshot_key,
+                                                          'journal': self._journal(id) or {'state': state}}, indent=2, sort_keys=True))
         return HandleCommandResult(stdout=json.dumps({'accepted': entry[0], 'journal': self._journal(id)}, indent=2, sort_keys=True))
 
     @handle_orch_error

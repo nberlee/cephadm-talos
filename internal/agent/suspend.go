@@ -297,7 +297,7 @@ func (g *Granter) operatorOf(r *http.Request) error {
 
 	id, err := pki.CertIdentity(r.TLS.PeerCertificates[0])
 	if err != nil || id.FSID != g.Channel.Self.FSID || id.Role != pki.RoleOperator {
-		return errors.New("only the operator suspends an agent")
+		return errors.New("only the operator calls this")
 	}
 
 	return nil

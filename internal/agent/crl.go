@@ -154,6 +154,7 @@ func (p *CRLPolicy) Set(s approval.Signed) (bool, error) {
 var failClosedOpen = map[string]bool{
 	"POST /v1/crl": true, "POST /v1/policy": true, "GET /status": true,
 	"POST /v1/suspend": true, "GET /v1/suspend": true, "POST /v1/readopt": true, "POST /v1/activate": true, "POST /v1/handoff": true,
+	"POST /v1/resolve": true, "GET /v1/resolve": true,
 }
 
 // handedOver reports whether the agent owns its node (its ownership record exists).

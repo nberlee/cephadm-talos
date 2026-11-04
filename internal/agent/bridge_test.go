@@ -49,8 +49,10 @@ type fakeBridge struct {
 	fsid string
 	// own is the module's incarnation: writes only below it; "" allows all
 	own string
-	// ledger is the module's executable ledger, in order
+	// ledger is the module's executable ledger, in order, above its snapshot
 	ledger []LedgerEntry
+	// snapshot is the ledger snapshot's key, "" for none
+	snapshot string
 	// ca issues mgr certificates; quorum and active answer status and mgr dump
 	ca      *testCA
 	quorum  []string
@@ -214,7 +216,7 @@ func (m *fakeBridge) run(req wire.BridgeRequest) map[string]any {
 			}
 		}
 
-		b, _ := json.Marshal(map[string]any{"entries": page, "more": false})
+		b, _ := json.Marshal(map[string]any{"entries": page, "more": false, "snapshot": m.snapshot})
 
 		return map[string]any{"outcome": "done", "r": 0, "out": string(b)}
 	case "secret get":

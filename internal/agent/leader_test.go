@@ -1396,6 +1396,10 @@ func TestAFailedZapEndsTheRemovalPurged(t *testing.T) {
 	testRemoval(t, 67)
 }
 
+func TestAResolvedZapFailsTheRemoval(t *testing.T) {
+	testRemoval(t, -1)
+}
+
 func testRemoval(t *testing.T, zapRC int) {
 	t.Helper()
 
@@ -1448,7 +1452,18 @@ func testRemoval(t *testing.T, zapRC int) {
 		t.Fatal("the removal ended before its zap")
 	}
 
-	finishJob(t, s.agent, rm.Op.ID+".zap", zapRC, "zap output")
+	if zapRC < 0 {
+		// killed between its start and its result, then resolved by the operator (plan 04, step 4)
+		uncertainJob(t, s.agent, rm.Op.ID+".zap")
+		must(t, s.leader.Tick(ctx, 42, 5))
+
+		if _, err := s.agent.Resolve(ctx, rm.Op.ID+".zap"); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		finishJob(t, s.agent, rm.Op.ID+".zap", zapRC, "zap output")
+	}
+
 	must(t, s.leader.Tick(ctx, 42, 5))
 
 	want := "completed"
@@ -1792,6 +1807,9 @@ func TestAnExitAfterARefusedEnterStopsNothing(t *testing.T) {
 func TestRevisionRequestsWaitWithoutTheLedger(t *testing.T) {
 	s := newLeaderSetup(t)
 	ctx := context.Background()
+
+	// the takeover's import reads the ledger's snapshot too
+	must(t, s.leader.Tick(ctx, 42, 5))
 
 	s.module.mu.Lock()
 	s.module.refuse = "ledger"

@@ -81,6 +81,9 @@ type Bridge struct {
 	// ops are the daemon and host of each executable operation the ledger
 	// returned, for the intents
 	ops map[string][2]string
+	// snapshot is the key of the ledger snapshot the last page followed, ""
+	// without one: every operation at or below it is finished (plan 04, step 4)
+	snapshot string
 }
 
 // intentRecord prefixes the bridge intents in the agent's records.
@@ -578,13 +581,16 @@ func (b *Bridge) Ledger(ctx context.Context, after string) (entries []LedgerEntr
 	}
 
 	var page struct {
-		Entries [][2]json.RawMessage `json:"entries"`
-		More    bool                 `json:"more"`
+		Entries  [][2]json.RawMessage `json:"entries"`
+		More     bool                 `json:"more"`
+		Snapshot string               `json:"snapshot"`
 	}
 
 	if err := json.Unmarshal([]byte(out), &page); err != nil {
 		return nil, false, fmt.Errorf("bridge: ledger: %w", err)
 	}
+
+	b.snapshot = page.Snapshot
 
 	prev := after
 
@@ -608,6 +614,37 @@ func (b *Bridge) Ledger(ctx context.Context, after string) (entries []LedgerEntr
 	}
 
 	return entries, page.More, nil
+}
+
+// LedgerAbove returns the snapshot key and the ids of every executable
+// operation above it (plan 04, step 4): an operation id of the ledger that is
+// not among them is at or below the snapshot, so finished. "" without a
+// snapshot.
+func (b *Bridge) LedgerAbove(ctx context.Context) (string, map[string]bool, error) {
+	ids := map[string]bool{}
+	after, snap := "", ""
+
+	for first := true; ; first = false {
+		entries, more, err := b.Ledger(ctx, after)
+		if err != nil {
+			return "", nil, err
+		}
+
+		if first {
+			snap = b.snapshot
+		} else if b.snapshot != snap {
+			return "", nil, fmt.Errorf("%w: the ledger was compacted while it was read", errRetry)
+		}
+
+		for _, e := range entries {
+			ids[e.Op.ID] = true
+			after = e.Key
+		}
+
+		if !more || len(entries) == 0 {
+			return snap, ids, nil
+		}
+	}
 }
 
 // MgrCerts are certificates the module issued for a mgr (bridge.py

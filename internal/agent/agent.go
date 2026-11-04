@@ -428,6 +428,8 @@ func (a *Agent) Handler() http.Handler {
 		mux.HandleFunc("GET /v1/node", a.Granter.HandleNode)
 		mux.HandleFunc("POST /v1/abandon", a.Granter.HandleAbandon)
 		mux.HandleFunc("POST /v1/close", a.Granter.HandleClose)
+		mux.HandleFunc("POST /v1/resolve", a.Granter.HandleResolve)
+		mux.HandleFunc("GET /v1/resolve", a.Granter.HandleResolve)
 	}
 
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {

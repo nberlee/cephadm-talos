@@ -1253,3 +1253,130 @@ class UpgradePausedByTheLeader(unittest.TestCase):
         st = m.Module.upgrade_status(mod).result
         self.assertTrue(st.is_paused and 'not done' in st.message)
         self.assertEqual(m.Module.upgrade_resume(mod).exception_str, '')
+
+
+class Compaction(unittest.TestCase):
+    """Plan 04, step 4: backpressure, the lookup table, journal pruning."""
+    NOW = __import__('datetime').datetime(2026, 11, 4, tzinfo=__import__('datetime').timezone.utc)
+
+    def test_backpressure_spares_the_controls(self):
+        from talos import ledger as lg
+        mod, entries = Upgrade.module(self, approved=[Upgrade.IMG])
+        mod._ledger.append({'id': 'op-%016x' % 9999, 'kind': 'upgrade_start', 'image': Upgrade.IMG})
+        for i in range(m.MAX_UNFINISHED):
+            mod._ledger.append({'id': 'op-%016x' % i, 'kind': 'restart', 'daemon': 'mgr.h3', 'host': 'h3'})
+        res = m.Module.daemon_action(mod, 'restart', 'mon.h1')
+        self.assertIn('unfinished', res.exception_str)
+        with self.assertRaisesRegex(m.OrchestratorError, 'unfinished'):
+            m.Module._accept_create(mod, 'h1', '/dev/vdb')
+        # the upgrade's controls go in
+        self.assertEqual(m.Module.upgrade_pause(mod).exception_str, '')
+        # once the leader catches up, new operations are accepted again
+        for i in range(10):
+            entries['talos/inc/20/journal/op/op-%016x' % i] = json.dumps({'state': 'completed'})
+        self.assertEqual(m.Module.daemon_action(mod, 'restart', 'mon.h1').exception_str, '')
+        self.assertEqual(lg.TERMINAL, m.TERMINAL)
+
+    def compacted(self):
+        """A module whose ledger has a snapshot covering a request's restart."""
+        import hashlib
+        mod, entries = Acceptance.module(self)
+        mod._gid = 20
+        cmd = {'prefix': 'orch daemon', 'action': 'restart', 'name': 'mon.h1'}
+        inbuf = json.dumps({'cmd': cmd, 'inbuf': None})
+        h = hashlib.sha256(json.dumps({'cmd': cmd, 'inbuf': None}, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        led = mod._ledger
+        key, op = led.append({'id': 'op-%016x' % 1, 'kind': 'restart', 'daemon': 'mon.h1', 'host': 'h1', 'request': Requests.UUID, 'inputs': h})
+        entries['talos/inc/20/journal/op/' + op['id']] = json.dumps({'state': 'completed'})
+        states = {op['id']: 'completed'}
+        rel, content = led.cut(m.cli_baseline(entries), states, key, set(), self.NOW)
+        self.assertTrue(led.publish(rel, content, self.NOW))
+        self.assertEqual(led.executable(), [])
+        return mod, entries, op, inbuf, h
+
+    def test_operation_and_request_over_the_lookup_table(self):
+        from talos import ledger as lg
+        mod, entries, op, inbuf, h = self.compacted()
+        mod.remote = lambda *a: self.fail('run again')
+        res = m.Module._request(mod, Requests.UUID, h, inbuf)
+        self.assertEqual(res.retval, 0, res.stderr)
+        self.assertIn(op['id'], res.stdout)
+        other = json.dumps({'cmd': {'prefix': 'orch daemon', 'action': 'restart', 'name': 'mgr.h3'}, 'inbuf': None})
+        import hashlib
+        oh = hashlib.sha256(json.dumps(json.loads(other), sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        self.assertEqual(m.Module._request(mod, Requests.UUID, oh, other).retval, -17)
+        out = m.Module._operation(mod, op['id'])
+        self.assertEqual(out.retval, 0, out.stderr)
+        shown = json.loads(out.stdout)
+        self.assertEqual((shown['accepted']['kind'], shown['journal']['state']), ('restart', 'completed'))
+        # the journal pruned, the table still has its state
+        del entries['talos/inc/20/journal/op/' + op['id']]
+        self.assertEqual(json.loads(m.Module._operation(mod, op['id']).stdout)['journal'], {'state': 'completed'})
+        # 30 days after the cut that covered it, a later cut drops it
+        key, nxt = mod._ledger.append({'id': 'op-%016x' % 2, 'kind': 'restart', 'daemon': 'mon.h1', 'host': 'h1'})
+        rel, content = mod._ledger.cut(m.cli_baseline(entries), {nxt['id']: 'completed'}, key, set(), self.NOW + lg.LOOKUP_KEEP)
+        self.assertTrue(mod._ledger.publish(rel, content, self.NOW + lg.LOOKUP_KEEP))
+        self.assertEqual(m.Module._operation(mod, op['id']).retval, -2)
+        self.assertEqual(m.Module._operation(mod, nxt['id']).retval, 0)
+
+    def test_pruning_across_incarnations(self):
+        from talos import ledger as lg
+        mod, entries, op, _, _ = self.compacted()
+        led = mod._ledger
+        above, _ = led.append({'id': 'op-%016x' % 3, 'kind': 'restart', 'daemon': 'mon.h1', 'host': 'h1'})
+        cov = op['id']
+        rgw = 'op-%016x' % 7  # covered, its certificate still in use: not in this ledger, so made live by hand
+        j20, j10 = 'talos/inc/20/journal/', 'talos/inc/10/journal/'
+        recs = {
+            j20 + 'takeover': json.dumps({'epoch': 7}), j20 + 'op/' + cov: '{}', j20 + 'op/' + cov + '.rev': json.dumps({'state': 'completed'}),
+            j20 + 'op/' + cov + '.prep': json.dumps({'state': 'uncertain'}),  # this incarnation still asks the agent
+            j20 + 'op/op-%016x' % 3: '{}', j20 + 'roll/' + cov + '.plan': '{}', j20 + 'roll/' + rgw + '.roll.h1': '{}',
+            j20 + 'roll/' + cov + '.renew': '{}', j20 + 'req/x': '{}',
+            j10 + 'takeover': json.dumps({'epoch': 5}), j10 + 'op/' + cov: '{}', j10 + 'op/' + cov + '.prep': json.dumps({'state': 'uncertain'}),
+            'talos/inc/30/journal/takeover': json.dumps({'epoch': 9}), 'talos/inc/30/journal/op/op-%016x' % 3: '{}',
+        }
+        # 10's takeover record stays until a later incarnation published
+        entries.update(recs)
+        mod._prune_journals(led.covered())
+        self.assertNotIn('mgr/cephadm/' + j10 + 'takeover', led.mon.rms)
+        led.mon.rms.clear()
+        recs['talos/inc/20/manifest/%020d' % 1] = '{}'
+        entries.update(recs)
+        fold = led.fold(m.cli_baseline(entries))
+        fold.rgw_certs['issued/%s/%s' % (rgw, 'ab' * 8)] = {'pos': 0, 'retired': False}
+        mod._authority = lambda: (led, fold)
+        mod._prune_journals(led.covered())
+        gone = {k[len('mgr/cephadm/'):] for k in led.mon.rms}
+        self.assertEqual(gone, {j20 + 'op/' + cov, j20 + 'op/' + cov + '.rev', j20 + 'roll/' + cov + '.plan',
+                                j10 + 'op/' + cov, j10 + 'op/' + cov + '.prep', j10 + 'takeover'})
+        # the takeover record went last; 30 has published nothing and keeps its own
+        self.assertEqual(led.mon.rms[-1], 'mgr/cephadm/' + j10 + 'takeover')
+        # the renewal's record goes with its done entry
+        fold.renewals_done.add(cov)
+        led.mon.rms.clear()
+        mod._prune_journals(led.covered())
+        self.assertIn('mgr/cephadm/' + j20 + 'roll/' + cov + '.renew', led.mon.rms)
+        self.assertTrue(above > lg.LEDGER_PREFIX)
+
+    def test_a_compaction_run(self):
+        from talos import ledger as lg
+        mod, entries = Acceptance.module(self)
+        mod._gid = 20
+        mod._logger = types.SimpleNamespace(info=lambda *a: None, warning=lambda *a: None)
+        led = mod._ledger
+        for i in range(1, 6):
+            led.append({'id': 'op-%016x' % i, 'kind': 'restart', 'daemon': 'mon.h1', 'host': 'h1'})
+            entries['talos/inc/20/journal/op/op-%016x' % i] = json.dumps({'state': 'completed'})
+        applied = max(led.entries)
+        entries.update(state_entries(inventory(), {'fsid': 'f', 'sealed': True, 'ledger_applied': applied}, incarnation='20'))
+        old = lg.COMPACT_AFTER
+        lg.COMPACT_AFTER = 3
+        try:
+            m.Module._compact(mod, led, lambda: True, self.NOW)
+            self.assertEqual(lg.LEDGER_PREFIX + led.snapshot_key, applied)
+            self.assertEqual(led.mon.rms, [])  # deleted only later
+            m.Module._compact(mod, led, lambda: True, self.NOW + lg.DELETE_AFTER)
+        finally:
+            lg.COMPACT_AFTER = old
+        self.assertFalse([k for k in led.mon.kv if k.startswith(lg.LEDGER_PREFIX)])
+        self.assertIn('mgr/cephadm/talos/inc/20/journal/op/op-%016x' % 1, led.mon.rms)

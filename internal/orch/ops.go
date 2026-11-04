@@ -507,7 +507,14 @@ func (o *Orch) PS(ctx context.Context, w io.Writer) error {
 		}
 	}
 
-	return tw.Flush()
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+
+	// the agents' jobs whose outcome is not known (plan 04, step 4)
+	o.psUnresolved(ctx, w)
+
+	return nil
 }
 
 func displayName(d state.Daemon) string {

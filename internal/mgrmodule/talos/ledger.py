@@ -14,12 +14,30 @@ incarnations in epoch order: an entry, takeover entries included, is valid only
 if its sequence number is at most the cutoff that the first later valid takeover
 entry records for its incarnation (-1 if that entry does not name it), or if no
 later valid takeover entry exists. A void takeover entry sets no cutoffs.
+
+Snapshots (plan 04, step 4): the active module folds the finished operations
+into a snapshot at a ledger key K, published once under
+`cephadm-talos/ledger-snapshot/<K>/` (chunks, then a manifest naming them with
+their sha256), and deletes the entries at or below K at least DELETE_AFTER
+later. A snapshot holds the fold at K, the incarnations it covered since the
+newest takeover entry at or below K (their highest sequence numbers, which
+later takeover cutoffs take as seen) and a lookup table of the covered
+operations. A reader takes the snapshot with the highest K whose chunks verify
+and which is valid (the first valid takeover entry above K saw every
+sequence number it covered), then the entries above K. Entries are read by key:
+listed in pages, then fetched in batches of `config-key get`.
 """
 
+import base64
+import copy
+import datetime
+import hashlib
 import json
 import re
 import threading
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
+
+from . import revocation
 
 LEDGER_PREFIX = 'cephadm-talos/ledger/'
 ENTRY_VERSION = 1
@@ -58,6 +76,23 @@ DAEMON_RE = re.compile(r'\A(mon|mgr|osd|rgw|keepalived)\.([A-Za-z0-9][A-Za-z0-9.
 HOST_RE = re.compile(r'\A[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z')
 UUID_RE = re.compile(r'\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z')
 WRITE_DEADLINE = 10.0
+# journal states after which the leader does nothing more for an operation
+TERMINAL = ('completed', 'nochange', 'failed', 'refused', 'abandoned')
+
+# snapshots (plan 04, step 4)
+SNAPSHOT_PREFIX = 'cephadm-talos/ledger-snapshot/'
+SNAPSHOT_SCHEMA = 1
+SNAPSHOT_KEY_RE = re.compile(r'\Acephadm-talos/ledger-snapshot/(\d{20}-\d{10}-(?:takeover|op-[0-9a-f]{16}|m-[0-9a-f]{16}))/(manifest|\d{1,6})\Z')
+# base64 characters per chunk: below the config-key entry limit
+SNAPSHOT_CHUNK = 32 << 10
+# a compaction cuts once more than this many entries follow the newest snapshot
+COMPACT_AFTER = 1000
+# the entries a snapshot covers are deleted no earlier than this after its publication
+DELETE_AFTER = datetime.timedelta(minutes=10)
+# the lookup table keeps a covered operation this long after the cut that covered it
+LOOKUP_KEEP = datetime.timedelta(days=30)
+# config-key gets (and removals) in flight at once while reading by key
+BATCH = 8
 
 
 class LedgerError(Exception):
@@ -66,6 +101,10 @@ class LedgerError(Exception):
 
 class OutcomeUnknown(LedgerError):
     """The mons did not answer a write: the operation may exist."""
+
+
+class SnapshotDamaged(LedgerError):
+    """A snapshot's manifest exists but its chunks do not verify."""
 
 
 def entry_key(epoch: int, seq: int, ident: str) -> str:
@@ -240,19 +279,63 @@ def executable(entries: Dict[str, Dict[str, Any]]) -> List[Tuple[str, Dict[str, 
     return out
 
 
-def takeover_cutoffs(entries: Dict[str, Dict[str, Any]], epoch: int) -> Dict[str, int]:
+def takeover_cutoffs(entries: Dict[str, Dict[str, Any]], epoch: int, snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, int]:
     """The cutoffs of a new takeover entry at epoch: the highest sequence number
-    of every incarnation since the newest valid takeover entry before epoch."""
+    of every incarnation since the newest valid takeover entry before epoch.
+    Entries are those above the snapshot, if any; its covered incarnations
+    count as seen."""
     valid = {k for k, _ in executable(entries)}
-    since = -1
+    since = snapshot['since'] if snapshot else -1
     for k, e in entries.items():
         if e['id'] == 'takeover' and e['epoch'] < epoch and _valid_takeover(entries, k):
             since = max(since, e['epoch'])
     cut: Dict[str, int] = {}
+    for gid, (ep, seq) in (snapshot['covered'] if snapshot else {}).items():
+        if since <= ep < epoch:
+            cut[gid] = max(cut.get(gid, 0), seq)
     for k, e in entries.items():
         if since <= e['epoch'] < epoch and (k in valid or e['id'] == 'takeover'):
             cut[str(e['gid'])] = max(cut.get(str(e['gid']), 0), e['seq'])
     return cut
+
+
+def snapshot_valid(snapshot: Dict[str, Any], above: Dict[str, Dict[str, Any]]) -> bool:
+    """Whether a snapshot is valid against the entries above its key (their
+    takeover entries suffice): the first valid takeover entry above it saw
+    every sequence number it covered. A stale predecessor's snapshot that
+    folded its own late writes is not."""
+    takeovers = sorted((e['epoch'], k) for k, e in above.items() if e['id'] == 'takeover' and _valid_takeover(above, k))
+    if not takeovers:
+        return True
+    first = above[takeovers[0][1]]
+    return all(first['cutoffs'].get(gid, -1) >= seq for gid, (ep, seq) in snapshot['covered'].items() if ep < first['epoch'])
+
+
+def cut_key(entries: Dict[str, Dict[str, Any]], states: Dict[str, str], applied: str, pinned: Set[str]) -> Optional[str]:
+    """The largest key K among entries (those above the newest snapshot) such
+    that every operation entry at or below K is finished (a terminal journal
+    state), at or below applied (the published ledger_applied) and not
+    pinned, and every module entry at or below K names such an operation or
+    one a snapshot covered already. Takeover entries and void entries do not
+    hold a cut back. None when nothing can be cut."""
+    valid = {k for k, _ in executable(entries)}
+    ids = {e['id'] for e in entries.values()}
+    ok: Set[str] = set()
+    last = None
+    for k in sorted(entries):
+        e = entries[k]
+        if e['id'] == 'takeover' or k not in valid:
+            last = k
+        elif e['id'].startswith('m-'):
+            if e['of'] not in ok and e['of'] in ids:
+                break
+            last = k
+        elif states.get(e['id']) in TERMINAL and k <= applied and e['id'] not in pinned:
+            ok.add(e['id'])
+            last = k
+        else:
+            break
+    return last
 
 
 def _valid_takeover(entries: Dict[str, Dict[str, Any]], key: str) -> bool:
@@ -273,7 +356,46 @@ class Fold:
     entry the host. A host is in maintenance from the acceptance of its enter
     (or powercycle) until the maintained entry of an exit (or that powercycle)."""
 
-    def __init__(self, inventory: Dict[str, Any], entries: List[Tuple[str, Dict[str, Any]]] = ()) -> None:
+    def __init__(self, inventory: Dict[str, Any], entries: Iterable[Tuple[str, Dict[str, Any]]] = (),
+                 snapshot: Optional[Dict[str, Any]] = None) -> None:
+        if snapshot is not None:
+            self._load(snapshot['state'])
+        else:
+            self._baseline(inventory)
+        positions = self.positions
+        offset = self.count
+        n = offset - 1
+        for n, (_, e) in enumerate(entries, offset):
+            self._apply(n, e, positions)
+        self.count = n + 1
+
+    # the fold's state, as a snapshot keeps it: sets as sorted lists, tuples as lists
+    def state(self, keep: Set[str]) -> Dict[str, Any]:
+        """The fold's state for a snapshot, with the positions of the
+        operations in keep (those a later entry may still name)."""
+        return json.loads(json.dumps({
+            'hosts': self.hosts, 'daemons': self.daemons, 'generations': {k: list(v) for k, v in self.generations.items()},
+            'uuids': self.uuids, 'creations': self.creations, 'maintenance': sorted(self.maintenance), 'upgrade': self.upgrade,
+            'rgw_certs': self.rgw_certs, 'mgr_renewals': self.mgr_renewals, 'mgr_retired': sorted(self.mgr_retired),
+            'agent_renewals': self.agent_renewals, 'agent_retired': sorted(self.agent_retired), 'agent_upgrade': self.agent_upgrade,
+            'cli_rgw': self.cli_rgw, 'vip': self.vip, 'ingress': self.ingress, 'vrrp_secret': self.vrrp_secret, 'rgw_port': self.rgw_port,
+            'renewals_done': sorted(self.renewals_done), 'retired_by': sorted(self.retired_by),
+            'positions': {o: n for o, n in self.positions.items() if o in keep}, 'count': self.count}))
+
+    def _load(self, st: Dict[str, Any]) -> None:
+        st = copy.deepcopy(st)
+        self.hosts, self.daemons, self.uuids, self.creations = st['hosts'], st['daemons'], st['uuids'], st['creations']
+        self.generations = {k: (v[0], v[1]) for k, v in st['generations'].items()}
+        self.maintenance = set(st['maintenance'])
+        self.upgrade, self.rgw_certs = st['upgrade'], st['rgw_certs']
+        self.mgr_renewals, self.mgr_retired = st['mgr_renewals'], set(st['mgr_retired'])
+        self.agent_renewals, self.agent_retired, self.agent_upgrade = st['agent_renewals'], set(st['agent_retired']), st['agent_upgrade']
+        self.cli_rgw, self.vip, self.ingress, self.vrrp_secret, self.rgw_port = st['cli_rgw'], st['vip'], st['ingress'], st['vrrp_secret'], st['rgw_port']
+        self.renewals_done, self.retired_by = set(st['renewals_done']), set(st['retired_by'])
+        self.positions = st['positions']
+        self.count = st['count']
+
+    def _baseline(self, inventory: Dict[str, Any]) -> None:
         self.hosts: Dict[str, str] = {h['name']: h['addr'] for h in inventory['hosts']}
         self.daemons: Dict[str, str] = {}  # "<type>.<id>" -> host
         self.generations: Dict[str, Tuple[str, bool]] = {}  # "<type>.<id>" -> (generation, open)
@@ -313,85 +435,100 @@ class Fold:
         self.vrrp_secret = 'rgw/vrrp'
         if any(d.get('daemon_type') == 'rgw' and d.get('daemon_id') for d in inventory['daemons']):
             self.rgw_certs['cli'] = {'pos': -1, 'retired': False}
-        positions: Dict[str, int] = {}
+        # the RGWs' port: the newest RGW add's (None: the CLI's, in its cluster record)
+        self.rgw_port: Optional[int] = None
+        # renewals with their done entry, and operations with a retire entry:
+        # their journal's roll records are no longer read (plan 04, step 4)
+        self.renewals_done: Set[str] = set()
+        self.retired_by: Set[str] = set()
+        # each operation's place in the executable entries, and how many there were
+        self.positions: Dict[str, int] = {}
+        self.count: int = 0
         for d in inventory['daemons']:
             if d.get('daemon_id'):
                 name = '%s.%s' % (d['daemon_type'], d['daemon_id'])
                 self.daemons[name], self.generations[name] = d['host'], ('cli', True)
                 if d.get('osd_uuid'):
                     self.uuids[name] = d['osd_uuid']
-        for n, (_, e) in enumerate(entries):
-            positions[e['id']] = n
-            kind = e['kind']
-            if kind == 'add_daemon' and e['host'] in self.hosts:
-                self.daemons[e['daemon']], self.generations[e['daemon']] = e['host'], (e['id'], True)
-                self.mgr_renewals.pop(e['daemon'], None)
-                if e.get('cert'):
-                    self.rgw_certs['user/' + e['id']] = {'pos': n, 'retired': False}
-            elif kind == 'close' and e['daemon'] in self.generations:
-                self.generations[e['daemon']] = (self.generations[e['daemon']][0], False)
-            elif kind == 'retire' and e['daemon'].startswith('keepalived.') and e['host'] in (self.ingress or {}).get('hosts', []):
-                pass  # a newer ingress places it again: it stays
-            elif kind == 'retire':
-                self.daemons.pop(e['daemon'], None)
-                self.generations.pop(e['daemon'], None)
-                self.uuids.pop(e['daemon'], None)
-            elif kind == 'retire_host' and not any(h == e['host'] for h in self.daemons.values()):
-                self.hosts.pop(e['host'], None)
-                self.maintenance.discard(e['host'])
-            elif kind == 'add_host' and e['host'] not in self.hosts:
-                self.hosts[e['host']] = e['addr']
-            elif kind in STOPS and e['host'] in self.hosts:
-                self.maintenance.add(e['host'])
-            elif kind == 'maintained':
-                self.maintenance.discard(e['host'])
-            elif kind == 'rgw_cert':
-                # counted from its issuing operation's place, like an operator's from its add
-                self.rgw_certs.setdefault('issued/%s/%s' % (e['of'], e['attempt']), {'pos': positions.get(e['of'], n), 'retired': False})
-            elif kind == 'rgw_cert_done' and e['of'] in positions:
-                for cid, c in self.rgw_certs.items():
-                    if cid != e['keep'] and c['pos'] < positions[e['of']]:
-                        c['retired'] = True
-            elif kind == 'renew_mgr' and self.open_generation(e['daemon']) is not None:
-                self.mgr_renewals.setdefault(e['daemon'], {})[e['id']] = None
-            elif kind == 'mgr_cert' and e['of'] in self.mgr_renewals.get(e['daemon'], {}):
-                self.mgr_renewals[e['daemon']][e['of']] = e['attempt']
-            elif kind == 'mgr_cert_done':
-                self.mgr_retired.update(self.mgr_retiring(e['daemon'], e['keep'], e['host']))
-            elif kind == 'renew_agent' and e['host'] in self.hosts:
-                self.agent_renewals.setdefault(e['host'], {})[e['id']] = None
-            elif kind == 'agent_cert' and e['of'] in self.agent_renewals.get(e['host'], {}):
-                self.agent_renewals[e['host']][e['of']] = e['attempt']
-            elif kind == 'agent_cert_done':
-                self.agent_retired.update(self.agent_retiring(e['host'], e['keep']))
-            elif kind == 'upgrade_agent':
-                self.agent_upgrade = e['id']
-            elif kind == 'apply_ingress':
-                self.ingress = {'vip': e['vip'], 'vrid': e['vrid'], 'op': e['id'], 'hosts': list(e['hosts'])}
-                self.vip = e['vip'].split('/')[0]
-                if e['new_password']:
-                    self.vrrp_secret = 'ingress/%s/vrrp' % e['id']
-                # a host left out keeps its keepalived until the module retires it
-                for h in e['hosts']:
-                    if h in self.hosts:
-                        self.daemons['keepalived.' + h], self.generations['keepalived.' + h] = h, (e['id'], True)
-            elif kind == 'upgrade_start' and self.upgrade is None:
-                self.upgrade = {'op': e['id'], 'image': e['image'], 'paused': False}
-            elif self.upgrade is not None and e.get('upgrade', e.get('of')) == self.upgrade['op'] and kind in UPGRADE_KINDS:
-                if kind in ('upgrade_pause', 'upgrade_resume'):
-                    self.upgrade['paused'] = kind == 'upgrade_pause'
-                else:
-                    self.upgrade = None
-            elif kind == 'create_osd' and e['host'] in self.hosts:
-                self.creations[e['id']] = {'host': e['host'], 'bind': None, 'confirmed': False, 'closed': False}
-            elif kind == 'bind' and e['of'] in self.creations and self.creations[e['of']]['bind'] is None:
-                self.creations[e['of']]['bind'] = e
-            elif kind == 'confirm' and e['of'] in self.creations and e['daemon'] not in self.daemons:
-                c = self.creations[e['of']]
-                c['confirmed'] = True
-                self.daemons[e['daemon']], self.generations[e['daemon']], self.uuids[e['daemon']] = c['host'], (e['of'], True), e['uuid']
-            elif kind == 'close_create' and e['of'] in self.creations:
-                self.creations[e['of']]['closed'] = True
+
+    def _apply(self, n: int, e: Dict[str, Any], positions: Dict[str, int]) -> None:
+        positions[e['id']] = n
+        kind = e['kind']
+        if kind == 'add_daemon' and e['daemon'].startswith('rgw.'):
+            self.rgw_port = int(e['port'])
+        if kind == 'retire':
+            self.retired_by.add(e['of'])
+        elif kind in ('mgr_cert_done', 'agent_cert_done'):
+            self.renewals_done.add(e['of'])
+        if kind == 'add_daemon' and e['host'] in self.hosts:
+            self.daemons[e['daemon']], self.generations[e['daemon']] = e['host'], (e['id'], True)
+            self.mgr_renewals.pop(e['daemon'], None)
+            if e.get('cert'):
+                self.rgw_certs['user/' + e['id']] = {'pos': n, 'retired': False}
+        elif kind == 'close' and e['daemon'] in self.generations:
+            self.generations[e['daemon']] = (self.generations[e['daemon']][0], False)
+        elif kind == 'retire' and e['daemon'].startswith('keepalived.') and e['host'] in (self.ingress or {}).get('hosts', []):
+            pass  # a newer ingress places it again: it stays
+        elif kind == 'retire':
+            self.daemons.pop(e['daemon'], None)
+            self.generations.pop(e['daemon'], None)
+            self.uuids.pop(e['daemon'], None)
+        elif kind == 'retire_host' and not any(h == e['host'] for h in self.daemons.values()):
+            self.hosts.pop(e['host'], None)
+            self.maintenance.discard(e['host'])
+        elif kind == 'add_host' and e['host'] not in self.hosts:
+            self.hosts[e['host']] = e['addr']
+        elif kind in STOPS and e['host'] in self.hosts:
+            self.maintenance.add(e['host'])
+        elif kind == 'maintained':
+            self.maintenance.discard(e['host'])
+        elif kind == 'rgw_cert':
+            # counted from its issuing operation's place, like an operator's from its add
+            self.rgw_certs.setdefault('issued/%s/%s' % (e['of'], e['attempt']), {'pos': positions.get(e['of'], n), 'retired': False})
+        elif kind == 'rgw_cert_done' and e['of'] in positions:
+            for cid, c in self.rgw_certs.items():
+                if cid != e['keep'] and c['pos'] < positions[e['of']]:
+                    c['retired'] = True
+        elif kind == 'renew_mgr' and self.open_generation(e['daemon']) is not None:
+            self.mgr_renewals.setdefault(e['daemon'], {})[e['id']] = None
+        elif kind == 'mgr_cert' and e['of'] in self.mgr_renewals.get(e['daemon'], {}):
+            self.mgr_renewals[e['daemon']][e['of']] = e['attempt']
+        elif kind == 'mgr_cert_done':
+            self.mgr_retired.update(self.mgr_retiring(e['daemon'], e['keep'], e['host']))
+        elif kind == 'renew_agent' and e['host'] in self.hosts:
+            self.agent_renewals.setdefault(e['host'], {})[e['id']] = None
+        elif kind == 'agent_cert' and e['of'] in self.agent_renewals.get(e['host'], {}):
+            self.agent_renewals[e['host']][e['of']] = e['attempt']
+        elif kind == 'agent_cert_done':
+            self.agent_retired.update(self.agent_retiring(e['host'], e['keep']))
+        elif kind == 'upgrade_agent':
+            self.agent_upgrade = e['id']
+        elif kind == 'apply_ingress':
+            self.ingress = {'vip': e['vip'], 'vrid': e['vrid'], 'op': e['id'], 'hosts': list(e['hosts'])}
+            self.vip = e['vip'].split('/')[0]
+            if e['new_password']:
+                self.vrrp_secret = 'ingress/%s/vrrp' % e['id']
+            # a host left out keeps its keepalived until the module retires it
+            for h in e['hosts']:
+                if h in self.hosts:
+                    self.daemons['keepalived.' + h], self.generations['keepalived.' + h] = h, (e['id'], True)
+        elif kind == 'upgrade_start' and self.upgrade is None:
+            self.upgrade = {'op': e['id'], 'image': e['image'], 'paused': False}
+        elif self.upgrade is not None and e.get('upgrade', e.get('of')) == self.upgrade['op'] and kind in UPGRADE_KINDS:
+            if kind in ('upgrade_pause', 'upgrade_resume'):
+                self.upgrade['paused'] = kind == 'upgrade_pause'
+            else:
+                self.upgrade = None
+        elif kind == 'create_osd' and e['host'] in self.hosts:
+            self.creations[e['id']] = {'host': e['host'], 'bind': None, 'confirmed': False, 'closed': False}
+        elif kind == 'bind' and e['of'] in self.creations and self.creations[e['of']]['bind'] is None:
+            self.creations[e['of']]['bind'] = e
+        elif kind == 'confirm' and e['of'] in self.creations and e['daemon'] not in self.daemons:
+            c = self.creations[e['of']]
+            c['confirmed'] = True
+            self.daemons[e['daemon']], self.generations[e['daemon']], self.uuids[e['daemon']] = c['host'], (e['of'], True), e['uuid']
+        elif kind == 'close_create' and e['of'] in self.creations:
+            self.creations[e['of']]['closed'] = True
 
     def mgr_retiring(self, name: str, keep: str, host: str) -> Set[str]:
         """What a mgr_cert_done keeping a renewal retires: the mgr's other
@@ -467,20 +604,41 @@ class Fold:
         return False
 
 
-class Ledger:
-    """This incarnation's view of the ledger: what it found when it captured,
-    plus what it appended since. Entries a stale module appends after this
-    module's takeover entry are void for every reader, so nothing is re-read."""
+def _iso(t: datetime.datetime) -> str:
+    return t.astimezone(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
-    def __init__(self, mon: Callable[[Dict[str, Any], float], Optional[Tuple[int, str, str]]], gid: int, epoch: int) -> None:
-        # mon runs one mon command and returns (r, out, outs), or None without an answer
+
+def _parse_iso(v: Any) -> datetime.datetime:
+    t = datetime.datetime.fromisoformat(str(v).replace('Z', '+00:00'))
+    return t if t.tzinfo else t.replace(tzinfo=datetime.timezone.utc)
+
+
+# mon(cmd, deadline[, reduce]) -> (r, out, outs), or None without an answer
+Mon = Callable[..., Optional[Tuple[int, str, str]]]
+# batch(cmds, deadline) -> one answer (or None) per command, sent together
+Batch = Callable[[List[Dict[str, Any]], float], List[Optional[Tuple[int, str, str]]]]
+
+
+class Ledger:
+    """This incarnation's view of the ledger: the newest valid snapshot it found
+    when it captured, the entries above it, plus what it appended since.
+    Entries a stale module appends after this module's takeover entry are void
+    for every reader, so nothing is re-read."""
+
+    def __init__(self, mon: Mon, gid: int, epoch: int, batch: Optional[Batch] = None) -> None:
         self.mon = mon
+        self.batch = batch or (lambda cmds, deadline: [mon(c, deadline) for c in cmds])
         self.gid, self.epoch = gid, epoch
         self.lock = threading.Lock()
-        self.entries: Dict[str, Dict[str, Any]] = {}
+        self.entries: Dict[str, Dict[str, Any]] = {}  # the entries above the snapshot
         self.seq = 0
         self.pending: Optional[Tuple[str, str]] = None  # an append whose outcome is unknown
         self.ready = False
+        # the snapshot the entries follow (its content), its key (relative to
+        # LEDGER_PREFIX) and when it was published
+        self.snapshot: Optional[Dict[str, Any]] = None
+        self.snapshot_key = ''
+        self.snapshot_at: Optional[datetime.datetime] = None
 
     def _set(self, key: str, value: str) -> None:
         res = self.mon({'prefix': 'config-key set', 'key': key, 'val': value}, WRITE_DEADLINE)
@@ -489,23 +647,134 @@ class Ledger:
         if res[0] != 0:
             raise LedgerError('the mons refused %s: %s' % (key, res[2]))
 
+    def _list(self, prefix: str) -> List[str]:
+        try:
+            return sorted(revocation.list_keys(self.mon, prefix))
+        except revocation.CRLError as e:
+            raise LedgerError(str(e))
+
+    def _get_many(self, keys: List[str]) -> Dict[str, Optional[str]]:
+        """config-key get of keys in batches: the value, or None for a key that
+        does not exist; raises unless every key was answered."""
+        out: Dict[str, Optional[str]] = {}
+        for o in range(0, len(keys), BATCH):
+            part = keys[o:o + BATCH]
+            res = self.batch([{'prefix': 'config-key get', 'key': k} for k in part], WRITE_DEADLINE)
+            for k, r in zip(part, res):
+                if r is None or r[0] not in (0, -2):
+                    raise LedgerError('cannot read %s' % k)
+                out[k] = r[1] if r[0] == 0 else None
+        if len(out) != len(keys):
+            raise LedgerError('the ledger was not read whole')
+        return out
+
+    def remove_keys(self, keys: List[str]) -> None:
+        for o in range(0, len(keys), BATCH):
+            part = keys[o:o + BATCH]
+            res = self.batch([{'prefix': 'config-key rm', 'key': k} for k in part], WRITE_DEADLINE)
+            for k, r in zip(part, res):
+                if r is None or r[0] not in (0, -2):
+                    raise LedgerError('cannot remove %s' % k)
+
+    def _read_entries(self, keys: List[str]) -> Dict[str, Dict[str, Any]]:
+        """Every listed ledger key read by key; a key gone meanwhile fails the read."""
+        found: Dict[str, Dict[str, Any]] = {}
+        for k, v in self._get_many(keys).items():
+            if v is None:
+                raise LedgerError('ledger entry %s went away while the ledger was read' % k)
+            try:
+                found[k] = check_entry(k, v)
+            except LedgerError:
+                continue  # not a module's entry: no authority
+        return found
+
+    def _snapshots(self) -> Dict[str, Set[str]]:
+        """The snapshot keys by cut: K -> the names below it (manifest, chunk numbers)."""
+        out: Dict[str, Set[str]] = {}
+        for k in self._list(SNAPSHOT_PREFIX):
+            m = SNAPSHOT_KEY_RE.match(k)
+            if m:
+                out.setdefault(m.group(1), set()).add(m.group(2))
+        return out
+
+    def _read_snapshot(self, cut: str) -> Optional[Tuple[Dict[str, Any], datetime.datetime]]:
+        """A snapshot's content and publication time; None without a manifest;
+        SnapshotDamaged when its chunks do not verify."""
+        base = SNAPSHOT_PREFIX + cut + '/'
+        raw = self._get_many([base + 'manifest'])[base + 'manifest']
+        if raw is None:
+            return None
+        try:
+            m = json.loads(raw)
+            chunks, sums = m['chunks'], m['sha256']
+            if m.get('schema') != SNAPSHOT_SCHEMA or m.get('key') != cut or not isinstance(chunks, list) or not chunks \
+                    or not isinstance(sums, list) or len(sums) != len(chunks) or any(c != base + str(i) for i, c in enumerate(chunks)):
+                raise ValueError('malformed manifest')
+            at = _parse_iso(m['at'])
+            got = self._get_many(chunks)
+            parts = []
+            for c, h in zip(chunks, sums):
+                v = got[c]
+                if v is None or hashlib.sha256(v.encode()).hexdigest() != h:
+                    raise ValueError('chunk %s does not match its manifest' % c)
+                parts.append(v)
+            data = base64.b64decode(''.join(parts), validate=True)
+            if len(data) != m['size']:
+                raise ValueError('size')
+            content = json.loads(data)
+            if not isinstance(content, dict) or content.get('version') != SNAPSHOT_SCHEMA or content.get('key') != cut \
+                    or not isinstance(content.get('covered'), dict) or type(content.get('since')) is not int or not isinstance(content.get('state'), dict) \
+                    or not isinstance(content.get('lookup'), list):
+                raise ValueError('malformed content')
+        except LedgerError:
+            raise
+        except (ValueError, KeyError, TypeError) as e:
+            raise SnapshotDamaged('ledger snapshot %s: %s' % (cut, e))
+        return content, at
+
     def open(self) -> None:
-        """Read the ledger and write this incarnation's takeover entry."""
+        """Read the newest valid snapshot and the ledger above it, and write
+        this incarnation's takeover entry."""
         with self.lock:
             if self.ready:
                 return
             if self.pending is None:
-                res = self.mon({'prefix': 'config-key dump', 'key': LEDGER_PREFIX}, WRITE_DEADLINE)
-                if res is None or res[0] != 0:
-                    raise LedgerError('cannot read the ledger')
-                found = {}
-                for k, v in json.loads(res[1]).items():
+                keys = [k for k in self._list(LEDGER_PREFIX) if k.startswith(LEDGER_PREFIX)]
+                snaps = self._snapshots()
+                raw: Dict[str, Dict[str, Any]] = {}
+                read_above: Optional[str] = None  # every key above it is read
+
+                def ensure(bound: str) -> None:
+                    nonlocal read_above
+                    todo = [k for k in keys if k > bound and (read_above is None or k <= read_above)]
+                    raw.update(self._read_entries(todo))
+                    read_above = bound
+
+                chosen: Optional[Tuple[str, Dict[str, Any], datetime.datetime]] = None
+                damaged: List[str] = []
+                for cut in sorted((c for c, names in snaps.items() if 'manifest' in names), reverse=True):
                     try:
-                        found[k] = check_entry(k, v)
-                    except LedgerError:
-                        continue  # not a module's entry: no authority
-                self.entries = found
-                cut = takeover_cutoffs(found, self.epoch)
+                        got = self._read_snapshot(cut)
+                    except SnapshotDamaged:
+                        damaged.append(cut)
+                        continue
+                    if got is None:
+                        continue
+                    ensure(LEDGER_PREFIX + cut)
+                    if snapshot_valid(got[0], {k: e for k, e in raw.items() if k > LEDGER_PREFIX + cut}):
+                        chosen = (cut, got[0], got[1])
+                        break
+                if chosen is None and damaged:
+                    # the entries it covered may be deleted: no fold can be trusted
+                    raise LedgerError('ledger snapshot %s is damaged and no older one is valid' % damaged[0])
+                if chosen is None:
+                    ensure('')
+                    self.snapshot, self.snapshot_key, self.snapshot_at = None, '', None
+                else:
+                    self.snapshot_key, self.snapshot, self.snapshot_at = chosen
+                base = LEDGER_PREFIX + self.snapshot_key if self.snapshot else ''
+                self.entries = {k: e for k, e in raw.items() if k > base}
+                cut = takeover_cutoffs(self.entries, self.epoch, self.snapshot)
                 key = entry_key(self.epoch, 0, 'takeover')
                 value = json.dumps({'version': ENTRY_VERSION, 'id': 'takeover', 'kind': 'takeover', 'gid': self.gid,
                                     'epoch': self.epoch, 'seq': 0, 'cutoffs': cut}, sort_keys=True)
@@ -553,5 +822,144 @@ class Ledger:
             return key, self.entries[key]
 
     def executable(self) -> List[Tuple[str, Dict[str, Any]]]:
+        """The executable entries above the snapshot, in order."""
         with self.lock:
             return executable(dict(self.entries))
+
+    def view(self) -> Tuple[Optional[Dict[str, Any]], List[Tuple[str, Dict[str, Any]]]]:
+        """The snapshot and the executable entries above it, read together."""
+        with self.lock:
+            return self.snapshot, executable(dict(self.entries))
+
+    def fold(self, inventory: Dict[str, Any]) -> Fold:
+        snap, ex = self.view()
+        return Fold(inventory, ex, snap)
+
+    def covered(self) -> Callable[[str], bool]:
+        """Whether an operation id is covered by the snapshot: an operation's
+        id with no executable entry above it (finished by definition)."""
+        with self.lock:
+            if self.snapshot is None:
+                return lambda ident: False
+            above = frozenset(e['id'] for _, e in executable(dict(self.entries)))
+        return lambda ident: OP_RE.match(ident) is not None and ident not in above
+
+    def lookup(self, ident: Optional[str] = None, request: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """A covered operation's row of the snapshot's lookup table, by id or by request uuid."""
+        with self.lock:
+            rows = (self.snapshot or {}).get('lookup', [])
+        for r in rows:
+            if ident is not None and r.get('id') == ident or request is not None and r.get('request') == request:
+                return dict(r)
+        return None
+
+    # --- compaction (plan 04, step 4) --------------------------------------
+
+    def cut(self, inventory: Dict[str, Any], states: Dict[str, str], applied: str, pinned: Set[str],
+            now: datetime.datetime) -> Optional[Tuple[str, Dict[str, Any]]]:
+        """The next snapshot (its key and content), None when nothing can be cut."""
+        with self.lock:
+            entries, snap = dict(self.entries), self.snapshot
+        k = cut_key(entries, states, applied, pinned)
+        if k is None:
+            return None
+        ex = executable(entries)
+        valid = {x for x, _ in ex}
+        below = [(x, e) for x, e in ex if x <= k]
+        fold = Fold(inventory, below, snap)
+        # the incarnations covered since the newest takeover entry at or below k
+        since = snap['since'] if snap else -1
+        for x, e in entries.items():
+            if x <= k and e['id'] == 'takeover' and _valid_takeover(entries, x):
+                since = max(since, e['epoch'])
+        covered = {g: list(v) for g, v in (snap['covered'] if snap else {}).items() if v[0] >= since}
+        for x, e in entries.items():
+            if x <= k and e['epoch'] >= since and (x in valid or e['id'] == 'takeover'):
+                g = str(e['gid'])
+                if g not in covered or e['seq'] > covered[g][1]:
+                    covered[g] = [e['epoch'], e['seq']]
+        # positions a later entry may still name: an operation's module entries
+        # can follow the cut, and a live RGW certificate's issuer
+        keep = {e['of'] for x, e in entries.items() if x > k and e['id'].startswith('m-')}
+        keep |= {cid.split('/')[1] for cid, c in fold.rgw_certs.items() if cid != 'cli' and not c['retired']}
+        rows = [r for r in (snap or {}).get('lookup', []) if _parse_iso(r['at']) > now - LOOKUP_KEEP]
+        for x, e in below:
+            if e['id'].startswith('m-'):
+                continue
+            row = {f: e[f] for f in ('id', 'kind', 'host', 'daemon', 'request', 'inputs') if f in e}
+            row.update(key=x[len(LEDGER_PREFIX):], state=states.get(e['id']), at=_iso(now))
+            rows.append(row)
+        rel = k[len(LEDGER_PREFIX):]
+        return rel, {'version': SNAPSHOT_SCHEMA, 'key': rel, 'since': since, 'covered': covered, 'state': fold.state(keep),
+                     'lookup': rows, 'gid': self.gid, 'epoch': self.epoch}
+
+    def publish(self, cut: str, content: Dict[str, Any], now: datetime.datetime) -> bool:
+        """Publish a snapshot once (chunks, then the manifest) and read the
+        ledger above it from then on. A manifest already there is never
+        replaced: it is taken if it verifies and is valid. True once this
+        ledger follows the snapshot."""
+        base = SNAPSHOT_PREFIX + cut + '/'
+        try:
+            there = self._read_snapshot(cut)
+        except SnapshotDamaged:
+            return False
+        if there is not None:
+            content, now = there
+            with self.lock:
+                above = {k: e for k, e in self.entries.items() if k > LEDGER_PREFIX + cut}
+            if not snapshot_valid(content, above):
+                return False
+        else:
+            enc = base64.b64encode(json.dumps(content, sort_keys=True).encode()).decode()
+            parts = [enc[o:o + SNAPSHOT_CHUNK] for o in range(0, len(enc), SNAPSHOT_CHUNK)]
+            for i, v in enumerate(parts):
+                self._set(base + str(i), v)
+            manifest = {'schema': SNAPSHOT_SCHEMA, 'key': cut, 'gid': self.gid, 'epoch': self.epoch, 'at': _iso(now),
+                        'chunks': [base + str(i) for i in range(len(parts))], 'sha256': [hashlib.sha256(v.encode()).hexdigest() for v in parts],
+                        'size': len(base64.b64decode(enc))}
+            self._set(base + 'manifest', json.dumps(manifest, sort_keys=True))
+            now = _parse_iso(manifest['at'])
+        with self.lock:
+            if self.snapshot is not None and self.snapshot_key >= cut:
+                return self.snapshot_key == cut
+            self.snapshot, self.snapshot_key, self.snapshot_at = content, cut, now
+            self.entries = {k: e for k, e in self.entries.items() if k > LEDGER_PREFIX + cut}
+        return True
+
+    def delete(self, now: datetime.datetime, active: Callable[[], bool], prune: Callable[[Callable[[str], bool]], None]) -> bool:
+        """Delete what the snapshot made redundant, at least DELETE_AFTER after
+        its publication, while this module is confirmed active right before
+        (active: a fresh mgr map) and the snapshot is still the highest valid
+        one: older snapshots (manifest first), then prune(covered) (the
+        journals), then the entries at or below its key. True when it ran."""
+        with self.lock:
+            snap, cut, at = self.snapshot, self.snapshot_key, self.snapshot_at
+        if snap is None or at is None or now - at < DELETE_AFTER:
+            return False
+        if not active():
+            return False
+        snaps = self._snapshots()
+        keys = [k for k in self._list(LEDGER_PREFIX) if k.startswith(LEDGER_PREFIX)]
+        # the takeover entries above it, read now: a later takeover that this
+        # snapshot's covered writes are void for makes it invalid
+        takeovers = self._read_entries([k for k in keys if k > LEDGER_PREFIX + cut and k.endswith('-takeover')])
+        if not snapshot_valid(snap, takeovers):
+            return False
+        for newer in sorted((c for c, names in snaps.items() if c > cut and 'manifest' in names), reverse=True):
+            try:
+                got = self._read_snapshot(newer)
+            except SnapshotDamaged:
+                continue
+            if got is not None and snapshot_valid(got[0], {k: e for k, e in takeovers.items() if k > LEDGER_PREFIX + newer}):
+                return False  # a newer valid snapshot: this module is not the one to delete
+        for older in sorted(c for c in snaps if c < cut):
+            names = snaps[older]
+            base = SNAPSHOT_PREFIX + older + '/'
+            # the manifest answered before any chunk goes: a reader never finds a
+            # manifest whose chunks are partly gone
+            if 'manifest' in names:
+                self.remove_keys([base + 'manifest'])
+            self.remove_keys(sorted(base + n for n in names if n != 'manifest'))
+        prune(self.covered())
+        self.remove_keys([k for k in keys if k <= LEDGER_PREFIX + cut])
+        return True

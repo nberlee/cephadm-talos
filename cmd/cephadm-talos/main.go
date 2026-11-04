@@ -57,6 +57,7 @@ Commands:
   recover mons [--image REF]               bring the mons of a suspended cluster back on their stores
   resume                                   end the recovery session: agents re-adopt their nodes, a new leader takes over
   agent restore <host> [--previous]        in a recovery session: apply a suspended host's agent again (--previous: the known good image)
+  resolve <host> [<operation>]             fail a job whose outcome is uncertain once it cannot run (without operation: list them)
   approve [--image REF] [--prepare H:DISK] [--zap H:DISK] [--drop H:SERIAL:ACTION] [--show]
                                            sign and publish the operator's approval of images and disks
   crl-policy closed|open                   the agents' policy for a revocation list past its nextUpdate (default open)
@@ -276,6 +277,19 @@ func run() error {
 		}
 
 		return o.RestoreAgent(ctx, host, *previous)
+	}
+
+	// an agent's job whose outcome is uncertain, failed by the operator (plan
+	// 04, step 4); also while the cluster is suspended
+	if cmd == "resolve" {
+		switch len(args) {
+		case 1:
+			return o.ListUnresolved(ctx, args[0])
+		case 2:
+			return o.Resolve(ctx, args[0], args[1])
+		}
+
+		return errors.New("resolve <host> [<operation>]")
 	}
 
 	// once a leader owns the cluster state the CLI reads it and changes

@@ -422,6 +422,13 @@ class BridgeTest(unittest.TestCase):
             after = got[-1]
         self.assertEqual(got, [k for k, _ in entries])
         self.assertEqual([p for _, p in mons.sent if p != 'mgr dump'], [])  # answered by the module
+        self.assertEqual(page['snapshot'], '')
+        # with a snapshot: its key, for a takeover's journal import (plan 04, step 4)
+        led = FakeLedger(entries)
+        led.snapshot, led.snapshot_key = {}, '%020d-%010d-op-%016x' % (4, 9, 9)
+        ch.authority = lambda: (led, lg.Fold(inventory()))
+        code, reply = self.call(ch, call='ledger', args={'after': got[-1]}, dispatch_id='%016x' % 799)
+        self.assertEqual(json.loads(reply['out']), {'entries': [], 'more': False, 'snapshot': led.snapshot_key})
 
     def test_keys_below_the_prefix_in_pages(self):
         ch, mons = self.channel()

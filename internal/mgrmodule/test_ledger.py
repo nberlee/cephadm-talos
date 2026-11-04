@@ -73,16 +73,36 @@ class ExecutableTest(unittest.TestCase):
 
 
 class Mons:
-    """config-key dump and set over a dict; `silent` writes are stored but not answered."""
+    """config-key ls (reduced), get, set and rm over a dict, with the module's
+    output limit; `silent` writes are stored but not answered."""
+
+    LIMIT = 256 << 10  # bridge.MAX_OUTPUT
 
     def __init__(self, kv=None):
         self.kv = dict(kv or {})
         self.silent = 0
         self.sets = []
+        self.gets = 0
+        self.rms = []
 
-    def __call__(self, cmd, deadline):
+    def __call__(self, cmd, deadline, reduce=None):
         if cmd['prefix'] == 'config-key dump':
-            return 0, json.dumps({k: v for k, v in self.kv.items() if k.startswith(cmd['key'])}), ''
+            out = json.dumps({k: v for k, v in self.kv.items() if k.startswith(cmd['key'])})
+            return (-27, '', '') if len(out) > self.LIMIT else (0, out, '')
+        if cmd['prefix'] == 'config-key ls':
+            out = json.dumps(sorted(self.kv))
+            if reduce is not None:
+                out = reduce(out)
+            return (-27, '', '') if len(out) > self.LIMIT else (0, out, '')
+        if cmd['prefix'] == 'config-key get':
+            self.gets += 1
+            if cmd['key'] not in self.kv:
+                return -2, '', 'ENOENT'
+            return 0, self.kv[cmd['key']], ''
+        if cmd['prefix'] == 'config-key rm':
+            self.rms.append(cmd['key'])
+            self.kv.pop(cmd['key'], None)
+            return 0, '', ''
         if cmd['prefix'] == 'config-key set':
             self.sets.append(cmd['key'])
             self.kv[cmd['key']] = cmd['val']
@@ -132,10 +152,10 @@ class LedgerTest(unittest.TestCase):
 
     def test_a_refused_append_is_not_accepted(self):
         class Refusing(Mons):
-            def __call__(self, cmd, deadline):
+            def __call__(self, cmd, deadline, reduce=None):
                 if cmd['prefix'] == 'config-key set' and 'takeover' not in cmd['key']:
                     return -27, '', 'too big'
-                return super().__call__(cmd, deadline)
+                return super().__call__(cmd, deadline, reduce)
         led = lg.Ledger(Refusing(), 20, 7)
         led.open()
         with self.assertRaises(lg.LedgerError):
@@ -405,3 +425,198 @@ class IngressFoldTest(unittest.TestCase):
             k, e = entry(5, 9, 'op-%016x' % 9, **bad)
             with self.assertRaises(lg.LedgerError, msg=bad):
                 lg.check_entry(k, json.dumps(e))
+
+
+class SnapshotTest(unittest.TestCase):
+    """Compaction (plan 04, step 4): the cut, snapshots, their readers and the
+    delayed deletion."""
+    INV = {'hosts': [{'name': 'h1', 'addr': '10.0.0.1'}, {'name': 'h2', 'addr': '10.0.0.2'}],
+           'daemons': [{'daemon_type': 'mgr', 'daemon_id': 'h1', 'host': 'h1'}, {'daemon_type': 'rgw', 'daemon_id': 'h1', 'host': 'h1'}],
+           'cli_rgw': {'port': 443}}
+    NOW = __import__('datetime').datetime(2026, 11, 4, tzinfo=__import__('datetime').timezone.utc)
+
+    def opened(self, mons, gid, epoch):
+        led = lg.Ledger(mons, gid, epoch)
+        led.open()
+        return led
+
+    def restart(self, led, n, daemon='mgr.h1', host='h1'):
+        return led.append({'id': 'op-%016x' % n, 'kind': 'restart', 'daemon': daemon, 'host': host})
+
+    @staticmethod
+    def state(fold):
+        st = fold.state(set())
+        st.pop('positions')
+        return st
+
+    def test_the_cut(self):
+        led = self.opened(Mons(), 20, 7)
+        k1, _ = self.restart(led, 1)
+        k2, _ = self.restart(led, 2)
+        m1, _ = led.append({'id': 'm-%016x' % 1, 'kind': 'close', 'of': 'op-%016x' % 1, 'daemon': 'mgr.h1', 'host': 'h1'})
+        k3, _ = self.restart(led, 3)
+        k4, _ = self.restart(led, 4)
+        m4, _ = led.append({'id': 'm-%016x' % 4, 'kind': 'close', 'of': 'op-%016x' % 4, 'daemon': 'mgr.h1', 'host': 'h1'})
+        done = {'op-%016x' % i: 'completed' for i in (1, 2, 3)}
+        entries = dict(led.entries)
+        last = max(entries)
+        self.assertEqual(lg.cut_key(entries, done, last, set()), k3)
+        # not past the published ledger_applied, an unfinished one or a pinned one
+        self.assertEqual(lg.cut_key(entries, done, k2, set()), m1)
+        self.assertEqual(lg.cut_key(entries, dict(done, **{'op-%016x' % 2: 'granting'}), last, set()), k1)
+        self.assertEqual(lg.cut_key(entries, done, last, {'op-%016x' % 1}), lg.entry_key(7, 0, 'takeover'))
+        # a module entry naming an operation that is not cut holds the cut back
+        self.assertEqual(lg.cut_key(entries, dict(done, **{'op-%016x' % 4: 'completed'}), last, set()), m4)
+        self.assertEqual(lg.cut_key(entries, done, last, set()), k3)
+        self.assertIsNone(lg.cut_key({}, done, last, set()))
+
+    def test_a_snapshot_folds_as_the_whole_ledger(self):
+        mons = Mons()
+        led = self.opened(mons, 20, 7)
+        add, _ = led.append({'id': 'op-%016x' % 1, 'kind': 'add_daemon', 'daemon': 'rgw.h2', 'host': 'h2', 'port': 8443})
+        self.restart(led, 2)  # unfinished: the cut stops before it
+        # the add's certificate entries follow the cut: its position is kept
+        led.append({'id': 'm-%016x' % 3, 'kind': 'rgw_cert', 'of': 'op-%016x' % 1, 'attempt': 'ab' * 8})
+        led.append({'id': 'm-%016x' % 4, 'kind': 'rgw_cert_done', 'of': 'op-%016x' % 1, 'keep': 'issued/op-%016x/%s' % (1, 'ab' * 8)})
+        whole = lg.Fold(self.INV, led.executable())
+        states = {'op-%016x' % 1: 'completed'}
+        rel, content = led.cut(self.INV, states, max(led.entries), set(), self.NOW)
+        self.assertEqual(lg.LEDGER_PREFIX + rel, add)
+        self.assertEqual(content['state']['positions'], {'op-%016x' % 1: 0})
+        self.assertEqual(content['covered'], {'20': [7, 1]})
+        self.assertTrue(led.publish(rel, content, self.NOW))
+        self.assertTrue(all(k > add for k in led.entries))
+        f = led.fold(self.INV)
+        self.assertEqual(self.state(f), self.state(whole))
+        self.assertEqual(f.rgw_port, 8443)
+        self.assertTrue(f.rgw_certs['cli']['retired'] and not f.rgw_certs['issued/op-%016x/%s' % (1, 'ab' * 8)]['retired'])
+        # a successor reads the snapshot and the entries above it: the same fold,
+        # positions continued, and the cutoffs it would have set from the whole ledger
+        succ = self.opened(mons, 30, 9)
+        self.assertEqual(succ.snapshot_key, rel)
+        self.assertEqual(self.state(succ.fold(self.INV)), self.state(whole))
+        later = self.opened(Mons({k: v for k, v in mons.kv.items() if not k.startswith(lg.SNAPSHOT_PREFIX)}), 31, 9)
+        self.assertEqual(json.loads(mons.kv[lg.entry_key(9, 0, 'takeover')])['cutoffs'], json.loads(later.mon.kv[lg.entry_key(9, 0, 'takeover')])['cutoffs'])
+        self.assertEqual(json.loads(mons.kv[lg.entry_key(9, 0, 'takeover')])['cutoffs'], {'20': 4})
+        self.assertEqual(succ.lookup(ident='op-%016x' % 1)['state'], 'completed')
+        self.assertTrue(succ.covered()('op-%016x' % 1))
+        self.assertFalse(succ.covered()('op-%016x' % 2))
+
+    def test_a_takeover_after_a_snapshot(self):
+        mons = Mons()
+        a = self.opened(mons, 10, 5)
+        for i in (1, 2, 3):
+            self.restart(a, i)
+        rel, content = a.cut(self.INV, {'op-%016x' % i: 'completed' for i in (1, 2)}, max(a.entries), set(), self.NOW)
+        self.assertTrue(a.publish(rel, content, self.NOW))
+        b = self.opened(mons, 20, 7)
+        self.assertEqual(json.loads(mons.kv[lg.entry_key(7, 0, 'takeover')])['cutoffs'], {'10': 3})
+        self.restart(b, 4)
+        # B's snapshot covers B's takeover: A is no longer covered, and C's
+        # takeover need not name it
+        rel, content = b.cut(self.INV, {'op-%016x' % i: 'completed' for i in (1, 2, 3, 4)}, max(b.entries), set(), self.NOW)
+        self.assertEqual(content['since'], 7)
+        self.assertEqual(content['covered'], {'20': [7, 1]})
+        self.assertTrue(b.publish(rel, content, self.NOW))
+        c = self.opened(mons, 30, 9)
+        self.assertEqual(c.snapshot_key, rel)
+        self.assertEqual(json.loads(mons.kv[lg.entry_key(9, 0, 'takeover')])['cutoffs'], {'20': 1})
+        d = self.opened(mons, 40, 11)
+        self.assertEqual(d.snapshot_key, rel)  # C's cutoffs do not name A: still valid
+        self.assertEqual([e['id'] for _, e in d.executable()], [])
+
+    def test_late_writes_and_a_stale_snapshot(self):
+        mons = Mons()
+        a = self.opened(mons, 10, 5)
+        for i in (1, 2, 3):
+            self.restart(a, i)
+        b = self.opened(mons, 20, 7)
+        self.restart(b, 4)
+        # A, stale, appends after B's takeover and cuts its own late write
+        late, _ = self.restart(a, 5)
+        done = {'op-%016x' % i: 'completed' for i in range(1, 6)}
+        rel, content = a.cut(self.INV, done, late, set(), self.NOW)
+        self.assertEqual(lg.LEDGER_PREFIX + rel, late)
+        self.assertTrue(a.publish(rel, content, self.NOW))
+        # rejected by every reader: B's takeover saw A only up to 3
+        c = self.opened(mons, 30, 9)
+        self.assertIsNone(c.snapshot)
+        self.assertEqual([e['id'] for _, e in c.executable()], ['op-%016x' % i for i in (1, 2, 3, 4)])
+        # nor does its writer delete for it
+        removed = []
+        self.assertFalse(a.delete(self.NOW + lg.DELETE_AFTER * 2, lambda: True, removed.append))
+        self.assertEqual((removed, mons.rms), ([], []))
+        # B's valid snapshot; a late write of A at or below it is ignored
+        rel, content = b.cut(self.INV, done, max(b.entries), set(), self.NOW)
+        self.assertTrue(b.publish(rel, content, self.NOW))
+        self.restart(a, 6)
+        d = self.opened(mons, 40, 11)
+        self.assertEqual(d.snapshot_key, rel)
+        self.assertEqual(self.state(d.fold(self.INV)), self.state(lg.Fold(self.INV, c.executable())))
+        self.assertNotIn('op-%016x' % 6, [e['id'] for _, e in d.executable()])
+
+    def test_deletion_waits_and_is_fenced(self):
+        mons = Mons()
+        led = self.opened(mons, 20, 7)
+        for i in (1, 2, 3):
+            self.restart(led, i)
+        done = {'op-%016x' % i: 'completed' for i in (1, 2, 3)}
+        first, content = led.cut(self.INV, {'op-%016x' % 1: 'completed'}, max(led.entries), set(), self.NOW)
+        self.assertTrue(led.publish(first, content, self.NOW))
+        k4, _ = self.restart(led, 4)
+        rel, content = led.cut(self.INV, done, max(led.entries), set(), self.NOW)
+        self.assertTrue(led.publish(rel, content, self.NOW))
+        pruned = []
+        # not before DELETE_AFTER, nor without a fresh confirmation of leadership
+        self.assertFalse(led.delete(self.NOW + lg.DELETE_AFTER / 2, lambda: True, pruned.append))
+        self.assertFalse(led.delete(self.NOW + lg.DELETE_AFTER, lambda: False, pruned.append))
+        self.assertEqual((pruned, mons.rms), ([], []))
+        self.assertTrue(led.delete(self.NOW + lg.DELETE_AFTER, lambda: True, pruned.append))
+        self.assertEqual(sorted(k for k in mons.kv if k.startswith(lg.LEDGER_PREFIX)), [k4])
+        self.assertEqual({k.split('/')[2] for k in mons.kv if k.startswith(lg.SNAPSHOT_PREFIX)}, {rel})
+        # the older snapshot's manifest went before its chunks
+        older = [k for k in mons.rms if k.startswith(lg.SNAPSHOT_PREFIX)]
+        self.assertTrue(older[0].endswith('/manifest'))
+        [covered] = pruned
+        self.assertTrue(covered('op-%016x' % 3) and not covered('op-%016x' % 4) and not covered('m-%016x' % 1))
+        # a successor reads the same
+        succ = self.opened(mons, 30, 9)
+        self.assertEqual(([e['id'] for _, e in succ.executable()], succ.snapshot_key), (['op-%016x' % 4], rel))
+
+    def test_a_damaged_snapshot(self):
+        mons = Mons()
+        led = self.opened(mons, 20, 7)
+        for i in (1, 2, 3):
+            self.restart(led, i)
+        first, content = led.cut(self.INV, {'op-%016x' % 1: 'completed'}, max(led.entries), set(), self.NOW)
+        self.assertTrue(led.publish(first, content, self.NOW))
+        rel, content = led.cut(self.INV, {'op-%016x' % i: 'completed' for i in (1, 2, 3)}, max(led.entries), set(), self.NOW)
+        self.assertTrue(led.publish(rel, content, self.NOW))
+        chunk = lg.SNAPSHOT_PREFIX + rel + '/0'
+        mons.kv[chunk] = mons.kv[chunk][:-4] + 'AAAA'
+        # the older one, while the entries above it are there
+        succ = self.opened(mons, 30, 9)
+        self.assertEqual(succ.snapshot_key, first)
+        self.assertEqual([e['id'] for _, e in succ.executable()], ['op-%016x' % 2, 'op-%016x' % 3])
+        # without it, nothing can be trusted: refused
+        del mons.kv[lg.SNAPSHOT_PREFIX + first + '/manifest']
+        with self.assertRaises(lg.LedgerError):
+            self.opened(mons, 40, 11)
+
+    def test_reading_by_key_past_the_output_limit(self):
+        mons = Mons()
+        led = self.opened(mons, 20, 7)
+        for i in range(1, 3001):
+            self.restart(led, i)
+        self.assertEqual(mons({'prefix': 'config-key dump', 'key': lg.LEDGER_PREFIX}, 1)[0], -27)
+        succ = self.opened(mons, 30, 9)
+        self.assertEqual(len(succ.executable()), 3000)
+        self.assertEqual(json.loads(mons.kv[lg.entry_key(9, 0, 'takeover')])['cutoffs'], {'20': 3000})
+        # a listed key that cannot be read fails the read
+        class Losing(Mons):
+            def __call__(self, cmd, deadline, reduce=None):
+                if cmd['prefix'] == 'config-key get' and cmd['key'].endswith('%016x' % 7):
+                    return None
+                return super().__call__(cmd, deadline, reduce)
+        with self.assertRaises(lg.LedgerError):
+            self.opened(Losing(mons.kv), 40, 11)

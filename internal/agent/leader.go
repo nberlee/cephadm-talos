@@ -487,7 +487,8 @@ func (l *LeaderLoop) takeover(ctx context.Context, b *Bridge, js store.Backend, 
 // (their outcome is then asked from the agent, or the grant abandoned) and
 // undecided requests into this incarnation's journal. Histories are merged
 // by id: the newest incarnation that has an operation for an id decides it,
-// so a request an intermediate incarnation completed is not run again.
+// so a request an intermediate incarnation completed is not run again. The
+// grants of an operation the ledger's snapshot covers are not imported.
 func (l *LeaderLoop) importPredecessors(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64) error {
 	all, err := b.Store(ctx, store.Prefix+"inc/")
 	if err != nil {
@@ -574,12 +575,24 @@ func (l *LeaderLoop) importPredecessors(ctx context.Context, b *Bridge, js store
 
 	own := JournalPrefix(gid)
 
+	// an operation at or below the ledger's snapshot is finished by definition:
+	// a predecessor's record of it, which the module prunes, is never brought
+	// back (plan 04, step 4)
+	snap, above, err := b.LedgerAbove(ctx)
+	if err != nil {
+		return err
+	}
+
 	for id, h := range ids {
 		// what this incarnation already has stays
 		if _, err := js.Get(ctx, own+"op/"+id); err == nil {
 			continue
 		} else if !errors.Is(err, store.ErrNotFound) {
 			return err
+		}
+
+		if base, _, _ := strings.Cut(id, "."); h.op > 0 && snap != "" && ledgerIDRe.MatchString(base) && !above[base] {
+			continue
 		}
 
 		if h.op > 0 {

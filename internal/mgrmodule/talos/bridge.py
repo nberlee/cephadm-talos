@@ -1722,7 +1722,9 @@ class Channel:
         return 200, {'outcome': 'done', 'r': 0, 'out': job.outb, 'outs': ''}
 
     def _ledger_page(self, led: Any, after: str) -> Dict[str, Any]:
-        """The executable entries after a key, in order, a page at a time."""
+        """The executable entries after a key, in order, a page at a time, and
+        the key of the snapshot they follow ('' without one): every operation
+        at or below it is finished (plan 04, step 4)."""
         rest = [(k, e) for k, e in led.executable() if k > after]
         page, size = [], 0
         for k, e in rest:
@@ -1730,7 +1732,8 @@ class Channel:
             if size > LEDGER_PAGE:
                 break
             page.append([k, e])
-        return {'outcome': 'done', 'r': 0, 'out': json.dumps({'entries': page, 'more': len(page) < len(rest)}), 'outs': ''}
+        snap = getattr(led, 'snapshot_key', '') if getattr(led, 'snapshot', None) is not None else ''
+        return {'outcome': 'done', 'r': 0, 'out': json.dumps({'entries': page, 'more': len(page) < len(rest), 'snapshot': snap}), 'outs': ''}
 
     def _outcome(self, dispatch: str, rec: Record) -> Dict[str, Any]:
         if rec.local:

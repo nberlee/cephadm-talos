@@ -349,6 +349,16 @@ type Suspend struct {
 	Session string `json:"session"`
 }
 
+// Resolve is the operator's request that an agent fail a job whose outcome is
+// uncertain (plan 04, step 4), with the operator certificate: the agent's
+// operation id, as the leader's journal names it (op-<hex>.prep).
+type Resolve struct {
+	Version   int    `json:"version"`
+	FSID      string `json:"fsid"`
+	Host      string `json:"host"`
+	Operation string `json:"operation"`
+}
+
 // SuspendReceipt is a suspended agent's state once nothing it started runs:
 // what the CLI must not touch, and what re-adoption keeps.
 type SuspendReceipt struct {

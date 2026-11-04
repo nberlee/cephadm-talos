@@ -94,6 +94,8 @@ func (l *LeaderLoop) ledgerOps(ctx context.Context, b *Bridge, js store.Backend,
 	}
 
 	after := st.LedgerApplied
+	// the last module entry passed over since the last checkpoint
+	skipped := ""
 
 	for {
 		entries, more, err := b.Ledger(ctx, after)
@@ -104,6 +106,14 @@ func (l *LeaderLoop) ledgerOps(ctx context.Context, b *Bridge, js store.Backend,
 		for _, e := range entries {
 			if !l.stillLeader(gid, epoch) {
 				return nil // the next leader carries on
+			}
+
+			// the module's own entries carry out its operations: nothing to
+			// run and no journal record; checkpointed past (plan 04, step 4)
+			if strings.HasPrefix(e.Op.ID, "m-") {
+				skipped, after = e.Key, e.Key
+
+				continue
 			}
 
 			// an upgrade step in progress, or an upgrade ending, holds the slot:
@@ -176,7 +186,15 @@ func (l *LeaderLoop) ledgerOps(ctx context.Context, b *Bridge, js store.Backend,
 				return err
 			}
 
-			after = e.Key
+			after, skipped = e.Key, ""
+		}
+
+		if skipped != "" && (!more || len(entries) == 0) {
+			if err := l.checkpoint(ctx, b, gid, skipped); err != nil {
+				return err
+			}
+
+			skipped = ""
 		}
 
 		if !more || len(entries) == 0 {
