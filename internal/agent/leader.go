@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -876,18 +877,14 @@ func (l *LeaderLoop) clusterState(ctx context.Context, b *Bridge) (*state.State,
 
 // agentClient talks to a host's agent and requires its certificate.
 func (l *LeaderLoop) agentClient(h state.Host) *http.Client {
-	cfg := l.ClientTLS.Clone()
-	cfg.VerifyConnection = func(cs tls.ConnectionState) error {
-		if len(cs.PeerCertificates) == 0 {
-			return errors.New("no server certificate")
-		}
-
-		if _, err := pki.Require(cs.PeerCertificates[0], pki.Identity{FSID: l.Self.FSID, Role: pki.RoleAgent, Name: h.Name}); err != nil {
+	// by its identity, not its address (plan 04, step 5)
+	cfg := WithPeer(l.ClientTLS, func(c *x509.Certificate) error {
+		if _, err := pki.Require(c, pki.Identity{FSID: l.Self.FSID, Role: pki.RoleAgent, Name: h.Name}); err != nil {
 			return err
 		}
 
-		return l.CRL.Check(cs.PeerCertificates[0])
-	}
+		return l.CRL.Check(c)
+	})
 
 	return &http.Client{Transport: &http.Transport{TLSClientConfig: cfg, DisableKeepAlives: true}, Timeout: grantTimeout + 30*time.Second}
 }
@@ -1007,6 +1004,12 @@ func (l *LeaderLoop) renderHost(ctx context.Context, b *Bridge, st *state.State,
 		// its document stays as it is, as does a leaving daemon's; a host in
 		// maintenance has none
 		if gone(d) || h.Maintenance || d.Type == state.TypeOSD && (d.OSDID == nil || d.OSDUUID == "") {
+			continue
+		}
+
+		// a moving host's keepalived is off until its peers name its new
+		// address (plan 04, step 5): its document stays off the node
+		if d.Type == state.TypeVIP && h.Move != nil && h.Move.VIPOff {
 			continue
 		}
 

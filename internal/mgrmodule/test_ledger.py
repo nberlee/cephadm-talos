@@ -330,6 +330,47 @@ class DrainAndNooutFoldTest(unittest.TestCase):
         self.assertEqual(lg.cut_key(dict(led.entries), {'op-%016x' % 1: 'completed'}, k2, set()), k2)
 
 
+class MoveFoldTest(unittest.TestCase):
+    """plan 04, step 5: a host's move, from acceptance to addr_set."""
+    INV = {'hosts': [{'name': 'h1', 'addr': '10.0.0.1'}, {'name': 'h2', 'addr': '10.0.0.2'}],
+           'daemons': [{'doc_name': 'x', 'host': 'h1', 'daemon_type': 'mgr', 'daemon_id': 'h1', 'service_name': 'mgr'}]}
+
+    def test_pending_until_confirmed(self):
+        op = 'op-%016x' % 1
+        mv = entry(5, 1, op, kind='set_host_addr', host='h1', addr='10.0.0.9')
+        resume = entry(5, 2, 'op-%016x' % 2, kind='move_resume', host='h1', move=op)
+        moved = entry(5, 3, 'm-%016x' % 3, kind='addr_moved', of=op, host='h1')
+        done = entry(5, 4, 'm-%016x' % 4, kind='addr_set', of=op, host='h1')
+        for k, e in (mv, resume, moved, done):
+            lg.check_entry(k, json.dumps(e))
+        f = lg.Fold(self.INV, [mv, resume])
+        # the address is not the host's before the leader confirmed it; no certificate for it
+        self.assertEqual((f.hosts['h1'], f.moving['h1'], f.agent_renewals), ('10.0.0.1', {'op': op, 'addr': '10.0.0.9', 'moved': False}, {}))
+        f = lg.Fold(self.INV, [mv, moved])
+        self.assertEqual((f.hosts['h1'], f.moving['h1']['moved']), ('10.0.0.9', True))
+        self.assertEqual((f.agent_renewals['h1'], f.mgr_renewals['mgr.h1']), ({op: None}, {op: None}))
+        f = lg.Fold(self.INV, [mv, moved, done])
+        self.assertEqual((f.hosts['h1'], f.moving), ('10.0.0.9', {}))
+        # refused before its confirmation: closed, the address kept
+        f = lg.Fold(self.INV, [mv, done])
+        self.assertEqual((f.hosts['h1'], f.moving), ('10.0.0.1', {}))
+        # another move's entries change nothing; the snapshot keeps the move
+        other = entry(5, 5, 'm-%016x' % 5, kind='addr_moved', of='op-%016x' % 9, host='h1')
+        self.assertEqual(lg.Fold(self.INV, [mv, other]).hosts['h1'], '10.0.0.1')
+        st = lg.Fold(self.INV, [mv]).state(set())
+        self.assertEqual(lg.Fold(self.INV, [], {'state': st}).moving, st['moving'])
+        for bad in (dict(kind='set_host_addr', host='h1'), dict(kind='set_host_addr', host='h1', addr='a b'), dict(kind='set_host_addr', addr='10.0.0.9'),
+                    dict(kind='set_host_addr', host='h1', addr='10.0.0.9', daemon='mon.h1'), dict(kind='move_resume', host='h1'),
+                    dict(kind='move_resume', host='h1', move='x')):
+            k, e = entry(5, 9, 'op-%016x' % 9, **bad)
+            with self.assertRaises(lg.LedgerError, msg=bad):
+                lg.check_entry(k, json.dumps(e))
+        for bad in (dict(kind='addr_moved', host='h1'), dict(kind='addr_set', of=op), dict(kind='addr_moved', of=op, host='h1', daemon='mon.h1')):
+            k, e = entry(5, 9, 'm-%016x' % 9, **bad)
+            with self.assertRaises(lg.LedgerError, msg=bad):
+                lg.check_entry(k, json.dumps(e))
+
+
 class UpgradeFoldTest(unittest.TestCase):
     IMG = 'quay.io/ceph/ceph@sha256:' + 'cd' * 32
 

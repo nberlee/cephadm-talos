@@ -111,7 +111,14 @@ func MgrFiles(s *state.State, h state.Host, withMgr bool, secret Secret) (Docume
 // rebuilds its store. An OSD needs its id, uuid and stable device: prepare it
 // first.
 func Daemon(s *state.State, h state.Host, d state.Daemon, image string, key Key, secret Secret) (*spec.ContainerConfig, error) {
-	p := daemons.Params{Name: s.DocName(d), Image: image, FSID: s.FSID, ID: d.ID, Addr: h.Addr, DeployID: d.DeployID}
+	// each daemon on the address it runs on: during its host's move the old
+	// one until its own step moved it (plan 04, step 5)
+	addr := s.DaemonAddr(d)
+	if addr == "" {
+		addr = h.Addr
+	}
+
+	p := daemons.Params{Name: s.DocName(d), Image: image, FSID: s.FSID, ID: d.ID, Addr: addr, DeployID: d.DeployID}
 
 	switch d.Type {
 	case state.TypeMon:
@@ -120,7 +127,7 @@ func Daemon(s *state.State, h state.Host, d state.Daemon, image string, key Key,
 			return nil, err
 		}
 
-		p.Keyring, p.Mode, p.Addrv = daemons.MonKeyring(k), "join", daemons.MonAddrv(h.Addr)
+		p.Keyring, p.Mode, p.Addrv = daemons.MonKeyring(k), "join", daemons.MonAddrv(addr)
 
 		return daemons.Mon(p), nil
 	case state.TypeMgr:
@@ -197,7 +204,8 @@ func Daemon(s *state.State, h state.Host, d state.Daemon, image string, key Key,
 }
 
 // vipParams sets a keepalived's VRRP parameters: priority by placement order
-// (the first is preferred), the other VIP hosts as unicast peers.
+// (the first is preferred), the other VIP hosts' keepalived as unicast peers,
+// each at the address it runs on (DaemonAddr).
 func vipParams(s *state.State, p *daemons.Params, d state.Daemon) {
 	r := s.RGW
 	p.Port, p.VIP, p.VRID = r.Port, r.VIP, r.VRID
@@ -206,8 +214,8 @@ func vipParams(s *state.State, p *daemons.Params, d state.Daemon) {
 	for i, other := range s.DaemonsOf(state.TypeVIP, "") {
 		if other.ID == d.ID {
 			p.Priority = 150 - 10*i
-		} else if oh, ok := s.Host(other.Host); ok {
-			p.Peers = append(p.Peers, oh.Addr)
+		} else if a := s.DaemonAddr(other); a != "" {
+			p.Peers = append(p.Peers, a)
 		}
 	}
 }

@@ -356,10 +356,21 @@ def _osd_dump(args: Dict[str, Any]) -> Dict[str, Any]:
     return {'prefix': 'osd dump', 'format': 'json'}
 
 
+def _ip(addrs: Any) -> str:
+    """The IP of an OSD map entry's address vector (its first address), '' without one."""
+    try:
+        a = addrs['addrvec'][0]['addr']
+    except (KeyError, IndexError, TypeError):
+        return ''
+    return a.rsplit(':', 1)[0].strip('[]') if isinstance(a, str) else ''
+
+
 def _osds(out: str) -> str:
-    """osd dump reduced to each OSD's id, uuid and whether it is up and in."""
+    """osd dump reduced to each OSD's id, uuid, whether it is up and in, and
+    the IPs it advertises (a move waits for them, plan 04 step 5)."""
     d = json.loads(out)
-    return json.dumps([{'osd': o['osd'], 'uuid': o.get('uuid', ''), 'up': bool(o.get('up')), 'in': bool(o.get('in'))} for o in d.get('osds', [])])
+    return json.dumps([{'osd': o['osd'], 'uuid': o.get('uuid', ''), 'up': bool(o.get('up')), 'in': bool(o.get('in')),
+                        'public_addr': _ip(o.get('public_addrs')), 'cluster_addr': _ip(o.get('cluster_addrs'))} for o in d.get('osds', [])])
 
 
 # calls whose output is reduced in the mgr before it is kept and returned
@@ -378,7 +389,8 @@ READ_PREFIXES = {'auth get', 'config get', 'config-key get', 'config-key ls', 'm
 # calls the module answers itself, for operations of its ledger (ledger.py)
 LOCAL = {'mgr cert', 'retire', 'retire host', 'bind disk', 'confirm osd', 'close create', 'osd out', 'drain', 'mon rm',
          'ok to stop', 'noout set', 'noout unset', 'maintained', 'mgr fail', 'ok to stop daemon', 'upgrade done', 'upgrade refused',
-         'rgw cert', 'rgw cert done', 'retire keepalived', 'mgr cert done', 'agent cert', 'agent cert done', 'drain done'}
+         'rgw cert', 'rgw cert done', 'retire keepalived', 'mgr cert done', 'agent cert', 'agent cert done', 'drain done',
+         'addr moved', 'addr set', 'move addr', 'clear osd addr'}
 
 ALLOWLIST: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     'status': _no_args('status'),
@@ -419,6 +431,13 @@ ALLOWLIST: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     'rgw cert': _operation,
     'rgw cert done': _operation_with('keep'),
     'retire keepalived': _operation_with('daemon'),
+    # a host's move (plan 04, step 5): its confirmation at the new address, its
+    # end, and a moved daemon's address in the monitors' configuration database
+    'addr moved': _operation,
+    'addr set': _operation,
+    'move addr': _operation_with('daemon'),
+    # a new OSD's id without address settings an earlier OSD of that id left
+    'clear osd addr': _operation_with('osd'),
 }
 
 
@@ -773,7 +792,17 @@ def device_matches(device_ids: str, serial: str) -> bool:
 
 # the reason a leader's operation holds a host's noout for (its noout set and
 # unset calls); the module's own are ledger.UNPLANNED
-NOOUT_REASONS = {'enter_maintenance': 'maintenance', 'powercycle_host': 'maintenance', 'exit_maintenance': 'maintenance'}
+NOOUT_REASONS = {'enter_maintenance': 'maintenance', 'powercycle_host': 'maintenance', 'exit_maintenance': 'maintenance', 'set_host_addr': 'move'}
+
+# a moved daemon's address settings in the monitors' configuration database
+# (plan 04, step 5): Ceph reuses a freed id, so a removal clears them
+ADDR_KEYS = {'mgr': ('public_addr',), 'osd': ('public_addr', 'cluster_addr')}
+
+
+def own_file(key: str, role: str) -> bool:
+    """Whether a secret's key is a role's file (mgr-*, agent-*): an
+    operation's issued keys may hold several roles' (a move's)."""
+    return key.rsplit('/', 1)[-1].startswith(role + '-')
 
 
 def ambiguous(host: str) -> bool:
@@ -1085,6 +1114,12 @@ class Channel:
                     return self._mon_rm(led, fold, ops, op, daemon)
                 if call == 'drain done':
                     return self._drain_done(led, fold, ops, op)
+                if call == 'clear osd addr':
+                    return self._clear_osd_addr(fold, op, (args or {}).get('osd'))
+                if call in ('addr moved', 'addr set', 'move addr'):
+                    return self._move(call, led, fold, ops, op, (args or {}).get('daemon'))
+                if call in ('noout set', 'noout unset') and op is not None and op['kind'] == 'set_host_addr':
+                    return self._move_noout(call, led, fold, ops, op)
                 if call in ('ok to stop', 'noout set', 'noout unset', 'maintained'):
                     return self._maintenance(call, led, fold, op)
                 if call == 'mgr fail':
@@ -1110,7 +1145,7 @@ class Channel:
                 return 503, {'error': '%s: %s' % (call, e.__class__.__name__)}
 
     def _mgr_cert(self, fold: Any, op: Optional[Dict[str, Any]], led: Any = None) -> Tuple[int, Dict[str, Any]]:
-        if op is not None and op['kind'] == 'renew_mgr':
+        if op is not None and op['kind'] in ('renew_mgr', 'set_host_addr'):
             return self._mgr_renewal_cert(led, fold, op)
         if op is None or op['kind'] != 'add_daemon' or not op['daemon'].startswith('mgr.') \
                 or fold.open_generation(op['daemon']) != op['id'] or op['host'] not in fold.hosts:
@@ -1134,8 +1169,10 @@ class Channel:
     def _mgr_renewal_cert(self, led: Any, fold: Any, op: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
         """A renewal's mgr certificates (plan 04, step 1): issued once per renewal,
         recorded with a module entry, the certificates kept beside the keys, so a
-        retry or a successor gets the same ones."""
-        name, host = op['daemon'], op['host']
+        retry or a successor gets the same ones. A move's (plan 04, step 5) is
+        a renewal of its operation from its addr_moved entry, for the new address."""
+        host = op['host']
+        name = op.get('daemon') or 'mgr.' + host
         if led is None or op['id'] not in fold.mgr_renewals.get(name, {}) or host not in fold.hosts:
             return 400, {'error': 'no renewal of a mgr in its open generation'}
         attempt = fold.mgr_renewals[name][op['id']]
@@ -1166,9 +1203,11 @@ class Channel:
         certificates kept beside the keys, and the ones before the renewal the
         leader passes), retired by a module entry, then deleted. Asked again,
         it revokes and deletes what the fold retired."""
-        if op is None or op['kind'] != 'renew_mgr' or op['id'] not in fold.mgr_renewals.get(op['daemon'], {}):
+        if op is None or op['kind'] not in ('renew_mgr', 'set_host_addr') \
+                or op['id'] not in fold.mgr_renewals.get(op.get('daemon') or 'mgr.' + op['host'], {}):
             return 400, {'error': 'no renewal of a mgr in its open generation'}
-        name, host = op['daemon'], op['host']
+        host = op['host']
+        name = op.get('daemon') or 'mgr.' + host
         if fold.mgr_renewals[name][op['id']] is None:
             return 400, {'error': 'the renewal issued no certificates'}
         if op['id'] in fold.mgr_retired:  # a later renewal's done retired it: nothing of it is in use
@@ -1195,7 +1234,7 @@ class Channel:
         if keys is None or keys.r != 0 or keys.too_large:
             return 503, {'error': 'cannot list the secrets; ask again'}
         for k in json.loads(keys.outb):
-            if any(k.startswith(p) for p in old):
+            if any(k.startswith(p) for p in old) and own_file(k, 'mgr'):
                 rm = self._mon({'prefix': 'config-key rm', 'key': k}, name)
                 if rm is None or rm.r not in (0, -2):
                     return 503, {'error': 'cannot remove a key of %s; ask again' % name}
@@ -1204,7 +1243,8 @@ class Channel:
     def _agent_cert(self, led: Any, fold: Any, op: Optional[Dict[str, Any]]) -> Tuple[int, Dict[str, Any]]:
         """A renewal's agent certificates (plan 04, step 2): as a mgr renewal's,
         issued once per renewal with a module entry, kept beside the keys."""
-        if op is None or op['kind'] != 'renew_agent' or op['id'] not in fold.agent_renewals.get(op['host'], {}) or op['host'] not in fold.hosts:
+        if op is None or op['kind'] not in ('renew_agent', 'set_host_addr') or op['id'] not in fold.agent_renewals.get(op['host'], {}) \
+                or op['host'] not in fold.hosts:
             return 400, {'error': 'no renewal of an agent of a host in the cluster'}
         host = op['host']
         attempt = fold.agent_renewals[host][op['id']]
@@ -1234,7 +1274,7 @@ class Channel:
         certificates are revoked, their keys retired by a module entry, then
         only what the fold retired is deleted; a renewal a later one retired
         changes nothing."""
-        if op is None or op['kind'] != 'renew_agent' or op['id'] not in fold.agent_renewals.get(op['host'], {}):
+        if op is None or op['kind'] not in ('renew_agent', 'set_host_addr') or op['id'] not in fold.agent_renewals.get(op['host'], {}):
             return 400, {'error': 'no renewal of an agent of a host in the cluster'}
         host = op['host']
         if fold.agent_renewals[host][op['id']] is None:
@@ -1257,7 +1297,7 @@ class Channel:
         if keys is None or keys.r != 0 or keys.too_large:
             return 503, {'error': 'cannot list the secrets; ask again'}
         for k in json.loads(keys.outb):
-            if any(k.startswith(p) for p in old):
+            if any(k.startswith(p) for p in old) and own_file(k, 'agent'):
                 rm = self._mon({'prefix': 'config-key rm', 'key': k})
                 if rm is None or rm.r not in (0, -2):
                     return 503, {'error': 'cannot remove a key of the agent of %s; ask again' % host}
@@ -1299,6 +1339,10 @@ class Channel:
         if name.startswith('mon.'):  # the mon. key is shared: nothing of its own to remove
             led.append({'id': 'm-' + secrets.token_hex(8), 'kind': 'retire', 'of': op['id'], 'daemon': name, 'host': op['host']})
             return 200, done
+        # a mgr's address settings go before its id can be reused (plan 04, step 5)
+        why = self._clear_addr(name)
+        if why is not None:
+            return 503, {'error': why}
         # a mgr's entity is its daemon name; an RGW's is client.rgw.<id>
         entity = 'client.' + name if name.startswith('rgw.') else name
         # tracked: an unanswered removal holds the retirement until it is answered,
@@ -1325,7 +1369,7 @@ class Channel:
         if keys is None or keys.r != 0 or keys.too_large:
             return 503, {'error': 'cannot list the secrets; ask again'}
         for k in json.loads(keys.outb):
-            if any(k.startswith(p) for p in mine):
+            if any(k.startswith(p) for p in mine) and own_file(k, 'mgr'):
                 rm = self._mon({'prefix': 'config-key rm', 'key': k}, name)
                 if rm is None or rm.r not in (0, -2):
                     return 503, {'error': 'cannot remove a key of %s; ask again' % name}
@@ -1393,6 +1437,9 @@ class Channel:
         done = {'outcome': 'done', 'r': 0, 'out': '', 'outs': ''}
         name = self._drain_step(ops, op, daemon, ('mon',)) if op is not None and op['kind'] == 'drain_host' else \
             op['daemon'] if op is not None and op['kind'] == 'remove_daemon' and op['daemon'].startswith('mon.') and daemon in (None, op['daemon']) else None
+        # a move's mon leaves the monmap and joins again at the new address (plan 04, step 5)
+        if op is not None and op['kind'] == 'set_host_addr':
+            name = 'mon.' + op['host'] if daemon == 'mon.' + op['host'] and self._moving(fold, ops, op, True) is not None else None
         if op is None or name is None:
             return 400, {'error': 'no removal of a mon'}
         mon_id = name.split('.', 1)[1]
@@ -1629,6 +1676,8 @@ class Channel:
                                         or op['kind'] == 'upgrade_agent' and fold.agent_upgrade == op['id'])
         # a drain's mgr step (plan 04, step 5), while the drain has not ended
         draining = op is not None and op['kind'] == 'drain_host' and self._drain_step(ops or {}, op, 'mgr.' + op['host'], ('mgr',)) is not None
+        # and a move's mgr step, while the move lasts
+        draining = draining or self._moving(fold, ops or {}, op) is not None
         if not upgrading and not draining and (op is None or op['kind'] not in ledger.STOPS or op['host'] not in fold.maintenance):
             return 400, {'error': 'no operation that must stop the active mgr'}
         job = self._mon({'prefix': 'mgr dump', 'format': 'json'})
@@ -1713,8 +1762,11 @@ class Channel:
         every RGW host's name and address and the VIP. Once per operation: asked
         again, it returns the one it issued."""
         if op is None or not (op['kind'] == 'add_daemon' and op['daemon'].startswith('rgw.') and not op.get('cert')
-                              or op['kind'] in ('apply_ingress', 'renew_rgw_cert')):
-            return 400, {'error': 'no RGW add, ingress or renewal that needs a generated certificate'}
+                              or op['kind'] in ('apply_ingress', 'renew_rgw_cert')
+                              # a move's, for its host's new address (plan 04, step 5)
+                              or op['kind'] == 'set_host_addr' and 'rgw.' + op['host'] in fold.daemons
+                              and self._moving(fold, {e['id']: e for _, e in led.executable()}, op, True) is not None):
+            return 400, {'error': 'no RGW add, ingress, renewal or move that needs a generated certificate'}
         done = [cid for cid in fold.rgw_certs if cid.startswith('issued/%s/' % op['id'])]
         if done:
             attempt = done[0].split('/')[2]
@@ -1910,9 +1962,13 @@ class Channel:
         # the retirement
         if not drained:
             return 400, {'error': '%s was not drained' % name}
+        if entry is not None and entry['up']:
+            return 409, {'error': '%s is not down yet' % name}
+        # its address settings go before the id is purged and can be reused (plan 04, step 5)
+        why = self._clear_addr(name)
+        if why is not None:
+            return 503, {'error': why}
         if entry is not None:
-            if entry['up']:
-                return 409, {'error': '%s is not down yet' % name}
             # the drained entry is the safety check, as in cephadm (the OSD out
             # since, checked above): once stopped, safe-to-destroy answers only
             # while every PG is active+clean
@@ -1930,6 +1986,95 @@ class Channel:
         if not any(e['kind'] == 'drain_done' and e['of'] == op['id'] for e in ops.values()):
             led.append({'id': 'm-' + secrets.token_hex(8), 'kind': 'drain_done', 'of': op['id'], 'host': op['host']})
         return 200, {'outcome': 'done', 'r': 0, 'out': '', 'outs': ''}
+
+    # --- a host's move (plan 04, step 5) --------------------------------------
+
+    def _moving(self, fold: Any, ops: Dict[str, Dict[str, Any]], op: Optional[Dict[str, Any]], moved: bool = False) -> Optional[Dict[str, Any]]:
+        """The fold's move of op's host if op is that executable set_host_addr
+        and it has not ended (no addr_set for it), with moved its address
+        confirmed (addr_moved); None otherwise."""
+        if op is None or op['kind'] != 'set_host_addr':
+            return None
+        mv = fold.moving.get(op['host'])
+        if mv is None or mv['op'] != op['id'] or moved and not mv['moved']:
+            return None
+        if any(e['kind'] == 'addr_set' and e['of'] == op['id'] for e in ops.values()):
+            return None
+        return mv
+
+    def _move(self, call: str, led: Any, fold: Any, ops: Dict[str, Dict[str, Any]], op: Optional[Dict[str, Any]],
+              daemon: Any) -> Tuple[int, Dict[str, Any]]:
+        """A move's module steps: addr moved (the leader found the node has the
+        new address: from now on it is the host's in the fold, and the move's
+        certificates name it), addr set (the move ended: closed in the fold,
+        idempotent), and move addr (a moved mgr's or OSD's public_addr, an
+        OSD's cluster_addr too, set to the new address in the monitors'
+        configuration database, for a daemon of the moving host only)."""
+        done = {'outcome': 'done', 'r': 0, 'out': '', 'outs': ''}
+        if op is None or op['kind'] != 'set_host_addr':
+            return 400, {'error': 'no move of a host'}
+        mid = 'm-' + secrets.token_hex(8)
+        if call == 'addr set':
+            if fold.moving.get(op['host'], {}).get('op') == op['id'] and not any(e['kind'] == 'addr_set' and e['of'] == op['id'] for e in ops.values()):
+                led.append({'id': mid, 'kind': 'addr_set', 'of': op['id'], 'host': op['host']})
+            return 200, done
+        mv = self._moving(fold, ops, op)
+        if mv is None:
+            return 400, {'error': 'the move of %s ended' % op['host']}
+        if call == 'addr moved':
+            if not mv['moved']:
+                led.append({'id': mid, 'kind': 'addr_moved', 'of': op['id'], 'host': op['host']})
+            return 200, done
+        # move addr
+        t = daemon.split('.', 1)[0] if isinstance(daemon, str) else ''
+        if not mv['moved'] or t not in ADDR_KEYS or fold.daemons.get(daemon) != op['host']:
+            return 400, {'error': '%s is not a mgr or OSD of %s, or its address is not confirmed yet' % (daemon, op['host'])}
+        if self._pending(daemon):
+            return 409, {'error': 'mutations for %s are not answered yet; ask again' % daemon}
+        for key in ADDR_KEYS[t]:
+            job = self._mon({'prefix': 'config set', 'who': daemon, 'name': key, 'value': mv['addr']}, daemon)
+            if job is None or job.r != 0:
+                return 503, {'error': 'config set %s %s: no answer or refused; ask again' % (daemon, key)}
+        return 200, done
+
+    def _move_noout(self, call: str, led: Any, fold: Any, ops: Dict[str, Dict[str, Any]], op: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        """noout for a move's OSDs, as a reason `move` of the host's noout
+        ownership: set only while the move lasts, unset also after."""
+        host = op['host']
+        if call == 'noout set' and self._moving(fold, ops, op, True) is None:
+            return 400, {'error': 'the move of %s ended or is not confirmed' % host}
+        if ambiguous(host):
+            return 400, {'error': 'host name %s is ambiguous for osd set-group' % host}
+        why = self._noout_change(led, host, NOOUT_REASONS['set_host_addr'], call == 'noout set', op['id'])
+        if why is not None:
+            return 503, {'error': '%s; ask again' % why}
+        return 200, {'outcome': 'done', 'r': 0, 'out': '', 'outs': ''}
+
+    def _clear_osd_addr(self, fold: Any, op: Optional[Dict[str, Any]], osd: Any) -> Tuple[int, Dict[str, Any]]:
+        """Before a created OSD's daemon first starts: the address settings an
+        earlier OSD of its id left (Ceph reuses freed ids) go, for a creation
+        that is bound and neither confirmed nor closed, and an id no OSD of the
+        fold has."""
+        if op is None or op['kind'] != 'create_osd' or fold.creating(op['id']) is None:
+            return 400, {'error': 'no creation of an OSD that is bound and open'}
+        name = 'osd.%d' % osd
+        if name in fold.daemons:
+            return 400, {'error': '%s is an OSD of the cluster' % name}
+        why = self._clear_addr(name)
+        if why is not None:
+            return 503, {'error': why}
+        return 200, {'outcome': 'done', 'r': 0, 'out': '', 'outs': ''}
+
+    def _clear_addr(self, name: str) -> Optional[str]:
+        """Remove a mgr's or OSD's address settings from the monitors'
+        configuration database (plan 04, step 5); None once removed (or none
+        to remove), else why not yet."""
+        t = name.split('.', 1)[0]
+        for key in ADDR_KEYS.get(t, ()):
+            job = self._mon({'prefix': 'config rm', 'who': name, 'name': key}, name)
+            if job is None or job.r not in (0, -2):
+                return 'config rm %s %s: no answer or refused; ask again' % (name, key)
+        return None
 
     def _retire_host(self, led: Any, fold: Any, ops: Dict[str, Dict[str, Any]], op: Optional[Dict[str, Any]]) -> Tuple[int, Dict[str, Any]]:
         if op is None or op['kind'] != 'remove_host':

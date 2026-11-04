@@ -51,8 +51,8 @@ KINDS = ('restart', 'redeploy', 'add_daemon', 'remove_daemon', 'remove_host', 'c
          'renew_mgr', 'renew_rgw_cert',
          # an agent's certificates and the agents' image (plan 04, step 2)
          'renew_agent', 'upgrade_agent', 'upgrade_agent_resume', 'upgrade_agent_stop',
-         # a host's drain and its controls (plan 04, step 5)
-         'drain_host', 'drain_stop', 'drain_resume')
+         # a host's drain and its controls, a host's address change and its resume (plan 04, step 5)
+         'drain_host', 'drain_stop', 'drain_resume', 'set_host_addr', 'move_resume')
 # the upgrade's kinds, operations and module entries: about the cluster, without a host
 UPGRADE_CONTROLS = ('upgrade_pause', 'upgrade_resume', 'upgrade_stop')
 UPGRADE_KINDS = ('upgrade_start',) + UPGRADE_CONTROLS + ('upgrade_done', 'upgrade_refused')
@@ -61,9 +61,11 @@ HOSTLESS = UPGRADE_KINDS + ('rgw_cert', 'rgw_cert_done', 'apply_ingress', 'renew
 VIP_RE = re.compile(r'\A(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}/(?:3[0-2]|[12]?\d)\Z')
 IMAGE_RE = re.compile(r'\A[a-z0-9][a-z0-9._/:-]{0,254}@sha256:[0-9a-f]{64}\Z')
 # kinds that are about a whole host: every other operation on it waits for them
-HOST_KINDS = ('remove_host', 'enter_maintenance', 'exit_maintenance', 'powercycle_host', 'add_host', 'drain_host')
+HOST_KINDS = ('remove_host', 'enter_maintenance', 'exit_maintenance', 'powercycle_host', 'add_host', 'drain_host', 'set_host_addr')
 # a drain's controls: run ahead of queued operations, never refused for a busy host
 DRAIN_CONTROLS = ('drain_stop', 'drain_resume')
+# a move's control (`ceph orch host set-addr` again on a paused move), as a drain's
+MOVE_CONTROLS = ('move_resume',)
 LABEL_RE = re.compile(r'\A[A-Za-z0-9._-]{1,64}\Z')
 ADDR_RE = re.compile(r'\A[0-9A-Fa-f:.]{2,45}\Z')
 # kinds that stop a host's daemons, and that start them again
@@ -73,7 +75,9 @@ STOPS, STARTS = ('enter_maintenance', 'powercycle_host'), ('exit_maintenance', '
 MODULE_KINDS = ('close', 'retire', 'retire_host', 'bind', 'confirm', 'close_create', 'drained', 'maintained', 'upgrade_done', 'upgrade_refused',
                 'rgw_cert', 'rgw_cert_done', 'mgr_cert', 'mgr_cert_done', 'agent_cert', 'agent_cert_done',
                 # a drain's end, and the noout ownership with the unplanned stops (plan 04, step 5)
-                'drain_done', 'noout_intent', 'noout', 'noout_keep', 'host_down', 'host_up')
+                'drain_done', 'noout_intent', 'noout', 'noout_keep', 'host_down', 'host_up',
+                # a move's confirmation at the new address and its end (plan 04, step 5)
+                'addr_moved', 'addr_set')
 # module entries without an operation (of absent), or with one if a leader's
 # operation caused them (maintenance's noout)
 NOOUT_KINDS = ('noout_intent', 'noout', 'noout_keep', 'host_down', 'host_up')
@@ -100,7 +104,7 @@ TERMINAL = ('completed', 'nochange', 'failed', 'refused', 'abandoned')
 
 # snapshots (plan 04, step 4)
 SNAPSHOT_PREFIX = 'cephadm-talos/ledger-snapshot/'
-SNAPSHOT_SCHEMA = 2
+SNAPSHOT_SCHEMA = 3
 SNAPSHOT_KEY_RE = re.compile(r'\Acephadm-talos/ledger-snapshot/(\d{20}-\d{10}-(?:takeover|op-[0-9a-f]{16}|m-[0-9a-f]{16}))/(manifest|[0-9a-f]{16}-\d{1,6})\Z')
 # chunks are named <nonce>-<i>, the nonce one per publication: two writers of
 # the same cut never write the same chunk key, and a manifest names only its own
@@ -196,7 +200,7 @@ def check_entry(key: str, raw: str) -> Dict[str, Any]:
             raise LedgerError('agent_cert entry %s' % key)
         if kind == 'agent_cert_done' and not (isinstance(e.get('keep'), str) and OP_RE.match(e['keep'])):
             raise LedgerError('agent_cert_done entry %s' % key)
-        if kind in ('drain_done',) + NOOUT_KINDS and daemon is not None:
+        if kind in ('drain_done', 'addr_moved', 'addr_set') + NOOUT_KINDS and daemon is not None:
             raise LedgerError('%s entry %s' % (kind, key))
         if kind in ('noout_intent', 'noout') and not (isinstance(e.get('reason'), str) and REASON_RE.match(e['reason'])
                                                       and type(e.get('on')) is bool and (kind == 'noout' or type(e.get('prior')) is bool)):
@@ -270,6 +274,16 @@ def check_entry(key: str, raw: str) -> Dict[str, Any]:
     if kind in DRAIN_CONTROLS:
         if daemon is not None or not isinstance(e.get('drain'), str) or not OP_RE.match(e['drain']) \
                 or set(e) - {'version', 'id', 'kind', 'host', 'drain', 'gid', 'epoch', 'seq', 'request', 'inputs'}:
+            raise LedgerError('operation entry %s' % key)
+        return e
+    if kind == 'set_host_addr':
+        if daemon is not None or not (isinstance(e.get('addr'), str) and ADDR_RE.match(e['addr'])) \
+                or set(e) - {'version', 'id', 'kind', 'host', 'addr', 'gid', 'epoch', 'seq', 'request', 'inputs'}:
+            raise LedgerError('operation entry %s' % key)
+        return e
+    if kind in MOVE_CONTROLS:
+        if daemon is not None or not isinstance(e.get('move'), str) or not OP_RE.match(e['move']) \
+                or set(e) - {'version', 'id', 'kind', 'host', 'move', 'gid', 'epoch', 'seq', 'request', 'inputs'}:
             raise LedgerError('operation entry %s' % key)
         return e
     if kind in ('remove_host', 'exit_maintenance', 'powercycle_host'):
@@ -424,7 +438,7 @@ class Fold:
             'agent_renewals': self.agent_renewals, 'agent_retired': sorted(self.agent_retired), 'agent_upgrade': self.agent_upgrade,
             'cli_rgw': self.cli_rgw, 'vip': self.vip, 'ingress': self.ingress, 'vrrp_secret': self.vrrp_secret, 'rgw_port': self.rgw_port,
             'renewals_done': sorted(self.renewals_done), 'retired_by': sorted(self.retired_by),
-            'draining': self.draining, 'noout': self.noout, 'down': self.down,
+            'draining': self.draining, 'noout': self.noout, 'down': self.down, 'moving': self.moving,
             'positions': {o: n for o, n in self.positions.items() if o in keep}, 'count': self.count}))
 
     def _load(self, st: Dict[str, Any]) -> None:
@@ -437,7 +451,7 @@ class Fold:
         self.agent_renewals, self.agent_retired, self.agent_upgrade = st['agent_renewals'], set(st['agent_retired']), st['agent_upgrade']
         self.cli_rgw, self.vip, self.ingress, self.vrrp_secret, self.rgw_port = st['cli_rgw'], st['vip'], st['ingress'], st['vrrp_secret'], st['rgw_port']
         self.renewals_done, self.retired_by = set(st['renewals_done']), set(st['retired_by'])
-        self.draining, self.noout, self.down = st['draining'], st['noout'], st['down']
+        self.draining, self.noout, self.down, self.moving = st['draining'], st['noout'], st['down'], st['moving']
         self.positions = st['positions']
         self.count = st['count']
 
@@ -500,6 +514,11 @@ class Fold:
         # unplanned stops by host (a Talos reboot or shutdown its agent
         # reported): {'boot', 'stop', 'at', 'held'}, held once its reason was added
         self.down: Dict[str, Dict[str, Any]] = {}
+        # hosts whose address changes (plan 04, step 5): {'op', 'addr', 'moved'}
+        # from the acceptance of set_host_addr until its addr_set entry; the
+        # host's address is the new one from its addr_moved entry (the leader
+        # found the node has it), not before
+        self.moving: Dict[str, Dict[str, Any]] = {}
         # each operation's place in the executable entries, and how many there were
         self.positions: Dict[str, int] = {}
         self.count: int = 0
@@ -513,7 +532,7 @@ class Fold:
     def _apply(self, n: int, e: Dict[str, Any], positions: Dict[str, int]) -> None:
         positions[e['id']] = n
         kind = e['kind']
-        if kind in NOOUT_KINDS or kind in ('drain_host', 'drain_done') + DRAIN_CONTROLS:
+        if kind in NOOUT_KINDS or kind in ('drain_host', 'drain_done', 'set_host_addr', 'addr_moved', 'addr_set') + DRAIN_CONTROLS:
             self._apply_host(e)
             return
         if kind == 'add_daemon' and e['daemon'].startswith('rgw.'):
@@ -538,7 +557,7 @@ class Fold:
         elif kind == 'retire_host' and not any(h == e['host'] for h in self.daemons.values()):
             self.hosts.pop(e['host'], None)
             self.maintenance.discard(e['host'])
-            for m in (self.draining, self.noout, self.down):
+            for m in (self.draining, self.noout, self.down, self.moving):
                 m.pop(e['host'], None)
         elif kind == 'add_host' and e['host'] not in self.hosts:
             self.hosts[e['host']] = e['addr']
@@ -604,6 +623,21 @@ class Fold:
         elif kind == 'drain_stop' or kind == 'drain_done':
             if self.draining.get(host, {}).get('op') == e.get('drain', e.get('of')):
                 del self.draining[host]
+        elif kind == 'set_host_addr':
+            self.moving.setdefault(host, {'op': e['id'], 'addr': e['addr'], 'moved': False})
+        elif kind == 'addr_moved':
+            mv = self.moving.get(host)
+            if mv is not None and mv['op'] == e['of'] and not mv['moved']:
+                mv['moved'] = True
+                self.hosts[host] = mv['addr']
+                # the move reissues the host's agent and mgr certificates for
+                # the new address, as renewals of its operation
+                self.agent_renewals.setdefault(host, {})[e['of']] = None
+                if self.open_generation('mgr.' + host) is not None:
+                    self.mgr_renewals.setdefault('mgr.' + host, {})[e['of']] = None
+        elif kind == 'addr_set':
+            if self.moving.get(host, {}).get('op') == e['of']:
+                del self.moving[host]
         elif kind == 'host_down':
             self.down[host] = {'boot': e['boot'], 'stop': e['stop'], 'at': e['at'], 'held': False}
         elif kind == 'host_up':

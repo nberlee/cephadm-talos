@@ -85,6 +85,7 @@ class Mons:
         self.not_ok = set()  # prefixes of ok-to-stop checks that refuse
         self.maint_calls = []
         self.flags = {}      # osd dump's crush_node_flags
+        self.config = []     # config set and rm: (prefix, who, name[, value])
         self.on_time = {'mgr dump'}  # answered also when late
 
     def send(self, res, cmd):
@@ -141,6 +142,10 @@ class Mons:
             res.complete(0, '', '')
         elif prefix == 'auth rm':
             self.auth_rm.append(json.loads(cmd)['entity'])
+            res.complete(0, '', '')
+        elif prefix in ('config set', 'config rm'):
+            c = json.loads(cmd)
+            self.config.append((prefix, c['who'], c['name']) + ((c['value'],) if 'value' in c else ()))
             res.complete(0, '', '')
         elif prefix == 'config-key ls':
             res.complete(0, json.dumps(self.keys), '')
@@ -1489,6 +1494,119 @@ class DrainCallsTest(unittest.TestCase):
         # an ended drain authorizes nothing
         self.assertEqual(self.call('osd out', operation=op)[0], 400)
         self.assertEqual(self.call('retire', operation=op, daemon='mgr.h1')[0], 400)
+
+
+class MoveCallsTest(unittest.TestCase):
+    """plan 04, step 5: a host's move through its own calls and the ones it reuses."""
+    setUp, call = LedgerCallsTest.setUp, LedgerCallsTest.call
+    fold = MaintenanceCallsTest.fold
+
+    def moving(self, host='h1', addr='10.0.0.9'):
+        return self.led.append({'id': 'op-%016x' % 800, 'kind': 'set_host_addr', 'host': host, 'addr': addr})[1]['id']
+
+    def test_the_moves_calls_are_authorized_by_its_operation_alone(self):
+        from cryptography import x509
+        import ipaddress
+        self.fold('mon.h1@h1', 'mon.h2@h2', 'mgr.h1@h1', 'mgr.h2@h2', 'osd.3@h1', 'osd.5@h2', 'rgw.h1@h1')
+        op = self.moving()
+        other = self.led.append({'id': 'op-%016x' % 801, 'kind': 'restart', 'daemon': 'mgr.h1', 'host': 'h1'})[1]['id']
+        # nothing before the confirmation: no address settings, no certificates
+        self.assertEqual(self.call('move addr', operation=op, daemon='mgr.h1')[0], 400)
+        self.assertEqual(self.call('agent cert', operation=op)[0], 400)
+        self.assertEqual(self.call('rgw cert', operation=op)[0], 400)
+        for call in ('addr moved', 'addr set'):
+            self.assertEqual(self.call(call, operation=other)[0], 400, call)
+        self.assertEqual(self.call('addr moved', operation=op)[1]['outcome'], 'done')
+        self.assertEqual(self.call('addr moved', operation=op)[1]['outcome'], 'done')
+        fold = self.ch.authority()[1]
+        self.assertEqual(fold.hosts['h1'], '10.0.0.9')
+        self.assertEqual([e['kind'] for _, e in self.led.executable()].count('addr_moved'), 1)
+        # a moved mgr's and OSD's address settings, for the moving host's daemons only
+        self.assertEqual(self.call('move addr', operation=op, daemon='mgr.h1')[1]['outcome'], 'done')
+        self.assertEqual(self.call('move addr', operation=op, daemon='osd.3')[1]['outcome'], 'done')
+        self.assertEqual(self.mons.config, [('config set', 'mgr.h1', 'public_addr', '10.0.0.9'), ('config set', 'osd.3', 'public_addr', '10.0.0.9'),
+                                            ('config set', 'osd.3', 'cluster_addr', '10.0.0.9')])
+        for daemon in ('mgr.h2', 'osd.5', 'mon.h1', 'rgw.h1'):
+            self.assertEqual(self.call('move addr', operation=op, daemon=daemon)[0], 400, daemon)
+        self.assertEqual(self.call('move addr', operation=other, daemon='mgr.h1')[0], 400)
+        # noout under the reason move
+        self.assertEqual(self.call('noout set', operation=op)[1]['outcome'], 'done')
+        self.assertEqual(self.ch.authority()[1].noout_reasons('h1'), ['move'])
+        self.assertEqual(self.call('noout unset', operation=op)[1]['outcome'], 'done')
+        self.assertEqual(self.ch.authority()[1].noout_reasons('h1'), [])
+        # the mgr failed over, the mon out of the monmap: its own host's only
+        self.mons.maps = [dict(mgrmap(42, 'h1'), standbys=[{'gid': 50, 'name': 'h2', 'available': True}])]
+        self.assertEqual(self.call('mgr fail', operation=op, gid=42)[1]['outcome'], 'done')
+        self.mons.monmap, self.mons.quorum = ['h1', 'h2', 'h3'], ['h1', 'h2', 'h3']
+        self.assertEqual(self.call('mon rm', operation=op, daemon='mon.h2')[0], 400)
+        self.assertEqual(self.call('mon rm', operation=op, daemon='mon.h1')[1]['outcome'], 'done')
+        self.assertEqual(self.mons.mon_rm, ['h1'])
+        self.assertIn('mon.h1', self.ch.authority()[1].daemons)  # it joins again
+        # the certificates name the new address, as renewals of the move
+        out = json.loads(self.call('agent cert', operation=op)[1]['out'])
+        srv = x509.load_pem_x509_certificate(out['server_cert'].encode())
+        ips = srv.extensions.get_extension_for_class(x509.SubjectAlternativeName).value.get_values_for_type(x509.IPAddress)
+        self.assertEqual(ips, [ipaddress.ip_address('10.0.0.9')])
+        mgr = json.loads(self.call('mgr cert', operation=op)[1]['out'])
+        srv = x509.load_pem_x509_certificate(mgr['server_cert'].encode())
+        self.assertIn(ipaddress.ip_address('10.0.0.9'), srv.extensions.get_extension_for_class(x509.SubjectAlternativeName).value.get_values_for_type(x509.IPAddress))
+        # a later mgr renewal's done retires the move's mgr keys, never its agent keys
+        self.mons.kv[b.SECRET_PREFIX + 'issued/%s/rgw/rgw-server.key' % op] = 'rgw'
+        self.assertEqual(self.call('mgr cert done', operation=op)[1]['outcome'], 'done')
+        self.assertEqual(self.call('agent cert done', operation=op)[1]['outcome'], 'done')
+        renew = self.led.append({'id': 'op-%016x' % 802, 'kind': 'renew_mgr', 'daemon': 'mgr.h1', 'host': 'h1'})[1]['id']
+        self.call('mgr cert', operation=renew)
+        self.assertEqual(self.call('mgr cert done', operation=renew)[1]['outcome'], 'done')
+        left = sorted(k.rsplit('/', 1)[-1] for k in self.mons.kv if k.startswith(b.SECRET_PREFIX + 'issued/' + op + '/'))
+        self.assertEqual([k for k in left if k.startswith('mgr-')], [])
+        self.assertIn('agent-server.key', left)
+        self.assertIn('rgw-server.key', left)
+        # the end: closed once, then nothing more is authorized
+        self.assertEqual(self.call('addr set', operation=op)[1]['outcome'], 'done')
+        self.assertEqual(self.call('addr set', operation=op)[1]['outcome'], 'done')
+        self.assertEqual([e['kind'] for _, e in self.led.executable()].count('addr_set'), 1)
+        self.assertEqual(self.ch.authority()[1].moving, {})
+        for call, args in (('move addr', {'daemon': 'mgr.h1'}), ('addr moved', {}), ('noout set', {}), ('mgr fail', {'gid': 42})):
+            self.assertEqual(self.call(call, operation=op, **args)[0], 400, call)
+
+    def test_a_refused_move_is_closed_without_moving(self):
+        self.fold('mon.h1@h1')
+        op = self.moving()
+        self.assertEqual(self.call('addr set', operation=op)[1]['outcome'], 'done')
+        fold = self.ch.authority()[1]
+        self.assertEqual((fold.moving, fold.hosts['h1']), ({}, '10.0.0.1'))
+
+    def test_removals_and_creations_clear_the_address_settings(self):
+        """A removed mgr's or OSD's settings go before its id is purged; a new
+        OSD's id has none left before its daemon starts."""
+        self.fold('mon.h1@h1', 'mgr.h1@h1', 'mgr.h2@h2', 'osd.3@h1')
+        uuid = '00000000-0000-4000-8000-000000000003'
+        inv = inventory('mon.h1@h1', 'mgr.h1@h1', 'mgr.h2@h2', 'osd.3@h1')
+        inv['daemons'][-1]['osd_uuid'] = uuid
+        self.ch.authority = lambda: (self.led, lg.Fold(inv, self.led.executable()))
+        rm = self.led.append({'id': 'op-%016x' % 810, 'kind': 'remove_osd', 'daemon': 'osd.3', 'host': 'h1', 'uuid': uuid, 'zap': False, 'force': True})[1]['id']
+        self.mons.osds = [{'osd': 3, 'uuid': uuid, 'up': False, 'in': False}]
+        self.assertEqual(self.call('drain', operation=rm)[1]['outcome'], 'done')
+        self.assertEqual(self.call('retire', operation=rm)[1]['outcome'], 'done')
+        self.assertEqual(self.mons.config, [('config rm', 'osd.3', 'public_addr'), ('config rm', 'osd.3', 'cluster_addr')])
+        self.assertEqual(self.mons.osd_calls, ['osd purge-actual'])
+        self.mons.config = []
+        rmm = self.led.append({'id': 'op-%016x' % 811, 'kind': 'remove_daemon', 'daemon': 'mgr.h1', 'host': 'h1'})[1]['id']
+        self.assertEqual(self.call('retire', operation=rmm)[1]['outcome'], 'done')
+        self.assertEqual(self.mons.config, [('config rm', 'mgr.h1', 'public_addr')])
+        self.assertEqual(self.mons.auth_rm, ['mgr.h1'])
+        # a creation clears its new id's settings before its daemon starts,
+        # only while bound and open, never for an OSD of the cluster
+        self.mons.config = []
+        create = self.led.append({'id': 'op-%016x' % 812, 'kind': 'create_osd', 'host': 'h1', 'device': '/dev/sdb'})[1]['id']
+        self.assertEqual(self.call('clear osd addr', operation=create, osd=3)[0], 400)  # not bound
+        self.led.append({'id': 'm-%016x' % 813, 'kind': 'bind', 'of': create, 'host': 'h1', 'serial': 'S1', 'link': '/dev/disk/by-id/x-S1',
+                         'job': '0123456789abcdef'})
+        self.assertEqual(self.call('clear osd addr', operation=create, osd=3)[1]['outcome'], 'done')
+        self.assertEqual(self.mons.config, [('config rm', 'osd.3', 'public_addr'), ('config rm', 'osd.3', 'cluster_addr')])
+        inv['daemons'].append({'doc_name': 'x', 'host': 'h2', 'daemon_type': 'osd', 'daemon_id': '7', 'service_name': 'osd'})
+        self.assertEqual(self.call('clear osd addr', operation=create, osd=7)[0], 400)
+        self.assertEqual(self.call('clear osd addr', operation=rmm, osd=9)[0], 400)
 
 
 class UpgradeCallsTest(unittest.TestCase):

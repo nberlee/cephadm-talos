@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"github.com/nberlee/cephadm-talos/internal/daemons"
 	"github.com/nberlee/cephadm-talos/internal/spec"
+	"net"
 	"net/http"
 	"path/filepath"
 	"regexp"
@@ -59,6 +60,8 @@ const (
 	KindDrain        = "drain_host"
 	KindDrainStop    = "drain_stop"
 	KindDrainResume  = "drain_resume"
+	KindSetAddr      = "set_host_addr"
+	KindMoveResume   = "move_resume"
 )
 
 // errWait is a step that waits as long as it takes (a drain), which does not
@@ -172,7 +175,14 @@ func (l *LeaderLoop) ledgerOps(ctx context.Context, b *Bridge, js store.Backend,
 			// a drain's controls (stop, resume) run ahead of queued operations
 			// (plan 04, step 5); a drain's step holds nothing here
 			if draining(st) && !isDrainControl(e.Op.Kind) {
-				if err := l.drainControlsAhead(ctx, b, js, gid, epoch, after); err != nil {
+				if err := l.controlsAheadOf(ctx, b, js, gid, epoch, after, isDrainControl); err != nil {
+					return err
+				}
+			}
+
+			// as a move's resume does
+			if moving(st) && !isMoveControl(e.Op.Kind) {
+				if err := l.controlsAheadOf(ctx, b, js, gid, epoch, after, isMoveControl); err != nil {
 					return err
 				}
 			}
@@ -220,8 +230,12 @@ func (l *LeaderLoop) ledgerOps(ctx context.Context, b *Bridge, js store.Backend,
 				return err
 			}
 
-			// then a drain's (plan 04, step 5)
-			return l.drainStep(ctx, b, js, gid, epoch)
+			// then a drain's and a move's (plan 04, step 5)
+			if err := l.drainStep(ctx, b, js, gid, epoch); err != nil {
+				return err
+			}
+
+			return l.moveStep(ctx, b, js, gid, epoch)
 		}
 	}
 }
@@ -326,15 +340,16 @@ func (l *LeaderLoop) ledgerOp(ctx context.Context, b *Bridge, js store.Backend, 
 	known := map[string]bool{KindRestart: true, KindRedeploy: true, KindAddDaemon: true, KindRemoveDaemon: true, KindRemoveHost: true, KindCreateOSD: true, KindRemoveOSD: true,
 		KindEnterMaint: true, KindExitMaint: true, KindPowercycle: true, KindUpgrade: true, KindUpPause: true, KindUpResume: true, KindUpStop: true,
 		KindIngress: true, KindAddHost: true, KindRenewMgr: true, KindRenewRGW: true, KindRenewAgent: true, KindAgentUpgrade: true, KindAgentResume: true, KindAgentStop: true,
-		KindDrain: true, KindDrainStop: true, KindDrainResume: true}
+		KindDrain: true, KindDrainStop: true, KindDrainResume: true, KindSetAddr: true, KindMoveResume: true}
 	cluster := op.Kind == KindUpgrade || isControl(op.Kind) || op.Kind == KindIngress || op.Kind == KindRenewRGW || op.Kind == KindAgentUpgrade || isAgentControl(op.Kind)
 	noDaemon := cluster || op.Kind == KindRemoveHost || op.Kind == KindAddHost || op.Kind == KindCreateOSD || op.Kind == KindEnterMaint || op.Kind == KindExitMaint || op.Kind == KindPowercycle ||
-		op.Kind == KindRenewAgent || op.Kind == KindDrain || isDrainControl(op.Kind)
+		op.Kind == KindRenewAgent || op.Kind == KindDrain || isDrainControl(op.Kind) || op.Kind == KindSetAddr || isMoveControl(op.Kind)
 	bound := isControl(op.Kind) || isAgentControl(op.Kind)
 	if !ledgerIDRe.MatchString(op.ID) || cluster != (op.Host == "") || !cluster && pki.ValidName(op.Host) != nil || !known[op.Kind] ||
 		(op.Kind == KindUpgrade || op.Kind == KindIngress || op.Kind == KindAgentUpgrade) != (op.Image != "") || (op.Kind == KindIngress) != (op.VIP != "") || bound != ledgerIDRe.MatchString(op.Upgrade) ||
 		noDaemon != (op.Daemon == "") || (op.Daemon != "" && !ledgerDaemonRe.MatchString(op.Daemon)) ||
-		(op.Kind == KindCreateOSD) != strings.HasPrefix(op.Device, "/dev/") || isDrainControl(op.Kind) != ledgerIDRe.MatchString(op.Drain) {
+		(op.Kind == KindCreateOSD) != strings.HasPrefix(op.Device, "/dev/") || isDrainControl(op.Kind) != ledgerIDRe.MatchString(op.Drain) ||
+		isMoveControl(op.Kind) != ledgerIDRe.MatchString(op.Move) || op.Kind == KindSetAddr && net.ParseIP(op.Addr) == nil {
 		return true, writeJSONKey(ctx, js, opKey, JournalOp{Version: journalVersion, Kind: op.Kind, Host: op.Host, State: JournalFailed, Error: "unknown or malformed operation"})
 	}
 
@@ -344,6 +359,23 @@ func (l *LeaderLoop) ledgerOp(ctx context.Context, b *Bridge, js store.Backend, 
 	}
 
 	switch op.Kind {
+	case KindSetAddr, KindMoveResume:
+		phase := func() error { return l.moveControl(ctx, b, js, gid, op) }
+
+		var onFail func() error
+
+		if op.Kind == KindSetAddr {
+			phase = func() error { return l.moveStart(ctx, b, js, gid, op) }
+			onFail = func() error { return l.moveRefused(ctx, b, op) }
+		}
+
+		if err := l.unstick(ctx, js, opKey, opKey, op, onFail, phase()); err != nil {
+			return false, err
+		}
+
+		s, err = l.journalState(ctx, b, js, gid, op.ID)
+
+		return err == nil && terminal(s), err
 	case KindDrain, KindDrainStop, KindDrainResume:
 		phase := func() error { return l.drainControl(ctx, b, js, gid, op) }
 
@@ -1385,6 +1417,16 @@ func (l *LeaderLoop) createOSD(ctx context.Context, b *Bridge, js store.Backend,
 	if rec.Job != nil && rec.Result != nil {
 		mode.extra = []string{"ContainerConfig/" + rec.Job.Doc}
 		mode.ack = &wire.JobAck{Job: rec.Job.ID, Inputs: rec.Job.Inputs, RC: rec.Result.RC}
+	}
+
+	// address settings an earlier OSD of its id left go before the daemon
+	// first starts (plan 04, step 5)
+	if rs, err := l.journalState(ctx, b, js, gid, op.ID+".rev"); err != nil {
+		return err
+	} else if rs == "" {
+		if _, err := b.do(ctx, "clear osd addr", map[string]any{"operation": op.ID, "osd": *d.OSDID}); err != nil {
+			return err
+		}
 	}
 
 	done, ok, err := l.step(ctx, b, js, gid, epoch, op.ID+".rev", op.Host, mode)

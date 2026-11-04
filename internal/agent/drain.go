@@ -80,6 +80,10 @@ func (l *LeaderLoop) drainStart(ctx context.Context, b *Bridge, js store.Backend
 		return refuse(fmt.Errorf("%s is in maintenance", h.Name))
 	}
 
+	if h.Move != nil {
+		return refuse(fmt.Errorf("the address of %s is changing", h.Name))
+	}
+
 	if err := l.changeState(ctx, b, gid, func(st *state.State) error {
 		h, ok := st.Host(op.Host)
 		if !ok {
@@ -151,9 +155,9 @@ func (l *LeaderLoop) drainControl(ctx context.Context, b *Bridge, js store.Backe
 	return finish(ctx, js, gid, op, wire.OpCompleted, nil)
 }
 
-// drainControlsAhead carries out the drain controls among the executable
-// operations after a ledger key, ahead of their turn.
-func (l *LeaderLoop) drainControlsAhead(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, after string) error {
+// controlsAheadOf carries out the controls (a drain's, a move's) among the
+// executable operations after a ledger key, ahead of their turn.
+func (l *LeaderLoop) controlsAheadOf(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, after string, control func(string) bool) error {
 	for {
 		entries, more, err := b.Ledger(ctx, after)
 		if err != nil {
@@ -161,7 +165,7 @@ func (l *LeaderLoop) drainControlsAhead(ctx context.Context, b *Bridge, js store
 		}
 
 		for _, e := range entries {
-			if isDrainControl(e.Op.Kind) {
+			if control(e.Op.Kind) {
 				if _, err := l.ledgerOp(ctx, b, js, gid, epoch, e); err != nil {
 					return err
 				}

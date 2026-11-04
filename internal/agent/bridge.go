@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -186,21 +187,20 @@ func NewDispatchID() (string, error) {
 }
 
 func (b *Bridge) client() *http.Client {
-	cfg := b.TLS.Clone()
 	// the mgr's server certificate names its host: the leader dials its own
-	// host's loopback address
-	cfg.ServerName = b.Mgr
-	cfg.VerifyConnection = func(cs tls.ConnectionState) error {
-		if len(cs.PeerCertificates) == 0 {
-			return errors.New("no server certificate")
-		}
-
-		if _, err := pki.Require(cs.PeerCertificates[0], pki.Identity{FSID: b.FSID, Role: pki.RoleMgr, Name: b.Mgr}); err != nil {
+	// host's loopback address and checks that name besides the identity
+	cfg := WithPeer(b.TLS, func(c *x509.Certificate) error {
+		if err := c.VerifyHostname(b.Mgr); err != nil {
 			return err
 		}
 
-		return b.CRL.Check(cs.PeerCertificates[0])
-	}
+		if _, err := pki.Require(c, pki.Identity{FSID: b.FSID, Role: pki.RoleMgr, Name: b.Mgr}); err != nil {
+			return err
+		}
+
+		return b.CRL.Check(c)
+	})
+	cfg.ServerName = b.Mgr
 
 	return &http.Client{Transport: &http.Transport{TLSClientConfig: cfg, DisableKeepAlives: true}}
 }
@@ -573,6 +573,9 @@ type LedgerOp struct {
 	// drain_stop, drain_resume: the drain they control (plan 04, step 5);
 	// drain_host's --zap-osd-devices is Zap
 	Drain string `json:"drain,omitempty"`
+	// move_resume: the move it resumes (plan 04, step 5); set_host_addr's
+	// new address is Addr
+	Move string `json:"move,omitempty"`
 }
 
 // Ledger returns the executable operations after a ledger key, in the order
@@ -836,11 +839,22 @@ func (b *Bridge) BindDisk(ctx context.Context, op, serial, link, job string) err
 	return err
 }
 
-// OSD is an OSD of the OSD map.
+// OSD is an OSD of the OSD map, with the IPs it advertises.
 type OSD struct {
-	ID   int    `json:"osd"`
-	UUID string `json:"uuid"`
-	Up   bool   `json:"up"`
+	ID          int    `json:"osd"`
+	UUID        string `json:"uuid"`
+	Up          bool   `json:"up"`
+	PublicAddr  string `json:"public_addr,omitempty"`
+	ClusterAddr string `json:"cluster_addr,omitempty"`
+}
+
+// MoveAddr asks the module to set a moved mgr's or OSD's address settings
+// (public_addr, an OSD's cluster_addr too) to its host's new address in the
+// monitors' configuration database, for a move's step (plan 04, step 5).
+func (b *Bridge) MoveAddr(ctx context.Context, op, daemon string) error {
+	_, err := b.do(ctx, "move addr", map[string]any{"operation": op, "daemon": daemon})
+
+	return err
 }
 
 // OSDs returns the OSD map's OSDs.
@@ -903,29 +917,50 @@ func (b *Bridge) ActiveMgrGID(ctx context.Context) (string, int64, error) {
 
 // MgrMap returns the active mgr's name and gid, and the standbys' names.
 func (b *Bridge) MgrMap(ctx context.Context) (string, int64, []string, error) {
+	active, gid, standbys, err := b.mgrDump(ctx)
+
+	var names []string
+	for _, s := range standbys {
+		names = append(names, s.Name)
+	}
+
+	return active, gid, names, err
+}
+
+// MgrGIDs returns the active mgr's name and gid, and each standby's gid by name.
+func (b *Bridge) MgrGIDs(ctx context.Context) (string, int64, map[string]int64, error) {
+	active, gid, standbys, err := b.mgrDump(ctx)
+
+	gids := map[string]int64{}
+	for _, s := range standbys {
+		gids[s.Name] = s.GID
+	}
+
+	return active, gid, gids, err
+}
+
+type standby struct {
+	Name string `json:"name"`
+	GID  int64  `json:"gid"`
+}
+
+func (b *Bridge) mgrDump(ctx context.Context) (string, int64, []standby, error) {
 	out, err := b.do(ctx, "mgr dump", map[string]any{})
 	if err != nil {
 		return "", 0, nil, err
 	}
 
 	var m struct {
-		ActiveName string `json:"active_name"`
-		ActiveGID  int64  `json:"active_gid"`
-		Standbys   []struct {
-			Name string `json:"name"`
-		} `json:"standbys"`
+		ActiveName string    `json:"active_name"`
+		ActiveGID  int64     `json:"active_gid"`
+		Standbys   []standby `json:"standbys"`
 	}
 
 	if err := json.Unmarshal([]byte(out), &m); err != nil || m.ActiveName == "" {
 		return "", 0, nil, errors.New("bridge: mgr dump: no active mgr")
 	}
 
-	var standbys []string
-	for _, s := range m.Standbys {
-		standbys = append(standbys, s.Name)
-	}
-
-	return m.ActiveName, m.ActiveGID, standbys, nil
+	return m.ActiveName, m.ActiveGID, m.Standbys, nil
 }
 
 // OKToStop asks the module for Ceph's check that one daemon of an upgrade's

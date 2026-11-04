@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -312,18 +312,15 @@ func (o *Orch) operatorClient(h state.Host) (*http.Client, error) {
 		return nil, err
 	}
 
-	cfg.VerifyConnection = func(cs tls.ConnectionState) error {
-		if len(cs.PeerCertificates) == 0 {
-			return errors.New("no server certificate")
-		}
-
-		if _, err := pki.Require(cs.PeerCertificates[0], pki.Identity{FSID: o.St.FSID, Role: pki.RoleAgent, Name: h.Name}); err != nil {
+	// by its identity, not its address (plan 04, step 5)
+	cfg = agent.WithPeer(cfg, func(c *x509.Certificate) error {
+		if _, err := pki.Require(c, pki.Identity{FSID: o.St.FSID, Role: pki.RoleAgent, Name: h.Name}); err != nil {
 			return err
 		}
 
 		// not an agent the revocation list names (plan 04, step 3)
-		return o.checkAgent(cs.PeerCertificates[0])
-	}
+		return o.checkAgent(c)
+	})
 
 	return &http.Client{Transport: &http.Transport{TLSClientConfig: cfg, DisableKeepAlives: true}, Timeout: 2 * time.Minute}, nil
 }

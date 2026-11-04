@@ -15,6 +15,7 @@ import datetime
 import errno
 import hashlib
 import http.client
+import ipaddress
 import json
 import os
 import re
@@ -333,6 +334,8 @@ def check_not_revoked(peercert: Optional[Dict[str, Any]], revoked: Any, now: Opt
 # the header naming the polling module's address: the agent sends its
 # going-down reports there, to the mgr its client certificate names (plan 04, step 5)
 MODULE_ADDR_HEADER = 'X-Cephadm-Talos-Module'
+# the module heartbeats its own host's agent here (plan 04, step 5)
+LOOPBACK = '127.0.0.1'
 
 
 def fetch_record(addr: str, tls: ssl.SSLContext, refresh: bool = False,
@@ -492,7 +495,8 @@ def filter_daemons(daemons: List[DaemonDescription], service_name: Optional[str]
 
 def build_hosts(inv: Dict[str, Any]) -> List[HostSpec]:
     return [HostSpec(h['name'], addr=h['addr'], labels=h.get('labels') or [],
-                     status='maintenance' if h.get('maintenance') else 'draining' if h.get('drain') else '') for h in inv['hosts']]
+                     status='maintenance' if h.get('maintenance') else 'draining' if h.get('drain') else 'moving' if h.get('move') else '')
+            for h in inv['hosts']]
 
 
 class Poller:
@@ -549,7 +553,13 @@ class Poller:
 
 
 def tls_context(directory: str = TALOS_DIR) -> ssl.SSLContext:
+    """The module's client side: an agent's chain verified against the agent
+    CA, not its address (plan 04, step 5); every caller checks the peer's
+    identity URI SAN and the revoked set after the handshake, so a host that
+    moved stays reachable before its certificates name its new address."""
     ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=os.path.join(directory, 'agent-ca.crt'))
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_REQUIRED
     ctx.minimum_version = ssl.TLSVersion.TLSv1_3
     ctx.load_cert_chain(os.path.join(directory, 'mgr-client.crt'), os.path.join(directory, 'mgr-client.key'))
     return ctx
@@ -816,6 +826,32 @@ class Module(orchestrator.Orchestrator, MgrModule):
         if host in self._drains(fold):
             raise OrchestratorError('%s is draining (ceph orch host drain stop %s)' % (host, host))
 
+    def _moves(self, fold: Any) -> Dict[str, str]:
+        """The hosts with a move (plan 04, step 5) and its operation: the
+        fold's, and the leader's records of a move still finishing."""
+        out = {h: mv['op'] for h, mv in fold.moving.items()}
+        try:
+            hosts = self._inventory()['hosts']
+        except InventoryError:
+            hosts = []
+        for h in hosts:
+            if isinstance(h.get('move'), dict):
+                out.setdefault(h['name'], str(h['move'].get('op')))
+        return out
+
+    def _not_moving(self, host: str) -> None:
+        _, fold = self._authority()
+        if host in self._moves(fold):
+            raise OrchestratorError('the address of %s is changing (ceph orch host ls)' % host)
+
+    def _move_record(self, host: str) -> Dict[str, Any]:
+        """The leader's record of a host's move, {} without one."""
+        try:
+            hosts = self._inventory()['hosts']
+        except InventoryError:
+            return {}
+        return next((h['move'] for h in hosts if h['name'] == host and isinstance(h.get('move'), dict)), {})
+
     def _drain_record(self, host: str) -> Dict[str, Any]:
         """The leader's record of a host's drain, {} without one."""
         try:
@@ -903,6 +939,8 @@ class Module(orchestrator.Orchestrator, MgrModule):
         # a draining host takes no new operation but the renewals (plan 04, step 5)
         if kind not in ('renew_mgr', 'renew_agent'):
             self._not_draining(host)
+        # a moving host none: the move reissues its certificates itself
+        self._not_moving(host)
         op_id = op_id or 'op-' + os.urandom(8).hex()
         entry = {'id': op_id, 'kind': kind, 'host': host, **extra, **self._request_fields()}
         if daemon:
@@ -1003,9 +1041,13 @@ class Module(orchestrator.Orchestrator, MgrModule):
         # a drain's operation while it lasts or the leader's record of it
         # stays: the bridge authorizes its steps by it (plan 04, step 5)
         pinned |= {d['op'] for d in fold.draining.values()}
+        pinned |= {mv['op'] for mv in fold.moving.values()}
         try:
             inv = inventory_from_store(store, choose_incarnation(store, getattr(self, '_gid', None)))
             pinned |= {str(h['drain'].get('op')) for h in inv['hosts'] if isinstance(h.get('drain'), dict)}
+            # a move's operation until the leader cleared its record (its steps'
+            # calls are authorized by it)
+            pinned |= {str(h['move'].get('op')) for h in inv['hosts'] if isinstance(h.get('move'), dict)}
         except InventoryError:
             return
         got = led.cut(cli_baseline(store), states, cluster.get('ledger_applied') or '', pinned, now)
@@ -1179,12 +1221,14 @@ class Module(orchestrator.Orchestrator, MgrModule):
         return issuer
 
     def _heartbeat(self, inv: Dict[str, Any], gid: int, epoch: int, nonce: str) -> str:
-        """Tell the local agent it is the leader's; returns the agent's session nonce."""
-        mine = [h['addr'] for h in inv['hosts'] if h['name'] == self.get_mgr_id()]
-        if len(mine) != 1:
-            raise ValueError('this mgr\'s host %s is not one inventory host' % self.get_mgr_id())
+        """Tell the local agent it is the leader's; returns the agent's session
+        nonce. Over loopback, not the host's published address (plan 04, step
+        5): a move of this host never cuts the leader off from its agent,
+        which is checked by its identity as before."""
+        if not any(h['name'] == self.get_mgr_id() for h in inv['hosts']):
+            raise ValueError('this mgr\'s host %s is not an inventory host' % self.get_mgr_id())
         status, body = bridge.post_json(
-            mine[0], AGENT_PORT, tls_context(), '/v1/heartbeat', bridge.heartbeat_body(inv['fsid'], self.get_mgr_id(), gid, epoch, nonce),
+            LOOPBACK, AGENT_PORT, tls_context(), '/v1/heartbeat', bridge.heartbeat_body(inv['fsid'], self.get_mgr_id(), gid, epoch, nonce),
             bridge.HEARTBEAT_INTERVAL, lambda cert: self._require_identity(cert, inv['fsid'], 'agent', self.get_mgr_id()))
         if status != 200:
             raise ValueError('agent answered %d to the heartbeat' % status)
@@ -1590,6 +1634,72 @@ class Module(orchestrator.Orchestrator, MgrModule):
         op_id = self._accept_control('drain_stop', hostname, drain=d['op'])
         return 'Scheduled to stop the drain of host %s (operation %s)' % (hostname, op_id)
 
+    @handle_orch_error
+    def update_host_addr(self, host: str, addr: str) -> str:
+        """Change a host's address (plan 04, step 5): the leader confirms the
+        node has it, then moves its daemons one at a time and reissues its
+        certificates; again on a paused move, resume it. cephadm only records
+        the address its SSH connection uses; here the mons, mgr, OSDs and RGW
+        follow."""
+        try:
+            new = ipaddress.ip_address(addr)
+        except ValueError:
+            raise OrchestratorError('%s is not an IP address: a Talos node is reached by its address' % addr)
+        addr = str(new)
+        if not ledger.ADDR_RE.match(addr) or new.is_unspecified or new.is_loopback or new.is_multicast:
+            raise OrchestratorError('%s cannot be a host address' % addr)
+        self._settle()
+        led, fold = self._authority()
+        if host not in fold.hosts:
+            raise OrchestratorError('%s is not a host of the cluster' % host)
+        mv = fold.moving.get(host)
+        if mv is not None:
+            rec = self._move_record(host)
+            if mv['addr'] != addr:
+                raise OrchestratorError('the address of %s is changing to %s (operation %s)' % (host, mv['addr'], mv['op']))
+            if rec.get('op') != mv['op'] or not rec.get('paused'):
+                raise OrchestratorError('the address change of %s is in progress (operation %s)' % (host, mv['op']))
+            op_id = self._accept_control('move_resume', host, move=mv['op'])
+            return 'Scheduled to resume the address change of host %s to %s (operation %s)' % (host, addr, op_id)
+        old = fold.hosts[host]
+        if addr == old:
+            raise OrchestratorError('%s has the address %s already' % (host, addr))
+        others = self._moves(fold)
+        if others:
+            raise OrchestratorError('the address of %s is changing: one host at a time' % ', '.join(sorted(others)))
+        if host in fold.maintenance:
+            raise OrchestratorError('%s is in maintenance (ceph orch host maintenance exit %s)' % (host, host))
+        if host in self._drains(fold):
+            raise OrchestratorError('%s is draining' % host)
+        if fold.upgrade is not None:
+            raise OrchestratorError('an upgrade is in progress (operation %s)' % fold.upgrade['op'])
+        agents = self._agent_upgrade_running(led)
+        if agents is not None:
+            raise OrchestratorError('the agent upgrade %s is in progress' % agents['id'])
+        index = self._journal_index()
+        for _, e in led.executable():
+            if e['kind'] == 'apply_ingress' and not self._finished(index, e['id']):
+                raise OrchestratorError('ingress operation %s is in progress' % e['id'])
+        taken = sorted(h for h, a in fold.hosts.items() if h != host and a == addr)
+        if taken:
+            raise OrchestratorError('%s has the address %s' % (taken[0], addr))
+        # Ceph's bind families follow the mons' addresses, keepalived is IPv4 only
+        if ipaddress.ip_address(old).version != new.version:
+            raise OrchestratorError('%s is not of the family of %s: an address change keeps the family' % (addr, old))
+        # its mon leaves the monmap and joins again while the rest keep quorum
+        mons = [n for n in fold.daemons if n.startswith('mon.')]
+        if 'mon.' + host in fold.daemons and len(mons) < 3:
+            raise OrchestratorError('%s runs a mon and the cluster has fewer than three: the rest must keep quorum while it moves' % host)
+        if any(n.startswith('osd.') and h == host for n, h in fold.daemons.items()) and bridge.ambiguous(host):
+            raise OrchestratorError('host name %s is ambiguous for osd set-group noout' % host)
+        # its mgr is failed over before it moves
+        if host == self.get_mgr_id():
+            standbys = [x for x in (self.get('mgr_map') or {}).get('standbys', []) if x.get('available', True)]
+            if not standbys:
+                raise OrchestratorError('%s runs the active mgr and no standby mgr is available' % host)
+        op_id = self._accept('set_host_addr', None, host, addr=addr)
+        return 'Scheduled to change the address of host %s from %s to %s (operation %s)' % (host, old, addr, op_id)
+
     @_accepting
     def _accept_control(self, kind: str, host: str, **fields: Any) -> str:
         """Accept a drain's control: ahead of queued operations in the leader,
@@ -1645,7 +1755,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
         unplanned stop, a reason or an open intent is reconciled; a host back
         from its stop (a new boot, or its stop cancelled, and its OSDs up again
         unless it is in maintenance) ends it. Then TALOS_HOST_DOWN and
-        TALOS_DRAIN_PAUSED."""
+        TALOS_DRAIN_PAUSED and TALOS_HOST_MOVE_PAUSED."""
         now = now or utcnow()
         channel = getattr(self, '_channel', None)
         led = getattr(self, '_ledger', None)
@@ -1704,6 +1814,12 @@ class Module(orchestrator.Orchestrator, MgrModule):
             checks['TALOS_DRAIN_PAUSED'] = {
                 'severity': 'warning', 'summary': 'a host drain is paused', 'count': len(paused),
                 'detail': ['the drain of %s paused: %s (ceph orch host drain %s resumes it)' % (h, d.get('error', ''), h) for h, d in paused]}
+        moves = [(h['name'], h['move']) for h in hosts if isinstance(h.get('move'), dict) and h['move'].get('paused')]
+        if moves:
+            checks['TALOS_HOST_MOVE_PAUSED'] = {
+                'severity': 'warning', 'summary': 'a host address change is paused', 'count': len(moves),
+                'detail': ['the move of %s to %s paused: %s (ceph orch host set-addr %s %s resumes it)'
+                           % (h, mv.get('to', ''), mv.get('error', ''), h, mv.get('to', '')) for h, mv in moves]}
         self._set_health('lifecycle', checks)
 
     def _noout_loop(self) -> None:
@@ -1906,6 +2022,8 @@ class Module(orchestrator.Orchestrator, MgrModule):
             raise OrchestratorError('hosts in maintenance: %s' % ', '.join(sorted(fold.maintenance)))
         if self._drains(fold):
             raise OrchestratorError('hosts draining: %s' % ', '.join(sorted(self._drains(fold))))
+        if self._moves(fold):
+            raise OrchestratorError('host addresses changing: %s' % ', '.join(sorted(self._moves(fold))))
         current = self._inventory().get('image', '')
         if image.split('@')[0] != current.split('@')[0]:
             raise OrchestratorError('the image is not from the cluster\'s repository %s' % current.split('@')[0])
@@ -2027,6 +2145,8 @@ class Module(orchestrator.Orchestrator, MgrModule):
         busy = sorted(set(hosts) & set(self._drains(fold)))
         if busy:
             raise OrchestratorError('hosts draining: %s' % ', '.join(busy))
+        if self._moves(fold):
+            raise OrchestratorError('host addresses changing: %s' % ', '.join(sorted(self._moves(fold))))
         cur = fold.ingress
         new_password = cur is None
         if cur is not None:
@@ -2238,6 +2358,8 @@ class Module(orchestrator.Orchestrator, MgrModule):
             raise OrchestratorError('operation %s (%s) is in progress' % (running['id'], running['kind']))
         if self._drains(fold):
             raise OrchestratorError('hosts draining: %s' % ', '.join(sorted(self._drains(fold))))
+        if self._moves(fold):
+            raise OrchestratorError('host addresses changing: %s' % ', '.join(sorted(self._moves(fold))))
         if not isinstance(image, str) or not ledger.IMAGE_RE.match(image):
             raise OrchestratorError('name the image by its digest: <repository>@sha256:<hex>')
         current = ((cluster or {}).get('agent') or {}).get('image') or ''

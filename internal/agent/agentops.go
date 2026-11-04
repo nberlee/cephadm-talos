@@ -131,7 +131,14 @@ func (l *LeaderLoop) agentGrant(ctx context.Context, b *Bridge, js store.Backend
 // agent keeps running. The leader's own agent restarts with its renewal and
 // continues it from the journal.
 func (l *LeaderLoop) renewAgent(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, op LedgerOp) error {
-	rec, found, err := l.readRenewal(ctx, b, js, gid, op.ID)
+	return l.renewAgentAs(ctx, b, js, gid, epoch, renewingOf(ctx, js, gid, op))
+}
+
+// renewAgentAs is renewAgent under a renewing (a move's step among them).
+func (l *LeaderLoop) renewAgentAs(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, r renewing) error {
+	op := r.op
+
+	rec, found, err := l.readRenewal(ctx, b, js, gid, r.base)
 	if err != nil {
 		return err
 	}
@@ -144,7 +151,7 @@ func (l *LeaderLoop) renewAgent(ctx context.Context, b *Bridge, js store.Backend
 
 		h, ok := st.Host(op.Host)
 		if !ok || h.Name != op.Host {
-			return l.endAgentRenewal(ctx, b, js, gid, op, fmt.Errorf("no host %s in the cluster state", op.Host))
+			return l.endAgentRenewalAs(ctx, b, js, gid, r, fmt.Errorf("no host %s in the cluster state", op.Host))
 		}
 
 		if !strings.HasPrefix(h.AgentKeys, op.ID+"/") {
@@ -156,7 +163,7 @@ func (l *LeaderLoop) renewAgent(ctx context.Context, b *Bridge, js store.Backend
 			// the certificates before, journaled once, before the state changes
 			if !found {
 				rec = mgrRenewal{ServerCert: h.AgentCert, ClientCert: h.AgentClientCert, Keys: h.AgentKeys}
-				if err := writeJSONKey(ctx, js, rollKey(gid, op.ID+".renew"), rec); err != nil {
+				if err := writeJSONKey(ctx, js, rollKey(gid, r.base+".renew"), rec); err != nil {
 					return err
 				}
 			}
@@ -182,7 +189,7 @@ func (l *LeaderLoop) renewAgent(ctx context.Context, b *Bridge, js store.Backend
 
 		// the keys only for the grant, through the bridge, which releases them
 		// for this renewal
-		done, ok, err := l.agentGrant(ctx, b, js, gid, epoch, op.ID+".self", h.Name, "self_update", func(g *wire.Grant) error {
+		done, ok, err := l.agentGrant(ctx, b, js, gid, epoch, r.base+".self", h.Name, "self_update", func(g *wire.Grant) error {
 			su := &wire.SelfUpdate{Cert: h.AgentCert, ClientCert: h.AgentClientCert}
 
 			var err error
@@ -203,7 +210,7 @@ func (l *LeaderLoop) renewAgent(ctx context.Context, b *Bridge, js store.Backend
 		}
 
 		if !ok {
-			return l.endAgentRenewal(ctx, b, js, gid, op, fmt.Errorf("the self-update of %s's agent did not apply", h.Name))
+			return l.endAgentRenewalAs(ctx, b, js, gid, r, fmt.Errorf("the self-update of %s's agent did not apply", h.Name))
 		}
 
 		if !l.servesCert(h.Addr, Port, h.AgentCert) {
@@ -212,7 +219,7 @@ func (l *LeaderLoop) renewAgent(ctx context.Context, b *Bridge, js store.Backend
 
 		// from here the new certificates stay: the module is asked until it answers
 		rec.Retiring = true
-		if err := writeJSONKey(ctx, js, rollKey(gid, op.ID+".renew"), rec); err != nil {
+		if err := writeJSONKey(ctx, js, rollKey(gid, r.base+".renew"), rec); err != nil {
 			return err
 		}
 	}
@@ -221,17 +228,17 @@ func (l *LeaderLoop) renewAgent(ctx context.Context, b *Bridge, js store.Backend
 		return fmt.Errorf("%w: %v", errWait, err)
 	}
 
-	return finish(ctx, js, gid, op, wire.OpCompleted, nil)
+	return r.end(wire.OpCompleted, nil)
 }
 
-// endAgentRenewal ends an agent's renewal failed, its certificates before
+// endAgentRenewalAs ends an agent's renewal failed, its certificates before
 // restored.
-func (l *LeaderLoop) endAgentRenewal(ctx context.Context, b *Bridge, js store.Backend, gid int64, op LedgerOp, cause error) error {
-	if err := l.renewAgentFailed(ctx, b, js, gid, op); err != nil {
+func (l *LeaderLoop) endAgentRenewalAs(ctx context.Context, b *Bridge, js store.Backend, gid int64, r renewing, cause error) error {
+	if err := l.renewAgentFailedAs(ctx, b, js, gid, r); err != nil {
 		return err
 	}
 
-	return finish(ctx, js, gid, op, JournalFailed, cause)
+	return r.end(JournalFailed, cause)
 }
 
 // renewAgentFailed is an agent renewal's cleanup when it fails: before it
@@ -239,7 +246,14 @@ func (l *LeaderLoop) endAgentRenewal(ctx context.Context, b *Bridge, js store.Ba
 // back in the state (their keys still exist), so the module renews anew;
 // after, the module is asked once more.
 func (l *LeaderLoop) renewAgentFailed(ctx context.Context, b *Bridge, js store.Backend, gid int64, op LedgerOp) error {
-	rec, found, err := l.readRenewal(ctx, b, js, gid, op.ID)
+	return l.renewAgentFailedAs(ctx, b, js, gid, renewingOf(ctx, js, gid, op))
+}
+
+// renewAgentFailedAs is renewAgentFailed under a renewing.
+func (l *LeaderLoop) renewAgentFailedAs(ctx context.Context, b *Bridge, js store.Backend, gid int64, r renewing) error {
+	op := r.op
+
+	rec, found, err := l.readRenewal(ctx, b, js, gid, r.base)
 	if err != nil || !found {
 		return err
 	}

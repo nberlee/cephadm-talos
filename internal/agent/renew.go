@@ -33,7 +33,28 @@ type mgrRenewal struct {
 // serves the new server certificate (it loads it itself; a standby when it
 // starts) before the module retires the others.
 func (l *LeaderLoop) renewMgr(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, op LedgerOp) error {
-	rec, found, err := l.readRenewal(ctx, b, js, gid, op.ID)
+	return l.renewMgrAs(ctx, b, js, gid, epoch, renewingOf(ctx, js, gid, op))
+}
+
+// renewing is what a renewal runs under: the operation the module issues its
+// certificates for (a renewal, or a host's move: plan 04, step 5), the
+// journal base of its records and phases, and how it ends.
+type renewing struct {
+	op   LedgerOp
+	base string
+	end  func(state string, err error) error
+}
+
+// renewingOf is a renewal operation as it runs on its own.
+func renewingOf(ctx context.Context, js store.Backend, gid int64, op LedgerOp) renewing {
+	return renewing{op: op, base: op.ID, end: func(s string, err error) error { return finish(ctx, js, gid, op, s, err) }}
+}
+
+// renewMgrAs is renewMgr under a renewing (a move's step among them).
+func (l *LeaderLoop) renewMgrAs(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, r renewing) error {
+	op := r.op
+
+	rec, found, err := l.readRenewal(ctx, b, js, gid, r.base)
 	if err != nil {
 		return err
 	}
@@ -49,7 +70,7 @@ func (l *LeaderLoop) renewMgr(ctx context.Context, b *Bridge, js store.Backend, 
 
 		h, ok := st.Host(op.Host)
 		if !ok || h.Name != op.Host || typ != state.TypeMgr || id != op.Host || !exists {
-			return l.endRenewal(ctx, b, js, gid, op, fmt.Errorf("%s is not a mgr of %s in the cluster state", op.Daemon, op.Host))
+			return l.endRenewalAs(ctx, b, js, gid, r, fmt.Errorf("%s is not a mgr of %s in the cluster state", op.Daemon, op.Host))
 		}
 
 		if !strings.HasPrefix(h.MgrKeys, op.ID+"/") {
@@ -61,7 +82,7 @@ func (l *LeaderLoop) renewMgr(ctx context.Context, b *Bridge, js store.Backend, 
 			// the certificates before, journaled once, before the state changes
 			if !found {
 				rec = mgrRenewal{ServerCert: h.MgrServerCert, ClientCert: h.MgrClientCert, Keys: h.MgrKeys}
-				if err := writeJSONKey(ctx, js, rollKey(gid, op.ID+".renew"), rec); err != nil {
+				if err := writeJSONKey(ctx, js, rollKey(gid, r.base+".renew"), rec); err != nil {
 					return err
 				}
 			}
@@ -84,13 +105,13 @@ func (l *LeaderLoop) renewMgr(ctx context.Context, b *Bridge, js store.Backend, 
 		}
 
 		if !h.Maintenance {
-			done, ok, err := l.step(ctx, b, js, gid, epoch, op.ID+".rev", h.Name, revisionMode{})
+			done, ok, err := l.step(ctx, b, js, gid, epoch, r.base+".rev", h.Name, revisionMode{})
 			if err != nil || !done {
 				return err
 			}
 
 			if !ok {
-				return l.endRenewal(ctx, b, js, gid, op, fmt.Errorf("the revision of %s did not apply", h.Name))
+				return l.endRenewalAs(ctx, b, js, gid, r, fmt.Errorf("the revision of %s did not apply", h.Name))
 			}
 
 			active, err := b.ActiveMgr(ctx)
@@ -105,7 +126,7 @@ func (l *LeaderLoop) renewMgr(ctx context.Context, b *Bridge, js store.Backend, 
 
 		// from here the new certificates stay: the module is asked until it answers
 		rec.Retiring = true
-		if err := writeJSONKey(ctx, js, rollKey(gid, op.ID+".renew"), rec); err != nil {
+		if err := writeJSONKey(ctx, js, rollKey(gid, r.base+".renew"), rec); err != nil {
 			return err
 		}
 	}
@@ -114,16 +135,16 @@ func (l *LeaderLoop) renewMgr(ctx context.Context, b *Bridge, js store.Backend, 
 		return fmt.Errorf("%w: %v", errWait, err)
 	}
 
-	return finish(ctx, js, gid, op, wire.OpCompleted, nil)
+	return r.end(wire.OpCompleted, nil)
 }
 
-// endRenewal ends a mgr's renewal failed, its certificates before restored.
-func (l *LeaderLoop) endRenewal(ctx context.Context, b *Bridge, js store.Backend, gid int64, op LedgerOp, cause error) error {
-	if err := l.renewMgrFailed(ctx, b, js, gid, op); err != nil {
+// endRenewalAs ends a mgr's renewal failed, its certificates before restored.
+func (l *LeaderLoop) endRenewalAs(ctx context.Context, b *Bridge, js store.Backend, gid int64, r renewing, cause error) error {
+	if err := l.renewMgrFailedAs(ctx, b, js, gid, r); err != nil {
 		return err
 	}
 
-	return finish(ctx, js, gid, op, JournalFailed, cause)
+	return r.end(JournalFailed, cause)
 }
 
 // renewMgrFailed is a mgr renewal's cleanup when it fails: before it asked the
@@ -131,7 +152,14 @@ func (l *LeaderLoop) endRenewal(ctx context.Context, b *Bridge, js store.Backend
 // state (their keys still exist), so the module sees the installed ones
 // again and renews anew; after, the module is asked once more.
 func (l *LeaderLoop) renewMgrFailed(ctx context.Context, b *Bridge, js store.Backend, gid int64, op LedgerOp) error {
-	rec, found, err := l.readRenewal(ctx, b, js, gid, op.ID)
+	return l.renewMgrFailedAs(ctx, b, js, gid, renewingOf(ctx, js, gid, op))
+}
+
+// renewMgrFailedAs is renewMgrFailed under a renewing.
+func (l *LeaderLoop) renewMgrFailedAs(ctx context.Context, b *Bridge, js store.Backend, gid int64, r renewing) error {
+	op := r.op
+
+	rec, found, err := l.readRenewal(ctx, b, js, gid, r.base)
 	if err != nil || !found {
 		return err
 	}
@@ -153,8 +181,8 @@ func (l *LeaderLoop) renewMgrFailed(ctx context.Context, b *Bridge, js store.Bac
 	})
 }
 
-// readRenewal reads a mgr renewal's record: this incarnation's, else an
-// earlier incarnation's (a takeover resumes from it).
+// readRenewal reads a renewal's record below its journal base op: this
+// incarnation's, else an earlier incarnation's (a takeover resumes from it).
 func (l *LeaderLoop) readRenewal(ctx context.Context, b *Bridge, js store.Backend, gid int64, op string) (mgrRenewal, bool, error) {
 	rec, found, err := readJSONKey[mgrRenewal](ctx, js, rollKey(gid, op+".renew"))
 	if err != nil || found {

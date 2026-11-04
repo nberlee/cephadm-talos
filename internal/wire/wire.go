@@ -465,6 +465,9 @@ type NodeReport struct {
 	Disks []Disk          `json:"disks"`
 	// BootID is the node's boot id; it changes with every boot
 	BootID string `json:"boot_id,omitempty"`
+	// Addrs are the node's own IP addresses, as Talos reports them: a host's
+	// move confirms the new one there (plan 04, step 5)
+	Addrs []string `json:"addrs,omitempty"`
 }
 
 // VRRP is a keepalived's latest start marker (vip.sh prints one per start)

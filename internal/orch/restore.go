@@ -3,6 +3,7 @@ package orch
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -449,6 +450,15 @@ func (o *Orch) agentServes(h state.Host, certPEM string) (bool, error) {
 		return false, err
 	}
 
+	// by its chain and identity, not its address (plan 04, step 5)
+	cfg = agent.WithPeer(cfg, func(c *x509.Certificate) error {
+		if _, err := pki.Require(c, pki.Identity{FSID: o.St.FSID, Role: pki.RoleAgent, Name: h.Name}); err != nil {
+			return err
+		}
+
+		return o.checkAgent(c)
+	})
+
 	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 10 * time.Second}, "tcp", agentAddr(h), cfg)
 	if err != nil {
 		return false, err
@@ -456,11 +466,6 @@ func (o *Orch) agentServes(h state.Host, certPEM string) (bool, error) {
 	defer conn.Close() //nolint:errcheck
 
 	peers := conn.ConnectionState().PeerCertificates
-	if len(peers) > 0 {
-		if err := o.checkAgent(peers[0]); err != nil {
-			return false, err
-		}
-	}
 
 	return len(peers) > 0 && peers[0].Equal(want), nil
 }

@@ -24,6 +24,18 @@ type InventoryHost struct {
 	NoOut bool `json:"noout,omitempty"`
 	// Drain is the host's drain, as the module reports it (plan 04, step 5)
 	Drain *InventoryDrain `json:"drain,omitempty"`
+	// Move is the host's address change, as the module reports it
+	Move *InventoryMove `json:"move,omitempty"`
+}
+
+// InventoryMove is a host's address change in progress.
+type InventoryMove struct {
+	Op     string `json:"op"`
+	From   string `json:"from"`
+	To     string `json:"to"`
+	Step   string `json:"step,omitempty"`
+	Paused bool   `json:"paused,omitempty"`
+	Error  string `json:"error,omitempty"`
 }
 
 // InventoryDrain is a host's drain in progress.
@@ -87,6 +99,10 @@ func InventoryOf(s *state.State) Inventory {
 		ih := InventoryHost{Name: h.Name, Addr: h.Addr, Labels: append([]string{}, h.Labels...), Maintenance: h.Maintenance, NoOut: h.NoOut}
 		if d := h.Drain; d != nil {
 			ih.Drain = &InventoryDrain{Op: d.Op, Step: d.Step, Stopped: d.Stopped, Paused: d.Paused, Error: d.Error}
+		}
+
+		if m := h.Move; m != nil {
+			ih.Move = &InventoryMove{Op: m.Op, From: m.From, To: m.To, Step: m.Step, Paused: m.Paused, Error: m.Error}
 		}
 
 		inv.Hosts = append(inv.Hosts, ih)

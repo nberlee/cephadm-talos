@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -415,18 +415,13 @@ func (a *Agent) NotifyDown(ctx context.Context, boot, stop string) error {
 		return err
 	}
 
-	cfg := a.ClientTLS.Clone()
-	cfg.VerifyConnection = func(cs tls.ConnectionState) error {
-		if len(cs.PeerCertificates) == 0 {
-			return errors.New("no server certificate")
-		}
-
-		if _, err := pki.Require(cs.PeerCertificates[0], pki.Identity{FSID: a.Channel.Self.FSID, Role: pki.RoleMgr, Name: t.Mgr}); err != nil {
+	cfg := WithPeer(a.ClientTLS, func(c *x509.Certificate) error {
+		if _, err := pki.Require(c, pki.Identity{FSID: a.Channel.Self.FSID, Role: pki.RoleMgr, Name: t.Mgr}); err != nil {
 			return err
 		}
 
-		return a.CRL.Check(cs.PeerCertificates[0])
-	}
+		return a.CRL.Check(c)
+	})
 
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()

@@ -149,24 +149,19 @@ func (c *Channel) Confirm(ctx context.Context, tlsCfg *tls.Config, t ConfirmTarg
 	// the module must be the named mgr of this cluster; its key signs the answer
 	var peer *x509.Certificate
 
-	cfg := tlsCfg.Clone()
-	cfg.VerifyConnection = func(cs tls.ConnectionState) error {
-		if len(cs.PeerCertificates) == 0 {
-			return errors.New("no server certificate")
-		}
-
-		if _, err := pki.Require(cs.PeerCertificates[0], pki.Identity{FSID: c.Self.FSID, Role: pki.RoleMgr, Name: t.Mgr}); err != nil {
+	cfg := WithPeer(tlsCfg, func(c0 *x509.Certificate) error {
+		if _, err := pki.Require(c0, pki.Identity{FSID: c.Self.FSID, Role: pki.RoleMgr, Name: t.Mgr}); err != nil {
 			return err
 		}
 
-		if err := c.CRL.Check(cs.PeerCertificates[0]); err != nil {
+		if err := c.CRL.Check(c0); err != nil {
 			return err
 		}
 
-		peer = cs.PeerCertificates[0]
+		peer = c0
 
 		return nil
-	}
+	})
 
 	sent := c.now()
 	until := sent.Add(ConfirmValidity)
@@ -262,7 +257,11 @@ func verifyConfirmation(raw []byte, peer *x509.Certificate, mgr string, req wire
 }
 
 // ClientTLSConfig is the agent's client side of the agent channel: its client
-// certificate, and only servers issued by the agent CA.
+// certificate, and only servers issued by the agent CA. The peer is verified
+// by its chain (the agent CA, server use, validity), not by the address it
+// was dialled at (plan 04, step 5): its identity is the URI SAN, which each
+// caller checks with WithPeer, so a host that moved stays reachable before
+// its certificates name its new address.
 func ClientTLSConfig(caPEM, certPEM, keyPEM []byte) (*tls.Config, error) {
 	cert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
@@ -274,5 +273,53 @@ func ClientTLSConfig(caPEM, certPEM, keyPEM []byte) (*tls.Config, error) {
 		return nil, errors.New("agent CA: no certificate found")
 	}
 
-	return &tls.Config{Certificates: []tls.Certificate{cert}, RootCAs: pool, MinVersion: tls.VersionTLS13}, nil
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert}, RootCAs: pool, MinVersion: tls.VersionTLS13,
+		// the chain is verified below, without the address
+		InsecureSkipVerify: true, //nolint:gosec
+		VerifyConnection:   func(cs tls.ConnectionState) error { return verifyChain(cs, pool) },
+	}, nil
+}
+
+// verifyChain verifies a server's chain against the roots for server use at
+// the current time, as Go's default verification does, without a host name.
+func verifyChain(cs tls.ConnectionState, roots *x509.CertPool) error {
+	if len(cs.PeerCertificates) == 0 {
+		return errors.New("no server certificate")
+	}
+
+	inter := x509.NewCertPool()
+	for _, c := range cs.PeerCertificates[1:] {
+		inter.AddCert(c)
+	}
+
+	_, err := cs.PeerCertificates[0].Verify(x509.VerifyOptions{Roots: roots, Intermediates: inter, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}})
+
+	return err
+}
+
+// WithPeer is a client configuration of ClientTLSConfig that also checks the
+// verified peer certificate (its identity, the revocation list) after the
+// chain.
+func WithPeer(base *tls.Config, check func(*x509.Certificate) error) *tls.Config {
+	cfg := base.Clone()
+	chain := base.VerifyConnection
+
+	cfg.VerifyConnection = func(cs tls.ConnectionState) error {
+		if len(cs.PeerCertificates) == 0 {
+			return errors.New("no server certificate")
+		}
+
+		if chain == nil {
+			return errors.New("no chain verification")
+		}
+
+		if err := chain(cs); err != nil {
+			return err
+		}
+
+		return check(cs.PeerCertificates[0])
+	}
+
+	return cfg
 }

@@ -1610,3 +1610,92 @@ class Lifecycle(unittest.TestCase):
         self.assertEqual(m.Module._noout_release(mod, 'h1').retval, 0)
         self.assertEqual(m.Module._noout_keep(mod, 'h2').retval, 0)
         self.assertEqual(mod._channel.calls, [('up', 'h1', None), ('keep', 'h2')])
+
+
+class Move(unittest.TestCase):
+    """plan 04, step 5: `ceph orch host set-addr`."""
+
+    def module(self, inv=None, standbys=True):
+        return Drain.module(self, inv or drain_inventory(), standbys)
+
+    def record(self, entries, inv, **move):
+        """The leader's published state with h2's move record."""
+        inv = json.loads(json.dumps(inv))
+        inv['hosts'][1]['move'] = move
+        entries.update(state_entries(inv, {'fsid': 'f', 'sealed': True}, incarnation='20'))
+
+    def test_refusals(self):
+        mod, _ = self.module()
+        for host, addr, why in (('h9', '10.5.0.9', 'not a host'), ('h2', 'host.example', 'not an IP'), ('h2', '10.5.0.2', 'already'),
+                                ('h2', '10.5.0.3', 'h3 has the address'), ('h2', 'fd00::9', 'family'), ('h5', '10.5.0.9', 'maintenance'),
+                                ('h2', '127.0.0.1', 'cannot be')):
+            self.assertIn(why, m.Module.update_host_addr(mod, host, addr).exception_str, (host, addr))
+        # a mon host with fewer than three mons
+        two = drain_inventory()
+        two['daemons'] = [x for x in two['daemons'] if x['doc_name'] not in ('ceph-f-mon-h3', 'ceph-f-mon-h4')]
+        self.assertIn('three', m.Module.update_host_addr(self.module(two)[0], 'h2', '10.5.0.9').exception_str)
+        # the active mgr's host without a standby
+        self.assertIn('standby', m.Module.update_host_addr(self.module(standbys=False)[0], 'h1', '10.5.0.9').exception_str)
+        # an upgrade, an ingress apply unfinished; a drain
+        mod, _ = self.module()
+        mod._ledger.append({'id': 'op-%016x' % 1, 'kind': 'upgrade_start', 'image': Upgrade.IMG})
+        self.assertIn('upgrade', m.Module.update_host_addr(mod, 'h2', '10.5.0.9').exception_str)
+        mod, _ = self.module()
+        mod._ledger.append({'id': 'op-%016x' % 2, 'kind': 'apply_ingress', 'vip': '10.5.0.100/24', 'vrid': 51, 'hosts': ['h4'],
+                            'image': Upgrade.IMG, 'new_password': False})
+        self.assertIn('ingress', m.Module.update_host_addr(mod, 'h2', '10.5.0.9').exception_str)
+        mod, _ = self.module()
+        mod._ledger.append({'id': 'op-%016x' % 3, 'kind': 'drain_host', 'host': 'h2', 'zap': False})
+        self.assertIn('draining', m.Module.update_host_addr(mod, 'h2', '10.5.0.9').exception_str)
+        self.assertEqual([e['kind'] for _, e in mod._ledger.executable()], ['drain_host'])
+
+    def test_accepted_once_and_resumed_when_paused(self):
+        inv = drain_inventory()
+        del inv['hosts'][4]['maintenance']
+        mod, entries = self.module(inv)
+        res = m.Module.update_host_addr(mod, 'h2', '10.5.0.9')
+        self.assertEqual(res.exception_str, '')
+        [(_, mv)] = mod._ledger.executable()
+        self.assertEqual((mv['kind'], mv['host'], mv['addr']), ('set_host_addr', 'h2', '10.5.0.9'))
+        entries['talos/inc/20/journal/op/' + mv['id']] = json.dumps({'state': 'completed'})
+        fold = mod._authority()[1]
+        # pending: not yet the host's address, its certificates still the old one's
+        self.assertEqual((fold.hosts['h2'], fold.moving['h2']['moved']), ('10.5.0.2', False))
+        # nothing else on h2 meanwhile, renewals included; no other move, upgrade or ingress
+        for res in (m.Module.daemon_action(mod, 'restart', 'mon.h2'), m.Module.enter_host_maintenance(mod, 'h2'),
+                    m.Module.drain_host(mod, 'h2'), m.Module.update_host_addr(mod, 'h3', '10.5.0.8'),
+                    m.Module.update_host_addr(mod, 'h2', '10.5.0.9'), m.Module.update_host_addr(mod, 'h2', '10.5.0.8')):
+            self.assertTrue(res.exception_str)
+        with self.assertRaisesRegex(m.OrchestratorError, 'changing'):
+            m.Module._accept(mod, 'renew_agent', None, 'h2')
+        mod._approved_images = lambda: [Upgrade.IMG]
+        self.assertIn('changing', m.Module.upgrade_start(mod, Upgrade.IMG, None, None, None, None, None).exception_str)
+        # confirmed by the leader: the fold's address, renewals of the move for its certificates
+        mod._ledger.append({'id': 'm-%016x' % 1, 'kind': 'addr_moved', 'of': mv['id'], 'host': 'h2'})
+        fold = mod._authority()[1]
+        self.assertEqual(fold.hosts['h2'], '10.5.0.9')
+        self.assertIn(mv['id'], fold.agent_renewals['h2'])
+        self.assertIn(mv['id'], fold.mgr_renewals['mgr.h2'])
+        # paused by the leader: set-addr again with the same address resumes it
+        self.record(entries, inv, op=mv['id'], **{'from': '10.5.0.2'}, to='10.5.0.9', step='mgr', paused=True, error='mgr: failed')
+        self.assertEqual(m.Module.get_hosts(mod).result[1].status, 'moving')
+        self.assertIn('changing to 10.5.0.9', m.Module.update_host_addr(mod, 'h2', '10.5.0.8').exception_str)
+        self.assertEqual(m.Module.update_host_addr(mod, 'h2', '10.5.0.9').exception_str, '')
+        resume = mod._ledger.executable()[-1][1]
+        self.assertEqual((resume['kind'], resume['move']), ('move_resume', mv['id']))
+        # its end: the fold and the leader's record cleared, h2 takes operations again
+        mod._ledger.append({'id': 'm-%016x' % 2, 'kind': 'addr_set', 'of': mv['id'], 'host': 'h2'})
+        self.assertTrue(m.Module.daemon_action(mod, 'restart', 'mon.h2').exception_str)  # the record still there
+        entries.update(state_entries(inv, {'fsid': 'f', 'sealed': True}, incarnation='20', seq=2))
+        self.assertEqual(m.Module.daemon_action(mod, 'restart', 'mon.h2').exception_str, '')
+
+    def test_a_paused_move_is_reported(self):
+        mod, entries = self.module()
+        self.record(entries, drain_inventory(), op='op-%016x' % 9, **{'from': '10.5.0.2'}, to='10.5.0.9', step='confirm', paused=True,
+                    error='confirm: failed the node of h2 does not have the address 10.5.0.9')
+        checks = {}
+        mod.set_health_checks = checks.update
+        mod._channel = types.SimpleNamespace(noout_reconcile=lambda *a: None, host_up=lambda *a: None)
+        mod._poller = types.SimpleNamespace(snapshot=lambda: {})
+        m.Module._noout_tick(mod)
+        self.assertIn('ceph orch host set-addr h2 10.5.0.9', checks['TALOS_HOST_MOVE_PAUSED']['detail'][0])

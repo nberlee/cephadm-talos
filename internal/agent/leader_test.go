@@ -1313,6 +1313,13 @@ func TestLeaderCreatesAnOSD(t *testing.T) {
 		t.Fatalf("module calls %v", calls)
 	}
 
+	// address settings an earlier OSD of id 5 left were cleared before its
+	// daemon was granted (plan 04, step 5), once
+	if i := slices.Index(calls, "clear osd addr "+create.Op.ID+" 5"); i < 0 || slices.Index(calls, "confirm osd "+create.Op.ID) < i ||
+		slices.Index(calls[i+1:], calls[i]) >= 0 {
+		t.Fatalf("module calls %v", calls)
+	}
+
 	st, _, err = s.leader.clusterState(ctx, s.leader.bridge())
 	must(t, err)
 

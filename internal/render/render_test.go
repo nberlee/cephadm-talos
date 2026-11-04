@@ -284,3 +284,76 @@ func TestDaemonDocuments(t *testing.T) {
 		t.Fatalf("dependency on a leaving rgw: %+v", c.DependsOnConfig.ContainersConfig)
 	}
 }
+
+// envOf is a rendered container's environment variable.
+func envOf(t *testing.T, s *state.State, name string) map[string]string {
+	t.Helper()
+
+	d, ok := s.Find(name)
+	if !ok {
+		t.Fatalf("no %s", name)
+	}
+
+	h, _ := s.Host(d.Host)
+
+	c, err := Daemon(s, h, d, image, keys, secrets(s))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out := map[string]string{}
+
+	for _, kv := range c.ContainerEnvironment {
+		k, v, _ := strings.Cut(kv, "=")
+		out[k] = v
+	}
+
+	return out
+}
+
+// During a host's move each daemon renders on the address it runs on: the
+// old one until its own step moved it (plan 04, step 5); ceph.conf and the
+// keepalived peers on the other hosts follow each daemon.
+func TestAMovingHostRendersEachDaemonWhereItRuns(t *testing.T) {
+	s := testState()
+
+	h1, _ := s.Host("h1")
+	h1.Addr = "10.5.0.9" // confirmed: the contact address
+	h1.Move = &state.Move{Op: "op-0123456789abcdef", From: "10.5.0.2", To: "10.5.0.9", Moved: []string{"mgr.h1"}}
+	s.AddHost(h1)
+
+	for name, want := range map[string]string{"mon.h1": "10.5.0.2", "osd.3": "10.5.0.2", "vip.h1": "10.5.0.2", "mgr.h1": "10.5.0.9"} {
+		if got := envOf(t, s, name)["ADDR"]; got != want {
+			t.Fatalf("%s renders ADDR %s, want %s", name, got, want)
+		}
+	}
+
+	if env := envOf(t, s, "mon.h1"); env["ADDRV"] != "[v2:10.5.0.2:3300,v1:10.5.0.2:6789]" {
+		t.Fatalf("mon ADDRV %s", env["ADDRV"])
+	}
+
+	if !strings.Contains(CephConf(s), "mon_host = [v2:10.5.0.2:3300,v1:10.5.0.2:6789]") {
+		t.Fatalf("ceph.conf names the unmoved mon elsewhere:\n%s", CephConf(s))
+	}
+
+	// h2's keepalived peers with h1's where it runs
+	if env := envOf(t, s, "vip.h2"); env["PEERS"] != "10.5.0.2" {
+		t.Fatalf("h2's keepalived does not peer with 10.5.0.2: %v", env)
+	}
+
+	// moved: the mon (a new generation), the keepalived
+	h1.Move.Moved = append(h1.Move.Moved, "mon.h1", "vip.h1", "osd.3")
+	s.AddHost(h1)
+
+	if env := envOf(t, s, "mon.h1"); env["ADDR"] != "10.5.0.9" || env["ADDRV"] != "[v2:10.5.0.9:3300,v1:10.5.0.9:6789]" {
+		t.Fatalf("moved mon %v", env)
+	}
+
+	if !strings.Contains(CephConf(s), "mon_host = [v2:10.5.0.9:3300,v1:10.5.0.9:6789]") {
+		t.Fatalf("ceph.conf:\n%s", CephConf(s))
+	}
+
+	if env := envOf(t, s, "vip.h2"); env["PEERS"] != "10.5.0.9" {
+		t.Fatalf("h2's keepalived peers %v", env)
+	}
+}

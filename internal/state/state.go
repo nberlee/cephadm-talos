@@ -46,6 +46,8 @@ type Host struct {
 	NoOut bool `json:"noout,omitempty"`
 	// Drain is the host's drain in progress (plan 04, step 5)
 	Drain *Drain `json:"drain,omitempty"`
+	// Move is the host's address change in progress (plan 04, step 5)
+	Move *Move `json:"move,omitempty"`
 	// Labels are the host's labels from `ceph orch host add` (stored only)
 	Labels []string `json:"labels,omitempty"`
 	// Talosconfig and Context override the cluster defaults for this node, so
@@ -95,6 +97,62 @@ type Drain struct {
 	Stopped bool   `json:"stopped,omitempty"`
 	Paused  bool   `json:"paused,omitempty"`
 	Error   string `json:"error,omitempty"`
+}
+
+// Move is a host's address change (`ceph orch host set-addr`, plan 04 step
+// 5): its steps run between ledger operations, one at a time, each journaled
+// as <Op>.m<Attempt>. Addr becomes To once the leader confirmed the node has
+// it (the contact address: the agent, the certificates); each daemon keeps
+// From until its own step moves it (Moved).
+type Move struct {
+	Op   string `json:"op"`
+	From string `json:"from"`
+	To   string `json:"to"`
+	// Step is the step in progress: "confirm", "rgw", "mgr", "osd", "mon",
+	// "conf", "certs"
+	Step    string `json:"step,omitempty"`
+	Attempt int    `json:"attempt,omitempty"`
+	// Done lists the steps that ended, and the sub-steps a step must not
+	// repeat ("mon.rm": the mon left the monmap)
+	Done []string `json:"done,omitempty"`
+	// Moved lists the daemons on To ("<type>.<id>"; an OSD by its id,
+	// "osd.<n>"; its host's keepalived "vip.<host>")
+	Moved []string `json:"moved,omitempty"`
+	// VIPOff: the host's keepalived is off during the RGW step, until its
+	// peers on the other ingress hosts name To
+	VIPOff bool `json:"vip_off,omitempty"`
+	// Before is the moved mgr's gid (or instance) before its restart: it is
+	// back with another one
+	Before string `json:"before,omitempty"`
+	// Paused by a failed step (Error, the step kept), until `ceph orch host
+	// set-addr` again resumes it
+	Paused bool   `json:"paused,omitempty"`
+	Error  string `json:"error,omitempty"`
+}
+
+// MoveName is the name a move records a daemon under in Moved.
+func MoveName(d Daemon) string {
+	if d.Type == TypeOSD && d.OSDID != nil {
+		return fmt.Sprintf("osd.%d", *d.OSDID)
+	}
+
+	return d.Type + "." + d.ID
+}
+
+// DaemonAddr is the address a daemon of the state runs on: its host's, or
+// during the host's move the old one until the daemon's own step moved it
+// (plan 04, step 5).
+func (s *State) DaemonAddr(d Daemon) string {
+	h, ok := s.Host(d.Host)
+	if !ok {
+		return ""
+	}
+
+	if m := h.Move; m != nil && !slices.Contains(m.Moved, MoveName(d)) {
+		return m.From
+	}
+
+	return h.Addr
 }
 
 // Published is the revision of what the talos mgr module reads from the nodes
@@ -1015,13 +1073,14 @@ func (s *State) DaemonsOf(typ, host string) []Daemon {
 	return out
 }
 
-// MonAddrs returns the addresses of the mon hosts, in placement order.
+// MonAddrs returns the addresses of the mons that joined, in placement
+// order, each where it runs (DaemonAddr).
 func (s *State) MonAddrs() []string {
 	var out []string
 
 	for _, d := range s.DaemonsOf(TypeMon, "") {
-		if h, ok := s.Host(d.Host); ok && !d.Joining {
-			out = append(out, h.Addr)
+		if a := s.DaemonAddr(d); a != "" && !d.Joining {
+			out = append(out, a)
 		}
 	}
 

@@ -266,10 +266,10 @@ class IssuerTest(unittest.TestCase):
         self.assertIsInstance(json.loads(self.kv.kv[rv.CRL_MANIFEST])['number'], str)
 
 
-def agent_pki():
-    """An agent CA, an agent server certificate for 127.0.0.1 and a mgr client certificate, as files."""
+def agent_pki(addr='127.0.0.1'):
+    """An agent CA, an agent server certificate for addr and a mgr client certificate, as files."""
     cert, key = ca()
-    srv = b.issue_mgr_certs(cert, key.encode(), 'f1', 'h1', '127.0.0.1', 'agent')
+    srv = b.issue_mgr_certs(cert, key.encode(), 'f1', 'h1', addr, 'agent')
     cli = b.issue_mgr_certs(cert, key.encode(), 'f1', 'h1', '127.0.0.1', 'mgr')
     d = tempfile.mkdtemp()
     files = {}
@@ -332,6 +332,100 @@ class ModuleChecksTest(unittest.TestCase):
         for bad in ({'crl_number': 7}, {'crl_number': 'x'}, {'crl_stale': 'yes'}):
             with self.assertRaises(ValueError):
                 m.validate_record(dict(rec, **bad))
+
+
+def serve_record(case, files):
+    """An agent on 127.0.0.1 serving a status record with the server
+    certificate of files; returns its port."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(files['srv.crt'], files['srv.key'])
+    ctx.load_verify_locations(files['agent-ca.crt'])
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    rec = json.dumps(test_talos.record({}, observed='2026-11-03T12:00:00Z')).encode()
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header('Content-Length', str(len(rec)))
+            self.end_headers()
+            self.wfile.write(rec)
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers['Content-Length']))
+            body = json.dumps({'version': b.WIRE_VERSION, 'session': 's'}).encode()
+            self.send_response(200)
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = http.server.ThreadingHTTPServer(('127.0.0.1', 0), H)
+    srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    case.addCleanup(srv.shutdown)
+    return srv.server_address[1]
+
+
+class IdentityNotAddressTest(unittest.TestCase):
+    """plan 04, step 5: the module's clients verify an agent's chain and
+    identity, not the address they dial (a host that moved)."""
+
+    def test_poll_and_post_accept_a_moved_agent_by_its_identity(self):
+        files = agent_pki('10.9.9.9')  # dialled at 127.0.0.1
+        port = serve_record(self, files)
+        old = m.AGENT_PORT
+        m.AGENT_PORT = port
+        self.addCleanup(setattr, m, 'AGENT_PORT', old)
+        self.assertEqual(m.fetch_record('127.0.0.1', m.tls_context(files['dir']), expect=('f1', 'h1'))['schema'], 2)
+        with self.assertRaises(ValueError):  # another identity
+            m.fetch_record('127.0.0.1', m.tls_context(files['dir']), expect=('f1', 'h2'))
+        with self.assertRaises(ValueError):  # revoked
+            m.fetch_record('127.0.0.1', m.tls_context(files['dir']), expect=('f1', 'h1'), revoked={files['serial']})
+        status, _ = b.post_json('127.0.0.1', port, m.tls_context(files['dir']), '/v1/crl', b'{}', 5,
+                                lambda cert: m.require_identity(cert, 'f1', 'agent', 'h1'))
+        self.assertEqual(status, 200)
+        with self.assertRaises(ValueError):
+            b.post_json('127.0.0.1', port, m.tls_context(files['dir']), '/v1/crl', b'{}', 5,
+                        lambda cert: m.require_identity(cert, 'f1', 'agent', 'h2'))
+
+    def test_another_chain_is_refused(self):
+        files, other = agent_pki('10.9.9.9'), agent_pki()
+        port = serve_record(self, other)
+        old = m.AGENT_PORT
+        m.AGENT_PORT = port
+        self.addCleanup(setattr, m, 'AGENT_PORT', old)
+        with self.assertRaises(ssl.SSLError):
+            m.fetch_record('127.0.0.1', m.tls_context(files['dir']), expect=('f1', 'h1'))
+        with self.assertRaises(ssl.SSLError):
+            b.post_json('127.0.0.1', port, m.tls_context(files['dir']), '/v1/crl', b'{}', 5, lambda cert: None)
+
+    def test_the_heartbeat_goes_over_loopback(self):
+        """The module heartbeats its own host's agent at 127.0.0.1, not at the
+        host's published address, checked by its identity."""
+        sent = []
+        old = b.post_json
+
+        def post(addr, port, ctx, path, body, deadline, check):
+            sent.append((addr, path))
+            check({'serialNumber': '01', 'notBefore': 'Jan  1 00:00:00 2026 GMT', 'notAfter': 'Jan  1 00:00:00 2036 GMT',
+                   'subjectAltName': (('URI', 'cephadm-talos://f1/agent/h1'),)})
+            return 200, json.dumps({'version': b.WIRE_VERSION, 'session': 's1'}).encode()
+        b.post_json = post
+        self.addCleanup(setattr, b, 'post_json', old)
+        old_ctx = m.tls_context
+        m.tls_context = lambda directory=None: None
+        self.addCleanup(setattr, m, 'tls_context', old_ctx)
+        mod = object.__new__(m.Module)
+        mod.get_mgr_id = lambda: 'h1'
+        mod._revoked = frozenset()
+        inv = {'fsid': 'f1', 'hosts': [{'name': 'h1', 'addr': '10.5.0.1'}]}
+        self.assertEqual(m.Module._heartbeat(mod, inv, 20, 7, ''), 's1')
+        self.assertEqual(sent, [(m.LOOPBACK, '/v1/heartbeat')])
+        with self.assertRaises(ValueError):  # another host's agent answering there
+            mod.get_mgr_id = lambda: 'h2'
+            m.Module._heartbeat(mod, {'fsid': 'f1', 'hosts': [{'name': 'h2', 'addr': '10.5.0.2'}]}, 20, 7, '')
 
 
 class ServersRefuseRevokedTest(unittest.TestCase):

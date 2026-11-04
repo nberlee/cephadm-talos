@@ -744,6 +744,10 @@ func (n *Node) Report(ctx context.Context) (wire.NodeReport, error) {
 		return r, err
 	}
 
+	if r.Addrs, err = n.Talos.Addresses(ctx, ""); err != nil {
+		return r, err
+	}
+
 	disks, err := n.Talos.Disks(ctx, "")
 	if err != nil {
 		return r, err

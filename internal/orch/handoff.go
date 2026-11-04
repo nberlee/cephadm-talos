@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -233,18 +234,15 @@ func (o *Orch) handOver(ctx context.Context, h state.Host) error {
 		return err
 	}
 
-	cfg.VerifyConnection = func(cs tls.ConnectionState) error {
-		if len(cs.PeerCertificates) == 0 {
-			return errors.New("no server certificate")
-		}
-
-		if _, err := pki.Require(cs.PeerCertificates[0], pki.Identity{FSID: o.St.FSID, Role: pki.RoleAgent, Name: h.Name}); err != nil {
+	// by its identity, not its address (plan 04, step 5)
+	cfg = agent.WithPeer(cfg, func(c *x509.Certificate) error {
+		if _, err := pki.Require(c, pki.Identity{FSID: o.St.FSID, Role: pki.RoleAgent, Name: h.Name}); err != nil {
 			return err
 		}
 
 		// not an agent the revocation list names (plan 04, step 3)
-		return o.checkAgent(cs.PeerCertificates[0])
-	}
+		return o.checkAgent(c)
+	})
 
 	body, err := json.Marshal(wire.Handoff{Version: wire.Version, FSID: o.St.FSID, Host: h.Name, Revision: 1})
 	if err != nil {
