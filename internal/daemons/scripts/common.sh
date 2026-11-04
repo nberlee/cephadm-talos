@@ -53,12 +53,14 @@ run_delayed() {
 			continue
 		fi
 		# gone; if a handler ran, status may be the signal's: wait again for
-		# the saved status (127: the first wait had already returned it)
+		# the saved status
 		while [ "$sig" = 1 ]; do
 			sig=0
 			again=0
-			wait "$child" 2>/dev/null || again=$?
-			if [ "$again" = 127 ]; then
+			wait "$child" 2>/tmp/run_delayed.wait || again=$?
+			# 127 with bash's "not a child" message: the status was already
+			# returned; a daemon's own 127 comes without the message
+			if [ "$again" = 127 ] && [ -s /tmp/run_delayed.wait ]; then
 				break
 			fi
 			status=$again
