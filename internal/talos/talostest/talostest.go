@@ -31,6 +31,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
@@ -65,6 +67,11 @@ type Node struct {
 	// FailAfterApply makes the next ApplyConfiguration store the config and
 	// then fail, like a connection lost after the node accepted it
 	FailAfterApply error
+
+	// the machine events published (PublishSequence) and the streams that follow them
+	evMu    sync.Mutex
+	events  []*machine.Event
+	evWatch []chan *machine.Event
 }
 
 const baseConfig = `version: v1alpha1
@@ -390,6 +397,99 @@ func (f *ImageService) Pull(req *machine.ImageServicePullRequest, srv machine.Im
 	f.mu.Unlock()
 
 	return srv.Send(&machine.ImageServicePullResponse{Response: &machine.ImageServicePullResponse_Name{Name: named.Name() + "@" + d}})
+}
+
+// PublishSequence publishes a sequence event, as machined does when a
+// sequence starts, stops or ends without running (code nil: no error).
+func (f *Node) PublishSequence(seq string, action machine.SequenceEvent_Action, code *common.Code) {
+	ev := &machine.SequenceEvent{Sequence: seq, Action: action}
+	if code != nil {
+		ev.Error = &common.Error{Code: *code, Message: "sequence failed"}
+	}
+
+	raw, err := proto.Marshal(ev)
+	if err != nil {
+		panic(err)
+	}
+
+	f.evMu.Lock()
+	defer f.evMu.Unlock()
+
+	e := &machine.Event{Id: fmt.Sprintf("%020d", len(f.events)+1), Data: &anypb.Any{TypeUrl: "talos/runtime/machine.SequenceEvent", Value: raw}}
+	f.events = append(f.events, e)
+
+	for _, ch := range f.evWatch {
+		ch <- e
+	}
+}
+
+// Events streams an empty event, then the events after the request's tail
+// id (none before it without one), then every one published.
+func (f *Node) Events(req *machine.EventsRequest, srv machine.MachineService_EventsServer) error {
+	if err := srv.Send(&machine.Event{}); err != nil {
+		return err
+	}
+
+	ch := make(chan *machine.Event, 64)
+
+	f.evMu.Lock()
+
+	var past []*machine.Event
+
+	if req.GetTailId() != "" {
+		for _, e := range f.events {
+			if e.Id > req.GetTailId() {
+				past = append(past, e)
+			}
+		}
+	}
+
+	f.evWatch = append(f.evWatch, ch)
+	f.evMu.Unlock()
+
+	defer func() {
+		f.evMu.Lock()
+		defer f.evMu.Unlock()
+
+		for i, c := range f.evWatch {
+			if c == ch {
+				f.evWatch = append(f.evWatch[:i], f.evWatch[i+1:]...)
+
+				break
+			}
+		}
+	}()
+
+	for _, e := range past {
+		if err := srv.Send(e); err != nil {
+			return err
+		}
+	}
+
+	for {
+		select {
+		case <-srv.Context().Done():
+			return nil
+		case e := <-ch:
+			if err := srv.Send(e); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// SetStage sets the machine's stage, as machined does when a sequence starts.
+func (f *Node) SetStage(t *testing.T, stage runtime.MachineStage) {
+	t.Helper()
+
+	ctx := context.Background()
+	ms := runtime.NewMachineStatus()
+	cur, err := f.St.Get(ctx, ms.Metadata())
+	must(t, err)
+
+	ms.Metadata().SetVersion(cur.Metadata().Version())
+	ms.TypedSpec().Stage = stage
+	must(t, f.St.Update(ctx, ms))
 }
 
 // Dial returns a Talos client connected to the node.

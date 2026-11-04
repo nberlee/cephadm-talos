@@ -256,6 +256,80 @@ class MaintenanceFoldTest(unittest.TestCase):
                 lg.check_entry(k, json.dumps(e))
 
 
+class DrainAndNooutFoldTest(unittest.TestCase):
+    """plan 04, step 5: a drain's mark, the noout ownership and unplanned stops."""
+    INV = {'hosts': [{'name': 'h1', 'addr': '10.0.0.1'}, {'name': 'h2', 'addr': '10.0.0.2'},
+                     {'name': 'h3', 'addr': '10.0.0.3', 'maintenance': True, 'noout': True}], 'daemons': []}
+
+    def test_a_drain_from_acceptance_until_done_or_stop(self):
+        drain = entry(5, 1, 'op-%016x' % 1, kind='drain_host', host='h1', zap=True)
+        stop = entry(5, 2, 'op-%016x' % 2, kind='drain_stop', host='h1', drain='op-%016x' % 1)
+        done = entry(5, 3, 'm-%016x' % 3, kind='drain_done', of='op-%016x' % 1, host='h1')
+        resume = entry(5, 4, 'op-%016x' % 4, kind='drain_resume', host='h1', drain='op-%016x' % 1)
+        for k, e in (drain, stop, done, resume):
+            lg.check_entry(k, json.dumps(e))
+        self.assertEqual(lg.Fold(self.INV, [drain]).draining, {'h1': {'op': 'op-%016x' % 1, 'zap': True}})
+        self.assertEqual(lg.Fold(self.INV, [drain, resume]).draining, {'h1': {'op': 'op-%016x' % 1, 'zap': True}})
+        self.assertEqual(lg.Fold(self.INV, [drain, stop]).draining, {})
+        self.assertEqual(lg.Fold(self.INV, [drain, done]).draining, {})
+        # another drain's stop changes nothing
+        other = entry(5, 5, 'op-%016x' % 5, kind='drain_stop', host='h1', drain='op-%016x' % 9)
+        self.assertIn('h1', lg.Fold(self.INV, [drain, other]).draining)
+        for bad in (dict(kind='drain_host', host='h1'), dict(kind='drain_host', host='h1', zap=1), dict(kind='drain_host', zap=False),
+                    dict(kind='drain_stop', host='h1'), dict(kind='drain_stop', host='h1', drain='x'), dict(kind='drain_host', host='h1', zap=False, daemon='mon.h1')):
+            k, e = entry(5, 9, 'op-%016x' % 9, **bad)
+            with self.assertRaises(lg.LedgerError, msg=bad):
+                lg.check_entry(k, json.dumps(e))
+
+    def noout(self, seq, kind, host='h1', **kw):
+        k, e = entry(5, seq, 'm-%016x' % seq, kind=kind, host=host, **kw)
+        lg.check_entry(k, json.dumps(e))
+        return k, e
+
+    def test_the_noout_ownership(self):
+        f = lg.Fold(self.INV)
+        # the CLI's maintenance noout is the module's
+        self.assertEqual(f.noout, {'h3': {'reasons': ['maintenance'], 'operator': False, 'intent': None}})
+        intent = self.noout(1, 'noout_intent', reason='maintenance', on=True, prior=False, of='op-%016x' % 7)
+        done = self.noout(2, 'noout', reason='maintenance', on=True, of='op-%016x' % 7)
+        self.assertEqual(lg.Fold(self.INV, [intent]).noout['h1'], {'reasons': [], 'operator': False, 'intent': {'reason': 'maintenance', 'on': True, 'prior': False}})
+        self.assertEqual(lg.Fold(self.INV, [intent, done]).noout['h1'], {'reasons': ['maintenance'], 'operator': False, 'intent': None})
+        # a flag already set at the first reason is the operator's
+        seen = self.noout(1, 'noout_intent', reason='maintenance', on=True, prior=True)
+        self.assertTrue(lg.Fold(self.INV, [seen, done]).noout['h1']['operator'])
+        # a second reason, then both go: the record goes with the last
+        down = self.noout(3, 'host_down', boot='b-1', at='2026-11-04T10:00:00Z')
+        plus = self.noout(4, 'noout', reason='unplanned', on=True)
+        f = lg.Fold(self.INV, [intent, done, down, plus])
+        self.assertEqual((f.noout['h1']['reasons'], f.down['h1']), (['maintenance', 'unplanned'], {'boot': 'b-1', 'at': '2026-11-04T10:00:00Z', 'held': True}))
+        minus = self.noout(5, 'noout', reason='maintenance', on=False)
+        up = self.noout(6, 'host_up')
+        unintent = self.noout(7, 'noout_intent', reason='unplanned', on=False, prior=True)
+        last = self.noout(8, 'noout', reason='unplanned', on=False)
+        f = lg.Fold(self.INV, [intent, done, down, plus, minus, up, unintent, last])
+        self.assertEqual((f.noout.get('h1'), f.down), (None, {}))
+        # keep: the reasons go, the module never unsets
+        keep = self.noout(9, 'noout_keep')
+        self.assertNotIn('h1', lg.Fold(self.INV, [intent, done, keep]).noout)
+        # the snapshot keeps all of it
+        st = lg.Fold(self.INV, [entry(5, 0, 'op-%016x' % 20, kind='drain_host', host='h2', zap=False), intent, done, down]).state(set())
+        g = lg.Fold(self.INV, [], {'state': st})
+        self.assertEqual((g.draining, g.noout, g.down), (st['draining'], st['noout'], st['down']))
+        for bad in (dict(kind='noout', host='h1', reason='Maint', on=True), dict(kind='noout', host='h1', reason='maintenance'),
+                    dict(kind='noout_intent', host='h1', reason='maintenance', on=True), dict(kind='host_down', host='h1', boot='b'),
+                    dict(kind='host_up', host='h1', of='op-%016x' % 1), dict(kind='noout_keep', host='h1', daemon='mon.h1'),
+                    dict(kind='drain_done', host='h1')):
+            k, e = entry(5, 9, 'm-%016x' % 9, **bad)
+            with self.assertRaises(lg.LedgerError, msg=bad):
+                lg.check_entry(k, json.dumps(e))
+        # a module entry without an operation does not hold a cut back
+        led = lg.Ledger(Mons(), 20, 7)
+        led.open()
+        k1, _ = led.append({'id': 'op-%016x' % 1, 'kind': 'restart', 'daemon': 'mgr.h1', 'host': 'h1'})
+        k2, _ = led.append({'id': 'm-%016x' % 2, 'kind': 'host_up', 'host': 'h1'})
+        self.assertEqual(lg.cut_key(dict(led.entries), {'op-%016x' % 1: 'completed'}, k2, set()), k2)
+
+
 class UpgradeFoldTest(unittest.TestCase):
     IMG = 'quay.io/ceph/ceph@sha256:' + 'cd' * 32
 

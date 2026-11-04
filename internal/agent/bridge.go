@@ -97,7 +97,7 @@ var intentCalls = map[string]bool{
 	"confirm osd": true, "close create": true, "osd out": true, "drain": true, "mon rm": true,
 	"noout set": true, "noout unset": true, "maintained": true, "mgr fail": true, "upgrade done": true,
 	"upgrade refused": true, "rgw cert": true, "rgw cert done": true, "retire keepalived": true, "mgr cert done": true,
-	"agent cert": true, "agent cert done": true,
+	"agent cert": true, "agent cert done": true, "drain done": true,
 }
 
 // intend records a call's intent before it is made.
@@ -570,6 +570,9 @@ type LedgerOp struct {
 	VRID            int      `json:"vrid,omitempty"`
 	Hosts           []string `json:"hosts,omitempty"`
 	NewPassword     bool     `json:"new_password,omitempty"`
+	// drain_stop, drain_resume: the drain they control (plan 04, step 5);
+	// drain_host's --zap-osd-devices is Zap
+	Drain string `json:"drain,omitempty"`
 }
 
 // Ledger returns the executable operations after a ledger key, in the order
@@ -783,6 +786,24 @@ func (b *Bridge) Retire(ctx context.Context, call, op string) error {
 // (a mgr's, plan 04 step 3).
 func (b *Bridge) RetireWith(ctx context.Context, op string, certs []string) error {
 	_, err := b.do(ctx, "retire", withCerts(map[string]any{"operation": op}, certs))
+
+	return err
+}
+
+// RetireDaemon is Retire of one daemon of a drain's step (plan 04, step 5):
+// call is "osd out", "drain", "retire" or "mon rm"; daemon "" for the drain's
+// first step, every OSD of its host out at once.
+func (b *Bridge) RetireDaemon(ctx context.Context, call, op, daemon string, certs []string) error {
+	args := map[string]any{"operation": op}
+	if daemon != "" {
+		args["daemon"] = daemon
+	}
+
+	if call == "retire" {
+		args = withCerts(args, certs)
+	}
+
+	_, err := b.do(ctx, call, args)
 
 	return err
 }

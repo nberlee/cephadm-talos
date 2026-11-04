@@ -77,6 +77,10 @@ type Record struct {
 	// any) and CRLStale whether it is past its nextUpdate (plan 04, step 3)
 	CRLNumber string `json:"crl_number,omitempty"`
 	CRLStale  bool   `json:"crl_stale,omitempty"`
+	// Boot is the node's boot id, and StopCancelled that boot id once a stop
+	// the agent reported was evidently cancelled on it (plan 04, step 5)
+	Boot          string `json:"boot,omitempty"`
+	StopCancelled string `json:"stop_cancelled,omitempty"`
 }
 
 // Agent keeps the last complete observation of its node.
@@ -110,6 +114,14 @@ type Agent struct {
 	CRL *crl.Holder
 	// CRLPolicy is the agent's fail-closed setting; nil fails open
 	CRLPolicy *CRLPolicy
+	// Stops follows the node's stop sequences (plan 04, step 5); nil reports none
+	Stops *StopWatch
+	// ClientTLS is the agent's client side, for its going-down reports
+	ClientTLS *tls.Config
+
+	// the module that polled the status last (pollerSeen)
+	modMu  sync.Mutex
+	module moduleTarget
 
 	// versions caches each daemon's reported version per instance
 	versions map[string]versionSeen
@@ -378,6 +390,10 @@ func (a *Agent) observe(ctx context.Context) error {
 
 	rec.CRLStale = a.CRL != nil && a.crlStale(rec.ObservedAt)
 
+	if a.Stops != nil {
+		rec.Boot, rec.StopCancelled = a.Stops.Report()
+	}
+
 	a.recMu.Lock()
 	a.rec = rec
 	a.recMu.Unlock()
@@ -441,6 +457,9 @@ func (a *Agent) Handler() http.Handler {
 				return
 			}
 		}
+
+		// where the active module is, for the going-down reports
+		a.pollerSeen(r)
 
 		if r.URL.Query().Get("refresh") == "1" {
 			if err := a.Refresh(r.Context(), true); err != nil {
@@ -615,7 +634,7 @@ func Main(ctx context.Context) error {
 		FSID: self.FSID, Host: self.Name, CACert: string(pems[0]), Repos: repos, ApprovalKey: os.Getenv(daemons.EnvApprovalKey), CRL: revoked,
 	}}
 	a := &Agent{
-		CRL: revoked, CRLPolicy: crlPolicy,
+		CRL: revoked, CRLPolicy: crlPolicy, ClientTLS: clientTLS,
 		Talos: tc, Life: ctx, Channel: ch, Records: recs, Node: node, Granter: NewGranter(node, ch, clientTLS, recs),
 		Exec: func(ctx context.Context, container string, args []string, stdout, stderr io.Writer) (int, error) {
 			return tc.Exec(ctx, "", container, args, nil, stdout, stderr)
@@ -627,9 +646,15 @@ func Main(ctx context.Context) error {
 		log.Printf("reconciling the last operations: %v", err)
 	}
 
+	// the node's stop sequences, reported to the module (plan 04, step 5); a
+	// report in flight outlives ctx, joined before the agent exits
+	a.Stops = &StopWatch{Talos: tc, Notify: a.NotifyDown, Log: log.Printf}
+	defer a.Stops.Wait()
+
 	var wg sync.WaitGroup
 
 	wg.Go(func() { a.Run(ctx) })
+	wg.Go(func() { a.Stops.Run(ctx) })
 
 	// the leader, while this host's mgr is the active one and heartbeats it
 	leader := &LeaderLoop{Self: self, Channel: ch, ClientTLS: clientTLS, Repos: repos, CACert: string(pems[0]), CRL: revoked, ApprovalKey: os.Getenv(daemons.EnvApprovalKey),

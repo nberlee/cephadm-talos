@@ -453,6 +453,14 @@ class Deadline(unittest.TestCase):
 
 
 class Records(unittest.TestCase):
+    def test_boot_and_cancelled_stop(self):
+        # plan 04, step 5: the node's boot id and a boot whose stop was cancelled
+        rec = m.validate_record(dict(record({}, '2026-10-28T12:00:00Z'), boot='b-2', stop_cancelled='b-2'))
+        self.assertEqual((rec['boot'], rec['stop_cancelled']), ('b-2', 'b-2'))
+        for bad in ({'boot': 3}, {'boot': 'a b'}, {'stop_cancelled': 'x/y'}):
+            with self.assertRaises(ValueError, msg=bad):
+                m.validate_record(dict(record({}, '2026-10-28T12:00:00Z'), **bad))
+
     def test_validate(self):
         rec = m.validate_record({'schema': 2, 'observed_at': '2026-10-28T12:00:00.123456789Z', 'containers': {}})
         self.assertEqual(rec['observed_at'].microsecond, 123456)
@@ -1409,3 +1417,174 @@ class Compaction(unittest.TestCase):
                 lg.COMPACT_AFTER = old
             covered = led.snapshot is not None and lg.LEDGER_PREFIX + led.snapshot_key >= lg.entry_key(7, 1, 'op-%016x' % 1)
             self.assertEqual(covered, cut, record)
+
+
+def drain_inventory(**extra):
+    """Hosts h1 to h5 (h5 in maintenance); four mons, mgrs on h1 and h2, an OSD
+    and an RGW on h1, a keepalived on h4."""
+    def d(t, i, host, **kw):
+        return dict({'doc_name': 'ceph-f-%s-%s' % (t, i), 'host': host, 'daemon_type': t, 'daemon_id': i, 'service_name': t}, **kw)
+    inv = inventory()
+    inv['hosts'] = [{'name': 'h%d' % i, 'addr': '10.5.0.%d' % i} for i in range(1, 6)]
+    inv['hosts'][4]['maintenance'] = True
+    inv['daemons'] = [d('mon', 'h%d' % i, 'h%d' % i) for i in range(1, 5)] + [
+        d('mgr', 'h1', 'h1'), d('mgr', 'h2', 'h2'), d('osd', '0', 'h1', osd_uuid='00000000-0000-4000-8000-000000000000'),
+        d('rgw', 'h1', 'h1', service_name='rgw.default'), d('keepalived', 'h4', 'h4', service_name='ingress.rgw.default')]
+    inv.update(extra)
+    return inv
+
+
+class Drain(unittest.TestCase):
+    """plan 04, step 5: `ceph orch host drain` and `drain stop`."""
+
+    def module(self, inv=None, standbys=True):
+        mod, entries = Acceptance.module(self, inv=inv or drain_inventory())
+        mod._gid = 20
+        mod.get_mgr_id = lambda: 'h1'
+        mod.get = lambda what: {'standbys': [{'name': 'h2', 'available': True}] if standbys else []} if what == 'mgr_map' else None
+        return mod, entries
+
+    def record(self, entries, inv, **drain):
+        """The leader's published state with h1's drain record."""
+        inv = json.loads(json.dumps(inv))
+        inv['hosts'][0]['drain'] = drain
+        entries.update(state_entries(inv, {'fsid': 'f', 'sealed': True}, incarnation='20'))
+
+    def test_refusals(self):
+        mod, _ = self.module()
+        for args in (('h1', True), ('h1', False, True), ('h9',), ('h5',), ('h4',)):
+            self.assertTrue(m.Module.drain_host(mod, *args).exception_str, args)
+        # three mons: none can go; the last mgr; the active mgr without a standby
+        three = drain_inventory()
+        three['daemons'] = [x for x in three['daemons'] if x['doc_name'] != 'ceph-f-mon-h4']
+        self.assertIn('three', m.Module.drain_host(self.module(three)[0], 'h2').exception_str)
+        lonely = drain_inventory()
+        lonely['daemons'] = [x for x in lonely['daemons'] if x['doc_name'] != 'ceph-f-mgr-h2']
+        self.assertIn('last mgr', m.Module.drain_host(self.module(lonely)[0], 'h1').exception_str)
+        self.assertIn('standby', m.Module.drain_host(self.module(standbys=False)[0], 'h1').exception_str)
+        # an upgrade or an ingress apply unfinished
+        mod, _ = self.module()
+        mod._ledger.append({'id': 'op-%016x' % 1, 'kind': 'upgrade_start', 'image': Upgrade.IMG})
+        self.assertIn('upgrade', m.Module.drain_host(mod, 'h1').exception_str)
+        mod, _ = self.module()
+        mod._ledger.append({'id': 'op-%016x' % 2, 'kind': 'apply_ingress', 'vip': '10.5.0.100/24', 'vrid': 51, 'hosts': ['h4'],
+                            'image': Upgrade.IMG, 'new_password': False})
+        self.assertIn('ingress', m.Module.drain_host(mod, 'h1').exception_str)
+        self.assertEqual(mod._ledger.executable()[-1][1]['kind'], 'apply_ingress')
+
+    def test_drain_stop_and_resume(self):
+        inv = drain_inventory()
+        del inv['hosts'][4]['maintenance']
+        mod, entries = self.module(inv)
+        res = m.Module.drain_host(mod, 'h1', zap_osd_devices=True)
+        self.assertEqual(res.exception_str, '')
+        [(_, drain)] = mod._ledger.executable()
+        self.assertEqual((drain['kind'], drain['host'], drain['zap']), ('drain_host', 'h1', True))
+        entries['talos/inc/20/journal/op/' + drain['id']] = json.dumps({'state': 'completed'})
+        # nothing new on h1 meanwhile, no other drain, no maintenance, no upgrade
+        for res in (m.Module.add_daemon(mod, AddAndRemove.spec(self, 'mgr', 'h1')), m.Module.daemon_action(mod, 'restart', 'mon.h1'),
+                    m.Module.remove_osds(mod, ['0']), m.Module.enter_host_maintenance(mod, 'h1'), m.Module.drain_host(mod, 'h2'),
+                    m.Module.drain_host(mod, 'h1', zap_osd_devices=True)):
+            self.assertTrue(res.exception_str)
+        with self.assertRaisesRegex(m.OrchestratorError, 'draining'):
+            m.Module._accept_create(mod, 'h1', '/dev/vdb')
+        mod._approved_images = lambda: [Upgrade.IMG]
+        self.assertIn('draining', m.Module.upgrade_start(mod, Upgrade.IMG, None, None, None, None, None).exception_str)
+        # paused by the leader: drain again resumes it, with the same --zap-osd-devices
+        self.record(entries, inv, op=drain['id'], step='', paused=True, error='osd.0: no answer')
+        self.assertTrue(m.Module.drain_host(mod, 'h1').exception_str)
+        self.assertEqual(m.Module.drain_host(mod, 'h1', zap_osd_devices=True).exception_str, '')
+        self.assertEqual(mod._ledger.executable()[-1][1]['kind'], 'drain_resume')
+        self.assertEqual(m.Module.get_hosts(mod).result[0].status, 'draining')
+        # stop: the fold drops the mark at once, the leader's record still holds h1
+        self.assertTrue(m.Module.stop_drain_host(mod, 'h2').exception_str)
+        self.assertEqual(m.Module.stop_drain_host(mod, 'h1').exception_str, '')
+        stop = mod._ledger.executable()[-1][1]
+        self.assertEqual((stop['kind'], stop['drain']), ('drain_stop', drain['id']))
+        self.assertEqual(mod._authority()[1].draining, {})
+        self.assertTrue(m.Module.daemon_action(mod, 'restart', 'mon.h1').exception_str)
+        self.assertTrue(m.Module.stop_drain_host(mod, 'h1').exception_str)
+        # the record cleared: h1 takes operations again
+        entries.update(state_entries(inv, {'fsid': 'f', 'sealed': True}, incarnation='20', seq=2))
+        self.assertEqual(m.Module.daemon_action(mod, 'restart', 'mon.h1').exception_str, '')
+
+
+class Lifecycle(unittest.TestCase):
+    """plan 04, step 5: the noout pass, coming back, health checks, noout keep and release."""
+
+    class Channel:
+        def __init__(self):
+            self.calls = []
+
+        def host_up(self, host, boot=None):
+            self.calls.append(('up', host, boot))
+
+        def noout_reconcile(self, host, osds):
+            self.calls.append(('reconcile', host, osds))
+
+        def noout_keep(self, host):
+            self.calls.append(('keep', host))
+
+    def module(self, inv=None):
+        mod, entries = Drain.module(self, inv)
+        mod._channel = self.Channel()
+        mod._poller = m.Poller(lambda *a: {})
+        self.addCleanup(mod._poller.shutdown)
+        self.health = {}
+        mod.set_health_checks = lambda c: self.health.update({'checks': c})
+        mod._logger = types.SimpleNamespace(info=lambda *a: None, warning=lambda *a: None, exception=lambda *a: None)
+        return mod, entries
+
+    def down(self, mod, host='h1', boot='b-1', at='2026-11-04T10:00:00Z'):
+        mod._ledger.append({'id': 'm-%016x' % len(mod._ledger.entries), 'kind': 'host_down', 'host': host, 'boot': boot, 'at': at})
+
+    def test_coming_back(self):
+        now = datetime.datetime(2026, 11, 4, 10, 10, tzinfo=datetime.timezone.utc)
+        mod, _ = self.module()
+        self.down(mod)
+        osd_up = [False]
+        mod.get = lambda what: {'osds': [{'osd': 0, 'up': osd_up[0]}]} if what == 'osd_map' else None
+        seen = datetime.datetime(2026, 11, 4, 10, 5, tzinfo=datetime.timezone.utc)
+        before = datetime.datetime(2026, 11, 4, 9, 59, tzinfo=datetime.timezone.utc)
+        for rec, back in (({'boot': 'b-1', 'observed_at': seen}, False), (None, False), ({'boot': 'b-2', 'observed_at': seen}, False),
+                          ({'boot': 'b-1', 'stop_cancelled': 'b-0', 'observed_at': seen}, False),
+                          # a cancellation observed before the stop's record: a later stop on the same boot
+                          ({'boot': 'b-1', 'stop_cancelled': 'b-1', 'observed_at': before}, False)):
+            mod._channel.calls = []
+            mod._poller.observations = {'h1': (rec, '')}
+            m.Module._noout_tick(mod, now)
+            self.assertEqual(mod._channel.calls, [('reconcile', 'h1', True)], rec)
+        # a new boot with its OSDs up again, or the stop cancelled
+        osd_up[0] = True
+        for rec in ({'boot': 'b-2', 'observed_at': seen}, {'boot': 'b-1', 'stop_cancelled': 'b-1', 'observed_at': seen}):
+            mod._channel.calls = []
+            mod._poller.observations = {'h1': (rec, '')}
+            m.Module._noout_tick(mod, now)
+            self.assertEqual(mod._channel.calls, [('up', 'h1', 'b-1')], rec)
+        # a host in maintenance is back with its new boot: its OSDs stay stopped
+        self.down(mod, 'h5')
+        osd_up[0] = False
+        mod._channel.calls = []
+        mod._poller.observations = {'h5': ({'boot': 'b-9', 'observed_at': seen}, '')}
+        m.Module._noout_tick(mod, now)
+        self.assertIn(('up', 'h5', 'b-1'), mod._channel.calls)
+
+    def test_health(self):
+        mod, entries = self.module()
+        mod.get = lambda what: {'osds': []}
+        self.down(mod, at='2026-11-04T10:00:00Z')
+        m.Module._noout_tick(mod, datetime.datetime(2026, 11, 4, 10, 29, tzinfo=datetime.timezone.utc))
+        self.assertNotIn('TALOS_HOST_DOWN', self.health['checks'])
+        m.Module._noout_tick(mod, datetime.datetime(2026, 11, 4, 10, 31, tzinfo=datetime.timezone.utc))
+        self.assertIn('noout release h1', self.health['checks']['TALOS_HOST_DOWN']['detail'][0])
+        Drain.record(self, entries, drain_inventory(), op='op-%016x' % 1, paused=True, error='mon rm refused')
+        m.Module._noout_tick(mod, datetime.datetime(2026, 11, 4, 10, 31, tzinfo=datetime.timezone.utc))
+        self.assertIn('mon rm refused', self.health['checks']['TALOS_DRAIN_PAUSED']['detail'][0])
+
+    def test_keep_and_release(self):
+        mod, _ = self.module()
+        self.assertEqual(m.Module._noout_release(mod, 'h1').retval, -22)  # no unplanned stop
+        self.down(mod)
+        self.assertEqual(m.Module._noout_release(mod, 'h1').retval, 0)
+        self.assertEqual(m.Module._noout_keep(mod, 'h2').retval, 0)
+        self.assertEqual(mod._channel.calls, [('up', 'h1', None), ('keep', 'h2')])

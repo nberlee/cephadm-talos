@@ -56,6 +56,9 @@ const (
 	KindAgentUpgrade = "upgrade_agent"
 	KindAgentResume  = "upgrade_agent_resume"
 	KindAgentStop    = "upgrade_agent_stop"
+	KindDrain        = "drain_host"
+	KindDrainStop    = "drain_stop"
+	KindDrainResume  = "drain_resume"
 )
 
 // errWait is a step that waits as long as it takes (a drain), which does not
@@ -166,6 +169,14 @@ func (l *LeaderLoop) ledgerOps(ctx context.Context, b *Bridge, js store.Backend,
 				}
 			}
 
+			// a drain's controls (stop, resume) run ahead of queued operations
+			// (plan 04, step 5); a drain's step holds nothing here
+			if draining(st) && !isDrainControl(e.Op.Kind) {
+				if err := l.drainControlsAhead(ctx, b, js, gid, epoch, after); err != nil {
+					return err
+				}
+			}
+
 			done, err := l.ledgerOp(ctx, b, js, gid, epoch, e)
 			if err != nil || !done {
 				l.holding = ""
@@ -205,7 +216,12 @@ func (l *LeaderLoop) ledgerOps(ctx context.Context, b *Bridge, js store.Backend,
 				return err
 			}
 
-			return l.agentUpgradeStep(ctx, b, js, gid, epoch)
+			if err := l.agentUpgradeStep(ctx, b, js, gid, epoch); err != nil {
+				return err
+			}
+
+			// then a drain's (plan 04, step 5)
+			return l.drainStep(ctx, b, js, gid, epoch)
 		}
 	}
 }
@@ -309,15 +325,16 @@ func (l *LeaderLoop) ledgerOp(ctx context.Context, b *Bridge, js store.Backend, 
 
 	known := map[string]bool{KindRestart: true, KindRedeploy: true, KindAddDaemon: true, KindRemoveDaemon: true, KindRemoveHost: true, KindCreateOSD: true, KindRemoveOSD: true,
 		KindEnterMaint: true, KindExitMaint: true, KindPowercycle: true, KindUpgrade: true, KindUpPause: true, KindUpResume: true, KindUpStop: true,
-		KindIngress: true, KindAddHost: true, KindRenewMgr: true, KindRenewRGW: true, KindRenewAgent: true, KindAgentUpgrade: true, KindAgentResume: true, KindAgentStop: true}
+		KindIngress: true, KindAddHost: true, KindRenewMgr: true, KindRenewRGW: true, KindRenewAgent: true, KindAgentUpgrade: true, KindAgentResume: true, KindAgentStop: true,
+		KindDrain: true, KindDrainStop: true, KindDrainResume: true}
 	cluster := op.Kind == KindUpgrade || isControl(op.Kind) || op.Kind == KindIngress || op.Kind == KindRenewRGW || op.Kind == KindAgentUpgrade || isAgentControl(op.Kind)
 	noDaemon := cluster || op.Kind == KindRemoveHost || op.Kind == KindAddHost || op.Kind == KindCreateOSD || op.Kind == KindEnterMaint || op.Kind == KindExitMaint || op.Kind == KindPowercycle ||
-		op.Kind == KindRenewAgent
+		op.Kind == KindRenewAgent || op.Kind == KindDrain || isDrainControl(op.Kind)
 	bound := isControl(op.Kind) || isAgentControl(op.Kind)
 	if !ledgerIDRe.MatchString(op.ID) || cluster != (op.Host == "") || !cluster && pki.ValidName(op.Host) != nil || !known[op.Kind] ||
 		(op.Kind == KindUpgrade || op.Kind == KindIngress || op.Kind == KindAgentUpgrade) != (op.Image != "") || (op.Kind == KindIngress) != (op.VIP != "") || bound != ledgerIDRe.MatchString(op.Upgrade) ||
 		noDaemon != (op.Daemon == "") || (op.Daemon != "" && !ledgerDaemonRe.MatchString(op.Daemon)) ||
-		(op.Kind == KindCreateOSD) != strings.HasPrefix(op.Device, "/dev/") {
+		(op.Kind == KindCreateOSD) != strings.HasPrefix(op.Device, "/dev/") || isDrainControl(op.Kind) != ledgerIDRe.MatchString(op.Drain) {
 		return true, writeJSONKey(ctx, js, opKey, JournalOp{Version: journalVersion, Kind: op.Kind, Host: op.Host, State: JournalFailed, Error: "unknown or malformed operation"})
 	}
 
@@ -327,6 +344,23 @@ func (l *LeaderLoop) ledgerOp(ctx context.Context, b *Bridge, js store.Backend, 
 	}
 
 	switch op.Kind {
+	case KindDrain, KindDrainStop, KindDrainResume:
+		phase := func() error { return l.drainControl(ctx, b, js, gid, op) }
+
+		var onFail func() error
+
+		if op.Kind == KindDrain {
+			phase = func() error { return l.drainStart(ctx, b, js, gid, op) }
+			onFail = func() error { return l.drainRefused(ctx, b, op) }
+		}
+
+		if err := l.unstick(ctx, js, opKey, opKey, op, onFail, phase()); err != nil {
+			return false, err
+		}
+
+		s, err = l.journalState(ctx, b, js, gid, op.ID)
+
+		return err == nil && terminal(s), err
 	case KindAgentUpgrade, KindAgentResume, KindAgentStop:
 		phase := func() error { return l.agentUpgradeResume(ctx, b, js, gid, op) }
 
@@ -854,7 +888,8 @@ func (l *LeaderLoop) addDaemon(ctx context.Context, b *Bridge, js store.Backend,
 		}
 
 		// only now ceph.conf names it, so clients never start against an empty address
-		if done, err := l.confEverywhere(ctx, b, js, gid, epoch, st, op); err != nil || !done {
+		fail := func(err error) error { return finish(ctx, js, gid, op, JournalFailed, err) }
+		if done, err := l.confEverywhere(ctx, b, js, gid, epoch, st, op.ID, fail); err != nil || !done {
 			return err
 		}
 	}
@@ -863,25 +898,65 @@ func (l *LeaderLoop) addDaemon(ctx context.Context, b *Bridge, js store.Backend,
 }
 
 // confEverywhere grants every host not in maintenance the revision of its
-// ceph.conf after a mon change, one phase per host; done reports that all
-// ended (a host it did not reach fails the operation).
-func (l *LeaderLoop) confEverywhere(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, st *state.State, op LedgerOp) (bool, error) {
+// ceph.conf after a mon change, one phase per host below the journal id id;
+// done reports that all ended (a host it did not reach fails the operation).
+func (l *LeaderLoop) confEverywhere(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, st *state.State, id string, fail func(error) error) (bool, error) {
 	for _, h := range st.Hosts {
 		if h.Maintenance {
 			continue
 		}
 
-		done, ok, err := l.step(ctx, b, js, gid, epoch, op.ID+".conf."+h.Name, h.Name, revisionMode{})
+		done, ok, err := l.step(ctx, b, js, gid, epoch, id+".conf."+h.Name, h.Name, revisionMode{})
 		if err != nil || !done {
 			return false, err
 		}
 
 		if !ok {
-			return false, finish(ctx, js, gid, op, JournalFailed, fmt.Errorf("ceph.conf did not reach %s", h.Name))
+			return false, fail(fmt.Errorf("ceph.conf did not reach %s", h.Name))
 		}
 	}
 
 	return true, nil
+}
+
+// removal is what a daemon's removal runs under: the accepted operation the
+// module authorizes its calls by (a removal, or a drain: plan 04, step 5),
+// the journal id of its phases and its end (the operation's own, or the
+// drain's step's), and the daemon.
+type removal struct {
+	op     LedgerOp
+	id     string
+	daemon string // its ledger name
+	uuid   string // an OSD's
+	zap    bool
+}
+
+// removalOf is the removal an operation is.
+func removalOf(op LedgerOp) removal {
+	return removal{op: op, id: op.ID, daemon: op.Daemon, uuid: op.UUID, zap: op.Zap}
+}
+
+// call asks the module for one of the removal's steps.
+func (r removal) call(ctx context.Context, b *Bridge, call string, certs ...string) error {
+	if r.op.Kind == KindDrain {
+		return b.RetireDaemon(ctx, call, r.op.ID, r.daemon, certs)
+	}
+
+	if call == "retire" && len(certs) > 0 {
+		return b.RetireWith(ctx, r.op.ID, certs)
+	}
+
+	return b.Retire(ctx, call, r.op.ID)
+}
+
+// finish ends the removal in the journal.
+func (r removal) finish(ctx context.Context, js store.Backend, gid int64, state string, err error) error {
+	rec := JournalOp{Version: journalVersion, Kind: r.op.Kind, Host: r.op.Host, State: state}
+	if err != nil {
+		rec.Error = err.Error()
+	}
+
+	return writeJSONKey(ctx, js, JournalPrefix(gid)+"op/"+r.id, rec)
 }
 
 // removeDaemon removes a mgr that is not the active one, or a mon: out of the
@@ -890,26 +965,33 @@ func (l *LeaderLoop) confEverywhere(ctx context.Context, b *Bridge, js store.Bac
 // first, as in cephadm, and ceph.conf stops naming it on every host before
 // its retirement.
 func (l *LeaderLoop) removeDaemon(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, op LedgerOp) error {
+	return l.removeDaemonAs(ctx, b, js, gid, epoch, removalOf(op))
+}
+
+// removeDaemonAs is removeDaemon under a removal (a drain's step among them).
+func (l *LeaderLoop) removeDaemonAs(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, r removal) error {
+	op := r.op
+
 	st, _, err := l.clusterState(ctx, b)
 	if err != nil {
 		return err
 	}
 
-	typ, id, _ := strings.Cut(op.Daemon, ".")
+	typ, id, _ := strings.Cut(r.daemon, ".")
 
 	h, ok := st.Host(op.Host)
 	if !ok || (typ != state.TypeMgr && typ != state.TypeMon && typ != state.TypeRGW) || id != op.Host {
-		return finish(ctx, js, gid, op, JournalFailed, fmt.Errorf("%s cannot be removed from %s", op.Daemon, op.Host))
+		return r.finish(ctx, js, gid, JournalFailed, fmt.Errorf("%s cannot be removed from %s", r.daemon, op.Host))
 	}
 
 	// the VIP leaves a host before its RGW (the module refuses this too)
 	if typ == state.TypeRGW && len(vipDocs(st, h.Name)) > 0 {
-		return finish(ctx, js, gid, op, JournalFailed, fmt.Errorf("%s has a keepalived: the ingress leaves it first", h.Name))
+		return r.finish(ctx, js, gid, JournalFailed, fmt.Errorf("%s has a keepalived: the ingress leaves it first", h.Name))
 	}
 
 	doc := st.DocName(state.Daemon{Type: typ, ID: id, Host: h.Name})
 
-	rs, err := l.journalState(ctx, b, js, gid, op.ID+".rev")
+	rs, err := l.journalState(ctx, b, js, gid, r.id+".rev")
 	if err != nil {
 		return err
 	}
@@ -917,7 +999,7 @@ func (l *LeaderLoop) removeDaemon(ctx context.Context, b *Bridge, js store.Backe
 	// the module checks the quorum without it and takes it out of the monmap
 	// (done once it is out), before its document goes
 	if typ == state.TypeMon && !terminal(rs) {
-		if err := b.Retire(ctx, "mon rm", op.ID); err != nil {
+		if err := r.call(ctx, b, "mon rm"); err != nil {
 			return err
 		}
 	}
@@ -933,21 +1015,21 @@ func (l *LeaderLoop) removeDaemon(ctx context.Context, b *Bridge, js store.Backe
 		if active == id {
 			if rs != "" {
 				// a removal grant whose outcome is not known is resolved first
-				return l.runRevision(ctx, b, js, gid, epoch, op.ID+".rev", op.Host, revisionMode{extra: []string{"ContainerConfig/" + doc}})
+				return l.runRevision(ctx, b, js, gid, epoch, r.id+".rev", op.Host, revisionMode{extra: []string{"ContainerConfig/" + doc}})
 			}
 
-			return finish(ctx, js, gid, op, JournalFailed, fmt.Errorf("%s is the active mgr", op.Daemon))
+			return r.finish(ctx, js, gid, JournalFailed, fmt.Errorf("%s is the active mgr", r.daemon))
 		}
 	}
 
-	if d, exists := st.Find(op.Daemon); exists {
+	if d, exists := st.Find(r.daemon); exists {
 		// a mgr's certificates, journaled before the state drops them: the
 		// module revokes them with its retirement (plan 04, step 3)
 		if typ == state.TypeMgr && (h.MgrServerCert != "" || h.MgrClientCert != "") {
-			if _, found, err := l.readJournal(ctx, b, js, gid, op.ID+".certs"); err != nil {
+			if _, found, err := l.readJournal(ctx, b, js, gid, r.id+".certs"); err != nil {
 				return err
 			} else if !found {
-				if err := writeJSONKey(ctx, js, rollKey(gid, op.ID+".certs"), removedCerts{ServerCert: h.MgrServerCert, ClientCert: h.MgrClientCert}); err != nil {
+				if err := writeJSONKey(ctx, js, rollKey(gid, r.id+".certs"), removedCerts{ServerCert: h.MgrServerCert, ClientCert: h.MgrClientCert}); err != nil {
 					return err
 				}
 			}
@@ -967,13 +1049,13 @@ func (l *LeaderLoop) removeDaemon(ctx context.Context, b *Bridge, js store.Backe
 		}
 	}
 
-	done, ok, err := l.step(ctx, b, js, gid, epoch, op.ID+".rev", op.Host, revisionMode{extra: []string{"ContainerConfig/" + doc}})
+	done, ok, err := l.step(ctx, b, js, gid, epoch, r.id+".rev", op.Host, revisionMode{extra: []string{"ContainerConfig/" + doc}})
 	if err != nil || !done {
 		return err
 	}
 
 	if !ok {
-		return finish(ctx, js, gid, op, JournalFailed, fmt.Errorf("the revision of %s did not apply", op.Host))
+		return r.finish(ctx, js, gid, JournalFailed, fmt.Errorf("the revision of %s did not apply", op.Host))
 	}
 
 	var rep wire.NodeReport
@@ -982,25 +1064,26 @@ func (l *LeaderLoop) removeDaemon(ctx context.Context, b *Bridge, js store.Backe
 	}
 
 	if slices.Contains(rep.Instances, doc) {
-		return fmt.Errorf("%w: %s has not stopped yet", errRetry, op.Daemon)
+		return fmt.Errorf("%w: %s has not stopped yet", errRetry, r.daemon)
 	}
 
 	if typ == state.TypeMon {
-		if done, err := l.confEverywhere(ctx, b, js, gid, epoch, st, op); err != nil || !done {
+		fail := func(err error) error { return r.finish(ctx, js, gid, JournalFailed, err) }
+		if done, err := l.confEverywhere(ctx, b, js, gid, epoch, st, r.id, fail); err != nil || !done {
 			return err
 		}
 	}
 
-	certs, _, err := l.readJournal(ctx, b, js, gid, op.ID+".certs")
+	certs, _, err := l.readJournal(ctx, b, js, gid, r.id+".certs")
 	if err != nil {
 		return err
 	}
 
-	if err := b.RetireWith(ctx, op.ID, []string{certs.ServerCert, certs.ClientCert}); err != nil {
+	if err := r.call(ctx, b, "retire", certs.ServerCert, certs.ClientCert); err != nil {
 		return err
 	}
 
-	return finish(ctx, js, gid, op, wire.OpCompleted, nil)
+	return r.finish(ctx, js, gid, wire.OpCompleted, nil)
 }
 
 // removeHost removes a host without daemons: every document its agent owns
@@ -1380,6 +1463,13 @@ func zapOf(op string) string {
 // the module (down, purged), with zap its disk zapped (the job checks the
 // label of this cluster and OSD), and only then out of the state.
 func (l *LeaderLoop) removeOSD(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, op LedgerOp) error {
+	return l.removeOSDAs(ctx, b, js, gid, epoch, removalOf(op))
+}
+
+// removeOSDAs is removeOSD under a removal (a drain's step among them).
+func (l *LeaderLoop) removeOSDAs(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, r removal) error {
+	op := r.op
+
 	st, _, err := l.clusterState(ctx, b)
 	if err != nil {
 		return err
@@ -1387,47 +1477,47 @@ func (l *LeaderLoop) removeOSD(ctx context.Context, b *Bridge, js store.Backend,
 
 	h, ok := st.Host(op.Host)
 	if !ok {
-		return finish(ctx, js, gid, op, JournalFailed, fmt.Errorf("no host %s", op.Host))
+		return r.finish(ctx, js, gid, JournalFailed, fmt.Errorf("no host %s", op.Host))
 	}
 
-	d, found := daemonOf(st, op.Daemon)
+	d, found := daemonOf(st, r.daemon)
 	if !found {
 		// out of the state: the removal ended before its journal record; a zap
 		// it was asked for counts only if its job completed
-		if op.Zap {
-			rec, ok, err := l.journalRecord(ctx, b, js, gid, op.ID+".zap")
+		if r.zap {
+			rec, ok, err := l.journalRecord(ctx, b, js, gid, r.id+".zap")
 			if err != nil {
 				return err
 			}
 
 			if !ok || rec.State != wire.OpCompleted {
-				return finish(ctx, js, gid, op, JournalFailed, errors.New("purged, not zapped"))
+				return r.finish(ctx, js, gid, JournalFailed, errors.New("purged, not zapped"))
 			}
 		}
 
-		return finish(ctx, js, gid, op, wire.OpCompleted, nil)
+		return r.finish(ctx, js, gid, wire.OpCompleted, nil)
 	}
 
-	if d.Host != op.Host || d.OSDUUID != op.UUID {
-		return finish(ctx, js, gid, op, JournalFailed, fmt.Errorf("%s in the state is another OSD", op.Daemon))
+	if d.Host != op.Host || d.OSDUUID != r.uuid {
+		return r.finish(ctx, js, gid, JournalFailed, fmt.Errorf("%s in the state is another OSD", r.daemon))
 	}
 
 	// out and drained for this removal also when an earlier one marked the OSD
 	// leaving and failed (the module's calls are idempotent per removal)
-	if err := b.Retire(ctx, "osd out", op.ID); err != nil {
+	if err := r.call(ctx, b, "osd out"); err != nil {
 		return err
 	}
 
 	// a drain takes as long as recovery does: waiting for it does not fail
-	if err := b.Retire(ctx, "drain", op.ID); err != nil {
+	if err := r.call(ctx, b, "drain"); err != nil {
 		return fmt.Errorf("%w: %v", errWait, err)
 	}
 
 	if !d.Leaving {
 		if err := l.changeState(ctx, b, gid, func(st *state.State) error {
-			x, ok := daemonOf(st, op.Daemon)
+			x, ok := daemonOf(st, r.daemon)
 			if !ok {
-				return fmt.Errorf("no %s", op.Daemon)
+				return fmt.Errorf("no %s", r.daemon)
 			}
 
 			x.Leaving = true
@@ -1441,7 +1531,7 @@ func (l *LeaderLoop) removeOSD(ctx context.Context, b *Bridge, js store.Backend,
 
 	doc := st.DocName(d)
 
-	done, ok, err := l.step(ctx, b, js, gid, epoch, op.ID+".rev", op.Host, revisionMode{extra: []string{"ContainerConfig/" + doc}})
+	done, ok, err := l.step(ctx, b, js, gid, epoch, r.id+".rev", op.Host, revisionMode{extra: []string{"ContainerConfig/" + doc}})
 	if err != nil || !done {
 		return err
 	}
@@ -1456,18 +1546,18 @@ func (l *LeaderLoop) removeOSD(ctx context.Context, b *Bridge, js store.Backend,
 	}
 
 	if slices.Contains(rep.Instances, doc) {
-		return fmt.Errorf("%w: %s has not stopped yet", errRetry, op.Daemon)
+		return fmt.Errorf("%w: %s has not stopped yet", errRetry, r.daemon)
 	}
 
-	if err := b.Retire(ctx, "retire", op.ID); err != nil {
+	if err := r.call(ctx, b, "retire"); err != nil {
 		return fmt.Errorf("%w: %v", errRetry, err)
 	}
 
 	var zapFailed error
 
-	if op.Zap {
+	if r.zap {
 		var zf errZapFailed
-		if err := l.zapOSD(ctx, b, js, gid, epoch, op, st, h, d); errors.As(err, &zf) {
+		if err := l.zapOSD(ctx, b, js, gid, epoch, r, st, h, d); errors.As(err, &zf) {
 			zapFailed = zf.error
 		} else if err != nil {
 			return err
@@ -1476,7 +1566,7 @@ func (l *LeaderLoop) removeOSD(ctx context.Context, b *Bridge, js store.Backend,
 
 	// purged: the OSD leaves the state, zapped or not
 	if err := l.changeState(ctx, b, gid, func(st *state.State) error {
-		if x, ok := daemonOf(st, op.Daemon); ok {
+		if x, ok := daemonOf(st, r.daemon); ok {
 			st.RemoveDaemon(x)
 		}
 
@@ -1486,21 +1576,23 @@ func (l *LeaderLoop) removeOSD(ctx context.Context, b *Bridge, js store.Backend,
 	}
 
 	if zapFailed != nil {
-		return finish(ctx, js, gid, op, JournalFailed, fmt.Errorf("purged, not zapped: %w", zapFailed))
+		return r.finish(ctx, js, gid, JournalFailed, fmt.Errorf("purged, not zapped: %w", zapFailed))
 	}
 
-	return finish(ctx, js, gid, op, wire.OpCompleted, nil)
+	return r.finish(ctx, js, gid, wire.OpCompleted, nil)
 }
 
 // zapOSD zaps a removed OSD's disk with a job that requires a BlueStore label
 // of this cluster and of that OSD, and acknowledges its outcome; a zap that
 // fails ends the removal as failed (the OSD is purged, its disk kept).
-func (l *LeaderLoop) zapOSD(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, op LedgerOp, st *state.State, h state.Host, d state.Daemon) error {
+func (l *LeaderLoop) zapOSD(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, r removal, st *state.State, h state.Host, d state.Daemon) error {
+	op := r.op
+
 	if d.DevicePath == "" || d.DiskSerial == "" {
-		return errZapFailed{fmt.Errorf("%s has no stable device and serial to zap", op.Daemon)}
+		return errZapFailed{fmt.Errorf("%s has no stable device and serial to zap", r.daemon)}
 	}
 
-	id := zapOf(op.ID)
+	id := zapOf(r.id)
 	job := daemons.Zap(daemons.Params{
 		Name: st.DocName(state.Daemon{Type: "job", ID: id}), Image: st.Image, FSID: st.FSID, ID: "job",
 		Device: d.DevicePath, DiskSerial: d.DiskSerial, OSDUUID: d.OSDUUID,
@@ -1511,7 +1603,7 @@ func (l *LeaderLoop) zapOSD(ctx context.Context, b *Bridge, js store.Backend, gi
 		return err
 	}
 
-	zap := op.ID + ".zap"
+	zap := r.id + ".zap"
 
 	done, _, err := l.step(ctx, b, js, gid, epoch, zap, op.Host, revisionMode{add: []Doc{{Kind: "ContainerConfig", Name: job.MetaName, YAML: y}}})
 	if err != nil {
@@ -1520,7 +1612,7 @@ func (l *LeaderLoop) zapOSD(ctx context.Context, b *Bridge, js store.Backend, gi
 
 	// a sub-step: the removal goes on only once the zap ended
 	if !done {
-		return fmt.Errorf("%w: the zap of %s has not ended yet", errRetry, op.Daemon)
+		return fmt.Errorf("%w: the zap of %s has not ended yet", errRetry, r.daemon)
 	}
 
 	rec, _, err := l.journalRecord(ctx, b, js, gid, zap)
@@ -1534,13 +1626,13 @@ func (l *LeaderLoop) zapOSD(ctx context.Context, b *Bridge, js store.Backend, gi
 			rc = rec.Result.RC
 		}
 
-		if err := l.ackJob(ctx, b, js, gid, epoch, op.ID+".zap", op.Host, rec, rc); err != nil {
+		if err := l.ackJob(ctx, b, js, gid, epoch, zap, op.Host, rec, rc); err != nil {
 			return err
 		}
 	}
 
 	if rec.State != wire.OpCompleted {
-		return errZapFailed{fmt.Errorf("the zap of %s ended %s %s", op.Daemon, rec.State, rec.Error)}
+		return errZapFailed{fmt.Errorf("the zap of %s ended %s %s", r.daemon, rec.State, rec.Error)}
 	}
 
 	return nil
@@ -1635,7 +1727,7 @@ func end(ctx context.Context, js store.Backend, gid int64, op LedgerOp, cause er
 // stopHost stops a host's daemons, as cephadm's maintenance enter, in phases
 // below base: Ceph's checks that they can stop (force overrides neither, as
 // in Ceph), the active mgr failed over if it runs there, keepalived off first,
-// noout for its OSDs (recorded in the state first, so the exit clears it), the
+// noout for its OSDs (a reason of the module's noout ownership), the
 // host marked in maintenance (its daemons stay in the state, not rendered),
 // then every document off and every instance gone. The checks and the active
 // mgr are checked again until the stop grant is sent.
@@ -1724,26 +1816,11 @@ func (l *LeaderLoop) stopHost(ctx context.Context, b *Bridge, js store.Backend, 
 		}
 	}
 
-	if !h.Maintenance && osds && !h.NoOut {
-		if err := l.changeState(ctx, b, gid, func(st *state.State) error {
-			h, ok := st.Host(op.Host)
-			if !ok {
-				return fmt.Errorf("no host %s", op.Host)
-			}
-
-			h.NoOut = true
-			st.AddHost(h)
-
-			return nil
-		}); err != nil {
-			return false, err
-		}
-
-		h.NoOut = true
-	}
-
-	// before the host is marked: from then on any revision stops its OSDs
-	if h.NoOut {
+	// before the host is marked: from then on any revision stops its OSDs.
+	// The module holds noout for the maintenance as one of the host's reasons
+	// and unsets it with the last one, never one the operator set (plan 04,
+	// step 5): asked again on a resumed operation, it changes nothing
+	if osds {
 		if err := b.Retire(ctx, "noout set", op.ID); err != nil {
 			return false, err
 		}
@@ -1788,7 +1865,7 @@ func (l *LeaderLoop) stopHost(ctx context.Context, b *Bridge, js store.Backend, 
 // unmark undoes the mark of a maintenance whose stop grant (base.rev) was
 // never sent or never applied (its checks kept refusing, or the node refused
 // it): revisions would stop the host's daemons without the checks. noout
-// stays recorded, so the exit clears it.
+// stays the module's maintenance reason, so the exit clears it.
 func (l *LeaderLoop) unmark(ctx context.Context, b *Bridge, js store.Backend, gid int64, host, base string) error {
 	rs, err := l.journalState(ctx, b, js, gid, base+".rev")
 	if err != nil {
@@ -1906,7 +1983,9 @@ func (l *LeaderLoop) startHost(ctx context.Context, b *Bridge, js store.Backend,
 		return false, err
 	}
 
-	for _, d := range st.DaemonsOf(state.TypeOSD, h.Name) {
+	hostOSDs := st.DaemonsOf(state.TypeOSD, h.Name)
+
+	for _, d := range hostOSDs {
 		if d.OSDID == nil || d.LocalOnly || d.Purged || d.Leaving {
 			continue
 		}
@@ -1922,11 +2001,16 @@ func (l *LeaderLoop) startHost(ctx context.Context, b *Bridge, js store.Backend,
 		}
 	}
 
-	if h.NoOut {
+	// the maintenance reason goes (the module unsets the flag with the last
+	// reason, if it set it)
+	if len(hostOSDs) > 0 || h.NoOut {
 		if err := b.Retire(ctx, "noout unset", op.ID); err != nil {
 			return false, err
 		}
+	}
 
+	// the CLI's record of a noout it set before the handoff
+	if h.NoOut {
 		if err := l.changeState(ctx, b, gid, func(st *state.State) error {
 			h, ok := st.Host(op.Host)
 			if !ok {

@@ -332,6 +332,15 @@ def _operation_with(*more: str) -> Callable[[Dict[str, Any]], Dict[str, Any]]:
 _operation = _operation_with()
 
 
+def _maybe_daemon(base: Callable[[Dict[str, Any]], Dict[str, Any]]) -> Callable[[Dict[str, Any]], Dict[str, Any]]:
+    """A removal's call, or a drain step's naming its daemon (plan 04, step 5)."""
+    def build(args: Dict[str, Any]) -> Dict[str, Any]:
+        if 'daemon' in args and not (isinstance(args['daemon'], str) and ledger.DAEMON_RE.match(args['daemon'])):
+            raise ValueError('not a daemon name')
+        return base({k: v for k, v in args.items() if k != 'daemon'})
+    return build
+
+
 def _operation_certs(args: Dict[str, Any]) -> Dict[str, Any]:
     """An operation with the certificates before it the leader journaled
     (plan 04, step 3): revoked once the module retires them."""
@@ -369,7 +378,7 @@ READ_PREFIXES = {'auth get', 'config get', 'config-key get', 'config-key ls', 'm
 # calls the module answers itself, for operations of its ledger (ledger.py)
 LOCAL = {'mgr cert', 'retire', 'retire host', 'bind disk', 'confirm osd', 'close create', 'osd out', 'drain', 'mon rm',
          'ok to stop', 'noout set', 'noout unset', 'maintained', 'mgr fail', 'ok to stop daemon', 'upgrade done', 'upgrade refused',
-         'rgw cert', 'rgw cert done', 'retire keepalived', 'mgr cert done', 'agent cert', 'agent cert done'}
+         'rgw cert', 'rgw cert done', 'retire keepalived', 'mgr cert done', 'agent cert', 'agent cert done', 'drain done'}
 
 ALLOWLIST: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     'status': _no_args('status'),
@@ -392,12 +401,13 @@ ALLOWLIST: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     'bind disk': _operation_with('serial', 'link', 'job'),
     'confirm osd': _operation_with('osd'),
     'close create': _operation,
-    'osd out': _operation,
-    'drain': _operation,
+    'osd out': _maybe_daemon(_operation),
+    'drain': _maybe_daemon(_operation),
     'osd dump': _osd_dump,
-    'retire': _operation_certs,
+    'retire': _maybe_daemon(_operation_certs),
     'retire host': _operation,
-    'mon rm': _operation,
+    'mon rm': _maybe_daemon(_operation),
+    'drain done': _operation,
     'ok to stop': _operation,
     'noout set': _operation,
     'noout unset': _operation,
@@ -761,6 +771,16 @@ def device_matches(device_ids: str, serial: str) -> bool:
     return False
 
 
+# the reason a leader's operation holds a host's noout for (its noout set and
+# unset calls); the module's own are ledger.UNPLANNED
+NOOUT_REASONS = {'enter_maintenance': 'maintenance', 'powercycle_host': 'maintenance', 'exit_maintenance': 'maintenance'}
+
+
+def ambiguous(host: str) -> bool:
+    """osd set-group resolves numbers (OSD ids), all and any before CRUSH bucket names."""
+    return re.match(r'\A(osd\.)?[0-9]+\Z', host) is not None or host in ('all', 'any', '*')
+
+
 def _daemon_of(entity: str) -> str:
     """The daemon name ("<type>.<id>") of a CephX entity."""
     return 'rgw.' + entity[len('client.rgw.'):] if entity.startswith('client.rgw.') else entity
@@ -793,6 +813,8 @@ class Channel:
         self._tl = threading.local()
         self.server: Optional[Server] = None
         self.bridge_server: Optional[Server] = None
+        # called after an agent reported its node going down (plan 04, step 5)
+        self.on_down: Optional[Callable[[], None]] = None
 
     def credentials(self) -> Credentials:
         return self.creds
@@ -1053,16 +1075,20 @@ class Channel:
             try:
                 if call == 'mgr cert':
                     return self._mgr_cert(fold, op, led)
-                if call in ('osd out', 'drain') or (call == 'retire' and op is not None and op['kind'] == 'remove_osd'):
-                    return self._removal(call, led, fold, ops, op)
+                daemon = (args or {}).get('daemon')
+                osd = op is not None and (op['kind'] == 'remove_osd' or op['kind'] == 'drain_host' and str(daemon).startswith('osd.'))
+                if call in ('osd out', 'drain') or call == 'retire' and osd:
+                    return self._removal(call, led, fold, ops, op, daemon)
                 if call == 'retire':
-                    return self._retire(led, fold, ops, op, (args or {}).get('certs', []))
+                    return self._retire(led, fold, ops, op, (args or {}).get('certs', []), daemon)
                 if call == 'mon rm':
-                    return self._mon_rm(led, fold, ops, op)
+                    return self._mon_rm(led, fold, ops, op, daemon)
+                if call == 'drain done':
+                    return self._drain_done(led, fold, ops, op)
                 if call in ('ok to stop', 'noout set', 'noout unset', 'maintained'):
                     return self._maintenance(call, led, fold, op)
                 if call == 'mgr fail':
-                    return self._mgr_fail(fold, op, (args or {}).get('gid'))
+                    return self._mgr_fail(fold, op, (args or {}).get('gid'), ops)
                 if call in ('ok to stop daemon', 'upgrade done', 'upgrade refused'):
                     return self._upgrade(call, led, fold, op, (args or {}).get('daemon'))
                 if call == 'rgw cert':
@@ -1237,13 +1263,28 @@ class Channel:
                     return 503, {'error': 'cannot remove a key of the agent of %s; ask again' % host}
         return 200, {'outcome': 'done', 'r': 0, 'out': '', 'outs': ''}
 
+    def _drain_step(self, ops: Dict[str, Dict[str, Any]], op: Optional[Dict[str, Any]], daemon: Any, types: Tuple[str, ...]) -> Optional[str]:
+        """The daemon of a drain's step (plan 04, step 5): op is an executable
+        drain_host not ended (no drain_done for it), daemon one of its host's
+        of the types (a mon, mgr or RGW id is its host's name, an OSD's host is
+        checked against the fold by the caller); None otherwise."""
+        if op is None or op['kind'] != 'drain_host' or not isinstance(daemon, str) or not ledger.DAEMON_RE.match(daemon):
+            return None
+        if any(e['kind'] == 'drain_done' and e['of'] == op['id'] for e in ops.values()):
+            return None
+        t, i = daemon.split('.', 1)
+        if t not in types or t != 'osd' and i != op['host']:
+            return None
+        return daemon
+
     def _retire(self, led: Any, fold: Any, ops: Dict[str, Dict[str, Any]], op: Optional[Dict[str, Any]],
-                certs: List[str] = []) -> Tuple[int, Dict[str, Any]]:
-        if op is None or op['kind'] != 'remove_daemon':
+                certs: List[str] = [], daemon: Any = None) -> Tuple[int, Dict[str, Any]]:
+        name = self._drain_step(ops, op, daemon, ('mon', 'mgr', 'rgw')) if op is not None and op['kind'] == 'drain_host' else \
+            op['daemon'] if op is not None and op['kind'] == 'remove_daemon' and daemon in (None, op['daemon']) else None
+        if op is None or name is None:
             return 400, {'error': 'no removal of a daemon'}
-        name = op['daemon']
         done = {'outcome': 'done', 'r': 0, 'out': '', 'outs': ''}
-        if any(e['kind'] == 'retire' and e['of'] == op['id'] for e in ops.values()):
+        if any(e['kind'] == 'retire' and e['of'] == op['id'] and e.get('daemon') == name for e in ops.values()):
             return 200, done  # retired already
         if name not in fold.generations:
             return 400, {'error': '%s is not in the cluster' % name}
@@ -1345,16 +1386,17 @@ class Channel:
                 return 503, {'error': 'the revocation of %d was not written; ask again' % serial}
         return None
 
-    def _mon_rm(self, led: Any, fold: Any, ops: Dict[str, Dict[str, Any]], op: Optional[Dict[str, Any]]) -> Tuple[int, Dict[str, Any]]:
+    def _mon_rm(self, led: Any, fold: Any, ops: Dict[str, Dict[str, Any]], op: Optional[Dict[str, Any]], daemon: Any = None) -> Tuple[int, Dict[str, Any]]:
         """A mon's removal from the monmap before its documents go, as cephadm's
         MonService.pre_remove: only while the quorum without it is a majority of
         the monmap without it (_check_safe_to_destroy)."""
         done = {'outcome': 'done', 'r': 0, 'out': '', 'outs': ''}
-        if op is None or op['kind'] != 'remove_daemon' or not op['daemon'].startswith('mon.'):
+        name = self._drain_step(ops, op, daemon, ('mon',)) if op is not None and op['kind'] == 'drain_host' else \
+            op['daemon'] if op is not None and op['kind'] == 'remove_daemon' and op['daemon'].startswith('mon.') and daemon in (None, op['daemon']) else None
+        if op is None or name is None:
             return 400, {'error': 'no removal of a mon'}
-        name = op['daemon']
         mon_id = name.split('.', 1)[1]
-        if any(e['kind'] == 'retire' and e['of'] == op['id'] for e in ops.values()):
+        if any(e['kind'] == 'retire' and e['of'] == op['id'] and e.get('daemon') == name for e in ops.values()):
             return 200, done
         if name not in fold.daemons:
             return 400, {'error': '%s is not in the cluster' % name}
@@ -1413,16 +1455,163 @@ class Channel:
                 if job.r != 0:
                     return 409, {'error': '%s: %s' % (cmd['prefix'], job.outs.strip()[:500])}
             return 200, done
-        # noout set or unset, on the host's CRUSH bucket (only a name Ceph cannot take for ids)
-        if re.match(r'\A(osd\.)?[0-9]+\Z', host) or host in ('all', 'any'):
+        # noout set or unset, on the host's CRUSH bucket (only a name Ceph cannot
+        # take for ids), as a reason of the noout ownership (plan 04, step 5)
+        if ambiguous(host):
             return 400, {'error': 'host name %s is ambiguous for osd set-group' % host}
-        prefix = 'osd set-group' if call == 'noout set' else 'osd unset-group'
-        job = self._mon({'prefix': prefix, 'flags': 'noout', 'who': [host]}, 'host/' + host)
-        if job is None or job.r != 0:
-            return 503, {'error': '%s noout %s: no answer or refused; ask again' % (prefix, host)}
+        why = self._noout_change(led, host, NOOUT_REASONS[op['kind']], call == 'noout set', op['id'])
+        if why is not None:
+            return 503, {'error': '%s; ask again' % why}
         return 200, done
 
-    def _mgr_fail(self, fold: Any, op: Optional[Dict[str, Any]], gid: Any) -> Tuple[int, Dict[str, Any]]:
+    # --- the noout ownership (plan 04, step 5) ------------------------------
+
+    def _noout_flag(self, host: str) -> Optional[bool]:
+        """Whether the host's CRUSH bucket has noout in the OSD map, read from
+        the mons; None without an answer."""
+        job = self._mon({'prefix': 'osd dump', 'format': 'json'}, None,
+                        lambda out: json.dumps('noout' in (json.loads(out).get('crush_node_flags') or {}).get(host, [])))
+        if job is None or job.r != 0 or job.too_large:
+            return None
+        return bool(json.loads(job.outb))
+
+    def _noout_append(self, led: Any, kind: str, host: str, reason: str, on: bool, of: Optional[str], prior: Optional[bool] = None) -> None:
+        e: Dict[str, Any] = {'id': 'm-' + secrets.token_hex(8), 'kind': kind, 'host': host, 'reason': reason, 'on': on}
+        if prior is not None:
+            e['prior'] = prior
+        if of:
+            e['of'] = of
+        led.append(e)
+
+    def _noout_change(self, led: Any, host: str, reason: str, on: bool, of: Optional[str] = None) -> Optional[str]:
+        """Add (on) or drop a reason the module holds a host's noout for; None
+        once the fold has it so, else why not yet (asked again). The flag is
+        set when the first reason appears and unset when the last goes, only
+        if the module set it: a flag already set at the first reason is the
+        operator's. A change that sends a command is recorded first as an
+        intent with the flag it observed, and completed after Ceph answered;
+        an intent without its completion (a predecessor's) is completed
+        first, from the flag read again. Under local_lock."""
+        if ambiguous(host):
+            return 'host name %s is ambiguous for osd set-group' % host
+        for _ in range(8):  # each pass appends one entry
+            if self._pending('host/' + host):  # a late change must not undo a later one
+                return 'noout changes for %s are not answered yet' % host
+            _, fold = self.authority()
+            st = fold.noout.get(host) or {'reasons': [], 'operator': False, 'intent': None}
+            it = st['intent']
+            if it is not None:
+                flag = self._noout_flag(host)
+                if flag is None:
+                    return 'cannot read the OSD map'
+                if it['on'] and it['prior'] and not flag:
+                    # the operator's flag went meanwhile: the module sets and owns it
+                    self._noout_append(led, 'noout_intent', host, it['reason'], True, of, False)
+                    continue
+                if flag != it['on']:
+                    prefix = 'osd set-group' if it['on'] else 'osd unset-group'
+                    job = self._mon({'prefix': prefix, 'flags': 'noout', 'who': [host]}, 'host/' + host)
+                    if job is None or job.r != 0:
+                        return '%s noout %s: no answer or refused' % (prefix, host)
+                self._noout_append(led, 'noout', host, it['reason'], it['on'], of)
+                continue
+            if (reason in st['reasons']) == on:
+                return None
+            others = [r for r in st['reasons'] if r != reason]
+            if on and others or not on and (others or st['operator']):
+                # the flag stays as it is: held for another reason, or the operator's
+                self._noout_append(led, 'noout', host, reason, on, of)
+                continue
+            flag = self._noout_flag(host)
+            if flag is None:
+                return 'cannot read the OSD map'
+            self._noout_append(led, 'noout_intent', host, reason, on, of, flag)
+        return 'noout of %s did not settle' % host
+
+    def noout_reconcile(self, host: str, osds: bool) -> Optional[str]:
+        """The leadership loop's pass over a host: an intent without its
+        completion is completed, an unplanned stop of a host with OSDs gets its
+        reason, a host back from one loses it. None when nothing is left."""
+        with self.local_lock:
+            led, _ = self.authority()
+            led.settle()
+            led, fold = self.authority()
+            st, d = fold.noout.get(host), fold.down.get(host)
+            if st is not None and st['intent'] is not None:
+                why = self._noout_change(led, host, st['intent']['reason'], st['intent']['on'])
+                if why is not None:
+                    return why
+            if d is not None and not d['held'] and osds:
+                return self._noout_change(led, host, ledger.UNPLANNED, True)
+            if d is None and ledger.UNPLANNED in fold.noout_reasons(host):
+                return self._noout_change(led, host, ledger.UNPLANNED, False)
+            return None
+
+    def host_up(self, host: str, boot: Optional[str] = None) -> Optional[str]:
+        """An unplanned stop ended (the host came back with its OSDs up, its
+        stop was cancelled, or the operator released it): recorded, then its
+        reason dropped. boot, if given, must be the stop's."""
+        with self.local_lock:
+            led, _ = self.authority()
+            led.settle()
+            led, fold = self.authority()
+            d = fold.down.get(host)
+            if d is not None and boot is not None and d['boot'] != boot:
+                return None  # another stop since: not this one's end
+            if d is not None:
+                led.append({'id': 'm-' + secrets.token_hex(8), 'kind': 'host_up', 'host': host})
+            return self._noout_change(led, host, ledger.UNPLANNED, False)
+
+    def noout_keep(self, host: str) -> Optional[str]:
+        """The operator takes a host's noout over: the module's reasons go and
+        it never unsets that flag."""
+        with self.local_lock:
+            led, _ = self.authority()
+            led.settle()
+            led, fold = self.authority()
+            st = fold.noout.get(host)
+            if st is None:
+                return 'the module holds no noout for %s' % host
+            if st['intent'] is not None:
+                why = self._noout_change(led, host, st['intent']['reason'], st['intent']['on'])
+                if why is not None:
+                    return why
+            led.append({'id': 'm-' + secrets.token_hex(8), 'kind': 'noout_keep', 'host': host})
+            return None
+
+    def going_down(self, req: Any, peer: str) -> Tuple[int, Dict[str, Any]]:
+        """An agent's report that its node runs a stop sequence (a Talos
+        reboot, shutdown, upgrade or reset outside the orchestrator): recorded
+        as an unplanned stop of its host; the leadership loop adds the noout
+        reason within its next pass (on_down wakes it)."""
+        if not isinstance(req, dict) or req.get('version') != WIRE_VERSION or set(req) != {'version', 'fsid', 'host', 'boot'} \
+                or req['fsid'] != self.fsid or req['host'] != peer or not isinstance(req['boot'], str) or not ledger.BOOT_RE.match(req['boot']):
+            return 400, {'error': 'malformed going-down report, or for another cluster or host'}
+        if self.leadership.captured() is None:
+            return 503, {'error': 'no captured incarnation'}
+        if not self.leadership.still_active():
+            return 409, {'error': 'not confirmed as the active mgr'}
+        with self.local_lock:
+            try:
+                led, _ = self.authority()
+                led.settle()
+                led, fold = self.authority()
+            except Exception as e:
+                return 503, {'error': 'no settled ledger: %s' % e}
+            if peer not in fold.hosts:
+                return 403, {'error': '%s is not a host of the cluster' % peer}
+            d = fold.down.get(peer)
+            if d is None or d['boot'] != req['boot']:
+                now = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+                try:
+                    led.append({'id': 'm-' + secrets.token_hex(8), 'kind': 'host_down', 'host': peer, 'boot': req['boot'], 'at': now})
+                except ledger.LedgerError as e:
+                    return 503, {'error': 'not recorded: %s' % e}
+        if self.on_down is not None:
+            self.on_down()
+        return 200, {'outcome': 'done'}
+
+    def _mgr_fail(self, fold: Any, op: Optional[Dict[str, Any]], gid: Any, ops: Optional[Dict[str, Dict[str, Any]]] = None) -> Tuple[int, Dict[str, Any]]:
         """`mgr fail` of the active mgr by its gid, for an operation that must stop
         it: only while it runs on the operation's host and a standby is available.
         The active mgr respawns, so the answer may never come; done also when
@@ -1430,7 +1619,9 @@ class Channel:
         done = {'outcome': 'done', 'r': 0, 'out': '', 'outs': ''}
         upgrading = op is not None and (op['kind'] == 'upgrade_start' and (fold.upgrade or {}).get('op') == op['id']
                                         or op['kind'] == 'upgrade_agent' and fold.agent_upgrade == op['id'])
-        if not upgrading and (op is None or op['kind'] not in ledger.STOPS or op['host'] not in fold.maintenance):
+        # a drain's mgr step (plan 04, step 5), while the drain has not ended
+        draining = op is not None and op['kind'] == 'drain_host' and self._drain_step(ops or {}, op, 'mgr.' + op['host'], ('mgr',)) is not None
+        if not upgrading and not draining and (op is None or op['kind'] not in ledger.STOPS or op['host'] not in fold.maintenance):
             return 400, {'error': 'no operation that must stop the active mgr'}
         job = self._mon({'prefix': 'mgr dump', 'format': 'json'})
         if job is None or job.r != 0 or job.too_large:
@@ -1638,17 +1829,44 @@ class Channel:
         except (ValueError, AttributeError):
             return False
 
-    def _removal(self, call: str, led: Any, fold: Any, ops: Dict[str, Dict[str, Any]], op: Optional[Dict[str, Any]]) -> Tuple[int, Dict[str, Any]]:
+    def _removal(self, call: str, led: Any, fold: Any, ops: Dict[str, Dict[str, Any]], op: Optional[Dict[str, Any]],
+                 daemon: Any = None) -> Tuple[int, Dict[str, Any]]:
         """The module's steps of an OSD removal, each checked against the OSD map
         by id and uuid first: out, drain (safe to destroy unless forced, while it
-        runs), and the retirement (down, still out unless forced, purge)."""
+        runs), and the retirement (down, still out unless forced, purge). A
+        drain's steps (plan 04, step 5) name their OSD, its uuid the fold's;
+        the drain's first step marks every OSD of its host out at once."""
         done = {'outcome': 'done', 'r': 0, 'out': '', 'outs': ''}
-        if op is None or op['kind'] != 'remove_osd':
+        if op is not None and op['kind'] == 'drain_host' and call == 'osd out' and daemon is None:
+            if any(e['kind'] == 'drain_done' and e['of'] == op['id'] for e in ops.values()):
+                return 400, {'error': 'the drain ended'}
+            names = sorted((n for n, h in fold.daemons.items() if h == op['host'] and n.startswith('osd.')), key=lambda n: int(n.split('.', 1)[1]))
+            if not names:
+                return 200, done
+            if any(self._pending(n) for n in names):
+                return 409, {'error': 'mutations for the OSDs of %s are not answered yet; ask again' % op['host']}
+            job = self.commands.submit({'prefix': 'osd out', 'ids': [n.split('.', 1)[1] for n in names]})
+            if job is None:
+                return 503, {'error': 'osd out: no room; ask again'}
+            self._sent({'prefix': 'osd out'}, job)
+            for n in names:
+                self._track(n, job)
+            ok = job.ev.wait(MAX_BRIDGE_DEADLINE) and job.r == 0
+            return (200, done) if ok else (503, {'error': 'osd out of %s: no answer or refused' % ', '.join(names)})
+        if op is not None and op['kind'] == 'drain_host':
+            name = self._drain_step(ops, op, daemon, ('osd',))
+            uuid, force = fold.uuids.get(name or ''), False
+        elif op is not None and op['kind'] == 'remove_osd' and daemon in (None, op['daemon']):
+            name, uuid, force = op['daemon'], op['uuid'], op['force']
+        else:
+            name = None
+        if op is None or name is None:
             return 400, {'error': 'no removal of an OSD'}
-        name, osd = op['daemon'], int(op['daemon'].split('.', 1)[1])
-        if any(e['kind'] == 'retire' and e['of'] == op['id'] for e in ops.values()):
+        osd = int(name.split('.', 1)[1])
+        mine = [e for e in ops.values() if e.get('of') == op['id'] and e.get('daemon') == name]
+        if any(e['kind'] == 'retire' for e in mine):
             return 200, done
-        if fold.uuids.get(name) != op['uuid']:
+        if fold.uuids.get(name) != uuid or uuid is None or op['kind'] == 'drain_host' and fold.daemons.get(name) != op['host']:
             return 400, {'error': '%s is not that OSD of the cluster' % name}
         # an earlier purge or out still unanswered first: the OSD map read below
         # must not be older than what this module already sent
@@ -1657,13 +1875,13 @@ class Channel:
         entry, answer = self._osd(osd)
         if answer is not None:
             return answer
-        if entry is not None and entry['uuid'] != op['uuid']:
+        if entry is not None and entry['uuid'] != uuid:
             return 400, {'error': '%s in the OSD map is another OSD' % name}
-        drained = any(e['kind'] == 'drained' and e['of'] == op['id'] for e in ops.values())
+        drained = any(e['kind'] == 'drained' for e in mine)
         mid = 'm-' + secrets.token_hex(8)
         # after its drain the OSD stays out: one marked in again may hold data
         # the drain never checked, and a new `osd out` would hide that
-        if drained and not op['force'] and entry is not None and entry.get('in'):
+        if drained and not force and entry is not None and entry.get('in'):
             return 409, {'error': '%s was marked in again after its drain' % name}
         if call == 'osd out':
             if entry is None:
@@ -1677,7 +1895,7 @@ class Channel:
                 return 400, {'error': '%s is not in the OSD map' % name}
             # checked while it runs on the first removal; an OSD a failed removal
             # already stopped is checked as it is
-            if not op['force'] and (entry.get('in') or not self._safe(osd)):
+            if not force and (entry.get('in') or not self._safe(osd)):
                 return 409, {'error': '%s is not out and safe to destroy yet' % name}
             led.append({'id': mid, 'kind': 'drained', 'of': op['id'], 'daemon': name, 'host': op['host']})
             return 200, done
@@ -1695,6 +1913,15 @@ class Channel:
                 return 503, {'error': 'osd purge-actual %s: no answer or refused; ask again' % name}
         led.append({'id': mid, 'kind': 'retire', 'of': op['id'], 'daemon': name, 'host': op['host']})
         return 200, done
+
+    def _drain_done(self, led: Any, fold: Any, ops: Dict[str, Dict[str, Any]], op: Optional[Dict[str, Any]]) -> Tuple[int, Dict[str, Any]]:
+        """A drain's end (done or stopped): closed in the fold, so its calls are
+        no longer authorized and the host no longer draining."""
+        if op is None or op['kind'] != 'drain_host':
+            return 400, {'error': 'no drain'}
+        if not any(e['kind'] == 'drain_done' and e['of'] == op['id'] for e in ops.values()):
+            led.append({'id': 'm-' + secrets.token_hex(8), 'kind': 'drain_done', 'of': op['id'], 'host': op['host']})
+        return 200, {'outcome': 'done', 'r': 0, 'out': '', 'outs': ''}
 
     def _retire_host(self, led: Any, fold: Any, ops: Dict[str, Dict[str, Any]], op: Optional[Dict[str, Any]]) -> Tuple[int, Dict[str, Any]]:
         if op is None or op['kind'] != 'remove_host':
@@ -1827,6 +2054,8 @@ class Channel:
                             self.reply(400, {'error': str(e)})
                             return
                         self.reply(*channel.confirm(req, getattr(self.connection, 'credentials', None)))
+                    elif self.path == '/v1/going-down' and not local:
+                        self.reply(*channel.going_down(req, name))
                     elif self.path == '/v1/bridge' and local:
                         if name != channel.mgr_id:  # only the local agent, the leader
                             self.reply(403, {'error': 'the bridge serves the local agent only'})

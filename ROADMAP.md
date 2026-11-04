@@ -41,7 +41,7 @@ Talos baseline: the nodes and `pkg/machinery` come from one combined build of ou
 | Shared namespaces, init (draft 07) | held | No SMB service |
 | `memlock` and other rlimits (draft 08) | held | No NVMe-oF gateway |
 
-Handled in the orchestrator, not requested: stopped state (agents re-render from desired state), pre-shutdown hooks (today only orchestrator-driven maintenance sets `noout`; plan 04 adds a best-effort `noout` when Talos reboots or shuts down outside the orchestrator), conditional apply (single-writer rule above), layer-2 VIP (keepalived).
+Handled in the orchestrator, not requested: stopped state (agents re-render from desired state), pre-shutdown hooks (orchestrator-driven maintenance sets `noout`; a Talos reboot or shutdown outside the orchestrator gets a best-effort `noout`, from the agent's report of the stop sequence, plan 04), conditional apply (single-writer rule above), layer-2 VIP (keepalived).
 
 ## Milestones
 

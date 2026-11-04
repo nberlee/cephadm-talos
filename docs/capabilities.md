@@ -54,7 +54,7 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `create_osds` | implemented | write path (plan 03): one disk on one host, nothing else of a drive group; the disk approved by the operator |
 | `daemon_action` | implemented | write path (plan 03): restart and redeploy (without an image); not start, stop, reconfig or rotate-key |
 | `describe_service` | milestone 5 |  |
-| `drain_host` | milestone 5 |  |
+| `drain_host` | implemented | plan 04 step 5: every OSD out at once, each OSD removed after its drain, then the RGW, the mgr (failed over first), the mon (while the rest keep quorum), one step at a time; `--zap-osd-devices`; not with `--force` or `--keep-conf-keyring`; refused for a host of the ingress, the last mgr's, a mon host leaving fewer than three mons; again on a paused drain resumes it |
 | `enter_host_maintenance` | implemented | write path (plan 03): with `--force`; not with `--yes-i-really-mean-it` |
 | `exit_host_maintenance` | implemented | write path (plan 03): not with `--force` or `--offline` |
 | `generate_certificates` | milestone 5 |  |
@@ -103,7 +103,7 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `set_prometheus_target` | milestone 5 |  |
 | `set_unmanaged` | milestone 5 |  |
 | `set_unmanaged_flag` | milestone 5 |  |
-| `stop_drain_host` | milestone 5 |  |
+| `stop_drain_host` | implemented | plan 04 step 5: no new step starts, a step in progress finishes; OSDs marked out stay out |
 | `stop_remove_osds` | milestone 5 |  |
 | `tuned_profile_add_setting` | milestone 5 |  |
 | `tuned_profile_add_settings` | milestone 5 |  |
@@ -179,8 +179,8 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `orch hardware shutdown` | milestone 5 | to validate on Talos (node-proxy talks to the BMC over Redfish) |
 | `orch hardware status` | milestone 5 | to validate on Talos (node-proxy talks to the BMC over Redfish) |
 | `orch host add` | implemented | write path (plan 03): a node the CLI enrolled |
-| `orch host drain` | milestone 5 |  |
-| `orch host drain stop` | milestone 5 |  |
+| `orch host drain` | implemented | plan 04 step 5 (see `drain_host`) |
+| `orch host drain stop` | implemented | plan 04 step 5 (see `stop_drain_host`) |
 | `orch host label add` | milestone 5 |  |
 | `orch host label rm` | milestone 5 |  |
 | `orch host ls` | implemented | read path (plan 02): the talos mgr module, installed as `cephadm` |

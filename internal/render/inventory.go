@@ -20,6 +20,19 @@ type InventoryHost struct {
 	Addr        string   `json:"addr"`
 	Labels      []string `json:"labels"`
 	Maintenance bool     `json:"maintenance,omitempty"`
+	// NoOut: the CLI's maintenance set noout (the module's fold takes it over)
+	NoOut bool `json:"noout,omitempty"`
+	// Drain is the host's drain, as the module reports it (plan 04, step 5)
+	Drain *InventoryDrain `json:"drain,omitempty"`
+}
+
+// InventoryDrain is a host's drain in progress.
+type InventoryDrain struct {
+	Op      string `json:"op"`
+	Step    string `json:"step,omitempty"`
+	Stopped bool   `json:"stopped,omitempty"`
+	Paused  bool   `json:"paused,omitempty"`
+	Error   string `json:"error,omitempty"`
 }
 
 // InventoryDaemon is a daemon of the inventory.
@@ -71,7 +84,12 @@ func InventoryOf(s *state.State) Inventory {
 	}
 
 	for _, h := range s.Hosts {
-		inv.Hosts = append(inv.Hosts, InventoryHost{Name: h.Name, Addr: h.Addr, Labels: append([]string{}, h.Labels...), Maintenance: h.Maintenance})
+		ih := InventoryHost{Name: h.Name, Addr: h.Addr, Labels: append([]string{}, h.Labels...), Maintenance: h.Maintenance, NoOut: h.NoOut}
+		if d := h.Drain; d != nil {
+			ih.Drain = &InventoryDrain{Op: d.Op, Step: d.Step, Stopped: d.Stopped, Paused: d.Paused, Error: d.Error}
+		}
+
+		inv.Hosts = append(inv.Hosts, ih)
 	}
 
 	for _, d := range s.Daemons {

@@ -945,6 +945,86 @@ func (c *Client) booted(ctx context.Context, node, old string) (bool, string) {
 	return true, ""
 }
 
+// WatchMachineStage calls fn with the node's machine stage, at once and on
+// every change, until the watch breaks (an error) or ctx ends (nil).
+func (c *Client) WatchMachineStage(ctx context.Context, node string, fn func(runtime.MachineStage)) error {
+	cl, nctx, err := c.node(ctx, node, "watch machinestatus")
+	if err != nil {
+		return err
+	}
+
+	wctx, cancel := context.WithCancel(nctx)
+	defer cancel()
+
+	ch := make(chan state.Event)
+	if err := cl.COSI.Watch(wctx, runtime.NewMachineStatus().Metadata(), ch); err != nil {
+		return wrap("watch machinestatus", err)
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case ev := <-ch:
+			switch ev.Type {
+			case state.Errored:
+				return wrap("watch machinestatus", ev.Error)
+			case state.Created, state.Updated:
+				if ms, ok := ev.Resource.(*runtime.MachineStatus); ok {
+					fn(ms.TypedSpec().Stage)
+				}
+			case state.Destroyed, state.Bootstrapped, state.Noop:
+			}
+		}
+	}
+}
+
+// WatchSequences calls fn with every sequence event of the node after the
+// event tailID ("": from now on), in order, until the stream breaks (an
+// error) or ctx ends (nil); it returns the id of the last event it saw.
+func (c *Client) WatchSequences(ctx context.Context, node, tailID string, fn func(*machine.SequenceEvent)) (string, error) {
+	cl, nctx, err := c.node(ctx, node, "events")
+	if err != nil {
+		return tailID, err
+	}
+
+	var opts []client.EventsOptionFunc
+	if tailID != "" {
+		opts = append(opts, client.WithTailID(tailID))
+	}
+
+	stream, err := cl.Events(nctx, opts...)
+	if err != nil {
+		return tailID, wrap("events", err)
+	}
+
+	for {
+		ev, err := stream.Recv()
+		if err != nil {
+			if ctx.Err() != nil {
+				return tailID, nil
+			}
+
+			return tailID, wrap("events", err)
+		}
+
+		if ev.GetId() != "" {
+			tailID = ev.GetId()
+		}
+
+		// the stream's first (empty) event and the kinds it does not know are
+		// not decoded
+		dec, err := client.UnmarshalEvent(ev)
+		if err != nil {
+			continue
+		}
+
+		if seq, ok := dec.Payload.(*machine.SequenceEvent); ok {
+			fn(seq)
+		}
+	}
+}
+
 // BootID returns the boot id of a node; it changes with every boot.
 func (c *Client) BootID(ctx context.Context, node string) (string, error) {
 	cl, nctx, err := c.node(ctx, node, "get bootid")

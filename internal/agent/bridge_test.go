@@ -155,15 +155,19 @@ func (m *fakeBridge) run(req wire.BridgeRequest) map[string]any {
 
 		return map[string]any{"outcome": "done", "r": 0, "out": string(b)}
 	case "bind disk", "confirm osd", "close create", "osd out", "drain":
-		m.retired = append(m.retired, req.Call+" "+str("operation"))
+		m.retired = append(m.retired, strings.TrimSpace(req.Call+" "+str("operation")+" "+str("daemon")))
 
 		return map[string]any{"outcome": "done", "r": 0, "out": ""}
 	case "osd dump":
 		b, _ := json.Marshal(m.osds)
 
 		return map[string]any{"outcome": "done", "r": 0, "out": string(b)}
-	case "retire", "retire host", "mon rm", "ok to stop", "noout set", "noout unset", "maintained", "upgrade done", "upgrade refused", "ok to stop daemon", "retire keepalived", "mgr cert done", "agent cert done":
-		m.retired = append(m.retired, req.Call+" "+str("operation"))
+	case "retire", "retire host", "mon rm", "ok to stop", "noout set", "noout unset", "maintained", "upgrade done", "upgrade refused", "ok to stop daemon", "retire keepalived", "mgr cert done", "agent cert done", "drain done":
+		if (req.Call == "retire" || req.Call == "mon rm") && str("daemon") != "" {
+			m.retired = append(m.retired, req.Call+" "+str("operation")+" "+str("daemon"))
+		} else {
+			m.retired = append(m.retired, req.Call+" "+str("operation"))
+		}
 
 		if list, ok := req.Args["certs"].([]any); ok {
 			if m.certs == nil {

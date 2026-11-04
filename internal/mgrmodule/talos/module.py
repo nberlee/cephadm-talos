@@ -65,6 +65,8 @@ POLL_INTERVAL = 30.0
 REQUEST_TIMEOUT = 10.0
 REFRESH_TIMEOUT = 30.0
 STALE_AFTER = datetime.timedelta(minutes=2)
+# an unplanned stop not ended after this raises TALOS_HOST_DOWN (plan 04, step 5)
+HOST_DOWN_AFTER = datetime.timedelta(minutes=30)
 MAX_WORKERS = 8
 
 
@@ -328,12 +330,17 @@ def check_not_revoked(peercert: Optional[Dict[str, Any]], revoked: Any, now: Opt
         raise ValueError('the peer certificate is not valid now')
 
 
+# the header naming the polling module's address: the agent sends its
+# going-down reports there, to the mgr its client certificate names (plan 04, step 5)
+MODULE_ADDR_HEADER = 'X-Cephadm-Talos-Module'
+
+
 def fetch_record(addr: str, tls: ssl.SSLContext, refresh: bool = False,
-                 expect: Optional[Tuple[str, str]] = None, revoked: Any = ()) -> Dict[str, Any]:
+                 expect: Optional[Tuple[str, str]] = None, revoked: Any = (), module: str = '') -> Dict[str, Any]:
     """Fetch and validate one agent's status record within an overall deadline; raises on any problem.
 
     expect is the (fsid, host) the agent's certificate must be issued to;
-    revoked the serials it must not have."""
+    revoked the serials it must not have; module this mgr's address."""
     total = REFRESH_TIMEOUT if refresh else REQUEST_TIMEOUT
     conn = http.client.HTTPSConnection(addr, AGENT_PORT, context=tls, timeout=total)
     expired = threading.Event()
@@ -363,7 +370,7 @@ def fetch_record(addr: str, tls: ssl.SSLContext, refresh: bool = False,
         if expect is not None:
             require_identity(conn.sock.getpeercert(), expect[0], 'agent', expect[1])
             check_not_revoked(conn.sock.getpeercert(), revoked)
-        conn.request('GET', '/status?refresh=1' if refresh else '/status')
+        conn.request('GET', '/status?refresh=1' if refresh else '/status', headers={MODULE_ADDR_HEADER: module} if module else {})
         resp = conn.getresponse()
         body = resp.read(MAX_RECORD + 1)
         if len(body) > MAX_RECORD:
@@ -395,6 +402,10 @@ def validate_record(rec: Any) -> Dict[str, Any]:
     if not isinstance(rec.get('crl_number', ''), str) or not re.match(r'\A\d{0,40}\Z', rec.get('crl_number', '')) \
             or not isinstance(rec.get('crl_stale', False), bool):
         raise ValueError('invalid revocation list state in status record')
+    # the node's boot id, and a boot whose stop sequences were all cancelled (plan 04, step 5)
+    for k in ('boot', 'stop_cancelled'):
+        if not isinstance(rec.get(k, ''), str) or rec.get(k) and not ledger.BOOT_RE.match(rec[k]):
+            raise ValueError('invalid %s in status record' % k)
     rec['observed_at'] = parse_time(rec['observed_at'])
     return rec
 
@@ -481,7 +492,7 @@ def filter_daemons(daemons: List[DaemonDescription], service_name: Optional[str]
 
 def build_hosts(inv: Dict[str, Any]) -> List[HostSpec]:
     return [HostSpec(h['name'], addr=h['addr'], labels=h.get('labels') or [],
-                     status='maintenance' if h.get('maintenance') else '') for h in inv['hosts']]
+                     status='maintenance' if h.get('maintenance') else 'draining' if h.get('drain') else '') for h in inv['hosts']]
 
 
 class Poller:
@@ -653,7 +664,9 @@ class Module(orchestrator.Orchestrator, MgrModule):
         names = [h['name'] for h in inv['hosts'] if h['addr'] == addr]
         if len(names) != 1:
             raise ValueError('address %s is not one inventory host' % addr)
-        return fetch_record(addr, tls_context(), refresh=refresh, expect=(inv['fsid'], names[0]), revoked=getattr(self, '_revoked', ()))
+        mine = [h['addr'] for h in inv['hosts'] if h['name'] == self.get_mgr_id()]
+        return fetch_record(addr, tls_context(), refresh=refresh, expect=(inv['fsid'], names[0]), revoked=getattr(self, '_revoked', ()),
+                            module=mine[0] if len(mine) == 1 else '')
 
     def _deliver_crl(self, inv: Dict[str, Any]) -> None:
         """Send the list to every inventory host whose poll failed or reported a
@@ -778,6 +791,33 @@ class Module(orchestrator.Orchestrator, MgrModule):
         if host in fold.maintenance:
             raise OrchestratorError('%s is in maintenance (ceph orch host maintenance exit %s)' % (host, host))
 
+    def _drains(self, fold: Any) -> Dict[str, str]:
+        """The hosts with a drain (plan 04, step 5) and its operation: the
+        fold's, and the leader's records of a stopped drain still finishing its
+        step."""
+        out = {h: d['op'] for h, d in fold.draining.items()}
+        try:
+            hosts = self._inventory()['hosts']
+        except InventoryError:
+            hosts = []
+        for h in hosts:
+            if isinstance(h.get('drain'), dict):
+                out.setdefault(h['name'], str(h['drain'].get('op')))
+        return out
+
+    def _not_draining(self, host: str) -> None:
+        _, fold = self._authority()
+        if host in self._drains(fold):
+            raise OrchestratorError('%s is draining (ceph orch host drain stop %s)' % (host, host))
+
+    def _drain_record(self, host: str) -> Dict[str, Any]:
+        """The leader's record of a host's drain, {} without one."""
+        try:
+            hosts = self._inventory()['hosts']
+        except InventoryError:
+            return {}
+        return next((h['drain'] for h in hosts if h['name'] == host and isinstance(h.get('drain'), dict)), {})
+
     def _rgw_port(self) -> Optional[int]:
         """The RGWs' port: the newest RGW add's (fold state), else the CLI's, None before any."""
         _, fold = self._authority()
@@ -854,6 +894,9 @@ class Module(orchestrator.Orchestrator, MgrModule):
         # host is in maintenance; the exit renders them (plan 04, step 1)
         if kind not in ('exit_maintenance', 'renew_mgr', 'renew_agent'):
             self._not_in_maintenance(host)
+        # a draining host takes no new operation but the renewals (plan 04, step 5)
+        if kind not in ('renew_mgr', 'renew_agent'):
+            self._not_draining(host)
         op_id = op_id or 'op-' + os.urandom(8).hex()
         entry = {'id': op_id, 'kind': kind, 'host': host, **extra, **self._request_fields()}
         if daemon:
@@ -951,6 +994,14 @@ class Module(orchestrator.Orchestrator, MgrModule):
         fold = led.fold(cli_baseline(store))
         if fold.upgrade is not None:
             pinned.add(fold.upgrade['op'])
+        # a drain's operation while it lasts or the leader's record of it
+        # stays: the bridge authorizes its steps by it (plan 04, step 5)
+        pinned |= {d['op'] for d in fold.draining.values()}
+        try:
+            inv = inventory_from_store(store, choose_incarnation(store, getattr(self, '_gid', None)))
+            pinned |= {str(h['drain'].get('op')) for h in inv['hosts'] if isinstance(h.get('drain'), dict)}
+        except InventoryError:
+            return
         got = led.cut(cli_baseline(store), states, cluster.get('ledger_applied') or '', pinned, now)
         self._cut_next = mono + COMPACT_EVERY
         if got is None or not active():
@@ -1046,6 +1097,9 @@ class Module(orchestrator.Orchestrator, MgrModule):
                             self._require_identity, self.log, self._authority, creds.ca_cert, creds.digest)
                         c.start()
                         channel = c  # only a started channel; a failed start is retried
+                        wake = self.__dict__.setdefault('_noout_wake', threading.Event())
+                        c.on_down = wake.set
+                        self._channel = c
                     else:
                         # a renewed server certificate, once the leader granted its files
                         channel.reload(os.path.join(TALOS_DIR, 'agent-ca.crt'), os.path.join(TALOS_DIR, 'mgr-server.crt'),
@@ -1075,6 +1129,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
                     self.log.exception('agent channel failed')
                 self._poller.stop.wait(bridge.HEARTBEAT_INTERVAL)
         finally:
+            self._channel = None
             if channel is not None:
                 channel.stop()
             leader_cmds.stop()
@@ -1137,6 +1192,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
         lead = threading.Thread(target=self._lead, args=(self.get('mgr_map'),), name='talos-lead', daemon=True)
         self._lead_thread = lead
         lead.start()
+        threading.Thread(target=self._noout_loop, name='talos-noout', daemon=True).start()
         while not self._poller.stop.is_set():
             try:
                 inv = self._inventory()
@@ -1286,6 +1342,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
             if not self._finished(index, e['id']):
                 raise OrchestratorError('%s has operation %s in progress (orch talos operation %s)' % (host, e['id'], e['id']))
         self._not_in_maintenance(host)
+        self._not_draining(host)
         op_id = 'op-' + os.urandom(8).hex()
         try:
             led.append({'id': op_id, 'kind': 'create_osd', 'host': host, 'device': device, **self._request_fields()})
@@ -1332,6 +1389,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
         except ledger.LedgerError as e:
             raise OrchestratorError('an earlier operation is not settled yet (%s); try again' % e)
         self._not_backlogged(led, self._journal_index())
+        self._not_draining(host)
         op_id = 'op-' + os.urandom(8).hex()
         try:
             led.append({'id': op_id, 'kind': 'remove_osd', 'daemon': name, 'host': host, 'uuid': uuid, 'zap': bool(zap), 'force': bool(force),
@@ -1384,6 +1442,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
             raise OrchestratorError('%s is not a host of the cluster' % hostname)
         if hostname in fold.maintenance:
             raise OrchestratorError('%s is already in maintenance' % hostname)
+        self._not_draining(hostname)
         if fold.upgrade is not None:
             raise OrchestratorError('an upgrade is in progress (operation %s)' % fold.upgrade['op'])
         led, _ = self._authority()
@@ -1459,6 +1518,190 @@ class Module(orchestrator.Orchestrator, MgrModule):
             raise OrchestratorError('%s is not in maintenance' % hostname)
         op_id = self._accept('exit_maintenance', None, hostname)
         return 'Scheduled to take host %s out of maintenance (operation %s)' % (hostname, op_id)
+
+    @handle_orch_error
+    def drain_host(self, hostname: str, force: bool = False, keep_conf_keyring: bool = False, zap_osd_devices: bool = False) -> str:
+        """Remove every daemon of a host, one at a time (plan 04, step 5); again
+        on a host whose drain paused, resume it."""
+        if force or keep_conf_keyring:
+            raise OrchestratorError('--force and --keep-conf-keyring are not supported by this backend')
+        self._settle()
+        led, fold = self._authority()
+        if hostname not in fold.hosts:
+            raise OrchestratorError('%s is not a host of the cluster' % hostname)
+        if hostname in fold.draining:
+            d, rec = fold.draining[hostname], self._drain_record(hostname)
+            if rec.get('op') != d['op'] or not rec.get('paused'):
+                raise OrchestratorError('the drain of %s is in progress (operation %s)' % (hostname, d['op']))
+            if bool(zap_osd_devices) != bool(d['zap']):
+                raise OrchestratorError('the drain of %s was accepted %s --zap-osd-devices' % (hostname, 'with' if d['zap'] else 'without'))
+            op_id = self._accept_control('drain_resume', hostname, drain=d['op'])
+            return 'Scheduled to resume the drain of host %s (operation %s)' % (hostname, op_id)
+        others = self._drains(fold)
+        if others:
+            raise OrchestratorError('%s is draining' % ', '.join(sorted(others)))
+        if hostname in fold.maintenance:
+            raise OrchestratorError('%s is in maintenance (ceph orch host maintenance exit %s)' % (hostname, hostname))
+        if fold.upgrade is not None:
+            raise OrchestratorError('an upgrade is in progress (operation %s)' % fold.upgrade['op'])
+        agents = self._agent_upgrade_running(led)
+        if agents is not None:
+            raise OrchestratorError('the agent upgrade %s is in progress' % agents['id'])
+        index = self._journal_index()
+        for _, e in led.executable():
+            if e['kind'] == 'apply_ingress' and not self._finished(index, e['id']):
+                raise OrchestratorError('ingress operation %s is in progress' % e['id'])
+        on = sorted(n for n, h in fold.daemons.items() if h == hostname)
+        # the ingress spec has one owner: a keepalived leaves with the ingress
+        if any(n.startswith('keepalived.') for n in on) or hostname in ((fold.ingress or {}).get('hosts') or []):
+            raise OrchestratorError('%s is a host of the ingress: apply the ingress without %s first' % (hostname, hostname))
+        mons = [n for n in fold.daemons if n.startswith('mon.')]
+        if 'mon.' + hostname in on and len(mons) - 1 < 3:
+            raise OrchestratorError('%s runs a mon and fewer than three would be left (the rest keep quorum while it goes)' % hostname)
+        if 'mgr.' + hostname in on and not [n for n in fold.daemons if n.startswith('mgr.') and n != 'mgr.' + hostname]:
+            raise OrchestratorError('%s runs the last mgr' % hostname)
+        if hostname == self.get_mgr_id():
+            standbys = [m for m in (self.get('mgr_map') or {}).get('standbys', []) if m.get('available', True)]
+            if not standbys:
+                raise OrchestratorError('%s runs the active mgr and no standby mgr is available' % hostname)
+        op_id = self._accept('drain_host', None, hostname, zap=bool(zap_osd_devices))
+        return 'Scheduled to drain host %s (operation %s)' % (hostname, op_id)
+
+    @handle_orch_error
+    def stop_drain_host(self, hostname: str) -> str:
+        """Stop a host's drain: no new step starts, one in progress finishes;
+        OSDs marked out stay out."""
+        self._settle()
+        _, fold = self._authority()
+        d = fold.draining.get(hostname)
+        if d is None:
+            raise OrchestratorError('%s is not draining' % hostname)
+        op_id = self._accept_control('drain_stop', hostname, drain=d['op'])
+        return 'Scheduled to stop the drain of host %s (operation %s)' % (hostname, op_id)
+
+    @_accepting
+    def _accept_control(self, kind: str, host: str, **fields: Any) -> str:
+        """Accept a drain's control: ahead of queued operations in the leader,
+        not refused for a busy host or by backpressure."""
+        led, _ = self._authority()
+        lead = getattr(self, '_leadership', None)
+        if lead is None or not lead.still_active():
+            raise OrchestratorError('this mgr is not confirmed as the active one; try again')
+        try:
+            led.settle()
+        except ledger.LedgerError as e:
+            raise OrchestratorError('an earlier operation is not settled yet (%s); try again' % e)
+        op_id = 'op-' + os.urandom(8).hex()
+        try:
+            led.append({'id': op_id, 'kind': kind, 'host': host, **fields, **self._request_fields()})
+        except ledger.OutcomeUnknown:
+            raise OrchestratorError('the mons did not answer: operation %s may have been accepted (orch talos operation %s)' % (op_id, op_id))
+        except ledger.LedgerError as e:
+            raise OrchestratorError('not accepted: %s' % e)
+        return op_id
+
+    @TalosCLICommand.Write('orch talos noout keep')
+    def _noout_keep(self, host: str) -> HandleCommandResult:
+        """Hand a host's noout the module set over to the operator: the module drops its reasons and never unsets it"""
+        return self._noout_command(host, keep=True)
+
+    @TalosCLICommand.Write('orch talos noout release')
+    def _noout_release(self, host: str) -> HandleCommandResult:
+        """End a host's unplanned stop that the module cannot see ending: its noout reason goes, and the flag with it if no other reason holds and the module set it"""
+        return self._noout_command(host, keep=False)
+
+    def _noout_command(self, host: str, keep: bool) -> HandleCommandResult:
+        try:
+            with _ACCEPT_LOCK:
+                self._not_suspended()
+                _, fold = self._authority()
+                channel = getattr(self, '_channel', None)
+                if channel is None:
+                    raise OrchestratorError('this mgr does not serve the agent channel yet; try again')
+                if not keep and host not in fold.down and ledger.UNPLANNED not in fold.noout_reasons(host):
+                    raise OrchestratorError('%s has no unplanned stop' % host)
+                why = channel.noout_keep(host) if keep else channel.host_up(host)
+                if why is not None:
+                    raise OrchestratorError(why)
+        except (OrchestratorError, ledger.LedgerError) as e:
+            return HandleCommandResult(retval=-22, stderr=str(e))
+        if keep:
+            return HandleCommandResult(stdout='the noout of %s is the operator\'s: the module never unsets it' % host)
+        return HandleCommandResult(stdout='the unplanned stop of %s ended' % host)
+
+    def _noout_tick(self, now: Optional[datetime.datetime] = None) -> None:
+        """The noout ownership's pass (plan 04, step 5): every host with an
+        unplanned stop, a reason or an open intent is reconciled; a host back
+        from its stop (a new boot, or its stop cancelled, and its OSDs up again
+        unless it is in maintenance) ends it. Then TALOS_HOST_DOWN and
+        TALOS_DRAIN_PAUSED."""
+        now = now or utcnow()
+        channel = getattr(self, '_channel', None)
+        led = getattr(self, '_ledger', None)
+        if channel is None or led is None or not led.ready:
+            return
+        _, fold = self._authority()
+        obs = self._poller.snapshot()
+        up = None
+        for host in sorted(set(fold.noout) | set(fold.down)):
+            osds = [int(n.split('.', 1)[1]) for n, h in fold.daemons.items() if h == host and n.startswith('osd.')]
+            d = fold.down.get(host)
+            try:
+                if d is not None:
+                    rec = obs.get(host, (None, ''))[0]
+                    boot = (rec or {}).get('boot') or ''
+                    # a cancellation counts only from an observation after the
+                    # stop's record: a later stop on the same boot is not ended
+                    # by the poll before it
+                    cancelled = rec is not None and rec.get('stop_cancelled') == d['boot'] and rec['observed_at'] > ledger._parse_iso(d['at'])
+                    back = bool(boot) and (boot != d['boot'] or cancelled)
+                    if back and osds and host not in fold.maintenance:
+                        if up is None:
+                            up = {o['osd'] for o in (self.get('osd_map') or {}).get('osds', []) if o.get('up')}
+                        back = set(osds) <= up
+                    if back:
+                        why = channel.host_up(host, d['boot'])
+                        if why is not None:
+                            self.log.info('noout of %s: %s', host, why)
+                        continue
+                why = channel.noout_reconcile(host, bool(osds))
+                if why is not None:
+                    self.log.info('noout of %s: %s', host, why)
+            except Exception as e:  # each host stands on its own; tried again next pass
+                self.log.warning('noout of %s: %s', host, e)
+        _, fold = self._authority()
+        checks: Dict[str, Any] = {}
+        late = sorted(h for h, d in fold.down.items() if now - ledger._parse_iso(d['at']) > HOST_DOWN_AFTER)
+        if late:
+            checks['TALOS_HOST_DOWN'] = {
+                'severity': 'warning', 'summary': 'hosts went down outside the orchestrator and are not back', 'count': len(late),
+                'detail': ['%s went down at %s: noout stays until it is back, the operator clears it (ceph orch talos noout release %s) or the host is removed'
+                           % (h, fold.down[h]['at'], h) for h in late]}
+        try:
+            hosts = self._inventory()['hosts']
+        except InventoryError:
+            hosts = []
+        paused = [(h['name'], h['drain']) for h in hosts if isinstance(h.get('drain'), dict) and h['drain'].get('paused')]
+        if paused:
+            checks['TALOS_DRAIN_PAUSED'] = {
+                'severity': 'warning', 'summary': 'a host drain is paused', 'count': len(paused),
+                'detail': ['the drain of %s paused: %s (ceph orch host drain %s resumes it)' % (h, d.get('error', ''), h) for h, d in paused]}
+        self._set_health('lifecycle', checks)
+
+    def _noout_loop(self) -> None:
+        """The noout ownership's passes, apart from the leadership loop (mon
+        commands may wait): every HEARTBEAT_INTERVAL, and at once after an
+        agent reported its node going down."""
+        wake = self.__dict__.setdefault('_noout_wake', threading.Event())
+        while not self._poller.stop.is_set():
+            try:
+                self._noout_tick()
+            except InventoryError as e:
+                self.log.warning('%s', e)
+            except Exception:
+                self.log.exception('noout pass failed')
+            wake.wait(bridge.HEARTBEAT_INTERVAL)
+            wake.clear()
 
     def _approved_images(self) -> List[str]:
         """The images of the operator's newest approval in config-key: its payload
@@ -1643,6 +1886,8 @@ class Module(orchestrator.Orchestrator, MgrModule):
             raise OrchestratorError('the agent upgrade %s is in progress' % agents['id'])
         if fold.maintenance:
             raise OrchestratorError('hosts in maintenance: %s' % ', '.join(sorted(fold.maintenance)))
+        if self._drains(fold):
+            raise OrchestratorError('hosts draining: %s' % ', '.join(sorted(self._drains(fold))))
         current = self._inventory().get('image', '')
         if image.split('@')[0] != current.split('@')[0]:
             raise OrchestratorError('the image is not from the cluster\'s repository %s' % current.split('@')[0])
@@ -1761,6 +2006,9 @@ class Module(orchestrator.Orchestrator, MgrModule):
         busy = sorted((set(hosts) | set((fold.ingress or {}).get('hosts') or [])) & fold.maintenance)
         if busy:
             raise OrchestratorError('hosts in maintenance: %s' % ', '.join(busy))
+        busy = sorted(set(hosts) & set(self._drains(fold)))
+        if busy:
+            raise OrchestratorError('hosts draining: %s' % ', '.join(busy))
         cur = fold.ingress
         new_password = cur is None
         if cur is not None:
@@ -1970,6 +2218,8 @@ class Module(orchestrator.Orchestrator, MgrModule):
             return 'Scheduled to resume agent upgrade %s (operation %s)' % (running['id'], op)
         if running is not None:
             raise OrchestratorError('operation %s (%s) is in progress' % (running['id'], running['kind']))
+        if self._drains(fold):
+            raise OrchestratorError('hosts draining: %s' % ', '.join(sorted(self._drains(fold))))
         if not isinstance(image, str) or not ledger.IMAGE_RE.match(image):
             raise OrchestratorError('name the image by its digest: <repository>@sha256:<hex>')
         current = ((cluster or {}).get('agent') or {}).get('image') or ''

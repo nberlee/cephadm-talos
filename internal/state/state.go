@@ -40,8 +40,12 @@ type Host struct {
 	// Maintenance: the host's daemons are stopped (their documents removed) and noout
 	// is set for it, like `ceph orch host maintenance enter`
 	Maintenance bool `json:"maintenance,omitempty"`
-	// NoOut: maintenance enter set `osd set-group noout` on this host's CRUSH bucket
+	// NoOut: the CLI's maintenance enter (before the handoff) set `osd set-group
+	// noout` on this host's CRUSH bucket; after the handoff the mgr module's
+	// ledger owns noout (plan 04, step 5)
 	NoOut bool `json:"noout,omitempty"`
+	// Drain is the host's drain in progress (plan 04, step 5)
+	Drain *Drain `json:"drain,omitempty"`
 	// Labels are the host's labels from `ceph orch host add` (stored only)
 	Labels []string `json:"labels,omitempty"`
 	// Talosconfig and Context override the cluster defaults for this node, so
@@ -69,6 +73,25 @@ type Host struct {
 	// of their keys, "<operation>/<attempt>" (SecretIssued); without it the
 	// keys are the CLI's (SecretHost)
 	MgrKeys string `json:"mgr_keys,omitempty"`
+}
+
+// Drain is a host's drain (`ceph orch host drain`, plan 04 step 5): its steps
+// run between ledger operations, one at a time, each journaled as
+// <Op>.d<Attempt>.
+type Drain struct {
+	Op  string `json:"op"`
+	Zap bool   `json:"zap,omitempty"` // --zap-osd-devices
+	// Step is the step in progress: "out" (every OSD of the host marked out
+	// at once) or the daemon it removes ("osd.3", "rgw.<host>", ...)
+	Step    string `json:"step,omitempty"`
+	Attempt int    `json:"attempt,omitempty"`
+	// Done lists the steps that are not removals once they ended ("out")
+	Done []string `json:"done,omitempty"`
+	// Stopped by `drain stop`: no new step starts; Paused by a failed step
+	// (Error), until `ceph orch host drain` again resumes it
+	Stopped bool   `json:"stopped,omitempty"`
+	Paused  bool   `json:"paused,omitempty"`
+	Error   string `json:"error,omitempty"`
 }
 
 // Published is the revision of what the talos mgr module reads from the nodes

@@ -84,11 +84,13 @@ class Mons:
         self.mon_rm = []
         self.not_ok = set()  # prefixes of ok-to-stop checks that refuse
         self.maint_calls = []
+        self.flags = {}      # osd dump's crush_node_flags
+        self.on_time = {'mgr dump'}  # answered also when late
 
     def send(self, res, cmd):
         prefix = json.loads(cmd)['prefix']
         self.sent.append((threading.current_thread().name, prefix))
-        if self.late and prefix != 'mgr dump':
+        if self.late and prefix not in self.on_time:
             self.pending.append(res)
             return
         if prefix == 'mgr dump':
@@ -115,7 +117,7 @@ class Mons:
             self.osd_calls.append(prefix)
             res.complete(0, '', '')
         elif prefix == 'osd dump':
-            res.complete(0, json.dumps({'osds': self.osds}), '')
+            res.complete(0, json.dumps({'osds': self.osds, 'crush_node_flags': self.flags}), '')
         elif prefix == 'osd metadata':
             i = json.loads(cmd)['id']
             res.complete(0, json.dumps(self.metadata[i]), '') if i in self.metadata else res.complete(-2, '', 'no metadata')
@@ -125,6 +127,9 @@ class Mons:
         elif prefix in ('osd set-group', 'osd unset-group', 'mgr fail'):
             c = json.loads(cmd)
             self.maint_calls.append((prefix, c.get('who')))
+            for w in c.get('who') or [] if prefix != 'mgr fail' else []:
+                f = set(self.flags.get(w, [])) - {'noout'} | ({'noout'} if prefix == 'osd set-group' else set())
+                self.flags[w] = sorted(f)
             res.complete(0, '', '')
         elif prefix == 'quorum_status':
             res.complete(0, json.dumps({'monmap': {'mons': [{'name': n} for n in self.monmap]}, 'quorum_names': self.quorum}), '')
@@ -1256,6 +1261,7 @@ class MaintenanceCallsTest(unittest.TestCase):
         self.fold('mon.h1@h1', 'osd.3@h1')
         enter = self.maint('enter_maintenance')
         self.mons.late = True
+        self.mons.on_time.add('osd dump')
         # sent, unanswered: unknown, and its outcome can be fetched by its dispatch id
         self.assertEqual(self.call('noout set', operation=enter), (200, {'outcome': 'unknown'}))
         dispatch = '%016x' % (900 + self.n)
@@ -1296,6 +1302,148 @@ class MaintenanceCallsTest(unittest.TestCase):
         other = self.maint('enter_maintenance', 'h2')
         self.assertEqual(self.call('mgr fail', operation=other, gid=42)[0], 400)
         self.assertEqual(self.call('mgr fail', operation=enter, gid='42')[0], 400)
+
+
+class NooutTest(unittest.TestCase):
+    """plan 04, step 5: the noout ownership, unplanned stops and going-down reports."""
+    setUp, call, accept = LedgerCallsTest.setUp, LedgerCallsTest.call, LedgerCallsTest.accept
+    fold, maint = MaintenanceCallsTest.fold, MaintenanceCallsTest.maint
+
+    def sets(self):
+        return [c for c in self.mons.maint_calls if c[0] in ('osd set-group', 'osd unset-group')]
+
+    def report(self, peer, **req):
+        return self.ch.going_down(dict({'version': 1, 'fsid': 'f1', 'host': peer, 'boot': 'b-1'}, **req), peer)
+
+    def test_maintenance_and_an_unplanned_stop_together(self):
+        self.fold('mon.h1@h1', 'osd.3@h1')
+        enter = self.maint('enter_maintenance')
+        self.assertEqual(self.call('noout set', operation=enter)[1]['outcome'], 'done')
+        self.assertEqual(self.sets(), [('osd set-group', ['h1'])])
+        woken = []
+        self.ch.on_down = lambda: woken.append(1)
+        self.assertEqual(self.report('h1')[0], 200)
+        self.assertEqual(self.report('h1')[0], 200)  # retried: recorded once
+        self.assertEqual(([e['kind'] for _, e in self.led.executable()].count('host_down'), len(woken)), (1, 2))
+        self.assertIsNone(self.ch.noout_reconcile('h1', True))
+        f = self.ch.authority()[1]
+        self.assertEqual(f.noout['h1']['reasons'], ['maintenance', 'unplanned'])
+        exit_ = self.maint('exit_maintenance')
+        self.assertEqual(self.call('noout unset', operation=exit_)[1]['outcome'], 'done')
+        self.assertEqual(self.sets(), [('osd set-group', ['h1'])])  # still held: the unplanned stop
+        self.assertEqual(self.ch.authority()[1].noout['h1']['reasons'], ['unplanned'])
+        self.assertIsNone(self.ch.host_up('h1', 'b-1'))
+        self.assertEqual(self.sets(), [('osd set-group', ['h1']), ('osd unset-group', ['h1'])])
+        f = self.ch.authority()[1]
+        self.assertEqual((f.noout, f.down), ({}, {}))
+
+    def test_an_operators_flag_is_never_unset(self):
+        self.fold('mon.h1@h1', 'osd.3@h1')
+        self.mons.flags = {'h1': ['noout']}
+        enter = self.maint('enter_maintenance')
+        self.assertEqual(self.call('noout set', operation=enter)[1]['outcome'], 'done')
+        self.assertTrue(self.ch.authority()[1].noout['h1']['operator'])
+        exit_ = self.maint('exit_maintenance')
+        self.assertEqual(self.call('noout unset', operation=exit_)[1]['outcome'], 'done')
+        self.assertEqual((self.sets(), self.mons.flags), ([], {'h1': ['noout']}))
+        self.assertEqual(self.ch.authority()[1].noout, {})
+
+    def test_keep_hands_the_flag_over(self):
+        self.fold('mon.h1@h1', 'osd.3@h1')
+        self.assertEqual(self.ch.noout_keep('h1'), 'the module holds no noout for h1')
+        enter = self.maint('enter_maintenance')
+        self.call('noout set', operation=enter)
+        self.assertIsNone(self.ch.noout_keep('h1'))
+        exit_ = self.maint('exit_maintenance')
+        self.assertEqual(self.call('noout unset', operation=exit_)[1]['outcome'], 'done')
+        self.assertEqual((self.sets(), self.mons.flags), ([('osd set-group', ['h1'])], {'h1': ['noout']}))
+
+    def test_a_predecessors_intent_is_completed_from_the_flag(self):
+        self.fold('mon.h1@h1', 'osd.3@h1')
+        # Ceph set the flag, the completion was never written: completed as the module's, no command
+        self.led.append({'id': 'm-%016x' % 1, 'kind': 'noout_intent', 'host': 'h1', 'reason': 'unplanned', 'on': True, 'prior': False})
+        self.mons.flags = {'h1': ['noout']}
+        self.assertIsNone(self.ch.noout_reconcile('h1', True))
+        f = self.ch.authority()[1]
+        self.assertEqual((f.noout['h1'], self.sets()), ({'reasons': ['unplanned'], 'operator': False, 'intent': None}, []))
+        # so the module unsets it with its last reason
+        self.assertIsNone(self.ch.noout_reconcile('h1', True))
+        self.assertEqual((self.sets(), self.ch.authority()[1].noout), ([('osd unset-group', ['h1'])], {}))
+        # an intent whose command never landed is sent again
+        self.led.append({'id': 'm-%016x' % 2, 'kind': 'noout_intent', 'host': 'h1', 'reason': 'maintenance', 'on': True, 'prior': False})
+        self.assertIsNone(self.ch.noout_reconcile('h1', True))
+        self.assertEqual(self.sets()[-1], ('osd set-group', ['h1']))
+        self.assertEqual(self.ch.authority()[1].noout['h1']['reasons'], ['maintenance'])
+
+    def test_going_down_reports(self):
+        self.fold('mon.h1@h1', 'osd.3@h1')
+        # an agent reports only its own host, of this cluster, and well formed
+        for peer, req in (('h2', {'host': 'h1'}), ('h1', {'fsid': 'other'}), ('h1', {'boot': 'a b'}), ('h1', {'extra': 1})):
+            self.assertEqual(self.ch.going_down(dict({'version': 1, 'fsid': 'f1', 'host': 'h1', 'boot': 'b-1'}, **req), peer)[0], 400, (peer, req))
+        self.assertEqual(self.report('h9')[0], 403)
+        self.assertEqual([e for _, e in self.led.executable() if e['kind'] == 'host_down'], [])
+        self.assertEqual(self.report('h1')[0], 200)
+        self.assertIsNone(self.ch.noout_reconcile('h1', True))
+        self.assertEqual(self.sets(), [('osd set-group', ['h1'])])
+        # a host without OSDs gets no reason
+        self.assertEqual(self.report('h2')[0], 200)
+        self.assertIsNone(self.ch.noout_reconcile('h2', False))
+        self.assertNotIn('h2', self.ch.authority()[1].noout)
+        # a later boot's report replaces the stop
+        self.assertEqual(self.report('h1', boot='b-2')[0], 200)
+        self.assertEqual(self.ch.authority()[1].down['h1']['boot'], 'b-2')
+        # the end of an earlier stop does not end it
+        self.assertIsNone(self.ch.host_up('h1', 'b-1'))
+        self.assertEqual((self.ch.authority()[1].down['h1']['boot'], self.sets()), ('b-2', [('osd set-group', ['h1'])]))
+        self.assertIsNone(self.ch.host_up('h1', 'b-2'))
+        self.assertEqual((list(self.ch.authority()[1].down), self.sets()[-1]), (['h2'], ('osd unset-group', ['h1'])))
+
+
+class DrainCallsTest(unittest.TestCase):
+    """plan 04, step 5: a drain's steps through the removals' calls."""
+    setUp, call = LedgerCallsTest.setUp, LedgerCallsTest.call
+    fold = MaintenanceCallsTest.fold
+
+    def drain(self, host='h1'):
+        return self.led.append({'id': 'op-%016x' % 700, 'kind': 'drain_host', 'host': host, 'zap': False})[1]['id']
+
+    def test_osds_out_at_once_then_each_removed(self):
+        inv = inventory('mon.h1@h1', 'mon.h2@h2', 'mgr.h1@h1', 'mgr.h2@h2', 'rgw.h1@h1', 'osd.3@h1', 'osd.4@h1', 'osd.5@h2')
+        for d in inv['daemons']:
+            if d['daemon_type'] == 'osd':
+                d['osd_uuid'] = '00000000-0000-4000-8000-00000000000%s' % d['daemon_id']
+        self.ch.authority = lambda: (self.led, lg.Fold(inv, self.led.executable()))
+        op = self.drain()
+        self.assertEqual(self.call('osd out', operation=op)[1]['outcome'], 'done')
+        self.assertEqual(self.mons.osd_calls, ['osd out'])
+        self.mons.osds = [{'osd': i, 'uuid': '00000000-0000-4000-8000-00000000000%d' % i, 'up': True, 'in': False} for i in (3, 4, 5)]
+        self.mons.safe = [3]
+        self.assertEqual(self.call('drain', operation=op, daemon='osd.3')[1]['outcome'], 'done')
+        # osd.3's drained entry does not count for osd.4
+        self.assertEqual(self.call('drain', operation=op, daemon='osd.4')[0], 409)
+        self.assertEqual(self.call('retire', operation=op, daemon='osd.3')[0], 409)  # still up
+        self.mons.osds[0]['up'] = False
+        self.assertEqual(self.call('retire', operation=op, daemon='osd.3')[1]['outcome'], 'done')
+        self.assertNotIn('osd.3', self.ch.authority()[1].daemons)
+        self.assertEqual(self.call('retire', operation=op, daemon='osd.3')[1]['outcome'], 'done')  # once
+        # only daemons of the drained host
+        for call, daemon in (('drain', 'osd.5'), ('drain', 'osd.9'), ('mon rm', 'mon.h2'), ('retire', 'mgr.h2')):
+            self.assertEqual(self.call(call, operation=op, daemon=daemon)[0], 400, (call, daemon))
+        self.assertEqual(self.call('retire', operation=op, daemon='rgw.h1')[1]['outcome'], 'done')
+        self.assertIn('client.rgw.h1', self.mons.auth_rm)
+        self.mons.maps = [dict(mgrmap(42, 'h1'), standbys=[{'gid': 50, 'name': 'h2', 'available': True}])]
+        self.assertEqual(self.call('mgr fail', operation=op, gid=42)[1]['outcome'], 'done')
+        self.assertIn(('mgr fail', '42'), self.mons.maint_calls)
+        self.mons.monmap, self.mons.quorum = ['h1', 'h2'], ['h1', 'h2']
+        self.assertEqual(self.call('mon rm', operation=op, daemon='mon.h1')[1]['outcome'], 'done')
+        self.assertEqual(self.mons.mon_rm, ['h1'])
+        self.assertEqual(self.call('drain done', operation=op)[1]['outcome'], 'done')
+        self.assertEqual(self.call('drain done', operation=op)[1]['outcome'], 'done')
+        self.assertEqual([e['kind'] for _, e in self.led.executable()].count('drain_done'), 1)
+        self.assertEqual(self.ch.authority()[1].draining, {})
+        # an ended drain authorizes nothing
+        self.assertEqual(self.call('osd out', operation=op)[0], 400)
+        self.assertEqual(self.call('retire', operation=op, daemon='mgr.h1')[0], 400)
 
 
 class UpgradeCallsTest(unittest.TestCase):

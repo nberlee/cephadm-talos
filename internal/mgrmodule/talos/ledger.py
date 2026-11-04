@@ -50,7 +50,9 @@ KINDS = ('restart', 'redeploy', 'add_daemon', 'remove_daemon', 'remove_host', 'c
          # renewals the module accepts by itself (plan 04, step 1)
          'renew_mgr', 'renew_rgw_cert',
          # an agent's certificates and the agents' image (plan 04, step 2)
-         'renew_agent', 'upgrade_agent', 'upgrade_agent_resume', 'upgrade_agent_stop')
+         'renew_agent', 'upgrade_agent', 'upgrade_agent_resume', 'upgrade_agent_stop',
+         # a host's drain and its controls (plan 04, step 5)
+         'drain_host', 'drain_stop', 'drain_resume')
 # the upgrade's kinds, operations and module entries: about the cluster, without a host
 UPGRADE_CONTROLS = ('upgrade_pause', 'upgrade_resume', 'upgrade_stop')
 UPGRADE_KINDS = ('upgrade_start',) + UPGRADE_CONTROLS + ('upgrade_done', 'upgrade_refused')
@@ -59,7 +61,9 @@ HOSTLESS = UPGRADE_KINDS + ('rgw_cert', 'rgw_cert_done', 'apply_ingress', 'renew
 VIP_RE = re.compile(r'\A(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}/(?:3[0-2]|[12]?\d)\Z')
 IMAGE_RE = re.compile(r'\A[a-z0-9][a-z0-9._/:-]{0,254}@sha256:[0-9a-f]{64}\Z')
 # kinds that are about a whole host: every other operation on it waits for them
-HOST_KINDS = ('remove_host', 'enter_maintenance', 'exit_maintenance', 'powercycle_host', 'add_host')
+HOST_KINDS = ('remove_host', 'enter_maintenance', 'exit_maintenance', 'powercycle_host', 'add_host', 'drain_host')
+# a drain's controls: run ahead of queued operations, never refused for a busy host
+DRAIN_CONTROLS = ('drain_stop', 'drain_resume')
 LABEL_RE = re.compile(r'\A[A-Za-z0-9._-]{1,64}\Z')
 ADDR_RE = re.compile(r'\A[0-9A-Fa-f:.]{2,45}\Z')
 # kinds that stop a host's daemons, and that start them again
@@ -67,7 +71,19 @@ STOPS, STARTS = ('enter_maintenance', 'powercycle_host'), ('exit_maintenance', '
 # the module's own entries (ids m-<hex>), which carry out a removal: close a
 # daemon's generation, retire the daemon, retire a host; end a host's maintenance
 MODULE_KINDS = ('close', 'retire', 'retire_host', 'bind', 'confirm', 'close_create', 'drained', 'maintained', 'upgrade_done', 'upgrade_refused',
-                'rgw_cert', 'rgw_cert_done', 'mgr_cert', 'mgr_cert_done', 'agent_cert', 'agent_cert_done')
+                'rgw_cert', 'rgw_cert_done', 'mgr_cert', 'mgr_cert_done', 'agent_cert', 'agent_cert_done',
+                # a drain's end, and the noout ownership with the unplanned stops (plan 04, step 5)
+                'drain_done', 'noout_intent', 'noout', 'noout_keep', 'host_down', 'host_up')
+# module entries without an operation (of absent), or with one if a leader's
+# operation caused them (maintenance's noout)
+NOOUT_KINDS = ('noout_intent', 'noout', 'noout_keep', 'host_down', 'host_up')
+NO_OF_KINDS = ('noout_keep', 'host_down', 'host_up')
+# why the module holds a host's noout: generic names (maintenance, unplanned, move)
+REASON_RE = re.compile(r'\A[a-z][a-z0-9_-]{0,31}\Z')
+UNPLANNED = 'unplanned'
+# a Talos boot id
+BOOT_RE = re.compile(r'\A[A-Za-z0-9._-]{1,64}\Z')
+ISO_RE = re.compile(r'\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z')
 # an RGW serving certificate's id (internal/state RGWCert): generated, the operator's, the CLI's
 RGW_CERT_RE = re.compile(r'\A(?:issued/op-[0-9a-f]{16}/[0-9a-f]{16}|user/op-[0-9a-f]{16}|cli)\Z')
 DEVICE_RE = re.compile(r'\A/dev/[A-Za-z0-9][A-Za-z0-9._:/-]{0,200}\Z')
@@ -82,7 +98,7 @@ TERMINAL = ('completed', 'nochange', 'failed', 'refused', 'abandoned')
 
 # snapshots (plan 04, step 4)
 SNAPSHOT_PREFIX = 'cephadm-talos/ledger-snapshot/'
-SNAPSHOT_SCHEMA = 1
+SNAPSHOT_SCHEMA = 2
 SNAPSHOT_KEY_RE = re.compile(r'\Acephadm-talos/ledger-snapshot/(\d{20}-\d{10}-(?:takeover|op-[0-9a-f]{16}|m-[0-9a-f]{16}))/(manifest|[0-9a-f]{16}-\d{1,6})\Z')
 # chunks are named <nonce>-<i>, the nonce one per publication: two writers of
 # the same cut never write the same chunk key, and a manifest names only its own
@@ -142,7 +158,12 @@ def check_entry(key: str, raw: str) -> Dict[str, Any]:
     if e['seq'] < 1 or not (ok_host or kind in HOSTLESS and 'host' not in e):
         raise LedgerError('entry %s' % key)
     if e['id'].startswith('m-'):
-        if kind not in MODULE_KINDS or not isinstance(e.get('of'), str) or not OP_RE.match(e['of']):
+        if kind not in MODULE_KINDS:
+            raise LedgerError('module entry %s' % key)
+        if kind in NOOUT_KINDS:
+            if 'of' in e and (kind in NO_OF_KINDS or not isinstance(e['of'], str) or not OP_RE.match(e['of'])):
+                raise LedgerError('module entry %s' % key)
+        elif not isinstance(e.get('of'), str) or not OP_RE.match(e['of']):
             raise LedgerError('module entry %s' % key)
         if kind in ('close', 'retire', 'drained') and not ok_daemon:
             raise LedgerError('module entry %s' % key)
@@ -173,6 +194,14 @@ def check_entry(key: str, raw: str) -> Dict[str, Any]:
             raise LedgerError('agent_cert entry %s' % key)
         if kind == 'agent_cert_done' and not (isinstance(e.get('keep'), str) and OP_RE.match(e['keep'])):
             raise LedgerError('agent_cert_done entry %s' % key)
+        if kind in ('drain_done',) + NOOUT_KINDS and daemon is not None:
+            raise LedgerError('%s entry %s' % (kind, key))
+        if kind in ('noout_intent', 'noout') and not (isinstance(e.get('reason'), str) and REASON_RE.match(e['reason'])
+                                                      and type(e.get('on')) is bool and (kind == 'noout' or type(e.get('prior')) is bool)):
+            raise LedgerError('%s entry %s' % (kind, key))
+        if kind == 'host_down' and not (isinstance(e.get('boot'), str) and BOOT_RE.match(e['boot'])
+                                        and isinstance(e.get('at'), str) and ISO_RE.match(e['at'])):
+            raise LedgerError('host_down entry %s' % key)
         return e
     if kind not in KINDS or (e.get('request') is not None and not (isinstance(e['request'], str) and UUID_RE.match(e['request']))):
         raise LedgerError('operation entry %s' % key)
@@ -229,6 +258,15 @@ def check_entry(key: str, raw: str) -> Dict[str, Any]:
                                               for c in ('agent_cert', 'agent_client_cert'))
                                       and isinstance(labels, list) and len(labels) <= 32 and all(isinstance(x, str) and LABEL_RE.match(x) for x in labels)) \
                 or set(e) - {'version', 'id', 'kind', 'host', 'addr', 'agent_cert', 'agent_client_cert', 'labels', 'gid', 'epoch', 'seq', 'request', 'inputs'}:
+            raise LedgerError('operation entry %s' % key)
+        return e
+    if kind == 'drain_host':
+        if daemon is not None or type(e.get('zap')) is not bool or set(e) - {'version', 'id', 'kind', 'host', 'zap', 'gid', 'epoch', 'seq', 'request', 'inputs'}:
+            raise LedgerError('operation entry %s' % key)
+        return e
+    if kind in DRAIN_CONTROLS:
+        if daemon is not None or not isinstance(e.get('drain'), str) or not OP_RE.match(e['drain']) \
+                or set(e) - {'version', 'id', 'kind', 'host', 'drain', 'gid', 'epoch', 'seq', 'request', 'inputs'}:
             raise LedgerError('operation entry %s' % key)
         return e
     if kind in ('remove_host', 'exit_maintenance', 'powercycle_host'):
@@ -330,7 +368,7 @@ def cut_key(entries: Dict[str, Dict[str, Any]], states: Dict[str, str], applied:
         if e['id'] == 'takeover' or k not in valid:
             last = k
         elif e['id'].startswith('m-'):
-            if e['of'] not in ok and e['of'] in ids:
+            if e.get('of') is not None and e['of'] not in ok and e['of'] in ids:
                 break
             last = k
         elif states.get(e['id']) in TERMINAL and k <= applied and e['id'] not in pinned:
@@ -383,6 +421,7 @@ class Fold:
             'agent_renewals': self.agent_renewals, 'agent_retired': sorted(self.agent_retired), 'agent_upgrade': self.agent_upgrade,
             'cli_rgw': self.cli_rgw, 'vip': self.vip, 'ingress': self.ingress, 'vrrp_secret': self.vrrp_secret, 'rgw_port': self.rgw_port,
             'renewals_done': sorted(self.renewals_done), 'retired_by': sorted(self.retired_by),
+            'draining': self.draining, 'noout': self.noout, 'down': self.down,
             'positions': {o: n for o, n in self.positions.items() if o in keep}, 'count': self.count}))
 
     def _load(self, st: Dict[str, Any]) -> None:
@@ -395,6 +434,7 @@ class Fold:
         self.agent_renewals, self.agent_retired, self.agent_upgrade = st['agent_renewals'], set(st['agent_retired']), st['agent_upgrade']
         self.cli_rgw, self.vip, self.ingress, self.vrrp_secret, self.rgw_port = st['cli_rgw'], st['vip'], st['ingress'], st['vrrp_secret'], st['rgw_port']
         self.renewals_done, self.retired_by = set(st['renewals_done']), set(st['retired_by'])
+        self.draining, self.noout, self.down = st['draining'], st['noout'], st['down']
         self.positions = st['positions']
         self.count = st['count']
 
@@ -444,6 +484,19 @@ class Fold:
         # their journal's roll records are no longer read (plan 04, step 4)
         self.renewals_done: Set[str] = set()
         self.retired_by: Set[str] = set()
+        # hosts draining (plan 04, step 5): {'op', 'zap'} from the drain's
+        # acceptance until its drain_done entry or a drain_stop's acceptance
+        self.draining: Dict[str, Dict[str, Any]] = {}
+        # the noout ownership by host: the reasons the module holds the flag
+        # for, whether the operator owns it (set before the first reason, or
+        # handed over), and the intent of a change not completed yet
+        # {'reason', 'on', 'prior'}; the CLI's maintenance noout is the module's
+        self.noout: Dict[str, Dict[str, Any]] = {
+            h['name']: {'reasons': ['maintenance'], 'operator': False, 'intent': None}
+            for h in inventory['hosts'] if h.get('maintenance') and h.get('noout')}
+        # unplanned stops by host (a Talos reboot or shutdown its agent
+        # reported): {'boot', 'at', 'held'}, held once its reason was added
+        self.down: Dict[str, Dict[str, Any]] = {}
         # each operation's place in the executable entries, and how many there were
         self.positions: Dict[str, int] = {}
         self.count: int = 0
@@ -457,6 +510,9 @@ class Fold:
     def _apply(self, n: int, e: Dict[str, Any], positions: Dict[str, int]) -> None:
         positions[e['id']] = n
         kind = e['kind']
+        if kind in NOOUT_KINDS or kind in ('drain_host', 'drain_done') + DRAIN_CONTROLS:
+            self._apply_host(e)
+            return
         if kind == 'add_daemon' and e['daemon'].startswith('rgw.'):
             self.rgw_port = int(e['port'])
         if kind == 'retire':
@@ -479,6 +535,8 @@ class Fold:
         elif kind == 'retire_host' and not any(h == e['host'] for h in self.daemons.values()):
             self.hosts.pop(e['host'], None)
             self.maintenance.discard(e['host'])
+            for m in (self.draining, self.noout, self.down):
+                m.pop(e['host'], None)
         elif kind == 'add_host' and e['host'] not in self.hosts:
             self.hosts[e['host']] = e['addr']
         elif kind in STOPS and e['host'] in self.hosts:
@@ -532,6 +590,48 @@ class Fold:
             self.daemons[e['daemon']], self.generations[e['daemon']], self.uuids[e['daemon']] = c['host'], (e['of'], True), e['uuid']
         elif kind == 'close_create' and e['of'] in self.creations:
             self.creations[e['of']]['closed'] = True
+
+    def _apply_host(self, e: Dict[str, Any]) -> None:
+        """A drain's entries and the noout ownership's (plan 04, step 5)."""
+        kind, host = e['kind'], e['host']
+        if host not in self.hosts:
+            return
+        if kind == 'drain_host':
+            self.draining.setdefault(host, {'op': e['id'], 'zap': e['zap']})
+        elif kind == 'drain_stop' or kind == 'drain_done':
+            if self.draining.get(host, {}).get('op') == e.get('drain', e.get('of')):
+                del self.draining[host]
+        elif kind == 'host_down':
+            self.down[host] = {'boot': e['boot'], 'at': e['at'], 'held': False}
+        elif kind == 'host_up':
+            self.down.pop(host, None)
+        elif kind in ('noout_intent', 'noout', 'noout_keep'):
+            st = self.noout.setdefault(host, {'reasons': [], 'operator': False, 'intent': None})
+            it = st['intent']
+            if kind == 'noout_intent':
+                st['intent'] = {'reason': e['reason'], 'on': e['on'], 'prior': e['prior']}
+            elif kind == 'noout_keep':
+                st['reasons'], st['operator'], st['intent'] = [], False, None
+            else:
+                ours = it is not None and it['reason'] == e['reason'] and it['on'] == e['on']
+                if e['on']:
+                    # the first reason: the flag is the operator's if the intent saw it set
+                    if not st['reasons']:
+                        st['operator'] = bool(ours and it['prior'])
+                    st['reasons'] = sorted(set(st['reasons']) | {e['reason']})
+                    if e['reason'] == UNPLANNED and host in self.down:
+                        self.down[host]['held'] = True
+                else:
+                    st['reasons'] = [r for r in st['reasons'] if r != e['reason']]
+                    if not st['reasons']:
+                        st['operator'] = False
+                if ours:
+                    st['intent'] = None
+            if not st['reasons'] and st['intent'] is None:
+                del self.noout[host]
+
+    def noout_reasons(self, host: str) -> List[str]:
+        return list((self.noout.get(host) or {}).get('reasons') or [])
 
     def mgr_retiring(self, name: str, keep: str, host: str) -> Set[str]:
         """What a mgr_cert_done keeping a renewal retires: the mgr's other
@@ -885,7 +985,7 @@ class Ledger:
                     covered[g] = [e['epoch'], e['seq']]
         # positions a later entry may still name: an operation's module entries
         # can follow the cut, and a live RGW certificate's issuer
-        keep = {e['of'] for x, e in entries.items() if x > k and e['id'].startswith('m-')}
+        keep = {e['of'] for x, e in entries.items() if x > k and e['id'].startswith('m-') and e.get('of')}
         keep |= {cid.split('/')[1] for cid, c in fold.rgw_certs.items() if cid != 'cli' and not c['retired']}
         rows = [r for r in (snap or {}).get('lookup', []) if _parse_iso(r['at']) > now - LOOKUP_KEEP]
         for x, e in below:
