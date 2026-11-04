@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -62,6 +63,10 @@ type Granter struct {
 
 	// Leader is the agent's leader loop, paused while the agent is suspended
 	Leader *LeaderLoop
+
+	// retired: the agent's records were retired, or its certificate's serial
+	// has a retirement mark (plan 04, step 6); it refuses everything
+	retired atomic.Bool
 
 	mu chan struct{} // one grant at a time; a buffered channel so a waiter can give up
 	// reports admits one node report at a time
@@ -131,10 +136,12 @@ func (g *Granter) checkGrant(gr wire.Grant, leader string) error {
 		return errors.New("the grant's mgr is not the sender's host")
 	case pki.ValidName(gr.Mgr) != nil || gr.GID <= 0 || gr.Epoch <= 0 || gr.Revision <= 0 || !operationRe.MatchString(gr.Operation):
 		return errors.New("malformed grant")
-	case len(gr.Docs) == 0 && gr.Restart == nil && gr.Ack == nil && !gr.Reboot && gr.SelfUpdate == nil && gr.Pull == "":
+	case len(gr.Docs) == 0 && gr.Restart == nil && gr.Ack == nil && !gr.Reboot && gr.SelfUpdate == nil && gr.Pull == "" && !gr.Retire:
 		return errors.New("a grant without documents")
-	case (gr.SelfUpdate != nil || gr.Pull != "") && (len(gr.Docs) > 0 || gr.Restart != nil || gr.Ack != nil || gr.Reboot || gr.SelfUpdate != nil && gr.Pull != ""):
+	case (gr.SelfUpdate != nil || gr.Pull != "") && (len(gr.Docs) > 0 || gr.Restart != nil || gr.Ack != nil || gr.Reboot || gr.Retire || gr.SelfUpdate != nil && gr.Pull != ""):
 		return errors.New("a self-update or a pull with anything else")
+	case gr.Retire && (len(gr.Docs) > 0 || gr.Restart != nil || gr.Ack != nil || gr.Reboot):
+		return errors.New("a retirement with anything else")
 	case len(gr.Docs) > 0 && gr.Restart != nil:
 		return errors.New("a grant with documents and a restart")
 	case gr.Reboot && (len(gr.Docs) > 0 || gr.Restart != nil || gr.Ack != nil):
@@ -280,7 +287,7 @@ func (g *Granter) admitted(epoch int64) error {
 // completed (the ownership has its revision) or refused before its intent
 // (the ownership is older). The barrier guarantees nothing newer ran since.
 // What the node cannot tell stays unresolved. Called under the grant slot.
-func (g *Granter) reconcile(ctx context.Context) error {
+func (g *Granter) reconcile(ctx context.Context) (err error) {
 	outcome, rev, owned, err := g.Node.Reconcile(ctx)
 	if err != nil {
 		return err
@@ -291,10 +298,26 @@ func (g *Granter) reconcile(ctx context.Context) error {
 		return err
 	}
 
+	// a retirement decided completed whose records are still here: they are
+	// moved aside once the rest is reconciled
+	retire := false
+
+	defer func() {
+		if retire && err == nil {
+			err = g.finishRetire()
+		}
+	}()
+
 	for _, n := range names {
 		op, found, err := g.readOp(strings.TrimPrefix(n, "op-"))
 		if err != nil || !found {
 			return err
+		}
+
+		if op.Retire && op.State == wire.OpCompleted {
+			retire = true
+
+			continue
 		}
 
 		// a reservation left by a stop between reserving and starting never
@@ -433,6 +456,8 @@ func (g *Granter) reconcile(ctx context.Context) error {
 				return err
 			}
 
+			retire = retire || op.Retire && op.State == wire.OpCompleted
+
 			continue
 		}
 
@@ -502,6 +527,11 @@ func (g *Granter) grant(ctx context.Context, gr wire.Grant) (wire.Operation, err
 
 	if err := g.reconcile(ctx); err != nil {
 		return wire.Operation{}, err
+	}
+
+	// a retirement the reconcile finished: its records are gone
+	if g.Retired() {
+		return wire.Operation{}, errRetired
 	}
 
 	hash := wire.GrantInputs(gr)
@@ -608,6 +638,10 @@ func (g *Granter) grant(ctx context.Context, gr wire.Grant) (wire.Operation, err
 
 	if gr.Pull != "" {
 		return g.pull(ctx, gr, op, until)
+	}
+
+	if gr.Retire {
+		return g.retire(ctx, gr, op, until)
 	}
 
 	// an acknowledgement alone changes no document; its revision is fenced like
@@ -1097,6 +1131,12 @@ func (g *Granter) HandleNode(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	default:
+	}
+
+	if g.Retired() {
+		http.Error(w, errRetired.Error(), http.StatusGone)
+
+		return
 	}
 
 	rep, err := g.Node.Report(ctx)

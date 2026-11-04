@@ -633,6 +633,11 @@ var uuidRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4
 
 // recordsJob is the recovery job's command: it reads the agent's records,
 // records the suspension with --session, and writes the report as its result.
+// With --retire it retires the records instead (plan 04, step 6): marks the
+// serials of their identity record and moves them aside; the caller has
+// checked that no agent document of the cluster is on the node. With
+// --serial, a host's journaled serial: --retire refuses records that do not
+// list it, and missing records under a retirement mark of it read as retired.
 func recordsJob(args []string) error {
 	fs := flag.NewFlagSet("records", flag.ExitOnError)
 	fsid := fs.String("fsid", "", "cluster fsid")
@@ -640,6 +645,9 @@ func recordsJob(args []string) error {
 	inputs := fs.String("inputs", "", "job inputs")
 	session := fs.String("session", "", "record the suspension for this recovery session")
 	settle := fs.Bool("settle-self", false, "first settle an interrupted self-update's apply intent as failed (agent restore)")
+	retire := fs.Bool("retire", false, "retire the records: mark their serials and move them aside (host forget, re-enrollment)")
+	serial := fs.String("serial", "", "the host's journaled agent server certificate serial (decimal)")
+	boot := fs.String("boot", "", "the node's boot id, as the caller read it from Talos (default: the kernel's)")
 	_ = fs.Parse(args)
 
 	jobs := filepath.Join(records.Mount, records.JobsDir)
@@ -651,12 +659,38 @@ func recordsJob(args []string) error {
 	}
 
 	dir := filepath.Join(records.Mount, records.RecordsDir, *fsid)
+	recs := &records.Store{Dir: dir}
 
 	rep, err := agent.RecordsReport{}, error(nil)
-	if _, err = os.Stat(dir); err != nil {
-		err = fmt.Errorf("no records of cluster %s on the node: %w", *fsid, err)
-	} else {
-		recs, settled := &records.Store{Dir: dir}, ""
+
+	switch {
+	case *retire && (*settle || *session != ""):
+		err = errors.New("--retire goes alone")
+	case *retire:
+		b := *boot
+		if b == "" {
+			b = kernelBootID()
+		}
+
+		rep, err = agent.RetireRecords(recs, *serial, b, time.Now())
+	default:
+		if _, err = os.Stat(dir); err != nil {
+			// moved aside under the host's serial: retired, not missing
+			retired, found, rerr := agent.RetiredRecords(dir, *serial)
+
+			switch {
+			case rerr != nil:
+				err = rerr
+			case found:
+				rep, err = retired, nil
+			default:
+				err = fmt.Errorf("no records of cluster %s on the node: %w", *fsid, err)
+			}
+
+			break
+		}
+
+		settled := ""
 		if *settle {
 			settled, err = agent.SettleSelfUpdate(recs)
 		}
@@ -681,4 +715,15 @@ func recordsJob(args []string) error {
 	}
 
 	return agent.WriteJobResult(jobs, *fsid, *job, *inputs, 0, out)
+}
+
+// kernelBootID is the node's boot id as Talos reports it (its BootID resource
+// is this file), "" if the job cannot read it.
+func kernelBootID() string {
+	b, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
+	if err != nil {
+		return ""
+	}
+
+	return strings.TrimSpace(string(b))
 }

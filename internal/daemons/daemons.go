@@ -348,6 +348,27 @@ func RecordsSettleJob(name, image, fsid, job, inputs string) *spec.ContainerConf
 	return c
 }
 
+// RecordsRetireJob is RecordsJob that retires the records (plan 04, step 6:
+// `host forget`, an enrollment over a non-member's records): it marks the
+// serials of their identity record and moves them aside, refusing records
+// that do not list serial (when given) or whose apply intent has not settled
+// on boot (the node's boot id the caller read, "" for the kernel's). The
+// caller checks first that no agent document of the cluster is on the node.
+func RecordsRetireJob(name, image, fsid, job, inputs, serial, boot string) *spec.ContainerConfig {
+	c := RecordsJob(name, image, fsid, job, inputs, "")
+	c.ContainerEntrypoint = append(c.ContainerEntrypoint, "--retire")
+
+	if serial != "" {
+		c.ContainerEntrypoint = append(c.ContainerEntrypoint, "--serial", serial)
+	}
+
+	if boot != "" {
+		c.ContainerEntrypoint = append(c.ContainerEntrypoint, "--boot", boot)
+	}
+
+	return c
+}
+
 // Probe renders a container that prints the Ceph version and architecture of
 // an image and exits, read back from its log. Unlike a Job it needs nothing from
 // a cluster (no records volume, no ceph.conf), so it runs before bootstrap.

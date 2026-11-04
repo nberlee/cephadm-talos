@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -81,6 +82,8 @@ type Record struct {
 	// the agent reported once it was evidently cancelled (plan 04, step 5)
 	Boot          string `json:"boot,omitempty"`
 	StopCancelled string `json:"stop_cancelled,omitempty"`
+	// Retired: the agent is retired (plan 04, step 6) and refuses everything
+	Retired bool `json:"retired,omitempty"`
 }
 
 // Agent keeps the last complete observation of its node.
@@ -355,6 +358,10 @@ func (a *Agent) observe(ctx context.Context) error {
 		}
 	}
 
+	if a.Granter != nil && a.Granter.Retired() {
+		rec.Retired = true
+	}
+
 	if a.Node != nil {
 		st := a.Node.Status(ctx)
 		rec.Node = &st
@@ -433,19 +440,33 @@ func (a *Agent) Handler() http.Handler {
 		mux.HandleFunc("POST /v1/heartbeat", a.Channel.HandleHeartbeat)
 	}
 
-	if a.Granter != nil {
-		mux.HandleFunc("POST /v1/grant", a.Granter.HandleGrant)
-		mux.HandleFunc("GET /v1/operations/{id}", a.Granter.HandleOperation)
-		mux.HandleFunc("POST /v1/handoff", a.Granter.HandleHandoff)
-		mux.HandleFunc("POST /v1/suspend", a.Granter.HandleSuspend)
-		mux.HandleFunc("GET /v1/suspend", a.Granter.HandleSuspendState)
-		mux.HandleFunc("POST /v1/readopt", a.Granter.HandleReadopt)
-		mux.HandleFunc("POST /v1/activate", a.Granter.HandleActivate)
-		mux.HandleFunc("GET /v1/node", a.Granter.HandleNode)
-		mux.HandleFunc("POST /v1/abandon", a.Granter.HandleAbandon)
-		mux.HandleFunc("POST /v1/close", a.Granter.HandleClose)
-		mux.HandleFunc("POST /v1/resolve", a.Granter.HandleResolve)
-		mux.HandleFunc("GET /v1/resolve", a.Granter.HandleResolve)
+	if g := a.Granter; g != nil {
+		// a retired agent answers every request of the channel with 410 Gone
+		// (plan 04, step 6): its records are retired, nothing is done anymore
+		handle := func(pattern string, h http.HandlerFunc) {
+			mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
+				if g.Retired() {
+					http.Error(w, errRetired.Error(), http.StatusGone)
+
+					return
+				}
+
+				h(w, r)
+			})
+		}
+
+		handle("POST /v1/grant", g.HandleGrant)
+		handle("GET /v1/operations/{id}", g.HandleOperation)
+		handle("POST /v1/handoff", g.HandleHandoff)
+		handle("POST /v1/suspend", g.HandleSuspend)
+		handle("GET /v1/suspend", g.HandleSuspendState)
+		handle("POST /v1/readopt", g.HandleReadopt)
+		handle("POST /v1/activate", g.HandleActivate)
+		handle("GET /v1/node", g.HandleNode)
+		handle("POST /v1/abandon", g.HandleAbandon)
+		handle("POST /v1/close", g.HandleClose)
+		handle("POST /v1/resolve", g.HandleResolve)
+		handle("GET /v1/resolve", g.HandleResolve)
 	}
 
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
@@ -606,23 +627,61 @@ func Main(ctx context.Context) error {
 	// cluster on the same node must not inherit another one's ownership,
 	// session floor or fence
 	dir := filepath.Join(records.Mount, records.RecordsDir, self.FSID)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("records: %w", err)
+	recs := &records.Store{Dir: dir}
+	serial := leaf.SerialNumber.String()
+
+	// a certificate whose serial has a retirement mark (plan 04, step 6): the
+	// agent is retired, refuses everything and creates no records, so a
+	// re-enrolled agent of the node starts from none
+	retired, err := records.Marked(dir, serial)
+	if err != nil {
+		return err
 	}
 
-	recs := &records.Store{Dir: dir}
+	if retired {
+		log.Printf("the agent's certificate (serial %s) is retired: everything is refused", serial)
+
+		// marked, but stopped before the move: the move is finished, if the
+		// records there are this generation's
+		if id, found, err := readIdentity(recs); err == nil && found && slices.Contains(id.Serials, serial) {
+			if err := retireSet(recs); err != nil {
+				log.Printf("finishing the retirement of the records: %v", err)
+			}
+		}
+	} else if resumed, err := ResumeRetirement(recs); resumed {
+		// another serial of these records was marked: a retirement in
+		// progress, finished here; this generation is retired too
+		retired = true
+
+		log.Printf("the records' retirement was in progress (finished: %v): everything is refused", err == nil)
+	} else if err != nil {
+		return fmt.Errorf("records: %w", err)
+	} else {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return fmt.Errorf("records: %w", err)
+		}
+
+		// the records name the generations they ran under, before anything is served
+		if err := RecordIdentity(recs, serial); err != nil {
+			return fmt.Errorf("records: %w", err)
+		}
+	}
 
 	// the revocation list from the agent's records, installed before anything
 	// is served, and its policy (plan 04, step 3): a self-update or a restored
 	// document starts the agent with its records
 	revoked := NewCRLHolder(string(pems[0]), recs)
-	if err := revoked.Load(); err != nil {
-		log.Printf("the recorded revocation list: %v", err)
-	}
 
-	crlPolicy, err := LoadCRLPolicy(recs, os.Getenv(daemons.EnvCRLFailClosed) == "1", os.Getenv(daemons.EnvApprovalKey), self.FSID)
-	if err != nil {
-		return fmt.Errorf("records: %w", err)
+	var crlPolicy *CRLPolicy
+
+	if !retired {
+		if err := revoked.Load(); err != nil {
+			log.Printf("the recorded revocation list: %v", err)
+		}
+
+		if crlPolicy, err = LoadCRLPolicy(recs, os.Getenv(daemons.EnvCRLFailClosed) == "1", os.Getenv(daemons.EnvApprovalKey), self.FSID); err != nil {
+			return fmt.Errorf("records: %w", err)
+		}
 	}
 
 	ch.CRL = revoked
@@ -641,9 +700,17 @@ func Main(ctx context.Context) error {
 		},
 	}
 
-	// an apply interrupted by the last stop is decided from the node first
-	if err := a.Granter.Reconcile(ctx); err != nil {
+	if retired {
+		a.Granter.SetRetired()
+		a.CRL = nil // nothing of the records is taken or served
+	} else if err := a.Granter.Reconcile(ctx); err != nil {
+		// an apply interrupted by the last stop is decided from the node
+		// first; a retirement decided completed retires the records
 		log.Printf("reconciling the last operations: %v", err)
+	}
+
+	if a.Granter.Retired() {
+		log.Printf("the agent is retired")
 	}
 
 	// the node's stop sequences, reported to the module (plan 04, step 5); a

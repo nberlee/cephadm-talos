@@ -89,6 +89,9 @@ type applyIntent struct {
 	// is the grant's, for the self-update record that decides it
 	Self      bool   `json:"self,omitempty"`
 	Operation string `json:"operation,omitempty"`
+	// Retire marks a self apply that removes the agent's own documents, its
+	// retirement (plan 04, step 6); Self is set with it
+	Retire bool `json:"retire,omitempty"`
 }
 
 // ApplySettle is how long after an apply was sent its absence from the config

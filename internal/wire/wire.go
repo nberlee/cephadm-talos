@@ -130,6 +130,11 @@ type Grant struct {
 	// Pull, instead of documents, has the agent pull this image (by digest)
 	// on its own node
 	Pull string `json:"pull,omitempty"`
+	// Retire, instead of documents, has the agent retire (plan 04, step 6):
+	// owning no document, it removes its own documents through its own
+	// socket, and once that is decided completed it moves its records aside
+	// and marks the serials of its certificates as retired
+	Retire bool `json:"retire,omitempty"`
 }
 
 // SelfUpdate is what a self-update changes in the agent's own documents: its
@@ -194,7 +199,8 @@ func GrantInputs(g Grant) string {
 		Ack       *JobAck          `json:"ack,omitempty"`
 		Self      *SelfUpdate      `json:"self_update,omitempty"`
 		Pull      string           `json:"pull,omitempty"`
-	}{g.FSID, g.Host, g.Revision, g.Operation, g.Docs, g.Restart, g.Reboot, g.Approval, g.Ack, g.SelfUpdate, g.Pull})
+		Retire    bool             `json:"retire,omitempty"`
+	}{g.FSID, g.Host, g.Revision, g.Operation, g.Docs, g.Restart, g.Reboot, g.Approval, g.Ack, g.SelfUpdate, g.Pull, g.Retire})
 
 	sum := sha256.Sum256(b)
 
@@ -246,6 +252,10 @@ type Operation struct {
 	// Pull: the grant pulls an image; one the agent's stop interrupted did
 	// not finish
 	Pull bool `json:"pull,omitempty"`
+	// Retire: the grant retires the agent; Self is set with it, so it is
+	// decided as a self-update is, from its apply intent or the record its
+	// decision left
+	Retire bool `json:"retire,omitempty"`
 	// a job's grant: the job, its result once read, and whether the leader
 	// acknowledged it (until then the record is kept)
 	Job    *JobRef    `json:"job,omitempty"`

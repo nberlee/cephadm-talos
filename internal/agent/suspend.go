@@ -62,6 +62,11 @@ func (g *Granter) readSuspension() (suspension, bool, error) {
 // suspended refuses while the agent is suspended; an unreadable record counts
 // as a suspension.
 func (g *Granter) suspended() error {
+	// retired: nothing is done anymore, whatever the records say
+	if g.Retired() {
+		return errRetired
+	}
+
 	s, found, err := g.readSuspension()
 	if err != nil {
 		return fmt.Errorf("the suspension record: %w", err)
