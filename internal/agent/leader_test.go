@@ -1106,7 +1106,7 @@ func TestLeaderAddsAndRemovesAMgr(t *testing.T) {
 	mgrDoc := "ContainerConfig/ceph-" + testFSID[:8] + "-mgr-h1"
 
 	// with its guard (plan 04, step 5, item 2b)
-	guardDoc := "ContainerConfig/ceph-" + testFSID[:8] + "-mgr-guard-h1"
+	guardDoc := "ContainerConfig/ceph-" + testFSID[:8] + "-mgrguard-h1"
 	if _, ok := rev.Docs[mgrDoc]; !ok || rev.Docs[guardDoc] == "" || rev.Docs["EtcFileConfig/ceph/talos/mgr-server.key"] == "" {
 		t.Fatalf("granted %v", rev.Docs)
 	}

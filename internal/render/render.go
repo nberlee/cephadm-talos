@@ -205,7 +205,7 @@ func Daemon(s *state.State, h state.Host, d state.Daemon, image string, key Key,
 
 // TypeMgrGuard is the document type of a mgr's guard (daemons.MgrGuard): not
 // a daemon of the state, rendered with its mgr.
-const TypeMgrGuard = "mgr-guard"
+const TypeMgrGuard = "mgrguard"
 
 // MgrGuardName is the document of a mgr's guard.
 func MgrGuardName(s *state.State, mgr state.Daemon) string {

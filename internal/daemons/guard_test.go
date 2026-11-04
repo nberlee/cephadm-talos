@@ -11,7 +11,7 @@ import (
 )
 
 func TestTheMgrGuard(t *testing.T) {
-	c := MgrGuard("ceph-f-mgr-guard-h1", "quay.io/ceph/ceph@sha256:aa", "f", "h1", "ceph-f-mgr-h1")
+	c := MgrGuard("ceph-f-mgrguard-h1", "quay.io/ceph/ceph@sha256:aa", "f", "h1", "ceph-f-mgr-h1")
 
 	// no capabilities, no mounts, no network of the host
 	if c.SecurityConfig == nil || c.SecurityConfig.SecurityProfile != config.ContainerSecurityProfileRestricted || len(c.SecurityConfig.CapabilitiesAdd()) != 0 ||
