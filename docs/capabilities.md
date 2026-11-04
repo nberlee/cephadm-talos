@@ -54,7 +54,7 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `create_osds` | implemented | write path (plan 03): one disk on one host, nothing else of a drive group; the disk approved by the operator |
 | `daemon_action` | implemented | write path (plan 03): restart and redeploy (without an image); not start, stop, reconfig or rotate-key |
 | `describe_service` | milestone 5 |  |
-| `drain_host` | implemented | plan 04 step 5: every OSD out at once, each OSD removed after its drain, then the RGW, the mgr (failed over first), the mon (while the rest keep quorum), one step at a time; `--zap-osd-devices`; not with `--force` or `--keep-conf-keyring`; refused for a host of the ingress, the last mgr's, a mon host leaving fewer than three mons; again on a paused drain resumes it |
+| `drain_host` | implemented | plan 04 step 5: every OSD out at once, each OSD removed after its drain, then the RGW, the mgr (failed over first), the mon (while the rest keep quorum), one step at a time; `--zap-osd-devices`; not with `--force` or `--keep-conf-keyring`; refused for a host of the ingress, the last mgr's, a mon host leaving fewer than three mons, and while a host's move is unfinished; again on a paused drain resumes it |
 | `enter_host_maintenance` | implemented | write path (plan 03): with `--force`; not with `--yes-i-really-mean-it` |
 | `exit_host_maintenance` | implemented | write path (plan 03): not with `--force` or `--offline` |
 | `generate_certificates` | milestone 5 |  |
@@ -110,7 +110,7 @@ The first four sections are checked against the Ceph source by `hack/capabilitie
 | `tuned_profile_ls` | milestone 5 |  |
 | `tuned_profile_rm_setting` | milestone 5 |  |
 | `tuned_profile_rm_settings` | milestone 5 |  |
-| `update_host_addr` | implemented | plan 04 step 5: an IP of the same family, confirmed on the node through its agent at the new address before it becomes the host's; then the RGW (keepalived back last, after its peers), the mgr (failed over first), the OSDs (under noout), the mon (out of the monmap, back with a fresh store), `mon_host` everywhere, the agent's and mgr's certificates; refused in maintenance, draining, during an upgrade, an agent upgrade, an ingress apply, an RGW certificate renewal or RGW add, or another move, for another host's address, a mon host with fewer than three mons, the active mgr's host without a standby; again on a paused move resumes it. cephadm only records the address its SSH connection uses |
+| `update_host_addr` | implemented | plan 04 step 5: an IP of the same family, confirmed on the node through its agent at the new address before it becomes the host's; then the RGW (keepalived back last, after its peers), the mgr (failed over first), the OSDs (under noout), the mon (out of the monmap, back with a fresh store), `mon_host` everywhere, the agent's and mgr's certificates; refused in maintenance, during a drain of any host, an upgrade, an agent upgrade, an ingress apply, an RGW certificate renewal or RGW add, or another move, for another host's address, a mon host with fewer than three mons, the active mgr's host without a standby; again on a paused move resumes it. cephadm only records the address its SSH connection uses |
 | `update_service` | milestone 5 |  |
 | `upgrade_available` | milestone 5 |  |
 | `upgrade_check` | milestone 5 |  |

@@ -692,3 +692,82 @@ func TestAResumedCertsStepGrantsAnew(t *testing.T) {
 		t.Fatalf("issued %d times: %v", n, s.calls())
 	}
 }
+
+// A drain and a move exclude each other cluster-wide (Codex round 2 of part
+// B): neither starts while the other is recorded, and as a guard neither's
+// steps run while the other is recorded.
+func TestADrainAndAMoveExcludeEachOther(t *testing.T) {
+	s := newLeaderSetup(t)
+	ctx := context.Background()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	record := func(change func(st *state.State)) {
+		must(t, s.leader.changeState(ctx, s.leader.bridge(), 42, func(st *state.State) error { change(st); return nil }))
+	}
+
+	moveOp, drainOp := "op-00000000000000c1", "op-00000000000000c2"
+
+	// a move recorded on h0: a drain of h1 is refused and closed in the fold
+	record(func(st *state.State) {
+		h, _ := st.Host("h0")
+		h.Move = &state.Move{Op: moveOp, From: "10.5.0.2", To: "10.5.0.8", Paused: true}
+		st.AddHost(h)
+	})
+
+	drain := s.accept(KindDrain, "", "h1", 1)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if r := s.op(t, drain.Op.ID); r.State != JournalFailed || !strings.Contains(r.Error, "changing") || !slices.Contains(s.calls(), "drain done "+drain.Op.ID) {
+		t.Fatalf("drain %+v, calls %v", r, s.calls())
+	}
+
+	// a drain recorded on h1 instead: a move of h0 is refused and closed
+	record(func(st *state.State) {
+		h, _ := st.Host("h0")
+		h.Move = nil
+		st.AddHost(h)
+
+		h1, _ := st.Host("h1")
+		h1.Drain = &state.Drain{Op: drainOp, Paused: true}
+		st.AddHost(h1)
+	})
+
+	s.accept(KindSetAddr, "", "h0", 2)
+
+	s.module.mu.Lock()
+	s.module.ledger[len(s.module.ledger)-1].Op.Addr = "10.5.0.8"
+	mv := s.module.ledger[len(s.module.ledger)-1]
+	s.module.mu.Unlock()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if r := s.op(t, mv.Op.ID); r.State != JournalFailed || !strings.Contains(r.Error, "draining") || !slices.Contains(s.calls(), "addr set "+mv.Op.ID) {
+		t.Fatalf("move %+v, calls %v", r, s.calls())
+	}
+
+	// both recorded (a guard): neither's step runs
+	record(func(st *state.State) {
+		h, _ := st.Host("h0")
+		h.Move = &state.Move{Op: moveOp, From: "10.5.0.2", To: "10.5.0.8"}
+		st.AddHost(h)
+
+		h1, _ := st.Host("h1")
+		h1.Drain = &state.Drain{Op: drainOp}
+		st.AddHost(h1)
+	})
+
+	for range 2 {
+		must(t, s.leader.Tick(ctx, 42, 5))
+	}
+
+	st, _, err := s.leader.clusterState(ctx, s.leader.bridge())
+	must(t, err)
+
+	h0, _ := st.Host("h0")
+	h1, _ := st.Host("h1")
+
+	if h0.Move.Step != "" || h1.Drain.Step != "" || s.ended(moveOp+".m1") || s.ended(drainOp+".d1") {
+		t.Fatalf("a step ran: move %+v, drain %+v", h0.Move, h1.Drain)
+	}
+}

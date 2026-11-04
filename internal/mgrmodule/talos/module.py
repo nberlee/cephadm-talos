@@ -1598,6 +1598,10 @@ class Module(orchestrator.Orchestrator, MgrModule):
         others = self._drains(fold)
         if others:
             raise OrchestratorError('%s is draining' % ', '.join(sorted(others)))
+        # a drain's revisions (ceph.conf after its mon) would restore keepalived
+        # a move holds off: one at a time, cluster-wide (plan 04, step 5)
+        if self._moves(fold):
+            raise OrchestratorError('host addresses changing: %s (a drain waits until the move ends)' % ', '.join(sorted(self._moves(fold))))
         if hostname in fold.maintenance:
             raise OrchestratorError('%s is in maintenance (ceph orch host maintenance exit %s)' % (hostname, hostname))
         if fold.upgrade is not None:
@@ -1672,8 +1676,9 @@ class Module(orchestrator.Orchestrator, MgrModule):
             raise OrchestratorError('the address of %s is changing: one host at a time' % ', '.join(sorted(others)))
         if host in fold.maintenance:
             raise OrchestratorError('%s is in maintenance (ceph orch host maintenance exit %s)' % (host, host))
-        if host in self._drains(fold):
-            raise OrchestratorError('%s is draining' % host)
+        # a drain anywhere: its revisions would interfere with the move's steps
+        if self._drains(fold):
+            raise OrchestratorError('%s draining: the address change waits until the drain ends' % ', '.join(sorted(self._drains(fold))))
         if fold.upgrade is not None:
             raise OrchestratorError('an upgrade is in progress (operation %s)' % fold.upgrade['op'])
         agents = self._agent_upgrade_running(led)

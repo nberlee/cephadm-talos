@@ -1713,3 +1713,19 @@ class Move(unittest.TestCase):
         mod, _ = self.module(inv)
         mod._ledger.append({'id': 'op-%016x' % 5, 'kind': 'renew_rgw_cert'})
         self.assertIn('RGW certificates', m.Module.update_host_addr(mod, 'h2', '10.5.0.9').exception_str)
+
+    def test_a_drain_and_a_move_exclude_each_other(self):
+        """Codex round 2 of part B: a drain anywhere refuses a move, a move
+        anywhere refuses a drain, with the reason."""
+        inv = drain_inventory()
+        del inv['hosts'][4]['maintenance']
+        mod, _ = self.module(inv)
+        self.assertEqual(m.Module.update_host_addr(mod, 'h2', '10.5.0.9').exception_str, '')
+        res = m.Module.drain_host(mod, 'h3')
+        self.assertIn('h2', res.exception_str)
+        self.assertIn('waits until the move ends', res.exception_str)
+        mod, _ = self.module(inv)
+        mod._ledger.append({'id': 'op-%016x' % 6, 'kind': 'drain_host', 'host': 'h3', 'zap': False})
+        res = m.Module.update_host_addr(mod, 'h2', '10.5.0.9')
+        self.assertIn('h3 draining', res.exception_str)
+        self.assertEqual([e['kind'] for _, e in mod._ledger.executable()], ['drain_host'])

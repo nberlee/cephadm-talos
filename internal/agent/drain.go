@@ -80,8 +80,10 @@ func (l *LeaderLoop) drainStart(ctx context.Context, b *Bridge, js store.Backend
 		return refuse(fmt.Errorf("%s is in maintenance", h.Name))
 	}
 
-	if h.Move != nil {
-		return refuse(fmt.Errorf("the address of %s is changing", h.Name))
+	for _, x := range st.Hosts {
+		if x.Move != nil {
+			return refuse(fmt.Errorf("the address of %s is changing (operation %s)", x.Name, x.Move.Op))
+		}
 	}
 
 	if err := l.changeState(ctx, b, gid, func(st *state.State) error {
@@ -258,6 +260,12 @@ func (l *LeaderLoop) drainStep(ctx context.Context, b *Bridge, js store.Backend,
 	}
 
 	if !found {
+		return nil
+	}
+
+	// a move holds every drain step until it ends (plan 04, step 5): a
+	// drain's revisions would restore keepalived the move holds off
+	if moving(st) {
 		return nil
 	}
 

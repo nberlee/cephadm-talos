@@ -81,13 +81,15 @@ func (l *LeaderLoop) moveStart(ctx context.Context, b *Bridge, js store.Backend,
 		if x.Move != nil {
 			return refuse(fmt.Errorf("the address of %s is changing (operation %s)", x.Name, x.Move.Op))
 		}
+
+		if x.Drain != nil {
+			return refuse(fmt.Errorf("%s is draining (operation %s)", x.Name, x.Drain.Op))
+		}
 	}
 
 	switch {
 	case h.Maintenance:
 		return refuse(fmt.Errorf("%s is in maintenance", h.Name))
-	case h.Drain != nil:
-		return refuse(fmt.Errorf("%s is draining", h.Name))
 	case h.Addr == op.Addr:
 		return refuse(fmt.Errorf("%s has the address %s already", h.Name, op.Addr))
 	}
@@ -213,6 +215,12 @@ func (l *LeaderLoop) moveStep(ctx context.Context, b *Bridge, js store.Backend, 
 
 	i := slices.IndexFunc(st.Hosts, func(h state.Host) bool { return h.Move != nil })
 	if i < 0 {
+		return nil
+	}
+
+	// a drain recorded holds the move's steps until it ends: they exclude
+	// each other cluster-wide
+	if draining(st) {
 		return nil
 	}
 
