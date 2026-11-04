@@ -8,8 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nberlee/cephadm-talos/internal/render"
-	"github.com/nberlee/cephadm-talos/internal/spec"
 	"github.com/nberlee/cephadm-talos/internal/state"
 )
 
@@ -105,15 +103,6 @@ func (o *Orch) MaintenanceEnter(ctx context.Context, name string, force bool) er
 	for _, d := range daemons {
 		o.printf("stopping %s\n", displayName(d))
 
-		// a mgr with its guard, which names it, in one apply
-		if d.Type == state.TypeMgr {
-			if err := o.apply(ctx, h.Addr, spec.Delete("ContainerConfig", render.MgrGuardName(o.St, d)), spec.Delete("ContainerConfig", o.St.DocName(d))); err != nil {
-				return err
-			}
-
-			continue
-		}
-
 		if err := o.remove(ctx, h.Addr, o.St.DocName(d)); err != nil {
 			return err
 		}
@@ -157,12 +146,7 @@ func (o *Orch) MaintenanceExit(ctx context.Context, name string) error {
 
 			o.printf("starting %s\n", displayName(d))
 
-			docs := []any{doc}
-			if d.Type == state.TypeMgr {
-				docs = append(docs, render.MgrGuard(o.St, d, o.St.ImageOf(d)))
-			}
-
-			if err := o.apply(ctx, h.Addr, docs...); err != nil {
+			if err := o.apply(ctx, h.Addr, doc); err != nil {
 				return err
 			}
 

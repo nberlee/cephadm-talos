@@ -357,15 +357,3 @@ func TestAMovingHostRendersEachDaemonWhereItRuns(t *testing.T) {
 		t.Fatalf("h2's keepalived peers %v", env)
 	}
 }
-
-func TestAMgrsGuard(t *testing.T) {
-	s := state.New("f0123456-0000-4000-8000-000000000000")
-	s.Image = "quay.io/ceph/ceph@sha256:aa"
-	mgr := state.Daemon{Type: state.TypeMgr, ID: "h1", Host: "h1"}
-
-	g := MgrGuard(s, mgr, s.Image)
-	if g.MetaName != s.DocName(state.Daemon{Type: TypeMgrGuard, ID: "h1"}) || g.MetaName != MgrGuardName(s, mgr) ||
-		len(g.DependsOnConfig.ContainersConfig) != 1 || g.DependsOnConfig.ContainersConfig[0].DependencyName != s.DocName(mgr) {
-		t.Fatalf("guard %s depends on %+v", g.MetaName, g.DependsOnConfig.ContainersConfig)
-	}
-}

@@ -2082,11 +2082,6 @@ func (l *LeaderLoop) startHost(ctx context.Context, b *Bridge, js store.Backend,
 		} else {
 			rest = append(rest, "ContainerConfig/"+st.DocName(d))
 		}
-
-		// a mgr's guard waits with its mgr (it names it)
-		if d.Type == state.TypeMgr {
-			rest = append(rest, "ContainerConfig/"+render.MgrGuardName(st, d))
-		}
 	}
 
 	if mon {

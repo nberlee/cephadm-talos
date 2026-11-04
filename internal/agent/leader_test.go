@@ -1105,9 +1105,7 @@ func TestLeaderAddsAndRemovesAMgr(t *testing.T) {
 	rev := s.op(t, add.Op.ID+".rev")
 	mgrDoc := "ContainerConfig/ceph-" + testFSID[:8] + "-mgr-h1"
 
-	// with its guard (plan 04, step 5, item 2b)
-	guardDoc := "ContainerConfig/ceph-" + testFSID[:8] + "-mgr-guard-h1"
-	if _, ok := rev.Docs[mgrDoc]; !ok || rev.Docs[guardDoc] == "" || rev.Docs["EtcFileConfig/ceph/talos/mgr-server.key"] == "" {
+	if _, ok := rev.Docs[mgrDoc]; !ok || rev.Docs["EtcFileConfig/ceph/talos/mgr-server.key"] == "" {
 		t.Fatalf("granted %v", rev.Docs)
 	}
 
@@ -1142,12 +1140,7 @@ func TestLeaderAddsAndRemovesAMgr(t *testing.T) {
 		t.Fatalf("removal grant %v", rev.Docs)
 	}
 
-	// the guard removed with its mgr, in the same grant
-	if rev, ok := s.op(t, rm.Op.ID+".rev").Docs[guardDoc]; !ok || rev != "" {
-		t.Fatalf("removal grant: guard %q %t", rev, ok)
-	}
-
-	if rep, err := s.agent.Node.Report(ctx); err != nil || rep.Owned[mgrDoc] != "" || rep.Owned[guardDoc] != "" || rep.Owned["EtcFileConfig/ceph/talos/mgr-server.key"] != "" {
+	if rep, err := s.agent.Node.Report(ctx); err != nil || rep.Owned[mgrDoc] != "" || rep.Owned["EtcFileConfig/ceph/talos/mgr-server.key"] != "" {
 		t.Fatalf("still owned: %+v %v", rep.Owned, err)
 	}
 
@@ -1627,8 +1620,7 @@ func TestMaintenanceStopsAndStartsAHost(t *testing.T) {
 		return out
 	}
 
-	// the mon, the mgr and its guard (plan 04, step 5, item 2b)
-	if len(daemonDocs()) != 3 {
+	if len(daemonDocs()) != 2 {
 		t.Fatalf("documents before: %v", daemonDocs())
 	}
 
@@ -1654,7 +1646,7 @@ func TestMaintenanceStopsAndStartsAHost(t *testing.T) {
 		t.Fatalf("calls %v", calls)
 	}
 
-	if f := s.op(t, enter.Op.ID+".fail"); f.MgrGID != 42 || len(daemonDocs()) != 3 {
+	if f := s.op(t, enter.Op.ID+".fail"); f.MgrGID != 42 || len(daemonDocs()) != 2 {
 		t.Fatalf("mgr fail record %+v, documents %v", f, daemonDocs())
 	}
 
@@ -1680,8 +1672,7 @@ func TestMaintenanceStopsAndStartsAHost(t *testing.T) {
 		t.Fatal("the daemons left the state")
 	}
 
-	// the exit starts the mon first and waits for it in the quorum (the mgr's
-	// guard is held with its mgr)
+	// the exit starts the mon first and waits for it in the quorum
 	exit := s.accept(KindExitMaint, "", "h1", 3)
 	must(t, s.leader.Tick(ctx, 42, 5))
 
@@ -1695,7 +1686,7 @@ func TestMaintenanceStopsAndStartsAHost(t *testing.T) {
 
 	must(t, s.leader.Tick(ctx, 42, 5))
 
-	if op := s.op(t, exit.Op.ID); op.State != "completed" || len(daemonDocs()) != 3 {
+	if op := s.op(t, exit.Op.ID); op.State != "completed" || len(daemonDocs()) != 2 {
 		t.Fatalf("exit: %+v, documents %v", op, daemonDocs())
 	}
 
