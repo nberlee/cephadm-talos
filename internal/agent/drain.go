@@ -123,10 +123,18 @@ func (l *LeaderLoop) drainControl(ctx context.Context, b *Bridge, js store.Backe
 			return nil // ended already
 		}
 
-		if op.Kind == KindDrainStop {
+		switch {
+		case op.Kind == KindDrainStop && h.Drain.Paused:
+			// the failed step is given up: the drain ends
+			h.Drain.Stopped, h.Drain.Paused, h.Drain.Step = true, false, ""
+		case op.Kind == KindDrainStop:
 			h.Drain.Stopped = true
-		} else if h.Drain.Step == "" {
+		case h.Drain.Paused:
+			// the failed step runs again first, under a new attempt
 			h.Drain.Paused, h.Drain.Error = false, ""
+			if h.Drain.Step != "" {
+				h.Drain.Attempt++
+			}
 		}
 
 		st.AddHost(h)
@@ -223,13 +231,14 @@ func (l *LeaderLoop) drainStep(ctx context.Context, b *Bridge, js store.Backend,
 
 	d := *h.Drain
 
+	// paused: its failed step stays recorded until a resume or a stop
+	if d.Paused {
+		return nil
+	}
+
 	if d.Step == "" {
 		next := ""
 		if !d.Stopped {
-			if d.Paused {
-				return nil
-			}
-
 			next = drainNext(st, h, d)
 		}
 
@@ -251,7 +260,7 @@ func (l *LeaderLoop) drainStep(ctx context.Context, b *Bridge, js store.Backend,
 
 		if err := l.changeState(ctx, b, gid, func(st *state.State) error {
 			if x, ok := st.Host(h.Name); ok && x.Drain != nil && x.Drain.Op == d.Op && x.Drain.Step == "" {
-				x.Drain.Step, x.Drain.Attempt = next, x.Drain.Attempt+1
+				x.Drain.Step, x.Drain.Attempt, x.Drain.First = next, x.Drain.Attempt+1, x.Drain.Attempt+1
 				st.AddHost(x)
 			}
 
@@ -260,7 +269,7 @@ func (l *LeaderLoop) drainStep(ctx context.Context, b *Bridge, js store.Backend,
 			return err
 		}
 
-		d.Step, d.Attempt = next, d.Attempt+1
+		d.Step, d.Attempt, d.First = next, d.Attempt+1, d.Attempt+1
 	}
 
 	id := fmt.Sprintf("%s.d%d", d.Op, d.Attempt)
@@ -295,11 +304,16 @@ func (l *LeaderLoop) drainStep(ctx context.Context, b *Bridge, js store.Backend,
 			return nil
 		}
 
-		switch {
-		case ok && d.Step == drainStepOut && !slices.Contains(x.Drain.Done, drainStepOut):
-			x.Drain.Done = append(x.Drain.Done, drainStepOut)
-		case !ok && !x.Drain.Stopped:
+		if !ok && !x.Drain.Stopped {
+			// the step stays: a resume continues its removal first
 			x.Drain.Paused, x.Drain.Error = true, fmt.Sprintf("%s: %s %s", d.Step, s, rec.Error)
+			st.AddHost(x)
+
+			return nil
+		}
+
+		if ok && d.Step == drainStepOut && !slices.Contains(x.Drain.Done, drainStepOut) {
+			x.Drain.Done = append(x.Drain.Done, drainStepOut)
 		}
 
 		x.Drain.Step = ""
@@ -313,7 +327,7 @@ func (l *LeaderLoop) drainStep(ctx context.Context, b *Bridge, js store.Backend,
 // ended in the journal.
 func (l *LeaderLoop) drainRun(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, st *state.State, h state.Host, d state.Drain, id string) error {
 	op := LedgerOp{ID: d.Op, Kind: KindDrain, Host: h.Name, Zap: d.Zap}
-	r := removal{op: op, id: id, daemon: d.Step, zap: d.Zap}
+	r := removal{op: op, id: id, daemon: d.Step, zap: d.Zap, base: fmt.Sprintf("%s.d%d", d.Op, max(d.First, 1))}
 
 	if d.Step == drainStepOut {
 		r.daemon = "" // every OSD of the host
@@ -332,8 +346,13 @@ func (l *LeaderLoop) drainRun(ctx context.Context, b *Bridge, js store.Backend, 
 
 	switch typ {
 	case state.TypeOSD:
-		if x, ok := daemonOf(st, d.Step); ok && x.Host == h.Name {
+		x, ok := daemonOf(st, d.Step)
+		if ok && x.Host == h.Name {
 			r.uuid = x.OSDUUID
+		} else if d.Attempt != d.First {
+			// resumed after its removal ended: an OSD leaves the state last
+			// (purged, zapped or not, which the pause reported)
+			return r.finish(ctx, js, gid, wire.OpCompleted, nil)
 		}
 
 		return l.removeOSDAs(ctx, b, js, gid, epoch, r)

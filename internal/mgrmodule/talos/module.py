@@ -515,6 +515,9 @@ class Poller:
         if self.stop.is_set():
             return
         futures = {}
+        # when the poll started, on this process's monotonic clock: a record
+        # fetched by it is no older (plan 04, step 5)
+        started = time.monotonic()
         for h in hosts:
             try:
                 futures[h['name']] = self.executor.submit(self.fetch, h['addr'], refresh)
@@ -522,7 +525,10 @@ class Poller:
                 return
         for name, f in futures.items():
             try:
-                obs: Tuple[Optional[Dict[str, Any]], str] = (f.result(), '')
+                rec = f.result()
+                if isinstance(rec, dict):
+                    rec['fetched_mono'] = started
+                obs: Tuple[Optional[Dict[str, Any]], str] = (rec, '')
             except Exception as e:  # each host stands on its own
                 obs = (None, str(e) or e.__class__.__name__)
             with self.lock:
@@ -1643,12 +1649,20 @@ class Module(orchestrator.Orchestrator, MgrModule):
         _, fold = self._authority()
         obs = self._poller.snapshot()
         up = None
+        # when this process first saw each stop: only a status record fetched
+        # by a poll started after it shows the host back
+        seen = self.__dict__.setdefault('_down_seen', {})
+        for key in [k for k in seen if fold.down.get(k[0], {}).get('stop') != k[1]]:
+            del seen[key]
         for host in sorted(set(fold.noout) | set(fold.down)):
             osds = [int(n.split('.', 1)[1]) for n, h in fold.daemons.items() if h == host and n.startswith('osd.')]
             d = fold.down.get(host)
             try:
                 if d is not None:
+                    since = seen.setdefault((host, d['stop']), time.monotonic())
                     rec = obs.get(host, (None, ''))[0]
+                    if rec is not None and rec.get('fetched_mono', float('-inf')) <= since:
+                        rec = None  # fetched before this module saw the stop: no evidence
                     boot = (rec or {}).get('boot') or ''
                     # a cancellation counts only for the stop recorded (its id
                     # the agent's): a later stop on the same boot has another

@@ -927,13 +927,26 @@ type removal struct {
 	op     LedgerOp
 	id     string
 	daemon string // its ledger name
-	uuid   string // an OSD's
-	zap    bool
+	// base is the journal id the removal began under, which keeps a removed
+	// mgr's certificates for its retirement (a drain step resumed after a
+	// pause runs under a new id); "" is id
+	base string
+	uuid string // an OSD's
+	zap  bool
 }
 
 // removalOf is the removal an operation is.
 func removalOf(op LedgerOp) removal {
 	return removal{op: op, id: op.ID, daemon: op.Daemon, uuid: op.UUID, zap: op.Zap}
+}
+
+// certs is the journal id of the certificates a mgr's removal journals.
+func (r removal) certs() string {
+	if r.base != "" {
+		return r.base + ".certs"
+	}
+
+	return r.id + ".certs"
 }
 
 // call asks the module for one of the removal's steps.
@@ -1026,10 +1039,10 @@ func (l *LeaderLoop) removeDaemonAs(ctx context.Context, b *Bridge, js store.Bac
 		// a mgr's certificates, journaled before the state drops them: the
 		// module revokes them with its retirement (plan 04, step 3)
 		if typ == state.TypeMgr && (h.MgrServerCert != "" || h.MgrClientCert != "") {
-			if _, found, err := l.readJournal(ctx, b, js, gid, r.id+".certs"); err != nil {
+			if _, found, err := l.readJournal(ctx, b, js, gid, r.certs()); err != nil {
 				return err
 			} else if !found {
-				if err := writeJSONKey(ctx, js, rollKey(gid, r.id+".certs"), removedCerts{ServerCert: h.MgrServerCert, ClientCert: h.MgrClientCert}); err != nil {
+				if err := writeJSONKey(ctx, js, rollKey(gid, r.certs()), removedCerts{ServerCert: h.MgrServerCert, ClientCert: h.MgrClientCert}); err != nil {
 					return err
 				}
 			}
@@ -1074,7 +1087,7 @@ func (l *LeaderLoop) removeDaemonAs(ctx context.Context, b *Bridge, js store.Bac
 		}
 	}
 
-	certs, _, err := l.readJournal(ctx, b, js, gid, r.id+".certs")
+	certs, _, err := l.readJournal(ctx, b, js, gid, r.certs())
 	if err != nil {
 		return err
 	}

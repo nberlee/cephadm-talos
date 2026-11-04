@@ -1545,17 +1545,26 @@ class Lifecycle(unittest.TestCase):
         osd_up = [False]
         mod.get = lambda what: {'osds': [{'osd': 0, 'up': osd_up[0]}]} if what == 'osd_map' else None
         seen = datetime.datetime(2026, 11, 4, 10, 5, tzinfo=datetime.timezone.utc)
-        for rec, back in (({'boot': 'b-1', 'observed_at': seen}, False), (None, False), ({'boot': 'b-2', 'observed_at': seen}, False),
+        fresh = time.monotonic() + 3600  # fetched after the module saw the stop
+        for rec, back in (({'boot': 'b-1', 'observed_at': seen, 'fetched_mono': fresh}, False), (None, False), ({'boot': 'b-2', 'observed_at': seen, 'fetched_mono': fresh}, False),
                           # the cancellation of an earlier stop on the same boot (a cached
                           # poll): not this stop's, whatever the clocks say
-                          ({'boot': 'b-1', 'stop_cancelled': 'b-1.aa.0', 'observed_at': seen}, False)):
+                          ({'boot': 'b-1', 'stop_cancelled': 'b-1.aa.0', 'observed_at': seen, 'fetched_mono': fresh}, False)):
+            mod._channel.calls = []
+            mod._poller.observations = {'h1': (rec, '')}
+            m.Module._noout_tick(mod, now)
+            self.assertEqual(mod._channel.calls, [('reconcile', 'h1', True)], rec)
+        osd_up[0] = True
+        # another boot, or this stop cancelled, in a record fetched before the
+        # module saw the stop (the poller's cache): no evidence
+        for rec in ({'boot': 'b-0', 'observed_at': seen, 'fetched_mono': 0.0},
+                    {'boot': 'b-1', 'stop_cancelled': 'b-1.aa.1', 'observed_at': seen, 'fetched_mono': 0.0}, {'boot': 'b-0', 'observed_at': seen}):
             mod._channel.calls = []
             mod._poller.observations = {'h1': (rec, '')}
             m.Module._noout_tick(mod, now)
             self.assertEqual(mod._channel.calls, [('reconcile', 'h1', True)], rec)
         # a new boot with its OSDs up again, or the stop cancelled
-        osd_up[0] = True
-        for rec in ({'boot': 'b-2', 'observed_at': seen}, {'boot': 'b-1', 'stop_cancelled': 'b-1.aa.1', 'observed_at': seen}):
+        for rec in ({'boot': 'b-2', 'observed_at': seen, 'fetched_mono': fresh}, {'boot': 'b-1', 'stop_cancelled': 'b-1.aa.1', 'observed_at': seen, 'fetched_mono': fresh}):
             mod._channel.calls = []
             mod._poller.observations = {'h1': (rec, '')}
             m.Module._noout_tick(mod, now)
@@ -1564,9 +1573,17 @@ class Lifecycle(unittest.TestCase):
         self.down(mod, 'h5')
         osd_up[0] = False
         mod._channel.calls = []
-        mod._poller.observations = {'h5': ({'boot': 'b-9', 'observed_at': seen}, '')}
+        mod._poller.observations = {'h5': ({'boot': 'b-9', 'observed_at': seen, 'fetched_mono': fresh}, '')}
         m.Module._noout_tick(mod, now)
         self.assertIn(('up', 'h5', 'b-1.aa.1'), mod._channel.calls)
+
+    def test_the_poll_stamps_when_it_started(self):
+        p = m.Poller(lambda addr, refresh: {'boot': 'b-1'})
+        self.addCleanup(p.shutdown)
+        before = time.monotonic()
+        p.poll([{'name': 'h1', 'addr': '10.5.0.1'}])
+        rec = p.snapshot()['h1'][0]
+        self.assertTrue(before <= rec['fetched_mono'] <= time.monotonic())
 
     def test_health(self):
         mod, entries = self.module()

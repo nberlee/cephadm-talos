@@ -170,7 +170,7 @@ func TestADrainStopsPausesAndResumes(t *testing.T) {
 	must(t, s.leader.Tick(ctx, 42, 5))
 
 	d := s.drain(t)
-	if d == nil || !d.Paused || d.Step != "" || !strings.Contains(d.Error, "osd.3") {
+	if d == nil || !d.Paused || d.Step != "osd.3" || !strings.Contains(d.Error, "osd.3") {
 		t.Fatalf("record: %+v", d)
 	}
 
@@ -336,5 +336,54 @@ func TestADrainStepContinuesARemovalPastTheStateChange(t *testing.T) {
 
 	if r := s.op(t, drain.Op.ID+".d3"); r.State != "completed" || !slices.Contains(s.calls(), "retire "+drain.Op.ID+" mgr.h1") {
 		t.Fatalf("step %+v, calls %v", r, s.calls())
+	}
+}
+
+func TestAResumedDrainFinishesTheRemovalItPausedIn(t *testing.T) {
+	s, _ := drainSetup(t)
+	ctx := context.Background()
+
+	drain := s.accept(KindDrain, "", "h1", 2)
+	must(t, s.leader.Tick(ctx, 42, 5)) // the OSDs out
+	must(t, s.leader.Tick(ctx, 42, 5)) // the OSD removed
+
+	// the mgr leaves the state, its retirement keeps failing: the drain pauses
+	s.module.mu.Lock()
+	s.module.refuse = "retire"
+	s.module.mu.Unlock()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+	s.leader.failing[drain.Op.ID+".d3"] = time.Now().Add(-stuckAfter - time.Minute)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if d := s.drain(t); d == nil || !d.Paused || d.Step != "mgr.h1" || d.First != 3 {
+		t.Fatalf("record: %+v", d)
+	}
+
+	// resumed: the mgr's removal is finished first, under a new attempt, its
+	// certificates (journaled by the first) revoked with its retirement
+	resume := s.accept(KindDrainResume, "", "h1", 3)
+	resume.Op.Drain = drain.Op.ID
+	s.module.mu.Lock()
+	s.module.ledger[len(s.module.ledger)-1] = resume
+	s.module.refuse = ""
+	s.module.mu.Unlock()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	s.module.mu.Lock()
+	revoked := s.module.certs["retire "+drain.Op.ID]
+	s.module.mu.Unlock()
+
+	if r := s.op(t, drain.Op.ID+".d4"); r.State != "completed" || len(revoked) != 2 {
+		t.Fatalf("step %+v, %d certificates revoked", r, len(revoked))
+	}
+
+	for range 2 {
+		must(t, s.leader.Tick(ctx, 42, 5))
+	}
+
+	if got := s.calls(); !slices.Contains(got, "retire "+drain.Op.ID+" mgr.h1") || !slices.Contains(got, "drain done "+drain.Op.ID) {
+		t.Fatalf("calls %v", got)
 	}
 }

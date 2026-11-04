@@ -85,10 +85,13 @@ type Drain struct {
 	// at once) or the daemon it removes ("osd.3", "rgw.<host>", ...)
 	Step    string `json:"step,omitempty"`
 	Attempt int    `json:"attempt,omitempty"`
+	// First is the attempt the step began with: a failed step stays recorded
+	// while the drain is paused and runs again under a new attempt on resume
+	First int `json:"first,omitempty"`
 	// Done lists the steps that are not removals once they ended ("out")
 	Done []string `json:"done,omitempty"`
 	// Stopped by `drain stop`: no new step starts; Paused by a failed step
-	// (Error), until `ceph orch host drain` again resumes it
+	// (Error, the step kept), until `ceph orch host drain` again resumes it
 	Stopped bool   `json:"stopped,omitempty"`
 	Paused  bool   `json:"paused,omitempty"`
 	Error   string `json:"error,omitempty"`
