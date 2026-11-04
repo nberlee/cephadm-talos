@@ -160,7 +160,9 @@ func (o *Orch) execTargets(ctx context.Context, node string) ([]string, error) {
 		var names []string
 
 		for name, s := range st {
-			if strings.HasPrefix(name, prefix+typ+"-") && s.State == containers.ContainerStateRunning {
+			// a mgr's guard (mgr-guard-<host>) shares the mgr's prefix but has no
+			// ceph.conf, keyring or host network: never a target
+			if strings.HasPrefix(name, prefix+typ+"-") && !strings.HasPrefix(name, prefix+"mgr-guard-") && s.State == containers.ContainerStateRunning {
 				names = append(names, name)
 			}
 		}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -170,5 +171,32 @@ func TestParseJobResult(t *testing.T) {
 		if _, _, err := parseJobResult([]byte(bad)); err == nil {
 			t.Errorf("accepted %q", bad)
 		}
+	}
+}
+
+// A mgr's guard shares the mgr's name prefix but has no ceph.conf, keyring
+// or host network: Ceph commands never run in it.
+func TestExecTargetsSkipAMgrsGuard(t *testing.T) {
+	f := talostest.New(t)
+	o := fakeOrch(t, f)
+	ctx := context.Background()
+
+	prefix := "ceph-" + o.St.Short() + "-"
+	for _, name := range []string{prefix + "mgr-guard-h1", prefix + "mgr-h1", prefix + "mon-h1"} {
+		cs := containers.NewContainerStatus(containers.NamespaceName, name)
+		cs.TypedSpec().State = containers.ContainerStateRunning
+
+		if err := f.St.Create(ctx, cs); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	targets, err := o.execTargets(ctx, "node")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if want := []string{prefix + "mgr-h1", prefix + "mon-h1"}; !slices.Equal(targets, want) {
+		t.Fatalf("targets %v, want %v", targets, want)
 	}
 }
