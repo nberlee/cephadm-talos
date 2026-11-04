@@ -928,8 +928,8 @@ type removal struct {
 	id     string
 	daemon string // its ledger name
 	// base is the journal id the removal began under, which keeps a removed
-	// mgr's certificates for its retirement (a drain step resumed after a
-	// pause runs under a new id); "" is id
+	// mgr's certificates for its retirement and an OSD's zap job (a drain step
+	// resumed after a pause runs under a new id); "" is id
 	base string
 	uuid string // an OSD's
 	zap  bool
@@ -940,13 +940,18 @@ func removalOf(op LedgerOp) removal {
 	return removal{op: op, id: op.ID, daemon: op.Daemon, uuid: op.UUID, zap: op.Zap}
 }
 
-// certs is the journal id of the certificates a mgr's removal journals.
-func (r removal) certs() string {
+// started is the journal id the removal began under.
+func (r removal) started() string {
 	if r.base != "" {
-		return r.base + ".certs"
+		return r.base
 	}
 
-	return r.id + ".certs"
+	return r.id
+}
+
+// certs is the journal id of the certificates a mgr's removal journals.
+func (r removal) certs() string {
+	return r.started() + ".certs"
 }
 
 // call asks the module for one of the removal's steps.
@@ -1498,7 +1503,7 @@ func (l *LeaderLoop) removeOSDAs(ctx context.Context, b *Bridge, js store.Backen
 		// out of the state: the removal ended before its journal record; a zap
 		// it was asked for counts only if its job completed
 		if r.zap {
-			rec, ok, err := l.journalRecord(ctx, b, js, gid, r.id+".zap")
+			rec, ok, err := l.journalRecord(ctx, b, js, gid, r.started()+".zap")
 			if err != nil {
 				return err
 			}
@@ -1566,6 +1571,21 @@ func (l *LeaderLoop) removeOSDAs(ctx context.Context, b *Bridge, js store.Backen
 		return fmt.Errorf("%w: %v", errRetry, err)
 	}
 
+	// purged: recorded in the state, so the rest of the removal (its zap, the
+	// state's entry) is finished also after a drain's stop (plan 04, step 5)
+	if !d.Purged {
+		if err := l.changeState(ctx, b, gid, func(st *state.State) error {
+			if x, ok := daemonOf(st, r.daemon); ok && !x.Purged {
+				x.Purged = true
+				st.AddDaemon(x)
+			}
+
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+
 	var zapFailed error
 
 	if r.zap {
@@ -1605,7 +1625,9 @@ func (l *LeaderLoop) zapOSD(ctx context.Context, b *Bridge, js store.Backend, gi
 		return errZapFailed{fmt.Errorf("%s has no stable device and serial to zap", r.daemon)}
 	}
 
-	id := zapOf(r.id)
+	// the zap job and its phase belong to the removal's first attempt: a
+	// resumed drain step continues that job, never starts another
+	id := zapOf(r.started())
 	job := daemons.Zap(daemons.Params{
 		Name: st.DocName(state.Daemon{Type: "job", ID: id}), Image: st.Image, FSID: st.FSID, ID: "job",
 		Device: d.DevicePath, DiskSerial: d.DiskSerial, OSDUUID: d.OSDUUID,
@@ -1616,7 +1638,7 @@ func (l *LeaderLoop) zapOSD(ctx context.Context, b *Bridge, js store.Backend, gi
 		return err
 	}
 
-	zap := r.id + ".zap"
+	zap := r.started() + ".zap"
 
 	done, _, err := l.step(ctx, b, js, gid, epoch, zap, op.Host, revisionMode{add: []Doc{{Kind: "ContainerConfig", Name: job.MetaName, YAML: y}}})
 	if err != nil {

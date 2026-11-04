@@ -485,3 +485,78 @@ func TestAStopGivesUpAFailedStepWhoseDaemonStays(t *testing.T) {
 		t.Fatalf("record after the stop: %+v", d)
 	}
 }
+
+func TestAStopFinishesAPurgedOSDsRemoval(t *testing.T) {
+	s, _ := drainSetup(t)
+	ctx := context.Background()
+
+	drain := s.accept(KindDrain, "", "h1", 2)
+	drain.Op.Zap = true
+	s.module.mu.Lock()
+	s.module.ledger[len(s.module.ledger)-1] = drain
+	s.module.mu.Unlock()
+
+	must(t, s.leader.Tick(ctx, 42, 5)) // the OSDs out
+	must(t, s.leader.Tick(ctx, 42, 5)) // the OSD retired, its zap running
+
+	st, _, err := s.leader.clusterState(ctx, s.leader.bridge())
+	must(t, err)
+
+	if x, ok := st.Find("osd.3"); !ok || !x.Purged {
+		t.Fatalf("the retired OSD is not marked purged: %+v", x)
+	}
+
+	// paused in the zap (its host unreachable, say), then stopped: the record
+	// keeps that removal, retried under a new attempt
+	must(t, s.leader.changeState(ctx, s.leader.bridge(), 42, func(st *state.State) error {
+		h, _ := st.Host("h1")
+		h.Drain.Paused, h.Drain.Error = true, "osd.3: the zap did not end"
+		st.AddHost(h)
+
+		return nil
+	}))
+
+	stop := s.accept(KindDrainStop, "", "h1", 3)
+	stop.Op.Drain = drain.Op.ID
+	s.module.mu.Lock()
+	s.module.ledger[len(s.module.ledger)-1] = stop
+	s.module.retired = nil
+	s.module.mu.Unlock()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if d := s.drain(t); d == nil || !d.Stopped || d.Paused || d.Step != "osd.3" || d.Attempt != 3 {
+		t.Fatalf("record after the stop: %+v", d)
+	}
+
+	// the first attempt's zap job ends: the removal finishes (no second zap),
+	// the OSD leaves the state, then the stopped drain ends; the mgr stays
+	finishJob(t, s.agent, drain.Op.ID+".d2.zap", 0, "zapped")
+
+	for range 2 {
+		must(t, s.leader.Tick(ctx, 42, 5))
+	}
+
+	if r := s.op(t, drain.Op.ID+".d3"); r.State != "completed" {
+		t.Fatalf("resumed step: %+v", r)
+	}
+
+	s.module.mu.Lock()
+	_, second := s.module.kv[JournalPrefix(42)+"op/"+drain.Op.ID+".d3.zap"]
+	s.module.mu.Unlock()
+
+	if second {
+		t.Fatal("a second zap was started")
+	}
+
+	st, _, err = s.leader.clusterState(ctx, s.leader.bridge())
+	must(t, err)
+
+	h, _ := st.Host("h1")
+	_, osd := st.Find("osd.3")
+	_, mgr := st.Find("mgr.h1")
+
+	if h.Drain != nil || osd || !mgr || !slices.Contains(s.calls(), "drain done "+drain.Op.ID) {
+		t.Fatalf("after: record %+v, osd %t, mgr %t, calls %v", h.Drain, osd, mgr, s.calls())
+	}
+}
