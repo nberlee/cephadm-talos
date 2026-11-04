@@ -60,5 +60,6 @@ run_delayed() {
 		wait "$sub" || true
 	done
 	status=$(cat /dev/shm/run_delayed.$$.rc 2>/dev/null || echo 1)
+	rm -f /dev/shm/run_delayed.$$.pid /dev/shm/run_delayed.$$.rc
 	exit "$status"
 }
