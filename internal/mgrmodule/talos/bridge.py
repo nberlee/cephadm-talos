@@ -1656,8 +1656,7 @@ class Channel:
             # one record per stop, by the id the agent gave it: a later stop
             # on the same boot replaces the one before
             d = fold.down.get(peer)
-            recorded = d is None or d['stop'] != req['stop']
-            if recorded:
+            if d is None or d['stop'] != req['stop']:
                 now = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
                 try:
                     led.append({'id': 'm-' + secrets.token_hex(8), 'kind': 'host_down', 'host': peer, 'boot': req['boot'], 'stop': req['stop'], 'at': now})
@@ -1665,8 +1664,10 @@ class Channel:
                     return 503, {'error': 'not recorded: %s' % e}
         # the active mgr's own host stops: it fails over at once, once the stop
         # is in the ledger (the successor's noout loop sets the noout from it),
-        # once per stop, after this reply (plan 04, step 5, item 2b)
-        if recorded and peer == self.mgr_id:
+        # after this reply (plan 04, step 5, item 2b). Here the fold holds this
+        # stop, whoever appended it (also an earlier request whose append the
+        # mons answered late); fail_over_self runs once per stop id
+        if peer == self.mgr_id:
             threading.Thread(target=self.fail_over_self, args=(req['stop'],), name='talos-failover', daemon=True).start()
         if self.on_down is not None:
             self.on_down()

@@ -1446,6 +1446,23 @@ class NooutTest(unittest.TestCase):
         self.mons.maps = [dict(mgrmap(43, 'h2'), standbys=[{'gid': 42, 'name': 'h1', 'available': True}])]
         self.assertFalse(self.ch.fail_over_self('b-1.aa.3'))
 
+    def test_a_failover_after_a_late_host_down(self):
+        self.fold('mon.h1@h1', 'osd.3@h1', 'mgr.h1@h1', 'mgr.h2@h2')
+        self.mons.maps = [dict(mgrmap(42, 'h1'), standbys=[{'gid': 50, 'name': 'h2', 'available': True}])]
+        fails = lambda: [c for c in self.mons.maint_calls if c[0] == 'mgr fail']
+        # the first report's append gets no answer: not recorded, no failover
+        self.led.mon.silent = 1
+        self.assertEqual(self.report('h1', stop='b-1.aa.1')[0], 503)
+        time.sleep(0.1)
+        self.assertEqual(fails(), [])
+        # the retry settles that append: the stop is in the ledger, it fails over once
+        self.assertEqual(self.report('h1', stop='b-1.aa.1')[0], 200)
+        self.assertTrue(wait_until(lambda: fails() == [('mgr fail', '42')]))
+        self.assertEqual([e['kind'] for _, e in self.led.executable()].count('host_down'), 1)
+        self.assertEqual(self.report('h1', stop='b-1.aa.1')[0], 200)
+        time.sleep(0.1)
+        self.assertEqual(fails(), [('mgr fail', '42')])
+
     def test_going_down_reports(self):
         self.fold('mon.h1@h1', 'osd.3@h1')
         # an agent reports only its own host, of this cluster, and well formed
