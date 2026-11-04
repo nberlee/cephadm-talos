@@ -24,12 +24,23 @@ mkdir -p /var/run/ceph /var/log/ceph
 run_delayed() {
 	local delay=$1 child="" status stop=0 forwarded=0
 	shift
-	trap 'stop=1' TERM
+	# the delayed forward is scheduled from the handler itself (once), so a
+	# SIGTERM that arrives before or between waits is never left unhandled
+	forward() {
+		if [ -n "$child" ] && [ "$forwarded" = 0 ]; then
+			forwarded=1
+			log "SIGTERM: the daemon stops in ${delay}s"
+			(sleep "$delay"; kill -TERM "$child" 2>/dev/null) &
+		fi
+	}
+	trap 'stop=1; forward' TERM
 	trap 'kill -HUP "$child" 2>/dev/null || true' HUP
 	trap 'kill -USR1 "$child" 2>/dev/null || true' USR1
 	trap 'kill -USR2 "$child" 2>/dev/null || true' USR2
 	"$@" &
 	child=$!
+	# a SIGTERM before the daemon was started
+	if [ "$stop" = 1 ]; then forward; fi
 	while :; do
 		# wait returns early when a trapped signal arrives: the daemon is
 		# gone only once kill -0 finds it no more (wait reaped it)
@@ -37,12 +48,6 @@ run_delayed() {
 		wait "$child" || status=$?
 		if ! kill -0 "$child" 2>/dev/null; then
 			exit "$status"
-		fi
-		if [ "$stop" = 1 ] && [ "$forwarded" = 0 ]; then
-			forwarded=1
-			log "SIGTERM: the daemon stops in ${delay}s"
-			sleep "$delay" || true
-			kill -TERM "$child" 2>/dev/null || true
 		fi
 	done
 }
