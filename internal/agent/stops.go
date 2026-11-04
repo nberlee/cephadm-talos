@@ -3,7 +3,9 @@ package agent
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -65,8 +67,10 @@ type stopTracker struct {
 	seen  bool // a stage was seen
 	// starts and canceled count each stop sequence's START events and the
 	// outcomes Talos reports as cancelled (a NOOP with CANCELED: another
-	// sequence took over)
-	starts, canceled map[string]int
+	// sequence took over); open the STARTs seen without an outcome yet, which
+	// an outcome must match (the watch starts from now: an earlier
+	// sequence's outcome is ignored)
+	starts, canceled, open map[string]int
 	// other: a stop sequence ended otherwise (any other error makes Talos
 	// shut its services down and reboot; a successful reboot reports one)
 	other     bool
@@ -107,26 +111,28 @@ func (t *stopTracker) sequence(ev *machine.SequenceEvent, now time.Time) bool {
 	}
 
 	if t.starts == nil {
-		t.starts, t.canceled = map[string]int{}, map[string]int{}
+		t.starts, t.canceled, t.open = map[string]int{}, map[string]int{}, map[string]int{}
 	}
 
 	switch ev.GetAction() {
 	case machine.SequenceEvent_START:
 		t.starts[seq]++
+		t.open[seq]++
 		t.lastStart, t.signalled = now, true
 
 		return true
 	case machine.SequenceEvent_NOOP:
-		if ev.GetError() == nil {
+		// not started (LOCKED: no START was published for it), or an outcome
+		// without a START this agent saw: no outcome of a sequence it follows
+		if ev.GetError() == nil || ev.GetError().GetCode() == common.Code_LOCKED || t.open[seq] == 0 {
 			return false
 		}
 
-		switch ev.GetError().GetCode() {
-		case common.Code_CANCELED:
+		t.open[seq]--
+
+		if ev.GetError().GetCode() == common.Code_CANCELED {
 			t.canceled[seq]++
-		case common.Code_LOCKED:
-			// not started: no START was published for it
-		default:
+		} else {
 			t.other = true
 		}
 	case machine.SequenceEvent_STOP:
@@ -164,18 +170,22 @@ type stopSource interface {
 // one to the module.
 type StopWatch struct {
 	Talos stopSource
-	// Notify sends one going-down report for a boot
-	Notify func(ctx context.Context, boot string) error
+	// Notify sends one going-down report: the boot and the stop's id
+	Notify func(ctx context.Context, boot, stop string) error
 	Now    func() time.Time
 	Log    func(format string, args ...any)
 
-	mu      sync.Mutex
-	boot    string
-	t       stopTracker
-	due     int // reports due (one per stop signal)
-	sent    int // the last one delivered
-	sending bool
-	wg      sync.WaitGroup
+	mu   sync.Mutex
+	boot string
+	// stop identifies the last stop signalled: the boot id, a nonce of this
+	// agent process and the signal's number, so a stop is never taken for an
+	// earlier one on the same boot, also after the agent restarted
+	stop, nonce string
+	t           stopTracker
+	due         int // reports due (one per stop signal)
+	sent        int // the last one delivered
+	sending     bool
+	wg          sync.WaitGroup
 }
 
 func (w *StopWatch) now() time.Time {
@@ -276,6 +286,14 @@ func (w *StopWatch) sequence(ev *machine.SequenceEvent) {
 func (w *StopWatch) signal() {
 	w.due++
 
+	if w.nonce == "" {
+		b := make([]byte, 4)
+		_, _ = rand.Read(b)
+		w.nonce = hex.EncodeToString(b)
+	}
+
+	w.stop = fmt.Sprintf("%s.%s.%d", w.boot, w.nonce, w.due)
+
 	if w.sending || w.Notify == nil {
 		return
 	}
@@ -293,7 +311,7 @@ func (w *StopWatch) send() {
 
 	for {
 		w.mu.Lock()
-		due, boot := w.due, w.boot
+		due, boot, stop := w.due, w.boot, w.stop
 
 		if w.sent >= due {
 			w.sending = false
@@ -304,7 +322,7 @@ func (w *StopWatch) send() {
 
 		w.mu.Unlock()
 
-		err := w.Notify(ctx, boot)
+		err := w.Notify(ctx, boot, stop)
 		if err == nil {
 			w.mu.Lock()
 			w.sent = max(w.sent, due)
@@ -327,14 +345,14 @@ func (w *StopWatch) send() {
 	}
 }
 
-// Report is the node's boot id and, if its stop was evidently cancelled on
-// this boot, that boot id (the status record's boot and stop_cancelled).
+// Report is the node's boot id and, if its last stop was evidently
+// cancelled, that stop's id (the status record's boot and stop_cancelled).
 func (w *StopWatch) Report() (boot, cancelled string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	if w.t.cancelled(w.now()) {
-		cancelled = w.boot
+		cancelled = w.stop
 	}
 
 	return w.boot, cancelled
@@ -378,11 +396,12 @@ type goingDown struct {
 	FSID    string `json:"fsid"`
 	Host    string `json:"host"`
 	Boot    string `json:"boot"`
+	Stop    string `json:"stop"`
 }
 
 // NotifyDown sends one going-down report to the module that polled last,
 // connecting by its mgr's certificate identity: a wrong address only fails.
-func (a *Agent) NotifyDown(ctx context.Context, boot string) error {
+func (a *Agent) NotifyDown(ctx context.Context, boot, stop string) error {
 	a.modMu.Lock()
 	t := a.module
 	a.modMu.Unlock()
@@ -391,7 +410,7 @@ func (a *Agent) NotifyDown(ctx context.Context, boot string) error {
 		return errors.New("no module has polled this agent yet")
 	}
 
-	body, err := json.Marshal(goingDown{Version: wire.Version, FSID: a.Channel.Self.FSID, Host: a.Channel.Self.Name, Boot: boot})
+	body, err := json.Marshal(goingDown{Version: wire.Version, FSID: a.Channel.Self.FSID, Host: a.Channel.Self.Name, Boot: boot, Stop: stop})
 	if err != nil {
 		return err
 	}

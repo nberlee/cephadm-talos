@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strings"
 
 	"github.com/nberlee/cephadm-talos/internal/state"
 	"github.com/nberlee/cephadm-talos/internal/store"
@@ -323,15 +324,17 @@ func (l *LeaderLoop) drainRun(ctx context.Context, b *Bridge, js store.Backend, 
 		return r.finish(ctx, js, gid, wire.OpCompleted, nil)
 	}
 
-	x, ok := daemonOf(st, d.Step)
-	if !ok || x.Host != h.Name {
-		// gone meanwhile (a removal ended before its record): nothing to do
-		return r.finish(ctx, js, gid, JournalNoChange, nil)
-	}
+	// a daemon absent from the state is not done: a removal takes it out of
+	// the state before its revision, the instance's end and its retirement,
+	// so the removal is continued under the step's journal id and the step
+	// ends only with the removal's record (an OSD leaves the state last)
+	typ, id2, _ := strings.Cut(d.Step, ".")
 
-	switch x.Type {
+	switch typ {
 	case state.TypeOSD:
-		r.uuid = x.OSDUUID
+		if x, ok := daemonOf(st, d.Step); ok && x.Host == h.Name {
+			r.uuid = x.OSDUUID
+		}
 
 		return l.removeOSDAs(ctx, b, js, gid, epoch, r)
 	case state.TypeMgr:
@@ -348,12 +351,12 @@ func (l *LeaderLoop) drainRun(ctx context.Context, b *Bridge, js store.Backend, 
 				return err
 			}
 
-			if active == x.ID {
+			if active == id2 {
 				if err := writeJSONKey(ctx, js, JournalPrefix(gid)+"op/"+id+".fail", JournalOp{Version: journalVersion, Kind: "mgr_fail", Host: h.Name, State: wire.OpStarted, MgrGID: agid}); err != nil {
 					return err
 				}
 
-				if err := b.MgrFail(ctx, d.Op, agid, x.ID, h.Name); err != nil {
+				if err := b.MgrFail(ctx, d.Op, agid, id2, h.Name); err != nil {
 					return fmt.Errorf("%w: failing the active mgr on %s over: %w", errRetry, h.Name, err)
 				}
 

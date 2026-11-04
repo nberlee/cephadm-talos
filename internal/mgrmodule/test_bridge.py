@@ -1313,7 +1313,7 @@ class NooutTest(unittest.TestCase):
         return [c for c in self.mons.maint_calls if c[0] in ('osd set-group', 'osd unset-group')]
 
     def report(self, peer, **req):
-        return self.ch.going_down(dict({'version': 1, 'fsid': 'f1', 'host': peer, 'boot': 'b-1'}, **req), peer)
+        return self.ch.going_down(dict({'version': 1, 'fsid': 'f1', 'host': peer, 'boot': 'b-1', 'stop': 'b-1.aa.1'}, **req), peer)
 
     def test_maintenance_and_an_unplanned_stop_together(self):
         self.fold('mon.h1@h1', 'osd.3@h1')
@@ -1332,10 +1332,17 @@ class NooutTest(unittest.TestCase):
         self.assertEqual(self.call('noout unset', operation=exit_)[1]['outcome'], 'done')
         self.assertEqual(self.sets(), [('osd set-group', ['h1'])])  # still held: the unplanned stop
         self.assertEqual(self.ch.authority()[1].noout['h1']['reasons'], ['unplanned'])
-        self.assertIsNone(self.ch.host_up('h1', 'b-1'))
+        self.assertIsNone(self.ch.host_up('h1', 'b-1.aa.1'))
         self.assertEqual(self.sets(), [('osd set-group', ['h1']), ('osd unset-group', ['h1'])])
         f = self.ch.authority()[1]
         self.assertEqual((f.noout, f.down), ({}, {}))
+
+    def test_no_noout_command_without_leadership(self):
+        self.fold('mon.h1@h1', 'osd.3@h1')
+        enter = self.maint('enter_maintenance')
+        self.ch.leadership.still_active = lambda *a: False
+        self.assertEqual(self.ch._noout_change(self.led, 'h1', 'maintenance', True, enter), 'not confirmed as the active mgr')
+        self.assertEqual(self.sets(), [])
 
     def test_an_operators_flag_is_never_unset(self):
         self.fold('mon.h1@h1', 'osd.3@h1')
@@ -1378,8 +1385,9 @@ class NooutTest(unittest.TestCase):
     def test_going_down_reports(self):
         self.fold('mon.h1@h1', 'osd.3@h1')
         # an agent reports only its own host, of this cluster, and well formed
-        for peer, req in (('h2', {'host': 'h1'}), ('h1', {'fsid': 'other'}), ('h1', {'boot': 'a b'}), ('h1', {'extra': 1})):
-            self.assertEqual(self.ch.going_down(dict({'version': 1, 'fsid': 'f1', 'host': 'h1', 'boot': 'b-1'}, **req), peer)[0], 400, (peer, req))
+        for peer, req in (('h2', {'host': 'h1'}), ('h1', {'fsid': 'other'}), ('h1', {'boot': 'a b'}), ('h1', {'stop': 'x/y'}), ('h1', {'extra': 1})):
+            self.assertEqual(self.ch.going_down(dict({'version': 1, 'fsid': 'f1', 'host': 'h1', 'boot': 'b-1', 'stop': 'b-1.aa.1'}, **req), peer)[0], 400, (peer, req))
+        self.assertEqual(self.ch.going_down({'version': 1, 'fsid': 'f1', 'host': 'h1', 'boot': 'b-1'}, 'h1')[0], 400)
         self.assertEqual(self.report('h9')[0], 403)
         self.assertEqual([e for _, e in self.led.executable() if e['kind'] == 'host_down'], [])
         self.assertEqual(self.report('h1')[0], 200)
@@ -1389,13 +1397,20 @@ class NooutTest(unittest.TestCase):
         self.assertEqual(self.report('h2')[0], 200)
         self.assertIsNone(self.ch.noout_reconcile('h2', False))
         self.assertNotIn('h2', self.ch.authority()[1].noout)
-        # a later boot's report replaces the stop
-        self.assertEqual(self.report('h1', boot='b-2')[0], 200)
-        self.assertEqual(self.ch.authority()[1].down['h1']['boot'], 'b-2')
+        # a later stop on the same boot replaces the stop: recorded by its id
+        self.assertEqual(self.report('h1', stop='b-1.aa.2')[0], 200)
+        self.assertEqual(self.ch.authority()[1].down['h1']['stop'], 'b-1.aa.2')
+        self.assertEqual([e['kind'] for _, e in self.led.executable()].count('host_down'), 3)
         # the end of an earlier stop does not end it
-        self.assertIsNone(self.ch.host_up('h1', 'b-1'))
-        self.assertEqual((self.ch.authority()[1].down['h1']['boot'], self.sets()), ('b-2', [('osd set-group', ['h1'])]))
-        self.assertIsNone(self.ch.host_up('h1', 'b-2'))
+        self.assertIsNone(self.ch.host_up('h1', 'b-1.aa.1'))
+        self.assertEqual((self.ch.authority()[1].down['h1']['stop'], self.sets()), ('b-1.aa.2', [('osd set-group', ['h1'])]))
+        # not without the mons showing this incarnation active: nothing recorded, nothing sent
+        active = self.ch.leadership.still_active
+        self.ch.leadership.still_active = lambda *a: False
+        self.assertEqual(self.ch.host_up('h1', 'b-1.aa.2'), 'not confirmed as the active mgr')
+        self.assertIn('h1', self.ch.authority()[1].down)
+        self.ch.leadership.still_active = active
+        self.assertIsNone(self.ch.host_up('h1', 'b-1.aa.2'))
         self.assertEqual((list(self.ch.authority()[1].down), self.sets()[-1]), (['h2'], ('osd unset-group', ['h1'])))
 
 

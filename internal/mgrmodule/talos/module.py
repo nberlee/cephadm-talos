@@ -402,9 +402,9 @@ def validate_record(rec: Any) -> Dict[str, Any]:
     if not isinstance(rec.get('crl_number', ''), str) or not re.match(r'\A\d{0,40}\Z', rec.get('crl_number', '')) \
             or not isinstance(rec.get('crl_stale', False), bool):
         raise ValueError('invalid revocation list state in status record')
-    # the node's boot id, and a boot whose stop sequences were all cancelled (plan 04, step 5)
-    for k in ('boot', 'stop_cancelled'):
-        if not isinstance(rec.get(k, ''), str) or rec.get(k) and not ledger.BOOT_RE.match(rec[k]):
+    # the node's boot id, and the id of a stop whose sequences were all cancelled (plan 04, step 5)
+    for k, pattern in (('boot', ledger.BOOT_RE), ('stop_cancelled', ledger.STOP_RE)):
+        if not isinstance(rec.get(k, ''), str) or rec.get(k) and not pattern.match(rec[k]):
             raise ValueError('invalid %s in status record' % k)
     rec['observed_at'] = parse_time(rec['observed_at'])
     return rec
@@ -1650,17 +1650,16 @@ class Module(orchestrator.Orchestrator, MgrModule):
                 if d is not None:
                     rec = obs.get(host, (None, ''))[0]
                     boot = (rec or {}).get('boot') or ''
-                    # a cancellation counts only from an observation after the
-                    # stop's record: a later stop on the same boot is not ended
-                    # by the poll before it
-                    cancelled = rec is not None and rec.get('stop_cancelled') == d['boot'] and rec['observed_at'] > ledger._parse_iso(d['at'])
+                    # a cancellation counts only for the stop recorded (its id
+                    # the agent's): a later stop on the same boot has another
+                    cancelled = rec is not None and rec.get('stop_cancelled') == d['stop']
                     back = bool(boot) and (boot != d['boot'] or cancelled)
                     if back and osds and host not in fold.maintenance:
                         if up is None:
                             up = {o['osd'] for o in (self.get('osd_map') or {}).get('osds', []) if o.get('up')}
                         back = set(osds) <= up
                     if back:
-                        why = channel.host_up(host, d['boot'])
+                        why = channel.host_up(host, d['stop'])
                         if why is not None:
                             self.log.info('noout of %s: %s', host, why)
                         continue

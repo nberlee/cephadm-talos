@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -89,6 +90,22 @@ func TestAStopIsCancelledOnlyOnEvidence(t *testing.T) {
 		t.Fatal("a failed shutdown counted as cancelled")
 	}
 
+	// an outcome without a START the agent saw (an earlier sequence's: the
+	// watch starts from now) pairs with no later START
+	var ut stopTracker
+	ut.sequence(seqEv("reboot", machine.SequenceEvent_NOOP, code(common.Code_CANCELED)), t0)
+	ut.sequence(seqEv("reboot", machine.SequenceEvent_START, nil), t0.Add(time.Second))
+
+	if ut.cancelled(t0.Add(time.Hour)) {
+		t.Fatal("an unmatched cancellation counted")
+	}
+
+	ut.sequence(seqEv("shutdown", machine.SequenceEvent_NOOP, code(common.Code_FATAL)), t0)
+
+	if ut.other || ut.open["reboot"] != 1 {
+		t.Fatalf("outcomes matched: %+v", ut)
+	}
+
 	// a sequence that never started (LOCKED) and other sequences change nothing
 	var lt stopTracker
 	if lt.sequence(seqEv("reboot", machine.SequenceEvent_NOOP, code(common.Code_LOCKED)), t0) ||
@@ -120,6 +137,7 @@ func TestTheStopWatchReportsEveryStop(t *testing.T) {
 	var (
 		mu    sync.Mutex
 		boots []string
+		stops []string
 		fail  = 2 // the module does not answer the first attempts
 		now   = time.Now()
 	)
@@ -129,7 +147,7 @@ func TestTheStopWatchReportsEveryStop(t *testing.T) {
 		defer mu.Unlock()
 
 		return now
-	}, Notify: func(_ context.Context, boot string) error {
+	}, Notify: func(_ context.Context, boot, stop string) error {
 		mu.Lock()
 		defer mu.Unlock()
 
@@ -140,6 +158,7 @@ func TestTheStopWatchReportsEveryStop(t *testing.T) {
 		}
 
 		boots = append(boots, boot)
+		stops = append(stops, stop)
 
 		return nil
 	}}
@@ -209,7 +228,11 @@ func TestTheStopWatchReportsEveryStop(t *testing.T) {
 		now = now.Add(time.Minute)
 		mu.Unlock()
 
-		if boot, cancelled := w.Report(); boot == "boot-1" && cancelled == "boot-1" {
+		mu.Lock()
+		last := stops[len(stops)-1]
+		mu.Unlock()
+
+		if boot, cancelled := w.Report(); boot == "boot-1" && cancelled == last {
 			break
 		}
 
@@ -223,8 +246,9 @@ func TestTheStopWatchReportsEveryStop(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	if boots[0] != "boot-1" || boots[1] != "boot-1" {
-		t.Fatalf("reports %v", boots)
+	// each stop its own id on the same boot
+	if boots[0] != "boot-1" || boots[1] != "boot-1" || stops[0] == stops[1] || !strings.HasPrefix(stops[1], "boot-1.") {
+		t.Fatalf("reports %v %v", boots, stops)
 	}
 }
 
@@ -277,7 +301,7 @@ func TestTheGoingDownReportGoesToThePollingModule(t *testing.T) {
 	a := &Agent{Channel: ch, ClientTLS: clientTLS, refresh: func(context.Context) error { return nil }}
 	a.rec = &Record{Schema: Schema, Containers: map[string]Container{}}
 
-	if err := a.NotifyDown(context.Background(), "boot-1"); err == nil {
+	if err := a.NotifyDown(context.Background(), "boot-1", "boot-1.ab.1"); err == nil {
 		t.Fatal("reported before any module polled")
 	}
 
@@ -304,14 +328,14 @@ func TestTheGoingDownReportGoesToThePollingModule(t *testing.T) {
 	// a module whose certificate names another mgr than the server's: refused
 	poll("h2", "127.0.0.1")
 
-	if err := a.NotifyDown(context.Background(), "boot-1"); err == nil {
+	if err := a.NotifyDown(context.Background(), "boot-1", "boot-1.ab.1"); err == nil {
 		t.Fatal("reported to a server that is not the polling mgr's")
 	}
 
 	poll("h0", "127.0.0.1")
-	must(t, a.NotifyDown(context.Background(), "boot-1"))
+	must(t, a.NotifyDown(context.Background(), "boot-1", "boot-1.ab.1"))
 
-	if got.Host != "h1" || got.Boot != "boot-1" || got.FSID != testFSID {
+	if got.Host != "h1" || got.Boot != "boot-1" || got.Stop != "boot-1.ab.1" || got.FSID != testFSID {
 		t.Fatalf("report %+v", got)
 	}
 }

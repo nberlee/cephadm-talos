@@ -83,6 +83,8 @@ REASON_RE = re.compile(r'\A[a-z][a-z0-9_-]{0,31}\Z')
 UNPLANNED = 'unplanned'
 # a Talos boot id
 BOOT_RE = re.compile(r'\A[A-Za-z0-9._-]{1,64}\Z')
+# a stop's id, the agent's: its boot id, a nonce of the agent process and a counter
+STOP_RE = re.compile(r'\A[A-Za-z0-9._-]{1,96}\Z')
 ISO_RE = re.compile(r'\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z')
 # an RGW serving certificate's id (internal/state RGWCert): generated, the operator's, the CLI's
 RGW_CERT_RE = re.compile(r'\A(?:issued/op-[0-9a-f]{16}/[0-9a-f]{16}|user/op-[0-9a-f]{16}|cli)\Z')
@@ -200,6 +202,7 @@ def check_entry(key: str, raw: str) -> Dict[str, Any]:
                                                       and type(e.get('on')) is bool and (kind == 'noout' or type(e.get('prior')) is bool)):
             raise LedgerError('%s entry %s' % (kind, key))
         if kind == 'host_down' and not (isinstance(e.get('boot'), str) and BOOT_RE.match(e['boot'])
+                                        and isinstance(e.get('stop'), str) and STOP_RE.match(e['stop'])
                                         and isinstance(e.get('at'), str) and ISO_RE.match(e['at'])):
             raise LedgerError('host_down entry %s' % key)
         return e
@@ -495,7 +498,7 @@ class Fold:
             h['name']: {'reasons': ['maintenance'], 'operator': False, 'intent': None}
             for h in inventory['hosts'] if h.get('maintenance') and h.get('noout')}
         # unplanned stops by host (a Talos reboot or shutdown its agent
-        # reported): {'boot', 'at', 'held'}, held once its reason was added
+        # reported): {'boot', 'stop', 'at', 'held'}, held once its reason was added
         self.down: Dict[str, Dict[str, Any]] = {}
         # each operation's place in the executable entries, and how many there were
         self.positions: Dict[str, int] = {}
@@ -602,7 +605,7 @@ class Fold:
             if self.draining.get(host, {}).get('op') == e.get('drain', e.get('of')):
                 del self.draining[host]
         elif kind == 'host_down':
-            self.down[host] = {'boot': e['boot'], 'at': e['at'], 'held': False}
+            self.down[host] = {'boot': e['boot'], 'stop': e['stop'], 'at': e['at'], 'held': False}
         elif kind == 'host_up':
             self.down.pop(host, None)
         elif kind in ('noout_intent', 'noout', 'noout_keep'):

@@ -294,3 +294,47 @@ func TestADrainContinuesAfterATakeover(t *testing.T) {
 		t.Fatal("the step in progress did not end under the successor")
 	}
 }
+
+func TestADrainStepContinuesARemovalPastTheStateChange(t *testing.T) {
+	s, _ := drainSetup(t)
+	ctx := context.Background()
+
+	drain := s.accept(KindDrain, "", "h1", 2)
+	must(t, s.leader.Tick(ctx, 42, 5)) // the OSDs out
+	must(t, s.leader.Tick(ctx, 42, 5)) // the OSD removed
+
+	// the mgr's removal takes it out of the state, then its retirement is refused
+	s.module.mu.Lock()
+	s.module.refuse = "retire"
+	s.module.mu.Unlock()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	st, _, err := s.leader.clusterState(ctx, s.leader.bridge())
+	must(t, err)
+
+	if _, ok := st.Find("mgr.h1"); ok {
+		t.Fatal("the mgr is still in the state")
+	}
+
+	// absent from the state, its step is not done: the removal goes on
+	if d := s.drain(t); d == nil || d.Step != "mgr.h1" {
+		t.Fatalf("record: %+v", d)
+	}
+
+	s.module.mu.Lock()
+	_, ended := s.module.kv[JournalPrefix(42)+"op/"+drain.Op.ID+".d3"]
+	s.module.refuse, s.module.retired = "", nil
+	s.module.mu.Unlock()
+
+	if ended {
+		t.Fatal("the step ended before its removal's retirement")
+	}
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if r := s.op(t, drain.Op.ID+".d3"); r.State != "completed" || !slices.Contains(s.calls(), "retire "+drain.Op.ID+" mgr.h1") {
+		t.Fatalf("step %+v, calls %v", r, s.calls())
+	}
+}

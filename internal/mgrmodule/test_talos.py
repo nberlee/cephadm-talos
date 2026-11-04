@@ -455,8 +455,8 @@ class Deadline(unittest.TestCase):
 class Records(unittest.TestCase):
     def test_boot_and_cancelled_stop(self):
         # plan 04, step 5: the node's boot id and a boot whose stop was cancelled
-        rec = m.validate_record(dict(record({}, '2026-10-28T12:00:00Z'), boot='b-2', stop_cancelled='b-2'))
-        self.assertEqual((rec['boot'], rec['stop_cancelled']), ('b-2', 'b-2'))
+        rec = m.validate_record(dict(record({}, '2026-10-28T12:00:00Z'), boot='b-2', stop_cancelled='b-2.aa.1'))
+        self.assertEqual((rec['boot'], rec['stop_cancelled']), ('b-2', 'b-2.aa.1'))
         for bad in ({'boot': 3}, {'boot': 'a b'}, {'stop_cancelled': 'x/y'}):
             with self.assertRaises(ValueError, msg=bad):
                 m.validate_record(dict(record({}, '2026-10-28T12:00:00Z'), **bad))
@@ -1535,8 +1535,8 @@ class Lifecycle(unittest.TestCase):
         mod._logger = types.SimpleNamespace(info=lambda *a: None, warning=lambda *a: None, exception=lambda *a: None)
         return mod, entries
 
-    def down(self, mod, host='h1', boot='b-1', at='2026-11-04T10:00:00Z'):
-        mod._ledger.append({'id': 'm-%016x' % len(mod._ledger.entries), 'kind': 'host_down', 'host': host, 'boot': boot, 'at': at})
+    def down(self, mod, host='h1', boot='b-1', at='2026-11-04T10:00:00Z', stop='b-1.aa.1'):
+        mod._ledger.append({'id': 'm-%016x' % len(mod._ledger.entries), 'kind': 'host_down', 'host': host, 'boot': boot, 'stop': stop, 'at': at})
 
     def test_coming_back(self):
         now = datetime.datetime(2026, 11, 4, 10, 10, tzinfo=datetime.timezone.utc)
@@ -1545,29 +1545,28 @@ class Lifecycle(unittest.TestCase):
         osd_up = [False]
         mod.get = lambda what: {'osds': [{'osd': 0, 'up': osd_up[0]}]} if what == 'osd_map' else None
         seen = datetime.datetime(2026, 11, 4, 10, 5, tzinfo=datetime.timezone.utc)
-        before = datetime.datetime(2026, 11, 4, 9, 59, tzinfo=datetime.timezone.utc)
         for rec, back in (({'boot': 'b-1', 'observed_at': seen}, False), (None, False), ({'boot': 'b-2', 'observed_at': seen}, False),
-                          ({'boot': 'b-1', 'stop_cancelled': 'b-0', 'observed_at': seen}, False),
-                          # a cancellation observed before the stop's record: a later stop on the same boot
-                          ({'boot': 'b-1', 'stop_cancelled': 'b-1', 'observed_at': before}, False)):
+                          # the cancellation of an earlier stop on the same boot (a cached
+                          # poll): not this stop's, whatever the clocks say
+                          ({'boot': 'b-1', 'stop_cancelled': 'b-1.aa.0', 'observed_at': seen}, False)):
             mod._channel.calls = []
             mod._poller.observations = {'h1': (rec, '')}
             m.Module._noout_tick(mod, now)
             self.assertEqual(mod._channel.calls, [('reconcile', 'h1', True)], rec)
         # a new boot with its OSDs up again, or the stop cancelled
         osd_up[0] = True
-        for rec in ({'boot': 'b-2', 'observed_at': seen}, {'boot': 'b-1', 'stop_cancelled': 'b-1', 'observed_at': seen}):
+        for rec in ({'boot': 'b-2', 'observed_at': seen}, {'boot': 'b-1', 'stop_cancelled': 'b-1.aa.1', 'observed_at': seen}):
             mod._channel.calls = []
             mod._poller.observations = {'h1': (rec, '')}
             m.Module._noout_tick(mod, now)
-            self.assertEqual(mod._channel.calls, [('up', 'h1', 'b-1')], rec)
+            self.assertEqual(mod._channel.calls, [('up', 'h1', 'b-1.aa.1')], rec)
         # a host in maintenance is back with its new boot: its OSDs stay stopped
         self.down(mod, 'h5')
         osd_up[0] = False
         mod._channel.calls = []
         mod._poller.observations = {'h5': ({'boot': 'b-9', 'observed_at': seen}, '')}
         m.Module._noout_tick(mod, now)
-        self.assertIn(('up', 'h5', 'b-1'), mod._channel.calls)
+        self.assertIn(('up', 'h5', 'b-1.aa.1'), mod._channel.calls)
 
     def test_health(self):
         mod, entries = self.module()

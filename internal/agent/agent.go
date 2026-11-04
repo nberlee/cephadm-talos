@@ -77,8 +77,8 @@ type Record struct {
 	// any) and CRLStale whether it is past its nextUpdate (plan 04, step 3)
 	CRLNumber string `json:"crl_number,omitempty"`
 	CRLStale  bool   `json:"crl_stale,omitempty"`
-	// Boot is the node's boot id, and StopCancelled that boot id once a stop
-	// the agent reported was evidently cancelled on it (plan 04, step 5)
+	// Boot is the node's boot id, and StopCancelled the id of the last stop
+	// the agent reported once it was evidently cancelled (plan 04, step 5)
 	Boot          string `json:"boot,omitempty"`
 	StopCancelled string `json:"stop_cancelled,omitempty"`
 }

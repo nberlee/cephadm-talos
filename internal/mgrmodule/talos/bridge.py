@@ -1510,6 +1510,9 @@ class Channel:
                     continue
                 if flag != it['on']:
                     prefix = 'osd set-group' if it['on'] else 'osd unset-group'
+                    # a command only while the mons show this incarnation active
+                    if not self.leadership.still_active(self.commands):
+                        return 'not confirmed as the active mgr'
                     job = self._mon({'prefix': prefix, 'flags': 'noout', 'who': [host]}, 'host/' + host)
                     if job is None or job.r != 0:
                         return '%s noout %s: no answer or refused' % (prefix, host)
@@ -1547,18 +1550,20 @@ class Channel:
                 return self._noout_change(led, host, ledger.UNPLANNED, False)
             return None
 
-    def host_up(self, host: str, boot: Optional[str] = None) -> Optional[str]:
+    def host_up(self, host: str, stop: Optional[str] = None) -> Optional[str]:
         """An unplanned stop ended (the host came back with its OSDs up, its
         stop was cancelled, or the operator released it): recorded, then its
-        reason dropped. boot, if given, must be the stop's."""
+        reason dropped. stop, if given, must be the id of the stop recorded."""
         with self.local_lock:
             led, _ = self.authority()
             led.settle()
             led, fold = self.authority()
             d = fold.down.get(host)
-            if d is not None and boot is not None and d['boot'] != boot:
+            if d is not None and stop is not None and d['stop'] != stop:
                 return None  # another stop since: not this one's end
             if d is not None:
+                if not self.leadership.still_active(self.commands):
+                    return 'not confirmed as the active mgr'
                 led.append({'id': 'm-' + secrets.token_hex(8), 'kind': 'host_up', 'host': host})
             return self._noout_change(led, host, ledger.UNPLANNED, False)
 
@@ -1582,10 +1587,11 @@ class Channel:
     def going_down(self, req: Any, peer: str) -> Tuple[int, Dict[str, Any]]:
         """An agent's report that its node runs a stop sequence (a Talos
         reboot, shutdown, upgrade or reset outside the orchestrator): recorded
-        as an unplanned stop of its host; the leadership loop adds the noout
+        as an unplanned stop of its host, once per stop id; the noout loop adds the noout
         reason within its next pass (on_down wakes it)."""
-        if not isinstance(req, dict) or req.get('version') != WIRE_VERSION or set(req) != {'version', 'fsid', 'host', 'boot'} \
-                or req['fsid'] != self.fsid or req['host'] != peer or not isinstance(req['boot'], str) or not ledger.BOOT_RE.match(req['boot']):
+        if not isinstance(req, dict) or req.get('version') != WIRE_VERSION or set(req) != {'version', 'fsid', 'host', 'boot', 'stop'} \
+                or req['fsid'] != self.fsid or req['host'] != peer or not isinstance(req['boot'], str) or not ledger.BOOT_RE.match(req['boot']) \
+                or not isinstance(req['stop'], str) or not ledger.STOP_RE.match(req['stop']):
             return 400, {'error': 'malformed going-down report, or for another cluster or host'}
         if self.leadership.captured() is None:
             return 503, {'error': 'no captured incarnation'}
@@ -1600,11 +1606,13 @@ class Channel:
                 return 503, {'error': 'no settled ledger: %s' % e}
             if peer not in fold.hosts:
                 return 403, {'error': '%s is not a host of the cluster' % peer}
+            # one record per stop, by the id the agent gave it: a later stop
+            # on the same boot replaces the one before
             d = fold.down.get(peer)
-            if d is None or d['boot'] != req['boot']:
+            if d is None or d['stop'] != req['stop']:
                 now = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
                 try:
-                    led.append({'id': 'm-' + secrets.token_hex(8), 'kind': 'host_down', 'host': peer, 'boot': req['boot'], 'at': now})
+                    led.append({'id': 'm-' + secrets.token_hex(8), 'kind': 'host_down', 'host': peer, 'boot': req['boot'], 'stop': req['stop'], 'at': now})
                 except ledger.LedgerError as e:
                     return 503, {'error': 'not recorded: %s' % e}
         if self.on_down is not None:

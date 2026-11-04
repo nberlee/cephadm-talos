@@ -298,10 +298,10 @@ class DrainAndNooutFoldTest(unittest.TestCase):
         seen = self.noout(1, 'noout_intent', reason='maintenance', on=True, prior=True)
         self.assertTrue(lg.Fold(self.INV, [seen, done]).noout['h1']['operator'])
         # a second reason, then both go: the record goes with the last
-        down = self.noout(3, 'host_down', boot='b-1', at='2026-11-04T10:00:00Z')
+        down = self.noout(3, 'host_down', boot='b-1', stop='b-1.aa.1', at='2026-11-04T10:00:00Z')
         plus = self.noout(4, 'noout', reason='unplanned', on=True)
         f = lg.Fold(self.INV, [intent, done, down, plus])
-        self.assertEqual((f.noout['h1']['reasons'], f.down['h1']), (['maintenance', 'unplanned'], {'boot': 'b-1', 'at': '2026-11-04T10:00:00Z', 'held': True}))
+        self.assertEqual((f.noout['h1']['reasons'], f.down['h1']), (['maintenance', 'unplanned'], {'boot': 'b-1', 'stop': 'b-1.aa.1', 'at': '2026-11-04T10:00:00Z', 'held': True}))
         minus = self.noout(5, 'noout', reason='maintenance', on=False)
         up = self.noout(6, 'host_up')
         unintent = self.noout(7, 'noout_intent', reason='unplanned', on=False, prior=True)
@@ -316,7 +316,7 @@ class DrainAndNooutFoldTest(unittest.TestCase):
         g = lg.Fold(self.INV, [], {'state': st})
         self.assertEqual((g.draining, g.noout, g.down), (st['draining'], st['noout'], st['down']))
         for bad in (dict(kind='noout', host='h1', reason='Maint', on=True), dict(kind='noout', host='h1', reason='maintenance'),
-                    dict(kind='noout_intent', host='h1', reason='maintenance', on=True), dict(kind='host_down', host='h1', boot='b'),
+                    dict(kind='noout_intent', host='h1', reason='maintenance', on=True), dict(kind='host_down', host='h1', boot='b', at='2026-11-04T10:00:00Z'),
                     dict(kind='host_up', host='h1', of='op-%016x' % 1), dict(kind='noout_keep', host='h1', daemon='mon.h1'),
                     dict(kind='drain_done', host='h1')):
             k, e = entry(5, 9, 'm-%016x' % 9, **bad)
