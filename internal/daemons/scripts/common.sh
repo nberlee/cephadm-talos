@@ -14,57 +14,51 @@ keyring() {
 
 mkdir -p /var/run/ceph /var/log/ceph
 
-# run_delayed SECONDS CMD... runs a daemon as this container's child, not
+# run_delayed SECONDS CMD... runs a daemon as this container's grandchild, not
 # exec'd (plan 04, step 5, item 2b): Talos signals only the container's PID 1,
 # which ignores a signal it has no handler for. On SIGTERM it waits SECONDS,
 # so the agent's going-down report reaches the host's module before the
-# daemon goes, then forwards SIGTERM once and waits for the daemon. The
-# container exits with the daemon's status, also when the daemon exits by
-# itself. HUP, USR1 and USR2 go to the daemon at once.
+# daemon goes, then forwards SIGTERM once to the daemon. HUP, USR1 and USR2
+# go to the daemon at once. The daemon runs under a subshell that no signal
+# reaches (signals go to PID 1, which sends them to the daemon itself), so
+# its wait is never interrupted: it records the daemon's pid and exit status
+# in /dev/shm (named by this shell's pid: 1 in a container, unique in tests;
+# a subshell's $$ is its parent's), and the container exits with that status, also when the daemon
+# exits by itself. (A wait in PID 1, interrupted by its own handlers, can lose
+# the status in bash.)
 run_delayed() {
-	local delay=$1 child="" status again stop=0 forwarded=0 sig=0
+	local delay=$1 daemon="" sub status stop=0 forwarded=0
 	shift
-	# the delayed forward is scheduled from the handler itself (once), so a
-	# SIGTERM that arrives before or between waits is never left unhandled
+	rm -f /dev/shm/run_delayed.$$.pid /dev/shm/run_delayed.$$.rc
 	forward() {
-		if [ -n "$child" ] && [ "$forwarded" = 0 ]; then
+		if [ -n "$daemon" ] && [ "$forwarded" = 0 ]; then
 			forwarded=1
 			log "SIGTERM: the daemon stops in ${delay}s"
-			(sleep "$delay"; kill -TERM "$child" 2>/dev/null) &
+			(sleep "$delay"; kill -TERM "$daemon" 2>/dev/null) &
 		fi
 	}
-	# sig marks that a handler ran, so a wait may have returned the signal's
-	# status (128 + n) instead of the daemon's
-	trap 'sig=1; stop=1; forward' TERM
-	trap 'sig=1; kill -HUP "$child" 2>/dev/null || true' HUP
-	trap 'sig=1; kill -USR1 "$child" 2>/dev/null || true' USR1
-	trap 'sig=1; kill -USR2 "$child" 2>/dev/null || true' USR2
-	"$@" &
-	child=$!
-	# a SIGTERM before the daemon was started
-	if [ "$stop" = 1 ]; then forward; fi
-	while :; do
-		# wait returns early when a trapped signal arrives: the daemon is
-		# gone only once kill -0 finds it no more (wait reaped it)
-		sig=0
+	pass() { if [ -n "$daemon" ]; then kill "-$1" "$daemon" 2>/dev/null || true; fi; }
+	trap 'stop=1; forward' TERM
+	trap 'pass HUP' HUP
+	trap 'pass USR1' USR1
+	trap 'pass USR2' USR2
+	(
+		"$@" &
+		echo "$!" > /dev/shm/run_delayed.$$.pid
 		status=0
-		wait "$child" || status=$?
-		if kill -0 "$child" 2>/dev/null; then
-			continue
-		fi
-		# gone; if a handler ran, status may be the signal's: wait again for
-		# the saved status
-		while [ "$sig" = 1 ]; do
-			sig=0
-			again=0
-			wait "$child" 2>/tmp/run_delayed.wait || again=$?
-			# 127 with bash's "not a child" message: the status was already
-			# returned; a daemon's own 127 comes without the message
-			if [ "$again" = 127 ] && [ -s /tmp/run_delayed.wait ]; then
-				break
-			fi
-			status=$again
-		done
-		exit "$status"
+		wait "$!" || status=$?
+		echo "$status" > /dev/shm/run_delayed.$$.rc
+	) &
+	sub=$!
+	while [ ! -s /dev/shm/run_delayed.$$.pid ] && kill -0 "$sub" 2>/dev/null; do
+		sleep 0.05
 	done
+	daemon=$(cat /dev/shm/run_delayed.$$.pid 2>/dev/null || true)
+	# a SIGTERM before the daemon's pid was known
+	if [ "$stop" = 1 ]; then forward; fi
+	while kill -0 "$sub" 2>/dev/null; do
+		wait "$sub" || true
+	done
+	status=$(cat /dev/shm/run_delayed.$$.rc 2>/dev/null || echo 1)
+	exit "$status"
 }
