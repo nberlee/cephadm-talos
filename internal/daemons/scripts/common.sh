@@ -22,7 +22,7 @@ mkdir -p /var/run/ceph /var/log/ceph
 # container exits with the daemon's status, also when the daemon exits by
 # itself. HUP, USR1 and USR2 go to the daemon at once.
 run_delayed() {
-	local delay=$1 child="" status stop=0 forwarded=0
+	local delay=$1 child="" status again stop=0 forwarded=0 sig=0
 	shift
 	# the delayed forward is scheduled from the handler itself (once), so a
 	# SIGTERM that arrives before or between waits is never left unhandled
@@ -33,10 +33,12 @@ run_delayed() {
 			(sleep "$delay"; kill -TERM "$child" 2>/dev/null) &
 		fi
 	}
-	trap 'stop=1; forward' TERM
-	trap 'kill -HUP "$child" 2>/dev/null || true' HUP
-	trap 'kill -USR1 "$child" 2>/dev/null || true' USR1
-	trap 'kill -USR2 "$child" 2>/dev/null || true' USR2
+	# sig marks that a handler ran, so a wait may have returned the signal's
+	# status (128 + n) instead of the daemon's
+	trap 'sig=1; stop=1; forward' TERM
+	trap 'sig=1; kill -HUP "$child" 2>/dev/null || true' HUP
+	trap 'sig=1; kill -USR1 "$child" 2>/dev/null || true' USR1
+	trap 'sig=1; kill -USR2 "$child" 2>/dev/null || true' USR2
 	"$@" &
 	child=$!
 	# a SIGTERM before the daemon was started
@@ -44,13 +46,23 @@ run_delayed() {
 	while :; do
 		# wait returns early when a trapped signal arrives: the daemon is
 		# gone only once kill -0 finds it no more (wait reaped it)
+		sig=0
 		status=0
 		wait "$child" || status=$?
-		if ! kill -0 "$child" 2>/dev/null; then
-			# a wait interrupted by a trapped signal returned the signal's
-			# status, not the daemon's: bash keeps the reaped child's status
-			wait "$child" 2>/dev/null
-			exit $?
+		if kill -0 "$child" 2>/dev/null; then
+			continue
 		fi
+		# gone; if a handler ran, status may be the signal's: wait again for
+		# the saved status (127: the first wait had already returned it)
+		while [ "$sig" = 1 ]; do
+			sig=0
+			again=0
+			wait "$child" 2>/dev/null || again=$?
+			if [ "$again" = 127 ]; then
+				break
+			fi
+			status=$again
+		done
+		exit "$status"
 	done
 }
