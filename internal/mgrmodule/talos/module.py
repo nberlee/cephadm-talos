@@ -934,9 +934,13 @@ class Module(orchestrator.Orchestrator, MgrModule):
             cluster = record_from_store(store, choose_incarnation(store, getattr(self, '_gid', None)), 'cluster')[0] or {}
         except InventoryError:
             return
-        # an upgrade's start until its record is finished: its steps read it,
-        # and the bridge authorizes the upgrade by it
-        pinned = {u['op'] for u in (cluster.get('upgrade'), cluster.get('agent_upgrade')) if u and u.get('op') and not u.get('finished')}
+        # an upgrade's start while its steps or the bridge may still read it:
+        # a Ceph upgrade's until the leader cleared its record (a finished one
+        # still asks `upgrade done`, authorized by the start, until then); an
+        # agent upgrade's until finished (its record stays, nothing reads the
+        # start after the publication that finishes it)
+        pinned = {u['op'] for u in (cluster.get('upgrade'),) if u and u.get('op')}
+        pinned |= {u['op'] for u in (cluster.get('agent_upgrade'),) if u and u.get('op') and not u.get('finished')}
         fold = led.fold(cli_baseline(store))
         if fold.upgrade is not None:
             pinned.add(fold.upgrade['op'])

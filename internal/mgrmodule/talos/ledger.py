@@ -34,6 +34,7 @@ import datetime
 import hashlib
 import json
 import re
+import secrets
 import threading
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -82,7 +83,9 @@ TERMINAL = ('completed', 'nochange', 'failed', 'refused', 'abandoned')
 # snapshots (plan 04, step 4)
 SNAPSHOT_PREFIX = 'cephadm-talos/ledger-snapshot/'
 SNAPSHOT_SCHEMA = 1
-SNAPSHOT_KEY_RE = re.compile(r'\Acephadm-talos/ledger-snapshot/(\d{20}-\d{10}-(?:takeover|op-[0-9a-f]{16}|m-[0-9a-f]{16}))/(manifest|\d{1,6})\Z')
+SNAPSHOT_KEY_RE = re.compile(r'\Acephadm-talos/ledger-snapshot/(\d{20}-\d{10}-(?:takeover|op-[0-9a-f]{16}|m-[0-9a-f]{16}))/(manifest|[0-9a-f]{16}-\d{1,6})\Z')
+# chunks are named <nonce>-<i>, the nonce one per publication: two writers of
+# the same cut never write the same chunk key, and a manifest names only its own
 # base64 characters per chunk: below the config-key entry limit
 SNAPSHOT_CHUNK = 32 << 10
 # a compaction cuts once more than this many entries follow the newest snapshot
@@ -708,7 +711,9 @@ class Ledger:
             m = json.loads(raw)
             chunks, sums = m['chunks'], m['sha256']
             if m.get('schema') != SNAPSHOT_SCHEMA or m.get('key') != cut or not isinstance(chunks, list) or not chunks \
-                    or not isinstance(sums, list) or len(sums) != len(chunks) or any(c != base + str(i) for i, c in enumerate(chunks)):
+                    or not isinstance(sums, list) or len(sums) != len(chunks) or not isinstance(chunks[0], str) \
+                    or any(c != chunks[0][:-1] + str(i) for i, c in enumerate(chunks)) or not SNAPSHOT_KEY_RE.match(chunks[0]) \
+                    or not chunks[0].startswith(base) or not chunks[0].endswith('-0'):
                 raise ValueError('malformed manifest')
             at = _parse_iso(m['at'])
             got = self._get_many(chunks)
@@ -912,10 +917,12 @@ class Ledger:
         else:
             enc = base64.b64encode(json.dumps(content, sort_keys=True).encode()).decode()
             parts = [enc[o:o + SNAPSHOT_CHUNK] for o in range(0, len(enc), SNAPSHOT_CHUNK)]
-            for i, v in enumerate(parts):
-                self._set(base + str(i), v)
+            nonce = secrets.token_hex(8)
+            names = ['%s%s-%d' % (base, nonce, i) for i in range(len(parts))]
+            for k, v in zip(names, parts):
+                self._set(k, v)
             manifest = {'schema': SNAPSHOT_SCHEMA, 'key': cut, 'gid': self.gid, 'epoch': self.epoch, 'at': _iso(now),
-                        'chunks': [base + str(i) for i in range(len(parts))], 'sha256': [hashlib.sha256(v.encode()).hexdigest() for v in parts],
+                        'chunks': names, 'sha256': [hashlib.sha256(v.encode()).hexdigest() for v in parts],
                         'size': len(base64.b64decode(enc))}
             self._set(base + 'manifest', json.dumps(manifest, sort_keys=True))
             now = _parse_iso(manifest['at'])
@@ -937,6 +944,15 @@ class Ledger:
         if snap is None or at is None or now - at < DELETE_AFTER:
             return False
         if not active():
+            return False
+        # the stored snapshot, verified again (manifest and every chunk) and the
+        # one this module follows: another writer of the same cut may have
+        # replaced or damaged it since
+        try:
+            stored = self._read_snapshot(cut)
+        except SnapshotDamaged:
+            return False
+        if stored is None or json.dumps(stored[0], sort_keys=True) != json.dumps(snap, sort_keys=True):
             return False
         snaps = self._snapshots()
         keys = [k for k in self._list(LEDGER_PREFIX) if k.startswith(LEDGER_PREFIX)]

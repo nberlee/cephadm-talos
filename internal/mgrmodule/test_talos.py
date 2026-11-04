@@ -1380,3 +1380,32 @@ class Compaction(unittest.TestCase):
             lg.COMPACT_AFTER = old
         self.assertFalse([k for k in led.mon.kv if k.startswith(lg.LEDGER_PREFIX)])
         self.assertIn('mgr/cephadm/talos/inc/20/journal/op/op-%016x' % 1, led.mon.rms)
+
+    def test_an_upgrade_start_stays_pinned_until_its_record_is_cleared(self):
+        """Codex round 1: a finished upgrade still asks `upgrade done` until
+        the leader cleared its record; an agent upgrade's start is unpinned
+        once finished."""
+        from talos import ledger as lg
+        img = 'quay.io/ceph/ceph@sha256:' + 'cd' * 32
+        for record, cut in (({'upgrade': {'op': 'op-%016x' % 1, 'finished': True}}, False), ({}, True),
+                            ({'agent_upgrade': {'op': 'op-%016x' % 1, 'finished': False}}, False),
+                            ({'agent_upgrade': {'op': 'op-%016x' % 1, 'finished': True}}, True)):
+            mod, entries = Acceptance.module(self)
+            mod._gid = 20
+            mod._logger = types.SimpleNamespace(info=lambda *a: None, warning=lambda *a: None)
+            led = mod._ledger
+            led.append({'id': 'op-%016x' % 1, 'kind': 'upgrade_start', 'image': img})
+            led.append({'id': 'm-%016x' % 1, 'kind': 'upgrade_done', 'of': 'op-%016x' % 1})
+            for i in range(2, 6):
+                led.append({'id': 'op-%016x' % i, 'kind': 'restart', 'daemon': 'mon.h1', 'host': 'h1'})
+            for i in range(1, 6):
+                entries['talos/inc/20/journal/op/op-%016x' % i] = json.dumps({'state': 'completed'})
+            entries.update(state_entries(inventory(), dict({'fsid': 'f', 'sealed': True, 'ledger_applied': max(led.entries)}, **record), incarnation='20'))
+            old = lg.COMPACT_AFTER
+            lg.COMPACT_AFTER = 3
+            try:
+                m.Module._compact(mod, led, lambda: True, self.NOW)
+            finally:
+                lg.COMPACT_AFTER = old
+            covered = led.snapshot is not None and lg.LEDGER_PREFIX + led.snapshot_key >= lg.entry_key(7, 1, 'op-%016x' % 1)
+            self.assertEqual(covered, cut, record)

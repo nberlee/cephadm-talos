@@ -592,7 +592,7 @@ class SnapshotTest(unittest.TestCase):
         self.assertTrue(led.publish(first, content, self.NOW))
         rel, content = led.cut(self.INV, {'op-%016x' % i: 'completed' for i in (1, 2, 3)}, max(led.entries), set(), self.NOW)
         self.assertTrue(led.publish(rel, content, self.NOW))
-        chunk = lg.SNAPSHOT_PREFIX + rel + '/0'
+        chunk = json.loads(mons.kv[lg.SNAPSHOT_PREFIX + rel + '/manifest'])['chunks'][0]
         mons.kv[chunk] = mons.kv[chunk][:-4] + 'AAAA'
         # the older one, while the entries above it are there
         succ = self.opened(mons, 30, 9)
@@ -620,3 +620,47 @@ class SnapshotTest(unittest.TestCase):
                 return super().__call__(cmd, deadline, reduce)
         with self.assertRaises(lg.LedgerError):
             self.opened(Losing(mons.kv), 40, 11)
+
+    def test_two_writers_of_one_cut(self):
+        """Codex round 1: a predecessor that found no manifest writes the same
+        cut after its successor published it; its chunks never overwrite the
+        successor's, and deletion verifies the stored snapshot first."""
+        mons = Mons()
+        led = self.opened(mons, 20, 7)
+        for i in (1, 2, 3):
+            self.restart(led, i)
+        done = {'op-%016x' % i: 'completed' for i in (1, 2, 3)}
+        rel, content = led.cut(self.INV, done, max(led.entries), set(), self.NOW)
+        self.assertTrue(led.publish(rel, content, self.NOW))
+        # the other writer saw no manifest, wrote its chunks and died before its manifest
+        other = lg.Ledger(mons, 10, 5)
+        other.ready = True
+        other._read_snapshot = lambda cut: None
+        real = other._set
+
+        def set_(key, value):
+            if key.endswith('/manifest'):
+                raise lg.OutcomeUnknown('gone')
+            real(key, value)
+        other._set = set_
+        theirs = dict(content, lookup=[{'id': 'x', 'at': lg._iso(self.NOW)}])
+        with self.assertRaises(lg.OutcomeUnknown):
+            other.publish(rel, theirs, self.NOW)
+        self.assertEqual(len([k for k in mons.kv if k.startswith(lg.SNAPSHOT_PREFIX + rel + '/') and not k.endswith('/manifest')]), 2)
+        self.assertEqual(self.opened(mons, 30, 9).snapshot_key, rel)
+        # a damaged stored snapshot: nothing is deleted for it
+        chunk = json.loads(mons.kv[lg.SNAPSHOT_PREFIX + rel + '/manifest'])['chunks'][0]
+        good = mons.kv[chunk]
+        mons.kv[chunk] = good[:-4] + 'AAAA'
+        self.assertFalse(led.delete(self.NOW + lg.DELETE_AFTER, lambda: True, lambda covered: None))
+        self.assertEqual(mons.rms, [])
+        # nor for a manifest another writer replaced
+        mons.kv[chunk] = good
+        saved = mons.kv[lg.SNAPSHOT_PREFIX + rel + '/manifest']
+        del mons.kv[lg.SNAPSHOT_PREFIX + rel + '/manifest']
+        other._set, other._read_snapshot = real, lg.Ledger._read_snapshot.__get__(other)
+        other.publish(rel, theirs, self.NOW)  # its own manifest replaces the successor's
+        self.assertFalse(led.delete(self.NOW + lg.DELETE_AFTER, lambda: True, lambda covered: None))
+        self.assertEqual(mons.rms, [])
+        mons.kv[lg.SNAPSHOT_PREFIX + rel + '/manifest'] = saved
+        self.assertTrue(led.delete(self.NOW + lg.DELETE_AFTER, lambda: True, lambda covered: None))
