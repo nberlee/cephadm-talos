@@ -178,8 +178,9 @@ func (l *LeaderLoop) drainControlsAhead(ctx context.Context, b *Bridge, js store
 
 // mustFinish reports whether a drain's step is a removal past its point of no
 // return: a mgr, RGW or mon taken out of the state (removeDaemon drops it
-// before the revision and the retirement), or an OSD purged (marked Purged
-// once retired, before its zap and its state entry go). It is finished before
+// before the revision and the retirement), or an OSD whose retirement was
+// asked for (marked Retiring before the module's purge, Purged after it,
+// both before its zap and its state entry go). It is finished before
 // the drain record goes, also after a stop. An OSD absent is removed (it
 // leaves the state last); a daemon still in the state, not purged, may be
 // abandoned by a stop.
@@ -192,7 +193,7 @@ func mustFinish(st *state.State, d state.Drain) bool {
 	if typ == state.TypeOSD {
 		x, ok := daemonOf(st, d.Step)
 
-		return ok && x.Purged
+		return ok && (x.Retiring || x.Purged)
 	}
 
 	x, ok := st.Find(d.Step)

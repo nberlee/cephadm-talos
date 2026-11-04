@@ -1567,12 +1567,28 @@ func (l *LeaderLoop) removeOSDAs(ctx context.Context, b *Bridge, js store.Backen
 		return fmt.Errorf("%w: %s has not stopped yet", errRetry, r.daemon)
 	}
 
+	// the retirement's intent, before the call: from here the removal is
+	// finished (the purge, its zap, the state's entry) also after a drain's
+	// stop, whether or not the module's purge is known to have happened
+	if !d.Retiring && !d.Purged {
+		if err := l.changeState(ctx, b, gid, func(st *state.State) error {
+			if x, ok := daemonOf(st, r.daemon); ok && !x.Retiring {
+				x.Retiring = true
+				st.AddDaemon(x)
+			}
+
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+
 	if err := r.call(ctx, b, "retire"); err != nil {
 		return fmt.Errorf("%w: %v", errRetry, err)
 	}
 
-	// purged: recorded in the state, so the rest of the removal (its zap, the
-	// state's entry) is finished also after a drain's stop (plan 04, step 5)
+	// purged: recorded in the state, so a retried removal goes on to its zap
+	// and the state's entry (plan 04, step 5)
 	if !d.Purged {
 		if err := l.changeState(ctx, b, gid, func(st *state.State) error {
 			if x, ok := daemonOf(st, r.daemon); ok && !x.Purged {

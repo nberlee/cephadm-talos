@@ -459,12 +459,14 @@ func TestAStopGivesUpAFailedStepWhoseDaemonStays(t *testing.T) {
 	s, _ := drainSetup(t)
 	ctx := context.Background()
 
+	drain := s.accept(KindDrain, "", "h1", 2)
+	must(t, s.leader.Tick(ctx, 42, 5)) // the OSDs out
+
+	// osd.3's own out is refused: nothing of its removal past its retirement
 	s.module.mu.Lock()
-	s.module.refuse = "retire" // osd.3 stays in the state until its retirement
+	s.module.refuse = "osd out"
 	s.module.mu.Unlock()
 
-	drain := s.accept(KindDrain, "", "h1", 2)
-	must(t, s.leader.Tick(ctx, 42, 5))
 	must(t, s.leader.Tick(ctx, 42, 5))
 	s.leader.failing[drain.Op.ID+".d2"] = time.Now().Add(-stuckAfter - time.Minute)
 	must(t, s.leader.Tick(ctx, 42, 5))
@@ -558,5 +560,53 @@ func TestAStopFinishesAPurgedOSDsRemoval(t *testing.T) {
 
 	if h.Drain != nil || osd || !mgr || !slices.Contains(s.calls(), "drain done "+drain.Op.ID) {
 		t.Fatalf("after: record %+v, osd %t, mgr %t, calls %v", h.Drain, osd, mgr, s.calls())
+	}
+}
+
+func TestAStopFinishesAnOSDRemovalWhoseRetirementWasAsked(t *testing.T) {
+	s, _ := drainSetup(t)
+	ctx := context.Background()
+
+	drain := s.accept(KindDrain, "", "h1", 2)
+	must(t, s.leader.Tick(ctx, 42, 5)) // the OSDs out
+
+	// the retirement's answer is lost (refused here): the intent is in the
+	// state before the call, so the module may have purged it
+	s.module.mu.Lock()
+	s.module.refuse = "retire"
+	s.module.mu.Unlock()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	st, _, err := s.leader.clusterState(ctx, s.leader.bridge())
+	must(t, err)
+
+	if x, ok := st.Find("osd.3"); !ok || !x.Retiring || x.Purged {
+		t.Fatalf("the OSD before its retirement's answer: %+v", x)
+	}
+
+	s.leader.failing[drain.Op.ID+".d2"] = time.Now().Add(-stuckAfter - time.Minute)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	// paused, then stopped: the removal is kept and retried, not given up
+	stop := s.accept(KindDrainStop, "", "h1", 3)
+	stop.Op.Drain = drain.Op.ID
+	s.module.mu.Lock()
+	s.module.ledger[len(s.module.ledger)-1] = stop
+	s.module.refuse, s.module.retired = "", nil
+	s.module.mu.Unlock()
+
+	for range 3 {
+		must(t, s.leader.Tick(ctx, 42, 5))
+	}
+
+	st, _, err = s.leader.clusterState(ctx, s.leader.bridge())
+	must(t, err)
+
+	h, _ := st.Host("h1")
+	_, osd := st.Find("osd.3")
+
+	if h.Drain != nil || osd || !slices.Contains(s.calls(), "retire "+drain.Op.ID+" osd.3") || !slices.Contains(s.calls(), "drain done "+drain.Op.ID) {
+		t.Fatalf("after: record %+v, osd %t, calls %v", h.Drain, osd, s.calls())
 	}
 }
