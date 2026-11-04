@@ -1656,15 +1656,49 @@ class Channel:
             # one record per stop, by the id the agent gave it: a later stop
             # on the same boot replaces the one before
             d = fold.down.get(peer)
-            if d is None or d['stop'] != req['stop']:
+            recorded = d is None or d['stop'] != req['stop']
+            if recorded:
                 now = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
                 try:
                     led.append({'id': 'm-' + secrets.token_hex(8), 'kind': 'host_down', 'host': peer, 'boot': req['boot'], 'stop': req['stop'], 'at': now})
                 except ledger.LedgerError as e:
                     return 503, {'error': 'not recorded: %s' % e}
+        # the active mgr's own host stops: it fails over at once, once the stop
+        # is in the ledger (the successor's noout loop sets the noout from it),
+        # once per stop, after this reply (plan 04, step 5, item 2b)
+        if recorded and peer == self.mgr_id:
+            threading.Thread(target=self.fail_over_self, args=(req['stop'],), name='talos-failover', daemon=True).start()
         if self.on_down is not None:
             self.on_down()
         return 200, {'outcome': 'done'}
+
+    def fail_over_self(self, stop: str) -> bool:
+        """`mgr fail` of this module's own mgr by its captured gid, for a stop
+        of its host: only while the mons show it active and a standby is
+        available, never twice for one stop. True when it was sent."""
+        with self.lock:
+            failed = self.__dict__.setdefault('_failed_over', set())
+            if stop in failed:
+                return False
+            failed.add(stop)
+        cap = self.leadership.captured()
+        job = self._mon({'prefix': 'mgr dump', 'format': 'json'})
+        if cap is None or job is None or job.r != 0 or job.too_large:
+            self.log.warning('no failover for the stop of this mgr\'s host: the mgr map cannot be read')
+            return False
+        try:
+            mm = json.loads(job.outb)
+            standbys = [s for s in mm.get('standbys', []) if s.get('available', True)]
+        except (ValueError, AttributeError):
+            return False
+        if mm.get('active_gid') != cap[0] or mm.get('active_name') != self.mgr_id:
+            return False
+        if not standbys:
+            self.log.info('this mgr\'s host stops and no standby mgr is available: no failover')
+            return False
+        self.log.info('this mgr\'s host stops: failing over to a standby')
+        self._mon({'prefix': 'mgr fail', 'who': str(cap[0])}, 'mgr.%s' % self.mgr_id)
+        return True
 
     def _mgr_fail(self, fold: Any, op: Optional[Dict[str, Any]], gid: Any, ops: Optional[Dict[str, Dict[str, Any]]] = None) -> Tuple[int, Dict[str, Any]]:
         """`mgr fail` of the active mgr by its gid, for an operation that must stop

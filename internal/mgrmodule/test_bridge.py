@@ -1417,6 +1417,35 @@ class NooutTest(unittest.TestCase):
         self.assertEqual(self.call('retire host', operation=rm)[1]['outcome'], 'done')
         self.assertEqual((self.sets(), self.mons.flags, 'h2' in self.ch.authority()[1].hosts), ([], {'h2': ['noout']}, False))
 
+    def test_the_active_mgrs_host_stopping_fails_it_over(self):
+        # plan 04, step 5, item 2b: this module's mgr is h1, gid 42
+        self.fold('mon.h1@h1', 'osd.3@h1', 'mgr.h1@h1', 'mgr.h2@h2')
+        fails = lambda: [c for c in self.mons.maint_calls if c[0] == 'mgr fail']
+        # no standby: no failover
+        self.assertEqual(self.report('h1', stop='b-1.aa.1')[0], 200)
+        self.assertTrue(wait_until(lambda: 'mgr dump' in [p for _, p in self.mons.sent]))
+        time.sleep(0.1)
+        self.assertEqual(fails(), [])
+        self.mons.maps = [dict(mgrmap(42, 'h1'), standbys=[{'gid': 50, 'name': 'h2', 'available': True}])]
+        # another host's stop: none
+        self.assertEqual(self.report('h2', stop='b-1.bb.1')[0], 200)
+        time.sleep(0.1)
+        self.assertEqual(fails(), [])
+        # a new stop of its own host: after host_down is in the ledger, mgr fail by its own gid
+        self.assertEqual(self.report('h1', stop='b-1.aa.2')[0], 200)
+        self.assertTrue(wait_until(lambda: fails() == [('mgr fail', '42')]))
+        self.assertEqual(self.ch.authority()[1].down['h1']['stop'], 'b-1.aa.2')
+        # the noout is the successor's: this module sent none for it
+        self.assertEqual(self.sets(), [])
+        # the same stop reported again: never twice
+        self.assertEqual(self.report('h1', stop='b-1.aa.2')[0], 200)
+        self.assertFalse(self.ch.fail_over_self('b-1.aa.2'))
+        time.sleep(0.1)
+        self.assertEqual(fails(), [('mgr fail', '42')])
+        # not when the mons show another mgr active
+        self.mons.maps = [dict(mgrmap(43, 'h2'), standbys=[{'gid': 42, 'name': 'h1', 'available': True}])]
+        self.assertFalse(self.ch.fail_over_self('b-1.aa.3'))
+
     def test_going_down_reports(self):
         self.fold('mon.h1@h1', 'osd.3@h1')
         # an agent reports only its own host, of this cluster, and well formed
