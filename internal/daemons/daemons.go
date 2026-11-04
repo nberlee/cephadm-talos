@@ -62,6 +62,11 @@ const (
 	RestartMaxDelay = 2 * time.Minute
 )
 
+// DelayedStopTimeout is the stop timeout of a mgr and a mon, whose entrypoint
+// delays the daemon's SIGTERM (4 and 6 seconds, run_delayed in common.sh;
+// plan 04, step 5, item 2b), well over the delay.
+const DelayedStopTimeout = 20 * time.Second
+
 // RGWStopTimeout lets radosgw drain: rgw_exit_timeout_secs (pinned to 120s
 // by rgw.sh) plus 10s. With rgw_graceful_stop it finishes requests in flight first.
 const RGWStopTimeout = 130 * time.Second
@@ -133,6 +138,7 @@ func Mon(p Params) *spec.ContainerConfig {
 	c.ContainerEnvironment = append(c.ContainerEnvironment, "MODE="+p.Mode, "ADDRV="+p.Addrv)
 	// restricted profile: no capabilities, read-only rootfs
 	c.SecurityConfig = spec.Restricted()
+	c.ContainerStopTimeout = DelayedStopTimeout
 
 	return c
 }
@@ -145,6 +151,7 @@ func Mon(p Params) *spec.ContainerConfig {
 func Mgr(p Params, moduleFiles ...string) *spec.ContainerConfig {
 	c := base(p, "mgr")
 	c.SecurityConfig = spec.Restricted()
+	c.ContainerStopTimeout = DelayedStopTimeout
 	c.MountsConfig = append(c.MountsConfig, spec.HostPath("/etc/ceph/mgr/cephadm", "/usr/share/ceph/mgr/cephadm", "ro"))
 
 	for _, f := range moduleFiles {

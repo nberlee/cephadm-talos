@@ -23,4 +23,6 @@ if [ "$(cat "$D/cephadm-talos-done" 2>/dev/null)" != "$DEPLOY_ID" ]; then
 fi
 
 log "starting mon.$ID"
-exec ceph-mon -f -i "$ID" --mon-data "$D" --public-addrv "$ADDRV" --default-log-to-file=false --default-log-to-stderr=true --default-mon-cluster-log-to-stderr=true
+# a child, not exec'd: its SIGTERM waits 6s, so the mon keeps quorum until the
+# module's host_down and failover are done (plan 04, step 5, item 2b)
+run_delayed 6 ceph-mon -f -i "$ID" --mon-data "$D" --public-addrv "$ADDRV" --default-log-to-file=false --default-log-to-stderr=true --default-mon-cluster-log-to-stderr=true
