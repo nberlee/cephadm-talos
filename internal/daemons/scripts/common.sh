@@ -47,7 +47,10 @@ run_delayed() {
 		status=0
 		wait "$child" || status=$?
 		if ! kill -0 "$child" 2>/dev/null; then
-			exit "$status"
+			# a wait interrupted by a trapped signal returned the signal's
+			# status, not the daemon's: bash keeps the reaped child's status
+			wait "$child" 2>/dev/null
+			exit $?
 		fi
 	done
 }
