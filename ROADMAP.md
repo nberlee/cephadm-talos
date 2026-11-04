@@ -27,7 +27,7 @@ Out of scope for v1: Omni-managed nodes. Omni applies the full config it compose
 
 ## Talos dependencies
 
-Talos baseline: the nodes and `pkg/machinery` come from one combined build of our four PRs (#14775, #14781, #14788, #14795) until they are in a Talos release; the supported Talos release becomes the first one containing them ([docs/support.md](docs/support.md)).
+Talos baseline: the nodes and `pkg/machinery` come from one combined build of our four PRs (#14775, #14781, #14788, #14795) until they are in a Talos release; the supported Talos release becomes the first one containing them ([docs/support.md](docs/support.md)). Upstream main has moved past the combined build (checked 2026-11-04): `ContainerConfig` gained a `lifecycle` subtree (`dependsOn` and the merged stop timeout live under it), the configuration API of container health checks (its controller not yet merged), and effective added capabilities for non-root containers. A later rebase of the combined build onto it moves our renders to `lifecycle.dependsOn` and `lifecycle.stopTimeout` and rebases #14781 and #14795; deferred by the user (2026-11-04).
 
 | Talos feature | Status | Until then |
 |---|---|---|
