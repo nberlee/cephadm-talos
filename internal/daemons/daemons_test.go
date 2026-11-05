@@ -157,3 +157,40 @@ func TestCephConfAndImageRepository(t *testing.T) {
 		t.Error("the setting is not in the document")
 	}
 }
+
+// The inspect path takes a retiring host's journaled serial, which the job needs
+// to read a set moved aside as retired (plan 04, step 6).
+func TestRecordsJobsCarryTheirSerial(t *testing.T) {
+	args := func(c *spec.ContainerConfig) string { return strings.Join(c.ContainerEntrypoint, " ") }
+
+	if got := args(RecordsJob("n", "i", "f", "j", "x", "", "")); strings.Contains(got, "--serial") {
+		t.Errorf("no serial asked: %s", got)
+	}
+
+	if got := args(RecordsJob("n", "i", "f", "j", "x", "s", "12")); !strings.Contains(got, "--session s --serial 12") {
+		t.Errorf("inspect: %s", got)
+	}
+
+	if got := args(RecordsRetireJob("n", "i", "f", "j", "x", "12", "boot")); !strings.Contains(got, "--serial 12 --retire --boot boot") {
+		t.Errorf("retire: %s", got)
+	}
+
+	if got := args(RecordsRetireJob("n", "i", "f", "j", "x", "", "")); strings.Contains(got, "--serial") {
+		t.Errorf("retire without a serial: %s", got)
+	}
+
+	if got := args(RecordsProbeJob("n", "i", "f", "j", "x")); !strings.Contains(got, "--none-ok") || strings.Contains(got, "--serial") {
+		t.Errorf("probe: %s", got)
+	}
+}
+
+func TestAMembersRecordsJobIsNotHeldToItsSerial(t *testing.T) {
+	got := strings.Join(RecordsMemberJob("n", "i", "f", "j", "x", "s", "12").ContainerEntrypoint, " ")
+	if !strings.Contains(got, "--session s --serial 12 --any-generation") {
+		t.Errorf("member: %s", got)
+	}
+
+	if got := strings.Join(RecordsJob("n", "i", "f", "j", "x", "s", "12").ContainerEntrypoint, " "); strings.Contains(got, "--any-generation") {
+		t.Errorf("held: %s", got)
+	}
+}

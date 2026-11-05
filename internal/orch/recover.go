@@ -30,8 +30,11 @@ var quorumTimeout = 10 * time.Minute
 // whose document is there is restarted, and one whose document went missing
 // (its agent still owned it) is applied again with its store's deployment id,
 // each only if its document, its store and its marker check out. Then it
-// waits for a quorum.
-func (o *Orch) RecoverMons(ctx context.Context, image string) error {
+// waits for a quorum. Nothing is written to a node whose agent is not suspended:
+// a host the session left out stays out, unless the operator names it in
+// members, asserting it is a real member; it is then suspended as a member
+// first, and only with its receipt recovered as any other.
+func (o *Orch) RecoverMons(ctx context.Context, image string, members []string) error {
 	if o.Talos.DryRun {
 		return errors.New("recover has no dry run")
 	}
@@ -55,10 +58,22 @@ func (o *Orch) RecoverMons(ctx context.Context, image string) error {
 		return errors.New("no suspended recovery session: run `cephadm-talos suspend` first")
 	}
 
-	// every host it may touch, also one found since the suspension
+	for _, name := range members {
+		if err := o.suspendAsMember(ctx, rec, name); err != nil {
+			return fmt.Errorf("%s: %w (nothing further is done with it, and no mon was recovered: fix that and run `cephadm-talos recover mons --member %s` again)", name, err, name)
+		}
+	}
+
+	// every host it may touch, also one found since the suspension. Once
+	// recovery began suspend refuses: resume suspends such a host once the mons
+	// answer, and refusing here could keep them from answering
 	for _, h := range o.removalHosts(rec) {
 		if hr := rec.Hosts[h.Name]; hr == nil || hr.Receipt == nil {
-			return fmt.Errorf("%s is not suspended in this session: run `cephadm-talos suspend` again", h.Name)
+			if rec.Phase != state.PhaseRecovering {
+				return fmt.Errorf("%s is not suspended in this session: run `cephadm-talos suspend` again", h.Name)
+			}
+
+			o.printf("warning: %s is not suspended in this session: `cephadm-talos resume` suspends it once the mons answer\n", h.Name)
 		}
 	}
 
@@ -72,6 +87,11 @@ func (o *Orch) RecoverMons(ctx context.Context, image string) error {
 	var failed []string
 
 	for _, h := range o.removalHosts(rec) {
+		// not suspended: nothing is written to its node
+		if hr := rec.Hosts[h.Name]; hr == nil || hr.Receipt == nil {
+			continue
+		}
+
 		if err := o.recoverMon(ctx, rec, h, image); err != nil {
 			o.printf("mon.%s: %v\n", h.Name, err)
 			failed = append(failed, h.Name)
@@ -79,10 +99,62 @@ func (o *Orch) RecoverMons(ctx context.Context, image string) error {
 	}
 
 	if err := o.waitQuorum(ctx, rec); err != nil {
-		return errors.Join(err, failedMons(failed))
+		return errors.Join(err, failedMons(failed), leftOutHint(leftOutHosts(rec)))
 	}
 
 	return failedMons(failed)
+}
+
+// leftOutHosts are the hosts the session left out, by name.
+func leftOutHosts(rec *state.Recovery) []state.Host {
+	return slices.DeleteFunc(journaledHosts(rec), func(h state.Host) bool { return !rec.Hosts[h.Name].LeftOut })
+}
+
+// leftOutHint names the hosts a missing quorum may depend on.
+func leftOutHint(left []state.Host) error {
+	if len(left) == 0 {
+		return nil
+	}
+
+	names := make([]string, 0, len(left))
+	for _, h := range left {
+		names = append(names, h.Name+" ("+h.Addr+")")
+	}
+
+	return fmt.Errorf("left out of this session, and possibly holding a mon the quorum needs: %s; nothing was done on those nodes. If one is a host of the cluster: `cephadm-talos recover mons --member <host>`", strings.Join(names, ", "))
+}
+
+// suspendAsMember is the operator's assertion that a host the session left out
+// is a real member: it is suspended as a member, by its agent or, if that does
+// not answer, through Talos as any member. It is not known to be retiring, and
+// its identity is read again from its agent or its document. A retry continues.
+func (o *Orch) suspendAsMember(ctx context.Context, rec *state.Recovery, name string) error {
+	hr := rec.Hosts[name]
+	if hr == nil || !hr.LeftOut && hr.Receipt != nil {
+		return errors.New("not a host this session left out")
+	}
+
+	if hr.LeftOut {
+		hr.Receipt = nil
+		hr.LeftOut = false
+
+		clearRetiring(hr)
+		hr.AgentSerial = ""
+
+		if err := rec.Save(); err != nil {
+			return err
+		}
+	}
+
+	if err := o.suspendHosts(ctx, []state.Host{{Name: name, Addr: hr.Addr}}, rec, SuspendOptions{}); err != nil {
+		return err
+	}
+
+	if hr.LeftOut {
+		return errors.New("its node is not that host, or does not answer: left out again")
+	}
+
+	return nil
 }
 
 var (

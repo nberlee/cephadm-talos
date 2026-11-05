@@ -62,6 +62,8 @@ const (
 	KindDrainResume  = "drain_resume"
 	KindSetAddr      = "set_host_addr"
 	KindMoveResume   = "move_resume"
+	// KindRetireForgotten is `ceph orch talos host forgotten` (plan 04, step 6)
+	KindRetireForgotten = "retire_forgotten"
 )
 
 // errWait is a step that waits as long as it takes (a drain), which does not
@@ -120,6 +122,15 @@ func (l *LeaderLoop) ledgerOps(ctx context.Context, b *Bridge, js store.Backend,
 				skipped, after = e.Key, e.Key
 
 				continue
+			}
+
+			// a retirement's control runs ahead of queued operations and of
+			// any step holding the slot: it changes that retirement's record
+			// alone, and the retirement goes on once the slot is free
+			if len(st.Retiring) > 0 && !isRetireControl(e.Op.Kind) {
+				if err := l.controlsAheadOf(ctx, b, js, gid, epoch, after, isRetireControl); err != nil {
+					return err
+				}
 			}
 
 			// an upgrade step in progress, or an upgrade ending, holds the slot:
@@ -355,16 +366,16 @@ func (l *LeaderLoop) ledgerOp(ctx context.Context, b *Bridge, js store.Backend, 
 	known := map[string]bool{KindRestart: true, KindRedeploy: true, KindAddDaemon: true, KindRemoveDaemon: true, KindRemoveHost: true, KindCreateOSD: true, KindRemoveOSD: true,
 		KindEnterMaint: true, KindExitMaint: true, KindPowercycle: true, KindUpgrade: true, KindUpPause: true, KindUpResume: true, KindUpStop: true,
 		KindIngress: true, KindAddHost: true, KindRenewMgr: true, KindRenewRGW: true, KindRenewAgent: true, KindAgentUpgrade: true, KindAgentResume: true, KindAgentStop: true,
-		KindDrain: true, KindDrainStop: true, KindDrainResume: true, KindSetAddr: true, KindMoveResume: true}
+		KindDrain: true, KindDrainStop: true, KindDrainResume: true, KindSetAddr: true, KindMoveResume: true, KindRetireForgotten: true}
 	cluster := op.Kind == KindUpgrade || isControl(op.Kind) || op.Kind == KindIngress || op.Kind == KindRenewRGW || op.Kind == KindAgentUpgrade || isAgentControl(op.Kind)
 	noDaemon := cluster || op.Kind == KindRemoveHost || op.Kind == KindAddHost || op.Kind == KindCreateOSD || op.Kind == KindEnterMaint || op.Kind == KindExitMaint || op.Kind == KindPowercycle ||
-		op.Kind == KindRenewAgent || op.Kind == KindDrain || isDrainControl(op.Kind) || op.Kind == KindSetAddr || isMoveControl(op.Kind)
+		op.Kind == KindRenewAgent || op.Kind == KindDrain || isDrainControl(op.Kind) || op.Kind == KindSetAddr || isMoveControl(op.Kind) || isRetireControl(op.Kind)
 	bound := isControl(op.Kind) || isAgentControl(op.Kind)
 	if !ledgerIDRe.MatchString(op.ID) || cluster != (op.Host == "") || !cluster && pki.ValidName(op.Host) != nil || !known[op.Kind] ||
 		(op.Kind == KindUpgrade || op.Kind == KindIngress || op.Kind == KindAgentUpgrade) != (op.Image != "") || (op.Kind == KindIngress) != (op.VIP != "") || bound != ledgerIDRe.MatchString(op.Upgrade) ||
 		noDaemon != (op.Daemon == "") || (op.Daemon != "" && !ledgerDaemonRe.MatchString(op.Daemon)) ||
 		(op.Kind == KindCreateOSD) != strings.HasPrefix(op.Device, "/dev/") || isDrainControl(op.Kind) != ledgerIDRe.MatchString(op.Drain) ||
-		isMoveControl(op.Kind) != ledgerIDRe.MatchString(op.Move) || op.Kind == KindSetAddr && net.ParseIP(op.Addr) == nil {
+		isMoveControl(op.Kind) != ledgerIDRe.MatchString(op.Move) || isRetireControl(op.Kind) != ledgerIDRe.MatchString(op.Remove) || op.Kind == KindSetAddr && net.ParseIP(op.Addr) == nil {
 		return true, writeJSONKey(ctx, js, opKey, JournalOp{Version: journalVersion, Kind: op.Kind, Host: op.Host, State: JournalFailed, Error: "unknown or malformed operation"})
 	}
 
@@ -374,6 +385,14 @@ func (l *LeaderLoop) ledgerOp(ctx context.Context, b *Bridge, js store.Backend, 
 	}
 
 	switch op.Kind {
+	case KindRetireForgotten:
+		if err := l.unstick(ctx, js, opKey, opKey, op, nil, l.retireForgotten(ctx, b, js, gid, op)); err != nil {
+			return false, err
+		}
+
+		s, err = l.journalState(ctx, b, js, gid, op.ID)
+
+		return err == nil && terminal(s), err
 	case KindSetAddr, KindMoveResume:
 		phase := func() error { return l.moveControl(ctx, b, js, gid, op) }
 

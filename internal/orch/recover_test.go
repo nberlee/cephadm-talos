@@ -15,6 +15,7 @@ import (
 	"github.com/nberlee/cephadm-talos/internal/daemons"
 	"github.com/nberlee/cephadm-talos/internal/spec"
 	"github.com/nberlee/cephadm-talos/internal/state"
+	"github.com/nberlee/cephadm-talos/internal/talos"
 	"github.com/nberlee/cephadm-talos/internal/talos/talostest"
 	"github.com/nberlee/cephadm-talos/internal/wire"
 )
@@ -120,7 +121,7 @@ func TestAMissingMonDocumentIsAppliedOnItsStore(t *testing.T) {
 	ctx := context.Background()
 	o.inspectMon = func(state.Host) (string, error) { return "d3p10y", nil }
 
-	_ = o.RecoverMons(ctx, "quay.io/ceph/ceph@sha256:"+strings.Repeat("ab", 32)) // no quorum in the fake
+	_ = o.RecoverMons(ctx, "quay.io/ceph/ceph@sha256:"+strings.Repeat("ab", 32), nil) // no quorum in the fake
 
 	doc := o.St.DocName(state.Daemon{Type: state.TypeMon, ID: h.Name, Host: h.Name})
 
@@ -154,7 +155,7 @@ func TestAMonIsNotStartedOnAStoreThatDoesNotMatch(t *testing.T) {
 	var out bytes.Buffer
 	o.Out = &out
 
-	if err := o.RecoverMons(ctx, ""); err == nil || !strings.Contains(err.Error(), "were not recovered") || !strings.Contains(out.String(), "is not the document's deployment id") {
+	if err := o.RecoverMons(ctx, "", nil); err == nil || !strings.Contains(err.Error(), "were not recovered") || !strings.Contains(out.String(), "is not the document's deployment id") {
 		t.Fatalf("a marker that differs: %v\n%s", err, out.String())
 	}
 
@@ -162,7 +163,7 @@ func TestAMonIsNotStartedOnAStoreThatDoesNotMatch(t *testing.T) {
 	o2, _, _ := recoverSetup(t, false)
 	o2.inspectMon = func(state.Host) (string, error) { t.Fatal("inspected a host without a mon"); return "", nil }
 
-	_ = o2.RecoverMons(ctx, "")
+	_ = o2.RecoverMons(ctx, "", nil)
 }
 
 func TestEachInspectionAfterAResultIsANewJob(t *testing.T) {
@@ -229,7 +230,7 @@ func TestRecoveryNeedsEveryHostSuspended(t *testing.T) {
 
 	o.inspectMon = func(state.Host) (string, error) { t.Fatal("an effect before every host was checked"); return "", nil }
 
-	if err := o.RecoverMons(context.Background(), ""); err == nil || !strings.Contains(err.Error(), "h9") {
+	if err := o.RecoverMons(context.Background(), "", nil); err == nil || !strings.Contains(err.Error(), "h9") {
 		t.Fatalf("a host without a receipt: %v", err)
 	}
 }
@@ -290,10 +291,210 @@ func TestALeftInspectionGoesAlsoWhenTheMonRuns(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_ = o.RecoverMons(ctx, "")
+	_ = o.RecoverMons(ctx, "", nil)
 
 	docs, err := o.configuredContainers(ctx, h.Addr, name)
 	if err != nil || slices.Contains(docs, name) {
 		t.Fatalf("the left inspection stayed: %v %v", docs, err)
+	}
+}
+
+// Offline, the workstation's cached hosts include contacts the suspension did
+// not count, as state.Load gives them: the journal is the authority, or a
+// removed host's contact fails `recover mons` before any mon is recovered.
+func TestAnOfflineRecoveryKeepsTheSessionsExclusions(t *testing.T) {
+	o, h, rec := recoverSetup(t, true)
+
+	// h8's retirement ended before the suspension; h7's node was left out of it
+	o.St.Hosts = append(o.St.Hosts, state.Host{Name: "h8", Addr: "127.0.0.8"}, state.Host{Name: "h7", Addr: "127.0.0.7"})
+	rec.Hosts["h7"] = &state.RecoveryHost{Addr: "127.0.0.7", Retiring: true, LeftOut: true, Receipt: &wire.SuspendReceipt{}}
+
+	if err := rec.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	names := func() []string {
+		var out []string
+		for _, x := range o.removalHosts(rec) {
+			out = append(out, x.Name)
+		}
+
+		return out
+	}
+
+	if got := names(); !slices.Equal(got, []string{h.Name}) {
+		t.Fatalf("offline: %v", got)
+	}
+
+	if err := o.RecoverMons(context.Background(), "", nil); err != nil && strings.Contains(err.Error(), "not suspended") {
+		t.Fatalf("recover mons: %v", err)
+	}
+
+	// with the published state, a member the session has not found still counts
+	o.opened = true
+
+	if got := names(); !slices.Equal(got, []string{h.Name, "h8"}) {
+		t.Fatalf("online: %v", got)
+	}
+
+	// without a session nothing is excluded: a removal's cleanup reaches the contacts
+	o.opened = false
+
+	if got := o.removalHosts(nil); len(got) != 3 {
+		t.Fatalf("no session: %v", got)
+	}
+}
+
+// Offline, a host's address is the journal's: the cached one may be from before
+// a move, and the session suspended the host at the journaled one.
+func TestAnOfflineSessionReachesAHostAtItsJournaledAddress(t *testing.T) {
+	o, h, rec := recoverSetup(t, true)
+
+	// a member moved and a retiring host moved, between this workstation's
+	// refreshes, its cache as state.Load gives it
+	o.St.Hosts = []state.Host{{Name: h.Name, Addr: "127.0.0.66", Talosconfig: "/other", Context: "c"}, {Name: "h9", Addr: "127.0.0.67"}}
+	rec.Hosts["h9"] = &state.RecoveryHost{Addr: "127.0.0.9", Retiring: true, Receipt: &wire.SuspendReceipt{}}
+	o.Talos.Hosts = map[string]talos.Conn{"127.0.0.66": {Talosconfig: "/other", Context: "c"}}
+
+	addrs := map[string]string{}
+	for _, x := range o.removalHosts(rec) {
+		addrs[x.Name] = x.Addr
+	}
+
+	if addrs[h.Name] != h.Addr || addrs["h9"] != "127.0.0.9" || len(addrs) != 2 {
+		t.Fatalf("offline: %v", addrs)
+	}
+
+	if c := o.Talos.Hosts[h.Addr]; c.Talosconfig != "/other" || c.Context != "c" {
+		t.Fatalf("its connection at the journaled address: %+v", c)
+	}
+
+	// the cache itself stays as it was, and the published state wins online
+	o.opened = true
+
+	if o.St.Hosts[0].Addr != "127.0.0.66" || o.removalHosts(rec)[0].Addr != "127.0.0.66" {
+		t.Fatalf("online: %+v", o.removalHosts(rec))
+	}
+}
+
+// A host left out may have a running agent, whose changes a write would race:
+// nothing is written to it without the operator's assertion.
+func TestRecoveryWritesNothingToAHostLeftOut(t *testing.T) {
+	o, _, rec := recoverSetup(t, false)
+	ctx := context.Background()
+
+	rec.Hosts["h9"] = &state.RecoveryHost{Addr: "127.0.0.9", Retiring: true, LeftOut: true, Receipt: retiredReceipt(rec.Session, "h9")}
+
+	if err := rec.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	doc := o.St.DocName(state.Daemon{Type: state.TypeMon, ID: "h9", Host: "h9"})
+	mon := daemons.Mon(daemons.Params{Name: doc, Image: "quay.io/ceph/ceph@sha256:" + strings.Repeat("ab", 32), FSID: o.St.FSID, ID: "h9", Addr: "127.0.0.9", DeployID: "d9", Mode: "join", Addrv: daemons.MonAddrv("127.0.0.9")})
+
+	if err := o.apply(ctx, "127.0.0.9", mon); err != nil {
+		t.Fatal(err)
+	}
+
+	before, err := o.Talos.MachineConfig(ctx, "127.0.0.9")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	o.inspectMon = func(h state.Host) (string, error) {
+		if h.Name == "h9" {
+			t.Error("inspected a host left out")
+		}
+
+		return "", nil
+	}
+
+	err = o.RecoverMons(ctx, "", nil)
+	if err == nil || !strings.Contains(err.Error(), "--member") {
+		t.Fatalf("without a quorum: %v", err)
+	}
+
+	after, err := o.Talos.MachineConfig(ctx, "127.0.0.9")
+	if err != nil || after != before {
+		t.Fatalf("the node's config changed: %v", err)
+	}
+
+	got, err := state.LoadRecovery(o.St.FSID)
+	if err != nil || !got.Hosts["h9"].LeftOut || len(got.Hosts["h9"].Restarted) != 0 {
+		t.Fatalf("journal %+v %v", got.Hosts["h9"], err)
+	}
+}
+
+// A host without a receipt is not suspended: it is not written to either.
+func TestRecoveryWritesNothingToAHostWithoutAReceipt(t *testing.T) {
+	o, _, rec := recoverSetup(t, false)
+	ctx := context.Background()
+
+	rec.Phase = state.PhaseRecovering
+	rec.Hosts["h9"] = &state.RecoveryHost{Addr: "127.0.0.9"}
+
+	if err := rec.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	doc := o.St.DocName(state.Daemon{Type: state.TypeMon, ID: "h9", Host: "h9"})
+	mon := daemons.Mon(daemons.Params{Name: doc, Image: "quay.io/ceph/ceph@sha256:" + strings.Repeat("ab", 32), FSID: o.St.FSID, ID: "h9", Addr: "127.0.0.9", DeployID: "d9", Mode: "join", Addrv: daemons.MonAddrv("127.0.0.9")})
+
+	if err := o.apply(ctx, "127.0.0.9", mon); err != nil {
+		t.Fatal(err)
+	}
+
+	o.inspectMon = func(h state.Host) (string, error) {
+		if h.Name == "h9" {
+			t.Error("inspected a host that is not suspended")
+		}
+
+		return "", nil
+	}
+
+	_ = o.RecoverMons(ctx, "", nil)
+}
+
+// --member names only hosts the session left out.
+func TestRecoverMemberNeedsAHostLeftOut(t *testing.T) {
+	o, h, _ := recoverSetup(t, false)
+
+	for _, name := range []string{"unknown", h.Name} {
+		if err := o.RecoverMons(context.Background(), "", []string{name}); err == nil || !strings.Contains(err.Error(), "not a host this session left out") {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+}
+
+// Without a quorum the error says which hosts it may depend on.
+func TestRecoveryNamesTheHostsLeftOutWithoutAQuorum(t *testing.T) {
+	o, _, rec := recoverSetup(t, false)
+
+	rec.Hosts["h9"] = &state.RecoveryHost{Addr: "127.0.0.9", LeftOut: true, Receipt: retiredReceipt(rec.Session, "h9")}
+
+	if err := rec.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	err := o.RecoverMons(context.Background(), "", nil)
+	if err == nil || !strings.Contains(err.Error(), "h9 (127.0.0.9)") || !strings.Contains(err.Error(), "--member") {
+		t.Fatalf("without a quorum: %v", err)
+	}
+}
+
+// Once recovery began suspend refuses: a host without a receipt warns, it does
+// not keep the mons from being recovered.
+func TestAResumedRecoveryIsNotHeldByAHostWithoutAReceipt(t *testing.T) {
+	o, _, rec := recoverSetup(t, false)
+
+	rec.Phase = state.PhaseRecovering
+	rec.Hosts["h9"] = &state.RecoveryHost{Addr: "127.0.0.9"}
+
+	if err := rec.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := o.RecoverMons(context.Background(), "", nil); err != nil && strings.Contains(err.Error(), "not suspended") {
+		t.Fatalf("held: %v", err)
 	}
 }

@@ -941,20 +941,50 @@ const zapNoLabel = 67
 // removalHosts are the hosts a removal goes through: the state's and the
 // contacts, and every host a recovery session found.
 func (o *Orch) removalHosts(rec *state.Recovery) []state.Host {
-	hosts := o.St.AllHosts()
+	if rec == nil {
+		return o.St.AllHosts()
+	}
 
-	if rec != nil {
-		names := make([]string, 0, len(rec.Hosts))
-		for n := range rec.Hosts {
-			names = append(names, n)
+	// a session: the published hosts and the journaled ones. A contact the
+	// suspension did not count as a member (plan 04, step 6) is not its host,
+	// nor is a retiring host left out of it. Without the published state,
+	// o.St.Hosts is the workstation's cache, contacts included (state.Load):
+	// then the journal alone says who the session's hosts are and where they
+	// are: the cached address may be from before a move. The cache holds no
+	// other identity (LocalHost: no certificates or key names), and what it
+	// says of the connection stays the host's at its journaled address
+	hosts := slices.DeleteFunc(slices.Clone(o.St.Hosts), func(h state.Host) bool {
+		hr := rec.Hosts[h.Name]
+
+		return hr == nil && !o.opened || hr != nil && hr.LeftOut
+	})
+
+	if !o.opened {
+		for i := range hosts {
+			if addr := rec.Hosts[hosts[i].Name].Addr; addr != "" && addr != hosts[i].Addr {
+				if _, known := o.Talos.Hosts[addr]; !known && o.Talos.Hosts != nil {
+					o.Talos.Hosts[addr] = talos.Conn{Talosconfig: hosts[i].Talosconfig, Context: hosts[i].Context}
+				}
+
+				hosts[i].Addr = addr
+			}
+		}
+	}
+
+	names := make([]string, 0, len(rec.Hosts))
+	for n := range rec.Hosts {
+		names = append(names, n)
+	}
+
+	sort.Strings(names)
+
+	for _, n := range names {
+		if rec.Hosts[n].LeftOut {
+			continue
 		}
 
-		sort.Strings(names)
-
-		for _, n := range names {
-			if !slices.ContainsFunc(hosts, func(h state.Host) bool { return h.Name == n }) && rec.Hosts[n].Addr != "" {
-				hosts = append(hosts, state.Host{Name: n, Addr: rec.Hosts[n].Addr})
-			}
+		if !slices.ContainsFunc(hosts, func(h state.Host) bool { return h.Name == n }) && rec.Hosts[n].Addr != "" {
+			hosts = append(hosts, state.Host{Name: n, Addr: rec.Hosts[n].Addr})
 		}
 	}
 

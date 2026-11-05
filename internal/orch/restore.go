@@ -80,6 +80,18 @@ func (o *Orch) RestoreAgent(ctx context.Context, name string, previous bool) err
 		}
 	}
 
+	// a removed host's agent does not come back (plan 04, step 6), and settling
+	// its intent would fail its retirement
+	if _, _, retiring := o.St.RetiringHost(name); retiring || hr.Retiring {
+		return fmt.Errorf("%s is retiring: its agent is not restored; `cephadm-talos resume` takes its node over", name)
+	}
+
+	// its receipt is a placeholder: the agent was never suspended, and nothing
+	// writes to a node whose agent is not
+	if hr.LeftOut {
+		return fmt.Errorf("%s was left out of this session, its agent is not suspended: `cephadm-talos resume` suspends a published member, or `cephadm-talos recover mons --member %s` if the mons do not answer", name, name)
+	}
+
 	h := state.Host{Name: name, Addr: hr.Addr}
 	if sh, ok := o.St.Host(name); ok && sh.Name == name {
 		h = sh

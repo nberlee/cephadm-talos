@@ -56,6 +56,13 @@ type Orch struct {
 	inspectMon func(h state.Host) (string, error)
 	// settleSelf replaces the records job that settles a self-update in tests
 	settleSelf func(h state.Host) (agent.RecordsReport, error)
+	// nodeRecords replaces a takeover's records jobs in tests
+	nodeRecords func(h state.Host, kind, serial string) (agent.RecordsReport, error)
+	// handOverHook replaces the handoff to a node's agent in tests
+	handOverHook func(h state.Host) error
+	// cephCommand replaces the ceph commands enrollment and `host forget` run
+	// on the admin host in tests
+	cephCommand func(cmd string) error
 
 	// incarnation is the one the state was read from: "cli", or a leader's
 	incarnation string

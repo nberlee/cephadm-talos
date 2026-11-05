@@ -31,7 +31,8 @@ import (
 // the record cleared. The retirement is taken as done once the agent answers
 // 410 Gone (retired), or once a grant was sent and it has not answered for
 // retireSilence. An agent that never answers waits for the operator
-// (TALOS_HOST_RETIRING; `host forget`).
+// (TALOS_HOST_RETIRING; `host forget`, whose `ceph orch talos host forgotten`
+// is a control that moves the record to its end, retireForgotten).
 
 // KindRetire is the journal kind of a retirement grant.
 const KindRetire = "retire"
@@ -48,6 +49,9 @@ const retireRetry = time.Minute
 // retireProbe bounds a retiring agent's probe, so a node that is off does not
 // stall every tick.
 const retireProbe = 10 * time.Second
+
+// isRetireControl reports whether a kind is a retirement's control.
+func isRetireControl(kind string) bool { return kind == KindRetireForgotten }
 
 // retireStepRe are the journal ids of a retirement's steps: resolved by the
 // retirement while the agent answers, never by the request loop.
@@ -459,10 +463,46 @@ func (l *LeaderLoop) retireGrant(ctx context.Context, b *Bridge, js store.Backen
 	return l.retireAgain(ctx, b, gid, name, r, now, fmt.Sprintf("the retirement grant %s ended %s: %s", id, rec.State, rec.Error))
 }
 
-// retireDone takes the retirement as done: the grant or strip of the step in
-// progress whose outcome is not known is decided by it (the agent no longer
-// answers, or answers that it is retired), then the end.
+// retireDone takes the retirement as done, then the end.
 func (l *LeaderLoop) retireDone(ctx context.Context, b *Bridge, js store.Backend, gid int64, name string, r state.Retiring, why string) error {
+	if err := l.retireTaken(ctx, b, js, gid, name, r, why, why); err != nil {
+		return err
+	}
+
+	r.Step, r.Retired = state.RetireEnd, true
+
+	return l.retireEnd(ctx, b, js, gid, name, r)
+}
+
+// retireForgotten carries out `ceph orch talos host forgotten`: the operator
+// asserts the host's node was taken over or will not return, so its
+// retirement moves to its end, reason "forgotten". The assertion is a force,
+// authorized by CephX only: all it lets the leader do is end the retirement,
+// which only revokes and deletes the old agent's credentials. The end runs
+// with the retirement's next step.
+func (l *LeaderLoop) retireForgotten(ctx context.Context, b *Bridge, js store.Backend, gid int64, op LedgerOp) error {
+	st, _, err := l.clusterState(ctx, b)
+	if err != nil {
+		return err
+	}
+
+	if r, ok := st.Retiring[op.Host]; ok && r.Op == op.Remove && r.Step != state.RetireEnd {
+		if err := l.retireTaken(ctx, b, js, gid, op.Host, *r, reasonForgotten, "the operator says the host is forgotten"); err != nil {
+			return err
+		}
+	}
+
+	return finish(ctx, js, gid, op, wire.OpCompleted, nil)
+}
+
+// reasonForgotten is Retiring.Reason after `host forgotten`.
+const reasonForgotten = "forgotten"
+
+// retireTaken records the retirement as done: the grant or strip of the step
+// in progress whose outcome is not known is decided by it (the agent no longer
+// answers, answers that it is retired, or the operator took its node over),
+// and the record moves to its end.
+func (l *LeaderLoop) retireTaken(ctx context.Context, b *Bridge, js store.Backend, gid int64, name string, r state.Retiring, reason, why string) error {
 	if r.Attempt > 0 {
 		id := retireID(r)
 		opKey := JournalPrefix(gid) + "op/" + id
@@ -482,15 +522,9 @@ func (l *LeaderLoop) retireDone(ctx context.Context, b *Bridge, js store.Backend
 
 	l.log("retirement of %s: done (%s)", name, why)
 
-	if err := l.changeRetiring(ctx, b, gid, name, r.Op, func(x *state.Retiring) {
-		x.Step, x.Retired, x.Silent, x.Error = state.RetireEnd, true, time.Time{}, ""
-	}); err != nil {
-		return err
-	}
-
-	r.Step, r.Retired = state.RetireEnd, true
-
-	return l.retireEnd(ctx, b, js, gid, name, r)
+	return l.changeRetiring(ctx, b, gid, name, r.Op, func(x *state.Retiring) {
+		x.Step, x.Retired, x.Reason, x.Silent, x.Error = state.RetireEnd, true, reason, time.Time{}, ""
+	})
 }
 
 // retireEnd has the module revoke and delete the retired agent's credentials

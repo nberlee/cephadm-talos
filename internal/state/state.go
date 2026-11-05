@@ -167,6 +167,10 @@ type Retiring struct {
 	Sent    bool      `json:"sent,omitempty"`
 	Silent  time.Time `json:"silent,omitzero"`
 	Retired bool      `json:"retired,omitempty"`
+	// Reason is why the retirement was taken as done: "forgotten" for the
+	// operator's assertion (`ceph orch talos host forgotten`), else the
+	// leader's finding
+	Reason string `json:"reason,omitempty"`
 	// Error is why the retirement waits ("" while it advances), for
 	// TALOS_HOST_RETIRING
 	Error string `json:"error,omitempty"`
@@ -547,6 +551,10 @@ type Local struct {
 	// operator certificate whose revocation is pending
 	CRLFailClosed  bool            `json:"crl_fail_closed,omitempty"`
 	OperatorRevoke []PendingRevoke `json:"operator_revoke,omitempty"`
+	// Retiring are the published retirements of removed hosts (their public
+	// identity), for a suspension while the cluster state cannot be read
+	// (plan 04, step 6)
+	Retiring map[string]*Retiring `json:"retiring,omitempty"`
 }
 
 // LocalHost is how the workstation reaches a node.
@@ -590,7 +598,7 @@ func Load(fsid string) (*State, error) {
 			st.path, l.Schema, l.FSID, SchemaVersion, fsid)
 	}
 
-	st.Talosconfig, st.Context = l.Talosconfig, l.Context
+	st.Talosconfig, st.Context, st.Retiring = l.Talosconfig, l.Context, l.Retiring
 
 	for _, h := range l.Hosts {
 		st.Hosts = append(st.Hosts, Host{Name: h.Name, Addr: h.Addr, Talosconfig: h.Talosconfig, Context: h.Context})
@@ -635,7 +643,7 @@ func (s *State) SaveLocked() error {
 		s.Agent.Approval = disk
 	}
 
-	l := Local{Schema: SchemaVersion, FSID: s.FSID, Talosconfig: s.Talosconfig, Context: s.Context, AdminKey: s.Keys["client.admin"]}
+	l := Local{Schema: SchemaVersion, FSID: s.FSID, Talosconfig: s.Talosconfig, Context: s.Context, AdminKey: s.Keys["client.admin"], Retiring: s.Retiring}
 
 	for _, h := range s.AllHosts() {
 		l.Hosts = append(l.Hosts, LocalHost{Name: h.Name, Addr: h.Addr, Talosconfig: h.Talosconfig, Context: h.Context})
@@ -1032,6 +1040,25 @@ func (s *State) AddHost(h Host) {
 func (s *State) RemoveHost(name string) {
 	s.Hosts = slices.DeleteFunc(s.Hosts, func(h Host) bool { return h.Name == name })
 	s.Contacts = slices.DeleteFunc(s.Contacts, func(h Host) bool { return h.Name == name })
+}
+
+// RetiringChanged tells whether the retirements differ from the ones kept
+// locally: a suspension without the mons can read only those, and must not take
+// a removed host for a member. Only which removals are in progress counts, not
+// their progress, so an ordinary command does not write the file each time.
+func (s *State) RetiringChanged(kept map[string]*Retiring) bool {
+	if len(s.Retiring) != len(kept) {
+		return true
+	}
+
+	for name, r := range s.Retiring {
+		k, ok := kept[name]
+		if !ok || r == nil || k == nil || r.Op != k.Op {
+			return true
+		}
+	}
+
+	return false
 }
 
 // RetiringHost is a removed host whose retirement has not ended, as a Host

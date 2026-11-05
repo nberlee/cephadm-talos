@@ -321,12 +321,18 @@ func RecordsInit(name, image string) *spec.ContainerConfig {
 // RecordsJob renders the recovery job that reads an agent's records, and
 // with session records its suspension (plan 03, step 7 slice D): the agent
 // binary as the agent's user, with the records volume only. It writes its
-// report as a job result.
-func RecordsJob(name, image, fsid, job, inputs, session string) *spec.ContainerConfig {
+// report as a job result. With serial, a retiring host's journaled agent server
+// certificate serial (plan 04, step 6): a set moved aside under it reports the
+// host as retired instead of failing.
+func RecordsJob(name, image, fsid, job, inputs, session, serial string) *spec.ContainerConfig {
 	c := spec.Container(name, image)
 	c.ContainerEntrypoint = []string{"/cephadm-talos", "records", "--fsid", fsid, "--job", job, "--inputs", inputs}
 	if session != "" {
 		c.ContainerEntrypoint = append(c.ContainerEntrypoint, "--session", session)
+	}
+
+	if serial != "" {
+		c.ContainerEntrypoint = append(c.ContainerEntrypoint, "--serial", serial)
 	}
 
 	c.ContainerEnvironment = []string{"JOB=" + job, "JOB_INPUTS=" + inputs, "CMD=records " + job}
@@ -338,11 +344,21 @@ func RecordsJob(name, image, fsid, job, inputs, session string) *spec.ContainerC
 	return c
 }
 
+// RecordsMemberJob is RecordsJob for a member's journaled serial, which only
+// recognizes records moved aside: a renewal in progress may have a certificate
+// the current records do not list yet.
+func RecordsMemberJob(name, image, fsid, job, inputs, session, serial string) *spec.ContainerConfig {
+	c := RecordsJob(name, image, fsid, job, inputs, session, serial)
+	c.ContainerEntrypoint = append(c.ContainerEntrypoint, "--any-generation")
+
+	return c
+}
+
 // RecordsSettleJob is RecordsJob that first settles an interrupted
 // self-update's apply intent (`agent restore`, plan 04 step 2): the agent's
 // records only, nothing on the node.
 func RecordsSettleJob(name, image, fsid, job, inputs string) *spec.ContainerConfig {
-	c := RecordsJob(name, image, fsid, job, inputs, "")
+	c := RecordsJob(name, image, fsid, job, inputs, "", "")
 	c.ContainerEntrypoint = append(c.ContainerEntrypoint, "--settle-self")
 
 	return c
@@ -355,16 +371,22 @@ func RecordsSettleJob(name, image, fsid, job, inputs string) *spec.ContainerConf
 // on boot (the node's boot id the caller read, "" for the kernel's). The
 // caller checks first that no agent document of the cluster is on the node.
 func RecordsRetireJob(name, image, fsid, job, inputs, serial, boot string) *spec.ContainerConfig {
-	c := RecordsJob(name, image, fsid, job, inputs, "")
+	c := RecordsJob(name, image, fsid, job, inputs, "", serial)
 	c.ContainerEntrypoint = append(c.ContainerEntrypoint, "--retire")
-
-	if serial != "" {
-		c.ContainerEntrypoint = append(c.ContainerEntrypoint, "--serial", serial)
-	}
 
 	if boot != "" {
 		c.ContainerEntrypoint = append(c.ContainerEntrypoint, "--boot", boot)
 	}
+
+	return c
+}
+
+// RecordsProbeJob is RecordsJob for a node that may hold no records of the
+// cluster at all (plan 04, step 6: an enrollment over a non-member's node):
+// none reads as retired, nothing owned and no intent, not as a failure.
+func RecordsProbeJob(name, image, fsid, job, inputs string) *spec.ContainerConfig {
+	c := RecordsJob(name, image, fsid, job, inputs, "", "")
+	c.ContainerEntrypoint = append(c.ContainerEntrypoint, "--none-ok")
 
 	return c
 }

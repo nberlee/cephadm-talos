@@ -43,6 +43,11 @@ type RecordsReport struct {
 	// Retired: the records were retired (moved aside under a serial whose
 	// retirement mark the job found): nothing owned, nothing open, no intent
 	Retired bool `json:"retired,omitempty"`
+	// Serial is the latest serial the set's identity record lists, its
+	// generation: a takeover retires exactly the set it inspected (plan 04,
+	// step 6). "" without an identity record. Serials are all it lists
+	Serial  string   `json:"serial,omitempty"`
+	Serials []string `json:"serials,omitempty"`
 }
 
 // InspectRecords reads an agent's records; with session it first records the
@@ -76,6 +81,15 @@ func InspectRecords(recs *records.Store, session string) (RecordsReport, error) 
 	}
 
 	rep.Revision, rep.Owned = own.Revision, own.Docs
+
+	id, found, err := readIdentity(recs)
+	if err != nil {
+		return RecordsReport{}, err
+	}
+
+	if found {
+		rep.Serial, rep.Serials = id.Serials[len(id.Serials)-1], id.Serials
+	}
 
 	if rep.Fence, err = n.fence(); err != nil {
 		return RecordsReport{}, err

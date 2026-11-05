@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
@@ -372,7 +373,7 @@ func RetireRecords(recs *records.Store, serial, boot string, now time.Time) (Rec
 		// a retry once the set is moved aside: retired already; without a
 		// serial, no records of the cluster are left to retire
 		if marked, merr := records.Marked(recs.Dir, serial); merr == nil && (marked || serial == "" && errors.Is(err, fs.ErrNotExist)) {
-			return retiredReport(), nil
+			return RetiredReport(), nil
 		}
 
 		return RecordsReport{}, fmt.Errorf("records: %w", err)
@@ -427,7 +428,40 @@ func RetireRecords(recs *records.Store, serial, boot string, now time.Time) (Rec
 		return RecordsReport{}, err
 	}
 
-	return retiredReport(), nil
+	return RetiredReport(), nil
+}
+
+// JobResultSaved reports whether a job's result file exists: a retirement
+// left behind that runs again (a `never` job on the next boot) replays it and
+// does not retire whatever the records are by then.
+func JobResultSaved(jobsDir, fsid, job string) bool {
+	if job == "" || strings.ContainsAny(job, "/.") {
+		return false
+	}
+
+	_, err := os.Stat(filepath.Join(jobsDir, fsid+"."+job+".result"))
+
+	return err == nil
+}
+
+// CheckRecordsSerial refuses current records that do not list serial (a host's
+// journaled serial): another generation's, which a job must neither suspend nor
+// settle. No serial asks nothing.
+func CheckRecordsSerial(recs *records.Store, serial string) error {
+	if serial == "" {
+		return nil
+	}
+
+	id, _, err := readIdentity(recs)
+	if err != nil {
+		return err
+	}
+
+	if !slices.Contains(id.Serials, serial) {
+		return fmt.Errorf("the records do not list serial %s: another generation's", serial)
+	}
+
+	return nil
 }
 
 // RetiredRecords is the records job's read of a host whose records are not
@@ -446,11 +480,11 @@ func RetiredRecords(dir, serial string) (RecordsReport, bool, error) {
 		return RecordsReport{}, false, err
 	}
 
-	return retiredReport(), true, nil
+	return RetiredReport(), true, nil
 }
 
-// retiredReport is a retired set's report: nothing owned, nothing open, no
+// RetiredReport is a retired set's report: nothing owned, nothing open, no
 // apply intent.
-func retiredReport() RecordsReport {
+func RetiredReport() RecordsReport {
 	return RecordsReport{Version: wire.Version, Owned: map[string]string{}, Open: []wire.Operation{}, Intents: []wire.BridgeIntent{}, Retired: true}
 }

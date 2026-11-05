@@ -226,3 +226,28 @@ func must(t *testing.T, err error) {
 		t.Fatal(err)
 	}
 }
+
+func TestRetiringChangedComparesRemovalsNotProgress(t *testing.T) {
+	kept := map[string]*Retiring{"h1": {Op: "op-1", Step: RetireStrip}}
+
+	for _, c := range []struct {
+		name string
+		now  map[string]*Retiring
+		want bool
+	}{
+		{"the same", map[string]*Retiring{"h1": {Op: "op-1", Step: RetireStrip}}, false},
+		{"progress only", map[string]*Retiring{"h1": {Op: "op-1", Step: RetireEnd}}, false},
+		{"a new retirement", map[string]*Retiring{"h1": {Op: "op-1"}, "h2": {Op: "op-2"}}, true},
+		{"another removal of the name", map[string]*Retiring{"h1": {Op: "op-9"}}, true},
+		{"another name", map[string]*Retiring{"h2": {Op: "op-1"}}, true},
+		{"ended", nil, true},
+	} {
+		if got := (&State{Retiring: c.now}).RetiringChanged(kept); got != c.want {
+			t.Errorf("%s: %v", c.name, got)
+		}
+	}
+
+	if (&State{}).RetiringChanged(nil) {
+		t.Error("none kept, none published")
+	}
+}

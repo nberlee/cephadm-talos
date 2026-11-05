@@ -424,3 +424,62 @@ func TestARetireWithoutASerialIsDoneOnceTheRecordsAreGone(t *testing.T) {
 		t.Fatal("an unmarked serial")
 	}
 }
+
+// The inspection names the generation a takeover then retires; a retirement
+// job left behind by an earlier run finds a later generation's records and
+// refuses, and one whose result is saved does not run again.
+func TestALeftRetirementJobDoesNotRetireALaterGeneration(t *testing.T) {
+	dir := t.TempDir()
+	recs := &records.Store{Dir: filepath.Join(dir, "records", "f")}
+
+	must(t, os.MkdirAll(recs.Dir, 0o700))
+	must(t, RecordIdentity(recs, "11"))
+	must(t, RecordIdentity(recs, "12"))
+
+	rep, err := InspectRecords(recs, "")
+	must(t, err)
+
+	if rep.Serial != "12" {
+		t.Fatalf("inspected %q", rep.Serial)
+	}
+
+	if _, err := RetireRecords(recs, "10", "", time.Now()); err == nil || !strings.Contains(err.Error(), "another generation") {
+		t.Fatalf("a stale job: %v", err)
+	}
+
+	if _, err := os.Stat(recs.Dir); err != nil {
+		t.Fatal(err)
+	}
+
+	jobs := t.TempDir()
+	if JobResultSaved(jobs, "f", "abc") {
+		t.Fatal("no result yet")
+	}
+
+	must(t, WriteJobResult(jobs, "f", "abc", "x", 0, []byte("{}")))
+
+	if !JobResultSaved(jobs, "f", "abc") {
+		t.Fatal("the result is saved")
+	}
+}
+
+// A job with a journaled serial neither suspends nor settles another
+// generation's records.
+func TestTheRecordsJobHoldsCurrentRecordsToTheSerial(t *testing.T) {
+	recs := &records.Store{Dir: filepath.Join(t.TempDir(), "records", "f")}
+	must(t, os.MkdirAll(recs.Dir, 0o700))
+
+	// no identity record: nothing lists it
+	if err := CheckRecordsSerial(recs, "11"); err == nil || !strings.Contains(err.Error(), "another generation") {
+		t.Fatalf("without an identity: %v", err)
+	}
+
+	must(t, CheckRecordsSerial(recs, ""))
+	must(t, RecordIdentity(recs, "11"))
+	must(t, RecordIdentity(recs, "12"))
+	must(t, CheckRecordsSerial(recs, "11"))
+
+	if err := CheckRecordsSerial(recs, "10"); err == nil || !strings.Contains(err.Error(), "another generation") {
+		t.Fatalf("another generation: %v", err)
+	}
+}

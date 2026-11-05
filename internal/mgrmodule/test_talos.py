@@ -1668,6 +1668,45 @@ class Retirement(unittest.TestCase):
         self.published(entries, {})
         self.assertEqual(m.Module.add_host(mod, HostSpec('h6', '10.5.0.6')).exception_str, '')
 
+    def test_forgotten_is_a_control_of_the_retirement(self):
+        mod, entries = self.module()
+        # no retirement: refused, nothing accepted
+        res = m.Module._host_forgotten(mod, 'h6')
+        self.assertEqual(res.retval, -22)
+        self.assertIn('not retiring', res.stderr)
+        self.assertEqual(m.Module._host_forgotten(mod, 'h2').retval, -22)
+        op = self.removed(mod, entries)
+        n = len(mod._ledger.executable())
+        # another removal's retry ends nothing of this one
+        res = m.Module._host_forgotten(mod, 'h6', 'op-%016x' % 0xaa)
+        self.assertEqual(res.retval, -22)
+        self.assertIn('not op-', res.stderr)
+        self.assertEqual(len(mod._ledger.executable()), n)
+        res = m.Module._host_forgotten(mod, 'h6', op)
+        self.assertEqual(res.retval, 0, res.stderr)
+        ex = mod._ledger.executable()
+        self.assertEqual(len(ex), n + 1)
+        e = ex[-1][1]
+        self.assertEqual((e['kind'], e['host'], e['remove']), ('retire_forgotten', 'h6', op))
+        # the host stays in the fold until retire done, and takes nothing meanwhile
+        self.assertIn('h6', mod._authority()[1].retiring)
+        self.assertTrue(m.Module.drain_host(mod, 'h6').exception_str)
+        # the fold's retirement ended: nothing left to assert, the record not cleared yet
+        mod._ledger.append({'id': 'm-%016x' % 2, 'kind': 'retire_host', 'of': op, 'host': 'h6'})
+        self.assertEqual(m.Module._host_forgotten(mod, 'h6').retval, -22)
+
+    def test_forgotten_is_refused_while_suspended(self):
+        mod, entries = self.module()
+        self.removed(mod, entries)
+        n = len(mod._ledger.executable())
+        command = mod.mon_command
+        mod.mon_command = lambda cmd: (0, '{"session": "s"}', '') if cmd.get('key') == m.SUSPENSION_KEY else command(cmd)
+        mod._not_suspended = types.MethodType(_not_suspended, mod)
+        res = m.Module._host_forgotten(mod, 'h6')
+        self.assertEqual(res.retval, -22)
+        self.assertIn('suspended', res.stderr)
+        self.assertEqual(len(mod._ledger.executable()), n)
+
     def test_the_removal_stays_pinned(self):
         from talos import ledger as lg
         for fold, record, cut in ((True, True, False), (False, True, False), (False, False, True)):

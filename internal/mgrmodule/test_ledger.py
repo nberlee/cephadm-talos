@@ -281,6 +281,28 @@ class DrainAndNooutFoldTest(unittest.TestCase):
             with self.assertRaises(lg.LedgerError, msg=bad):
                 lg.check_entry(k, json.dumps(e))
 
+    def test_a_retirements_control_changes_no_fold(self):
+        op = 'op-%016x' % 1
+        rm = entry(5, 1, op, kind='remove_host', host='h1')
+        retiring = entry(5, 2, 'm-%016x' % 2, kind='retiring', of=op, host='h1', enroll_cert='', enroll_client_cert='')
+        forgotten = entry(5, 3, 'op-%016x' % 3, kind='retire_forgotten', host='h1', remove=op)
+        for k, e in (rm, retiring, forgotten):
+            lg.check_entry(k, json.dumps(e))
+        # the leader's record moves; the fold keeps the host until retire_host
+        f = lg.Fold(self.INV, [rm, retiring, forgotten])
+        self.assertEqual(f.retiring['h1']['op'], op)
+        self.assertIn('h1', f.hosts)
+        done = entry(5, 4, 'm-%016x' % 4, kind='retire_host', of=op, host='h1')
+        self.assertNotIn('h1', lg.Fold(self.INV, [rm, retiring, forgotten, done]).hosts)
+        # a request's fields are allowed, as for every control
+        k, e = entry(5, 5, 'op-%016x' % 5, kind='retire_forgotten', host='h1', remove=op, request='0b8f3a52-7c1e-4d3a-9f6e-2a4b5c6d7e8f', inputs='a' * 64)
+        lg.check_entry(k, json.dumps(e))
+        for bad in (dict(kind='retire_forgotten', host='h1'), dict(kind='retire_forgotten', host='h1', remove='x'), dict(kind='retire_forgotten', remove=op),
+                    dict(kind='retire_forgotten', host='h1', remove=op, daemon='mon.h1'), dict(kind='retire_forgotten', host='h1', remove=op, drain=op)):
+            k, e = entry(5, 9, 'op-%016x' % 9, **bad)
+            with self.assertRaises(lg.LedgerError, msg=bad):
+                lg.check_entry(k, json.dumps(e))
+
     def noout(self, seq, kind, host='h1', **kw):
         k, e = entry(5, seq, 'm-%016x' % seq, kind=kind, host=host, **kw)
         lg.check_entry(k, json.dumps(e))

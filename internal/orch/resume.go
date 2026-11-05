@@ -69,6 +69,26 @@ func (o *Orch) Resume(ctx context.Context) error {
 		}
 	}
 
+	// what an offline suspension took for retiring or left out, and the
+	// published state has as a member: such a host joins the session here. A
+	// failure stays pending in the journal, and a retry of resume asks again
+	o.reconcileMembers(rec)
+
+	pending, err := o.pendingSuspensions(ctx, rec)
+	if err != nil {
+		return err
+	}
+
+	if err := rec.Save(); err != nil {
+		return err
+	}
+
+	if len(pending) > 0 {
+		if err := o.suspendHosts(ctx, pending, rec, SuspendOptions{}); err != nil {
+			return err
+		}
+	}
+
 	// the session's hosts; once a re-adoption began, only the journaled ones
 	// (the leader may add a host after an activation)
 	hosts := o.removalHosts(rec)
@@ -79,9 +99,53 @@ func (o *Orch) Resume(ctx context.Context) error {
 
 	for _, h := range hosts {
 		if hr := rec.Hosts[h.Name]; hr == nil || hr.Receipt == nil {
-			return fmt.Errorf("%s is not suspended in this session: run `cephadm-talos suspend` again", h.Name)
+			return fmt.Errorf("%s is not suspended in this session and its re-adoptions began: run `cephadm-talos resume` again", h.Name)
 		}
 	}
+
+	// a host the published state now has retiring (its removal ran just before
+	// the suspension) and not re-adopted yet is one too
+	for name, hr := range rec.Hosts {
+		if rh, r, ok := o.St.RetiringHost(name); ok && (!hr.Retiring || hr.RetireOp == "") && hr.Readopt == nil {
+			journalRetiring(hr, rh, r)
+
+			if err := rec.Save(); err != nil {
+				return err
+			}
+		}
+	}
+
+	// one whose removal finished since it was journaled is no host to bring back
+	for name, hr := range rec.Hosts {
+		if sh, member := o.St.Host(name); hr.Retiring || hr.Readopt != nil || member && sh.Name == name {
+			continue
+		}
+
+		// not published: enrolled, or gone
+		members, err := o.publishedMembers(ctx)
+		if err != nil {
+			return fmt.Errorf("the cluster's hosts: %w", err)
+		}
+
+		if !slices.ContainsFunc(members, func(h state.Host) bool { return h.Name == name }) {
+			o.printf("%s: no longer a host of the cluster: its node is taken over, not brought back\n", name)
+
+			hr.Retiring = true
+
+			if err := rec.Save(); err != nil {
+				return err
+			}
+		}
+	}
+
+	// a retiring host is never re-adopted, activated or applied again (plan 04,
+	// step 6): its node is taken over and the module told, below. It runs no
+	// daemon, so nothing else of the resumption concerns it
+	hosts = slices.DeleteFunc(hosts, func(h state.Host) bool {
+		hr := rec.Hosts[h.Name]
+
+		return hr.Retiring || hr.LeftOut
+	})
 
 	// (b) what the recovery changed is what the published state names; read
 	// before the phase changes, so a refusal leaves `recover mons` open, and
@@ -142,6 +206,14 @@ func (o *Orch) Resume(ctx context.Context) error {
 			if err := o.restoreAgent(ctx, rec, h); err != nil {
 				return fmt.Errorf("%s: %w", h.Name, err)
 			}
+		}
+	}
+
+	// the retiring hosts' nodes taken over: their agents' suspension ends with
+	// their documents
+	for _, h := range retiringHosts(rec) {
+		if err := o.finishRetiring(ctx, rec, h); err != nil {
+			return fmt.Errorf("%s: finishing its retirement: %w", h.Name, err)
 		}
 	}
 
@@ -214,12 +286,43 @@ func (o *Orch) Resume(ctx context.Context) error {
 
 	o.printf("leader %s took over\n", inc)
 
+	// the module accepts again: the retirements of the nodes taken over end
+	for _, h := range retiringHosts(rec) {
+		if err := o.retireTold(ctx, rec, h); err != nil {
+			return fmt.Errorf("%s: telling the module: %w (run `cephadm-talos resume` again)", h.Name, err)
+		}
+	}
+
 	rec.Phase = state.PhaseResumed
 	if err := rec.Save(); err != nil {
 		return err
 	}
 
 	return rec.Close()
+}
+
+// retireTold tells the module a retiring host's node was taken over, unless
+// that removal's retirement ended meanwhile: another retirement of the name (a
+// later enrollment and removal, from another workstation) is not this node's.
+func (o *Orch) retireTold(ctx context.Context, rec *state.Recovery, h state.Host) error {
+	hr := rec.Hosts[h.Name]
+	if !hr.RetireFinished || hr.RetireTold {
+		return nil
+	}
+
+	if err := o.Open(ctx); err != nil {
+		return err
+	}
+
+	if _, r, ok := o.St.RetiringHost(h.Name); ok && r.Op == hr.RetireOp {
+		if err := o.tellForgotten(ctx, h.Name, hr.RetireOp); err != nil {
+			return err
+		}
+	}
+
+	hr.RetireTold = true
+
+	return rec.Save()
 }
 
 // journaledHosts are the hosts the session journaled, by name.
@@ -312,7 +415,8 @@ func advanced(receipt *wire.SuspendReceipt, revision int64) bool {
 }
 
 // agentHost is a host with its agent's certificates and keys: the state's
-// (its keys through AgentKeys), else the ones the suspension read from the
+// (its keys through AgentKeys), a retiring host's journaled identity and never
+// anything else (plan 04, step 6), else the ones the suspension read from the
 // agent's document before it removed it (a host the leader removed), else an
 // enrollment record's; the keys from the cluster's secrets.
 func (o *Orch) agentHost(ctx context.Context, h state.Host, hr *state.RecoveryHost) (state.Host, error) {
@@ -323,9 +427,14 @@ func (o *Orch) agentHost(ctx context.Context, h state.Host, hr *state.RecoveryHo
 
 	serverKey, clientKey := state.SecretHost(h.Name, state.SecretAgentServer), state.SecretHost(h.Name, state.SecretAgentClient)
 
-	if sh, ok := o.St.Host(h.Name); ok {
+	if rh, _, ok := o.St.RetiringHost(h.Name); ok {
+		h = rh
+		serverKey, clientKey = h.AgentKeySecret(state.SecretAgentServer), h.AgentKeySecret(state.SecretAgentClient)
+	} else if sh, ok := o.St.Host(h.Name); ok {
 		h = sh
 		serverKey, clientKey = h.AgentKeySecret(state.SecretAgentServer), h.AgentKeySecret(state.SecretAgentClient)
+	} else if hr != nil && hr.Retiring && hr.AgentCert == "" {
+		return state.Host{}, errors.New("no agent certificates journaled for a retiring host")
 	} else if hr != nil && hr.AgentCert != "" {
 		h.AgentCert, h.AgentClientCert = hr.AgentCert, hr.AgentClientCert
 

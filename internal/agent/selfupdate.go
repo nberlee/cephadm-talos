@@ -585,6 +585,12 @@ func SettleSelfUpdate(recs *records.Store) (string, error) {
 		return "", err
 	}
 
+	// a retirement's intent is decided completed once its documents are gone
+	// (RetireRecords), never failed by a restore (plan 04, step 6)
+	if intent.Retire {
+		return "", fmt.Errorf("the apply intent of operation %s is a retirement: a retiring agent is not restored", intent.Operation)
+	}
+
 	const superseded = "superseded by agent restore"
 
 	op, found, err := g.readOp(intent.Operation)

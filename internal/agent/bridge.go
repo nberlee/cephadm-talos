@@ -584,6 +584,8 @@ type LedgerOp struct {
 	// move_resume: the move it resumes (plan 04, step 5); set_host_addr's
 	// new address is Addr
 	Move string `json:"move,omitempty"`
+	// retire_forgotten: the removal whose retirement it ends (plan 04, step 6)
+	Remove string `json:"remove,omitempty"`
 }
 
 // Ledger returns the executable operations after a ledger key, in the order

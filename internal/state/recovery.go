@@ -136,6 +136,29 @@ type RecoveryHost struct {
 	// suspension ended
 	Readopt   *wire.ReadoptReceipt `json:"readopt,omitempty"`
 	Activated bool                 `json:"activated,omitempty"`
+	// AgentSerial is the serial of the host's agent server certificate when it
+	// was journaled, for every host whose certificate was known: a removal may
+	// finish during the suspension, and its records moved aside are recognized
+	// by it (plan 04, step 6)
+	AgentSerial string `json:"agent_serial,omitempty"`
+	// Retiring: a removed host still retiring (plan 04, step 6), journaled
+	// with its identity from the state's record: RetireOp, its removal's
+	// operation, AgentCert, AgentClientCert and the key names above.
+	// It is suspended like any other but never re-adopted or activated, and
+	// its documents are never applied again: the resumption takes its node
+	// over (RetireFinished once its records are retired), then tells the
+	// module (RetireTold), which ends the retirement
+	Retiring       bool   `json:"retiring,omitempty"`
+	RetireOp       string `json:"retire_op,omitempty"`
+	RetireFinished bool   `json:"retire_finished,omitempty"`
+	RetireTold     bool   `json:"retire_told,omitempty"`
+	// LeftOut: a host the session does not touch, with a receipt of nothing: a
+	// retiring host whose node answers neither as an agent nor through Talos or
+	// is not its generation (its retirement waits for `host forget`), or a
+	// workstation's cached host on a node that is no longer it. Nothing on the
+	// node was changed; if the published state has it as a member after all,
+	// the session suspends it then
+	LeftOut bool `json:"left_out,omitempty"`
 }
 
 // AgentApply is an apply of a host's agent documents: their hashes as the

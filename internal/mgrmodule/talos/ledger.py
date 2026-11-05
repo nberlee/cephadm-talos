@@ -52,7 +52,9 @@ KINDS = ('restart', 'redeploy', 'add_daemon', 'remove_daemon', 'remove_host', 'c
          # an agent's certificates and the agents' image (plan 04, step 2)
          'renew_agent', 'upgrade_agent', 'upgrade_agent_resume', 'upgrade_agent_stop',
          # a host's drain and its controls, a host's address change and its resume (plan 04, step 5)
-         'drain_host', 'drain_stop', 'drain_resume', 'set_host_addr', 'move_resume')
+         'drain_host', 'drain_stop', 'drain_resume', 'set_host_addr', 'move_resume',
+         # the operator's assertion that a retiring host is forgotten (plan 04, step 6)
+         'retire_forgotten')
 # the upgrade's kinds, operations and module entries: about the cluster, without a host
 UPGRADE_CONTROLS = ('upgrade_pause', 'upgrade_resume', 'upgrade_stop')
 UPGRADE_KINDS = ('upgrade_start',) + UPGRADE_CONTROLS + ('upgrade_done', 'upgrade_refused')
@@ -66,6 +68,10 @@ HOST_KINDS = ('remove_host', 'enter_maintenance', 'exit_maintenance', 'powercycl
 DRAIN_CONTROLS = ('drain_stop', 'drain_resume')
 # a move's control (`ceph orch host set-addr` again on a paused move), as a drain's
 MOVE_CONTROLS = ('move_resume',)
+# a retirement's control (`ceph orch talos host forgotten`, plan 04 step 6): names
+# the removal it ends, runs ahead of queued operations and changes no fold state:
+# the leader moves its record to the end, whose retire_host ends the fold's
+RETIRE_CONTROLS = ('retire_forgotten',)
 LABEL_RE = re.compile(r'\A[A-Za-z0-9._-]{1,64}\Z')
 ADDR_RE = re.compile(r'\A[0-9A-Fa-f:.]{2,45}\Z')
 # kinds that stop a host's daemons, and that start them again
@@ -285,6 +291,11 @@ def check_entry(key: str, raw: str) -> Dict[str, Any]:
     if kind == 'set_host_addr':
         if daemon is not None or not (isinstance(e.get('addr'), str) and ADDR_RE.match(e['addr'])) \
                 or set(e) - {'version', 'id', 'kind', 'host', 'addr', 'gid', 'epoch', 'seq', 'request', 'inputs'}:
+            raise LedgerError('operation entry %s' % key)
+        return e
+    if kind in RETIRE_CONTROLS:
+        if daemon is not None or not isinstance(e.get('remove'), str) or not OP_RE.match(e['remove']) \
+                or set(e) - {'version', 'id', 'kind', 'host', 'remove', 'gid', 'epoch', 'seq', 'request', 'inputs'}:
             raise LedgerError('operation entry %s' % key)
         return e
     if kind in MOVE_CONTROLS:

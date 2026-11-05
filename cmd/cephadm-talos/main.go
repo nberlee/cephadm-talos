@@ -35,7 +35,9 @@ Commands:
                                            create a cluster: 1 mon + 1 mgr on the node
   host add <ip>                            add a Talos node (volume + ceph.conf)
   host ls                                  list hosts
-  host rm <host>                           forget a host without daemons
+  host rm <host>                           forget a host without daemons (handed over: ceph orch host rm)
+  host forget [--node-is-gone] <host>      end a removed host's retirement whose agent does not retire: take its node over
+                                           through Talos (--node-is-gone: the node will not return), then ceph orch talos host forgotten
   host maintenance enter|exit [--force] <host>
                                            ok-to-stop + noout + stop the host's daemons, or undo
   host reboot [--force] <host>             maintenance enter, Talos reboot, maintenance exit
@@ -54,7 +56,9 @@ Commands:
   orch [--request U] [-i F|-] -- <words>   run a ceph orch command once per request uuid (retry with --request)
   handoff                                  hand the nodes to their agents and the state to the leader
   suspend [--reboot] [--force]             suspend the agents and the leader for a recovery session
-  recover mons [--image REF]               bring the mons of a suspended cluster back on their stores
+  recover mons [--image REF] [--member HOST]...
+                                           bring the mons of a suspended cluster back on their stores (--member: a host the
+                                           session left out is a real member: suspend it as one first, then recover it)
   resume                                   end the recovery session: agents re-adopt their nodes, a new leader takes over
   agent restore <host> [--previous]        in a recovery session: apply a suspended host's agent again (--previous: the known good image)
   resolve <host> [<operation>]             fail a job whose outcome is uncertain once it cannot run (without operation: list them)
@@ -173,14 +177,18 @@ func run() error {
 	// step 7 slice D, items 7 and 8)
 	if cmd == "recover" {
 		if len(args) == 0 || args[0] != "mons" {
-			return errors.New("recover mons [--image REF]")
+			return errors.New("recover mons [--image REF] [--member HOST]...")
 		}
 
 		fs := flag.NewFlagSet("recover mons", flag.ExitOnError)
 		image := fs.String("image", "", "the Ceph image (by digest) of a mon whose document is applied again, if its node has no other")
+
+		var members stringList
+
+		fs.Var(&members, "member", "a host the session left out is a real member: suspend it as one first, then recover it (repeatable)")
 		_ = fs.Parse(args[1:])
 
-		return o.RecoverMons(ctx, *image)
+		return o.RecoverMons(ctx, *image, members)
 	}
 
 	if cmd == "shell" && o.InRecovery() {
@@ -191,6 +199,8 @@ func run() error {
 	if st.Agent != nil {
 		localCA, localImage = st.Agent.CACert, st.Agent.Image
 	}
+
+	localRetiring := st.Retiring
 
 	offline := false
 
@@ -203,7 +213,7 @@ func run() error {
 
 		fmt.Fprintln(os.Stderr, "warning:", err)
 		fmt.Fprintln(os.Stderr, "warning: working from the hosts in this workstation's state")
-	} else if o.St.Agent != nil && (o.St.Agent.CACert != localCA || o.St.Agent.Image != localImage) {
+	} else if o.St.Agent != nil && (o.St.Agent.CACert != localCA || o.St.Agent.Image != localImage || o.St.RetiringChanged(localRetiring)) {
 		// kept locally for a suspension or recovery without the mons
 		if err := o.KeepLocal(); err != nil {
 			fmt.Fprintln(os.Stderr, "warning:", err)
@@ -298,8 +308,9 @@ func run() error {
 		switch cmd {
 		case "ps", "ls", "conf", "logs", "shell", "handoff", "approve", "orch", "crl-policy":
 		case "host":
-			// enrollment, then `ceph orch host add` (plan 03, step 7)
-			if len(args) == 0 || args[0] != "ls" && args[0] != "add" {
+			// enrollment, then `ceph orch host add` (plan 03, step 7), and a
+			// removed host's node taken over (plan 04, step 6)
+			if len(args) == 0 || args[0] != "ls" && args[0] != "add" && args[0] != "forget" {
 				return orch.ErrManaged
 			}
 		default:
@@ -344,12 +355,23 @@ func run() error {
 	return runCommand(ctx, o, cmd, args)
 }
 
+// stringList is a repeatable flag.
+type stringList []string
+
+func (l *stringList) String() string { return strings.Join(*l, ",") }
+
+func (l *stringList) Set(v string) error {
+	*l = append(*l, v)
+
+	return nil
+}
+
 // runCommand runs one command on the opened cluster.
 func runCommand(ctx context.Context, o *orch.Orch, cmd string, args []string) error {
 	switch cmd {
 	case "host":
 		if len(args) == 0 {
-			return errors.New("host add|ls|rm")
+			return errors.New("host add|ls|rm|forget")
 		}
 
 		switch args[0] {
@@ -373,6 +395,22 @@ func runCommand(ctx context.Context, o *orch.Orch, cmd string, args []string) er
 			}
 
 			return o.RemoveHost(ctx, args[1])
+		case "forget":
+			fs := flag.NewFlagSet("host forget", flag.ExitOnError)
+			gone := fs.Bool("node-is-gone", false, "the node does not answer Talos and will not return: only tell the module")
+			_ = fs.Parse(args[1:])
+
+			// the flag before or after the host
+			host := fs.Arg(0)
+			if fs.NArg() > 0 {
+				_ = fs.Parse(fs.Args()[1:])
+			}
+
+			if host == "" || fs.NArg() != 0 {
+				return errors.New("host forget [--node-is-gone] <host>")
+			}
+
+			return o.HostForget(ctx, host, *gone)
 		case "maintenance":
 			if len(args) < 3 {
 				return errors.New("host maintenance enter|exit [--force] <host>")
@@ -637,7 +675,11 @@ var uuidRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4
 // serials of their identity record and moves them aside; the caller has
 // checked that no agent document of the cluster is on the node. With
 // --serial, a host's journaled serial: --retire refuses records that do not
-// list it, and missing records under a retirement mark of it read as retired.
+// list it, and missing records under a retirement mark of it read as retired;
+// with --none-ok missing records read as retired whatever the marks (an
+// enrollment's look at a node that may never have held any). Current records
+// that do not list --serial are refused before anything is recorded or settled:
+// another generation's; a member's job passes --any-generation.
 func recordsJob(args []string) error {
 	fs := flag.NewFlagSet("records", flag.ExitOnError)
 	fsid := fs.String("fsid", "", "cluster fsid")
@@ -648,6 +690,8 @@ func recordsJob(args []string) error {
 	retire := fs.Bool("retire", false, "retire the records: mark their serials and move them aside (host forget, re-enrollment)")
 	serial := fs.String("serial", "", "the host's journaled agent server certificate serial (decimal)")
 	boot := fs.String("boot", "", "the node's boot id, as the caller read it from Talos (default: the kernel's)")
+	anyGeneration := fs.Bool("any-generation", false, "--serial only recognizes records moved aside: current records need not list it (a member, whose renewal may be in progress)")
+	noneOK := fs.Bool("none-ok", false, "no records of the cluster on the node read as retired (an enrollment's look at the node)")
 	_ = fs.Parse(args)
 
 	jobs := filepath.Join(records.Mount, records.JobsDir)
@@ -656,6 +700,11 @@ func recordsJob(args []string) error {
 	// on the same node are beside them)
 	if !uuidRe.MatchString(*fsid) {
 		return fmt.Errorf("malformed fsid %q", *fsid)
+	}
+
+	// a retirement that ran already replays its result (plan 04, step 6)
+	if *retire && agent.JobResultSaved(jobs, *fsid, *job) {
+		return nil
 	}
 
 	dir := filepath.Join(records.Mount, records.RecordsDir, *fsid)
@@ -683,6 +732,8 @@ func recordsJob(args []string) error {
 				err = rerr
 			case found:
 				rep, err = retired, nil
+			case *noneOK && errors.Is(err, os.ErrNotExist):
+				rep, err = agent.RetiredReport(), nil
 			default:
 				err = fmt.Errorf("no records of cluster %s on the node: %w", *fsid, err)
 			}
@@ -691,7 +742,12 @@ func recordsJob(args []string) error {
 		}
 
 		settled := ""
-		if *settle {
+		// before anything is recorded or settled
+		if !*anyGeneration {
+			err = agent.CheckRecordsSerial(recs, *serial)
+		}
+
+		if err == nil && *settle {
 			settled, err = agent.SettleSelfUpdate(recs)
 		}
 

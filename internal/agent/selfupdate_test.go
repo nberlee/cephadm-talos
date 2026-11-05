@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/siderolabs/talos/pkg/machinery/resources/network"
 
@@ -417,5 +418,22 @@ func TestASelfUpdateKeepsTheFailClosedPolicy(t *testing.T) {
 	// a pinned input, as the CA and the repositories (plan 04, step 3)
 	if d := ownOnNode(t, g.Node); d.env[daemons.EnvCRLFailClosed] != "1" {
 		t.Fatal("the self-update dropped the fail-closed policy")
+	}
+}
+
+// A retirement's intent is never settled as failed by a restore: its
+// retirement would stay failed in the agent's own records (plan 04, step 6).
+func TestARestoreDoesNotSettleARetirement(t *testing.T) {
+	g, _, _ := selfSetup(t)
+
+	n := &Node{Records: g.Records}
+	must(t, n.writeJSON(applyRecord, applyIntent{Schema: ownershipSchema, Revision: 9, Self: true, Retire: true, Operation: "op-r9", BootID: "boot-1", At: time.Now()}))
+
+	if op, err := SettleSelfUpdate(g.Records); err == nil || op != "" || !strings.Contains(err.Error(), "retirement") {
+		t.Fatalf("settled %q, %v", op, err)
+	}
+
+	if pending, err := n.readJSON(applyRecord, &applyIntent{}); err != nil || !pending {
+		t.Fatalf("the intent is gone: %v", err)
 	}
 }

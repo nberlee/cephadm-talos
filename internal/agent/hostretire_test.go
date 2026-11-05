@@ -485,3 +485,145 @@ func TestARefusedStartIsGivenUp(t *testing.T) {
 		t.Fatalf("retiring %+v", r)
 	}
 }
+
+// forgotten accepts `ceph orch talos host forgotten` of h1's removal.
+func (s *leaderSetup) forgotten(remove string, seq int64) LedgerEntry {
+	return s.acceptOp(KindRetireForgotten, seq, func(op *LedgerOp) { op.Host, op.Remove = "h1", remove })
+}
+
+// The operator's assertion ends a retirement waiting for an agent that never
+// answered: without it, it waits however long it takes.
+func TestAForgottenHostsRetirementEnds(t *testing.T) {
+	s := retiringSetup(t)
+	ctx := context.Background()
+	now := time.Now()
+	s.at(now)
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+	s.unreachable()
+
+	rm := s.accept(KindRemoveHost, "", "h1", 1)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	// another removal's assertion changes nothing, and is done
+	other := s.forgotten("op-00000000000000ff", 2)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if op := s.op(t, other.Op.ID); op.State != wire.OpCompleted {
+		t.Fatalf("another removal's: %+v", op)
+	}
+
+	if r := s.retiring(t)["h1"]; r == nil || r.Step != state.RetireStrip || r.Reason != "" {
+		t.Fatalf("retiring %+v", r)
+	}
+
+	// an assertion: the end follows, which revokes the journaled certificates
+	f := s.forgotten(rm.Op.ID, 3)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if op := s.op(t, f.Op.ID); op.State != wire.OpCompleted {
+		t.Fatalf("forgotten: %+v", op)
+	}
+
+	if r := s.retiring(t); len(r) != 0 {
+		t.Fatalf("still retiring %+v", r)
+	}
+
+	if calls := s.moduleCalls(); !slices.Contains(calls, "retire done "+rm.Op.ID) {
+		t.Fatalf("module calls %v", calls)
+	}
+
+	s.module.mu.Lock()
+	certs := s.module.certs["retire done "+rm.Op.ID]
+	s.module.mu.Unlock()
+
+	if !slices.Equal(certs, []string{s.agentCert, "client-of-h1"}) {
+		t.Fatalf("revoked with the end: %v", certs)
+	}
+}
+
+// The record shows why it ended, and an end the module refuses is asked again
+// with the retirement's steps: the assertion itself is done.
+func TestAForgottenRetirementRecordsItsReason(t *testing.T) {
+	s := retiringSetup(t)
+	ctx := context.Background()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+	s.unreachable()
+
+	rm := s.accept(KindRemoveHost, "", "h1", 1)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	s.module.mu.Lock()
+	s.module.refuse = "retire done"
+	s.module.mu.Unlock()
+
+	f := s.forgotten(rm.Op.ID, 2)
+	_ = s.leader.Tick(ctx, 42, 5)
+
+	if op := s.op(t, f.Op.ID); op.State != wire.OpCompleted {
+		t.Fatalf("forgotten: %+v", op)
+	}
+
+	if r := s.retiring(t)["h1"]; r == nil || r.Step != state.RetireEnd || r.Reason != "forgotten" || !r.Retired {
+		t.Fatalf("retiring %+v", r)
+	}
+
+	s.module.mu.Lock()
+	s.module.refuse = ""
+	s.module.mu.Unlock()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if r := s.retiring(t); len(r) != 0 {
+		t.Fatalf("still retiring %+v", r)
+	}
+}
+
+// A queued operation that does not end holds the ledger, not the assertion.
+func TestAForgottenRunsAheadOfAQueuedOperation(t *testing.T) {
+	s := retiringSetup(t)
+	ctx := context.Background()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+	s.unreachable()
+
+	rm := s.accept(KindRemoveHost, "", "h1", 1)
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	// a queued removal the module does not start keeps the ledger at it
+	s.module.mu.Lock()
+	s.module.refuse = "retire start"
+	s.module.mu.Unlock()
+
+	s.accept(KindRemoveHost, "", "h9", 2)
+	f := s.forgotten(rm.Op.ID, 3)
+	_ = s.leader.Tick(ctx, 42, 5)
+
+	// held: no retirement step ran after the ledger
+	if slices.Contains(s.moduleCalls(), "retire done "+rm.Op.ID) {
+		t.Fatal("the ledger was not held")
+	}
+
+	if op := s.op(t, f.Op.ID); op.State != wire.OpCompleted {
+		t.Fatalf("forgotten: %+v", op)
+	}
+
+	if r := s.retiring(t)["h1"]; r == nil || r.Step != state.RetireEnd || r.Reason != "forgotten" {
+		t.Fatalf("retiring %+v", r)
+	}
+}
+
+func TestAMalformedForgottenFails(t *testing.T) {
+	s := retiringSetup(t)
+	ctx := context.Background()
+
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	bad := s.acceptOp(KindRetireForgotten, 1, func(op *LedgerOp) { op.Host, op.Remove = "h1", "not-an-op" })
+	must(t, s.leader.Tick(ctx, 42, 5))
+
+	if op := s.op(t, bad.Op.ID); op.State != JournalFailed {
+		t.Fatalf("malformed: %+v", op)
+	}
+}

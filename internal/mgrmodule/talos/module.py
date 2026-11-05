@@ -1776,7 +1776,9 @@ class Module(orchestrator.Orchestrator, MgrModule):
             led.settle()
         except ledger.LedgerError as e:
             raise OrchestratorError('an earlier operation is not settled yet (%s); try again' % e)
-        self._not_retiring(host)
+        # the one control of a retirement itself is about a retiring host
+        if kind not in ledger.RETIRE_CONTROLS:
+            self._not_retiring(host)
         op_id = 'op-' + os.urandom(8).hex()
         try:
             led.append({'id': op_id, 'kind': kind, 'host': host, **fields, **self._request_fields()})
@@ -1785,6 +1787,26 @@ class Module(orchestrator.Orchestrator, MgrModule):
         except ledger.LedgerError as e:
             raise OrchestratorError('not accepted: %s' % e)
         return op_id
+
+    @TalosCLICommand.Write('orch talos host forgotten')
+    def _host_forgotten(self, host: str, operation: Optional[str] = None) -> HandleCommandResult:
+        """Assert that a retiring host's node was taken over (cephadm-talos host forget) or will not return: its retirement ends, its agent's certificates revoked and its keys deleted; with an operation, only that removal's retirement"""
+        try:
+            self._settle()
+            _, fold = self._authority()
+            rec = self._retiring_records().get(host)
+            rt = fold.retiring.get(host)
+            # the leader's record, which the control moves: published before
+            # the removal ended, and the fold's until the retirement's end
+            if rec is None or rt is None or str(rec.get('op')) != rt['op']:
+                raise OrchestratorError('%s is not retiring' % host)
+            # a retry must not end a later retirement of the same name
+            if operation is not None and operation != rt['op']:
+                raise OrchestratorError('%s is retiring by operation %s, not %s' % (host, rt['op'], operation))
+            op_id = self._accept_control('retire_forgotten', host, remove=rt['op'])
+        except OrchestratorError as e:
+            return HandleCommandResult(retval=-22, stderr=str(e))
+        return HandleCommandResult(stdout='Scheduled to end the retirement of host %s (operation %s)' % (host, op_id))
 
     @TalosCLICommand.Write('orch talos noout keep')
     def _noout_keep(self, host: str) -> HandleCommandResult:

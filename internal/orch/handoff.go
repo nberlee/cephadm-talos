@@ -223,6 +223,10 @@ func (o *Orch) waitJoined(ctx context.Context, h state.Host, name string) error 
 // handOver asks one node's agent to take ownership, with the operator
 // certificate; an agent that already owns its node is handed over.
 func (o *Orch) handOver(ctx context.Context, h state.Host) error {
+	if o.handOverHook != nil {
+		return o.handOverHook(h)
+	}
+
 	if o.Talos.DryRun {
 		o.printf("# hand %s to its agent\n", h.Name)
 

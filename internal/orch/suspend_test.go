@@ -43,11 +43,20 @@ type fakeAgent struct {
 	readopts    []map[string]string
 	activations []wire.Activate
 	refuseAct   int
+	// host is the host it answers as ("" for h1); retired: it answers 410 Gone
+	host    string
+	retired bool
 }
 
 func (a *fakeAgent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	if a.retired {
+		http.Error(w, "the agent is retired", http.StatusGone)
+
+		return
+	}
 
 	switch r.URL.Path {
 	case "/v1/readopt":
@@ -100,7 +109,12 @@ func (a *fakeAgent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		st.Waiting = []string{"job abc of operation op-1"}
 		w.WriteHeader(http.StatusAccepted)
 	} else {
-		st.Receipt = &wire.SuspendReceipt{Version: wire.Version, Session: a.session, Host: "h1", Revision: a.revision, Unresolved: []wire.Operation{}, Intents: []wire.BridgeIntent{}}
+		host := a.host
+		if host == "" {
+			host = "h1"
+		}
+
+		st.Receipt = &wire.SuspendReceipt{Version: wire.Version, Session: a.session, Host: host, Revision: a.revision, Unresolved: []wire.Operation{}, Intents: []wire.BridgeIntent{}}
 	}
 
 	_ = json.NewEncoder(w).Encode(st)
