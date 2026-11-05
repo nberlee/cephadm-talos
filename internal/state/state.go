@@ -130,6 +130,55 @@ type Move struct {
 	Error  string `json:"error,omitempty"`
 }
 
+// Retiring is a removed host's retirement (`ceph orch host rm`, plan 04 step
+// 6): recorded by the removal, which drops the host from the hosts, with the
+// agent identity it journals (its address, its certificates and the name of
+// their keys, and the certificates its enrollment record carried then); its
+// steps run between ledger operations: the strip of its owned documents, the
+// retirement grant (journaled <Op>.retire.<Attempt>), the end (the module's
+// `retire done`), then the record is cleared.
+type Retiring struct {
+	Op   string `json:"op"`
+	Addr string `json:"addr"`
+	// AgentCert and AgentClientCert are the agent's certificates in the state
+	// at the removal; AgentKeys names their keys' secrets as Host.AgentKeys
+	// ("<operation>/<attempt>", "" for the CLI's host/<host>/agent-*.key)
+	AgentCert       string `json:"agent_cert,omitempty"`
+	AgentClientCert string `json:"agent_client_cert,omitempty"`
+	AgentKeys       string `json:"agent_keys,omitempty"`
+	// EnrollCert and EnrollClientCert are the certificates the host's
+	// enrollment record (cephadm-talos/enroll/<host>) carried at the removal,
+	// "" without one: the end deletes the record only if it still carries them
+	EnrollCert       string `json:"enroll_cert,omitempty"`
+	EnrollClientCert string `json:"enroll_client_cert,omitempty"`
+	// Step is the step in progress: "strip", "grant" or "end"
+	Step string `json:"step"`
+	// Attempt numbers the steps' journal ids (<Op>.strip.<n>, <Op>.retire.<n>)
+	Attempt int `json:"attempt,omitempty"`
+	// Since is when the retirement began; Tried when the last strip or grant
+	// was sent
+	Since time.Time `json:"since"`
+	Tried time.Time `json:"tried,omitzero"`
+	// Sent: a retirement grant was sent (its journal granting, uncertain or
+	// completed); Silent is since when the agent has not answered at Addr
+	// (zero while it answers); Retired once the leader takes the retirement
+	// as done (the agent answered 410 Gone, or a grant was sent and it has
+	// not answered for two minutes)
+	Sent    bool      `json:"sent,omitempty"`
+	Silent  time.Time `json:"silent,omitzero"`
+	Retired bool      `json:"retired,omitempty"`
+	// Error is why the retirement waits ("" while it advances), for
+	// TALOS_HOST_RETIRING
+	Error string `json:"error,omitempty"`
+}
+
+// Retirement steps (Retiring.Step).
+const (
+	RetireStrip = "strip"
+	RetireGrant = "grant"
+	RetireEnd   = "end"
+)
+
 // MoveName is the name a move records a daemon under in Moved.
 func MoveName(d Daemon) string {
 	if d.Type == TypeOSD && d.OSDID != nil {
@@ -438,6 +487,9 @@ type State struct {
 	Upgrade *Upgrade `json:"-"`
 	// AgentUpgrade is the agent upgrade in progress or the last one finished
 	AgentUpgrade *AgentUpgrade `json:"-"`
+	// Retiring are the removed hosts whose retirement has not ended, by name
+	// (plan 04, step 6): no longer in Hosts
+	Retiring map[string]*Retiring `json:"-"`
 	// Inventory is the revision of the mgr module's inventory record: bumped,
 	// with its time, only when its content changes
 	Inventory InventoryRevision `json:"-"`
@@ -740,6 +792,8 @@ type cluster struct {
 	Upgrade *Upgrade `json:"upgrade,omitempty"`
 	// AgentUpgrade is the agent upgrade in progress or the last one finished
 	AgentUpgrade *AgentUpgrade `json:"agent_upgrade,omitempty"`
+	// Retiring are the removed hosts' retirements in progress
+	Retiring map[string]*Retiring `json:"retiring,omitempty"`
 }
 
 // Secret names: config-key entries below store.SecretPrefix, one per secret.
@@ -844,6 +898,7 @@ func (s *State) Records() (map[string][]byte, error) {
 		Schema: SchemaVersion, FSID: s.FSID, Image: s.Image, CephVersion: s.CephVersion, Arch: s.Arch,
 		RGW: s.RGW, Published: s.Published, ConfPending: s.ConfPending, RGWPending: s.RGWPending, Inventory: s.Inventory,
 		HandingOver: s.HandingOver, Sealed: s.Sealed, LedgerApplied: s.LedgerApplied, Upgrade: s.Upgrade, AgentUpgrade: s.AgentUpgrade,
+		Retiring: s.Retiring,
 	}
 
 	if s.Agent != nil {
@@ -931,7 +986,7 @@ func (s *State) ApplyRecords(recs map[string][]byte) error {
 	s.Image, s.CephVersion, s.Arch, s.RGW, s.Published = c.Image, c.CephVersion, c.Arch, c.RGW, c.Published
 	s.ConfPending, s.RGWPending, s.Hosts, s.Daemons = c.ConfPending, c.RGWPending, hosts, daemons
 	s.Inventory, s.HandingOver, s.Sealed, s.LedgerApplied, s.Upgrade = c.Inventory, c.HandingOver, c.Sealed, c.LedgerApplied, c.Upgrade
-	s.AgentUpgrade = c.AgentUpgrade
+	s.AgentUpgrade, s.Retiring = c.AgentUpgrade, c.Retiring
 	s.Agent = c.Agent
 
 	if s.Agent != nil && operator != nil {
@@ -977,6 +1032,18 @@ func (s *State) AddHost(h Host) {
 func (s *State) RemoveHost(name string) {
 	s.Hosts = slices.DeleteFunc(s.Hosts, func(h Host) bool { return h.Name == name })
 	s.Contacts = slices.DeleteFunc(s.Contacts, func(h Host) bool { return h.Name == name })
+}
+
+// RetiringHost is a removed host whose retirement has not ended, as a Host
+// to reach its agent with: its name, the address and the certificates its
+// retirement journaled.
+func (s *State) RetiringHost(name string) (Host, *Retiring, bool) {
+	r, ok := s.Retiring[name]
+	if !ok || r == nil {
+		return Host{}, nil, false
+	}
+
+	return Host{Name: name, Addr: r.Addr, AgentCert: r.AgentCert, AgentClientCert: r.AgentClientCert, AgentKeys: r.AgentKeys}, r, true
 }
 
 // AllHosts are the members and the contacts: every node this cluster may have

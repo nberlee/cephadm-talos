@@ -68,6 +68,8 @@ REFRESH_TIMEOUT = 30.0
 STALE_AFTER = datetime.timedelta(minutes=2)
 # an unplanned stop not ended after this raises TALOS_HOST_DOWN (plan 04, step 5)
 HOST_DOWN_AFTER = datetime.timedelta(minutes=30)
+# a removed host's retirement not ended after this raises TALOS_HOST_RETIRING (plan 04, step 6)
+HOST_RETIRING_AFTER = datetime.timedelta(minutes=10)
 MAX_WORKERS = 8
 
 
@@ -690,7 +692,11 @@ class Module(orchestrator.Orchestrator, MgrModule):
         the agent's server certificate is checked against the agent CA and
         its identity, not the revoked set (the list is public), so an agent
         whose own certificate was revoked still gets lists. Then report the
-        agents whose list is past its nextUpdate."""
+        agents whose list is past its nextUpdate. A removed host still to retire
+        (plan 04, step 6) is not polled and gets the list every time, at its
+        journaled address, from the agent with its journaled certificate: with
+        a stale list a fail-closed agent answers 503, neither its retirement
+        nor silence, until a new list comes."""
         crl = getattr(self, '_crl', None)
         obs = self._poller.snapshot()
         stale = sorted(n for n, (rec, _) in obs.items() if rec is not None and rec.get('crl_stale'))
@@ -709,11 +715,22 @@ class Module(orchestrator.Orchestrator, MgrModule):
                 self._poller.executor.submit(self._send_crl, inv['fsid'], h, body)
             except RuntimeError:  # shut down meanwhile
                 return
+        for name, r in sorted(self._retiring_records().items()):
+            if r.get('step') == 'end' or not r.get('addr') or not r.get('agent_cert'):
+                continue  # done with its agent
+            try:
+                self._poller.executor.submit(self._send_crl, inv['fsid'], {'name': name, 'addr': r['addr'], 'agent_cert': r['agent_cert']}, body)
+            except RuntimeError:
+                return
 
     def _send_crl(self, fsid: str, h: Dict[str, Any], body: bytes) -> None:
+        def check(cert: Optional[Dict[str, Any]]) -> None:
+            require_identity(cert, fsid, 'agent', h['name'])
+            # a retiring host's agent is the one with the journaled certificate
+            if h.get('agent_cert') and int((cert or {}).get('serialNumber') or '0', 16) != revocation.cert_serial(h['agent_cert'])[0]:
+                raise ValueError('%s does not serve the certificate its retirement journaled' % h['name'])
         try:
-            status, reply = bridge.post_json(h['addr'], AGENT_PORT, tls_context(), '/v1/crl', body, REQUEST_TIMEOUT,
-                                             lambda cert: require_identity(cert, fsid, 'agent', h['name']))
+            status, reply = bridge.post_json(h['addr'], AGENT_PORT, tls_context(), '/v1/crl', body, REQUEST_TIMEOUT, check)
             if status != 200:
                 self.log.info('the agent of %s refused the revocation list: %d %s', h['name'], status, reply[:200].decode(errors='replace'))
         except Exception as e:
@@ -844,6 +861,31 @@ class Module(orchestrator.Orchestrator, MgrModule):
         if host in self._moves(fold):
             raise OrchestratorError('the address of %s is changing (ceph orch host ls)' % host)
 
+    def _retiring_records(self) -> Dict[str, Dict[str, Any]]:
+        """The leader's retirement records of removed hosts (plan 04, step 6),
+        by host, from its published cluster record; {} when it cannot be read."""
+        store = self.get_store_prefix(STORE_PREFIX)
+        try:
+            cluster = record_from_store(store, choose_incarnation(store, getattr(self, '_gid', None)), 'cluster')[0] or {}
+        except InventoryError:
+            return {}
+        recs = cluster.get('retiring') if isinstance(cluster, dict) else None
+        return {h: r for h, r in recs.items() if isinstance(r, dict)} if isinstance(recs, dict) else {}
+
+    def _retirements(self, fold: Any) -> Dict[str, str]:
+        """The removed hosts retiring and their removal's operation: the
+        fold's, and the leader's records until it cleared them."""
+        out = {h: r['op'] for h, r in fold.retiring.items()}
+        for h, r in self._retiring_records().items():
+            out.setdefault(h, str(r.get('op')))
+        return out
+
+    def _not_retiring(self, host: str) -> None:
+        _, fold = self._authority()
+        op = self._retirements(fold).get(host)
+        if op is not None:
+            raise OrchestratorError('%s is being removed (operation %s): its agent retires first' % (host, op))
+
     def _move_record(self, host: str) -> Dict[str, Any]:
         """The leader's record of a host's move, {} without one."""
         try:
@@ -944,6 +986,8 @@ class Module(orchestrator.Orchestrator, MgrModule):
             self._not_draining(host)
         # a moving host none: the move reissues its certificates itself
         self._not_moving(host)
+        # a removed host none until its retirement ended (plan 04, step 6)
+        self._not_retiring(host)
         op_id = op_id or 'op-' + os.urandom(8).hex()
         entry = {'id': op_id, 'kind': kind, 'host': host, **extra, **self._request_fields()}
         if daemon:
@@ -1045,6 +1089,10 @@ class Module(orchestrator.Orchestrator, MgrModule):
         # stays: the bridge authorizes its steps by it (plan 04, step 5)
         pinned |= {d['op'] for d in fold.draining.values()}
         pinned |= {mv['op'] for mv in fold.moving.values()}
+        # a host removal's while the fold or the leader's record holds its
+        # retirement: the bridge authorizes its calls by it (plan 04, step 6)
+        pinned |= {r['op'] for r in fold.retiring.values()}
+        pinned |= {str(r.get('op')) for r in ((cluster.get('retiring') if isinstance(cluster, dict) else None) or {}).values() if isinstance(r, dict)}
         try:
             inv = inventory_from_store(store, choose_incarnation(store, getattr(self, '_gid', None)))
             pinned |= {str(h['drain'].get('op')) for h in inv['hosts'] if isinstance(h.get('drain'), dict)}
@@ -1396,6 +1444,8 @@ class Module(orchestrator.Orchestrator, MgrModule):
                 raise OrchestratorError('%s has operation %s in progress (orch talos operation %s)' % (host, e['id'], e['id']))
         self._not_in_maintenance(host)
         self._not_draining(host)
+        # every admission path refuses a removed host until its retirement ended (plan 04, step 6)
+        self._not_retiring(host)
         op_id = 'op-' + os.urandom(8).hex()
         try:
             led.append({'id': op_id, 'kind': 'create_osd', 'host': host, 'device': device, **self._request_fields()})
@@ -1443,6 +1493,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
             raise OrchestratorError('an earlier operation is not settled yet (%s); try again' % e)
         self._not_backlogged(led, self._journal_index())
         self._not_draining(host)
+        self._not_retiring(host)
         op_id = 'op-' + os.urandom(8).hex()
         try:
             led.append({'id': op_id, 'kind': 'remove_osd', 'daemon': name, 'host': host, 'uuid': uuid, 'zap': bool(zap), 'force': bool(force),
@@ -1527,6 +1578,8 @@ class Module(orchestrator.Orchestrator, MgrModule):
             raise OrchestratorError('labels: at most 32, letters, digits, dots, dashes and underscores')
         self._settle()
         _, fold = self._authority()
+        # a removed host's name until its retirement ended (plan 04, step 6)
+        self._not_retiring(host)
         if host in fold.hosts:
             raise OrchestratorError('%s is a host of the cluster already' % host)
         r, out, _ = self.mon_command({'prefix': 'config-key get', 'key': ENROLL_PREFIX + host})
@@ -1723,6 +1776,7 @@ class Module(orchestrator.Orchestrator, MgrModule):
             led.settle()
         except ledger.LedgerError as e:
             raise OrchestratorError('an earlier operation is not settled yet (%s); try again' % e)
+        self._not_retiring(host)
         op_id = 'op-' + os.urandom(8).hex()
         try:
             led.append({'id': op_id, 'kind': kind, 'host': host, **fields, **self._request_fields()})
@@ -1765,8 +1819,8 @@ class Module(orchestrator.Orchestrator, MgrModule):
         """The noout ownership's pass (plan 04, step 5): every host with an
         unplanned stop, a reason or an open intent is reconciled; a host back
         from its stop (a new boot, or its stop cancelled, and its OSDs up again
-        unless it is in maintenance) ends it. Then TALOS_HOST_DOWN and
-        TALOS_DRAIN_PAUSED and TALOS_HOST_MOVE_PAUSED."""
+        unless it is in maintenance) ends it. Then TALOS_HOST_DOWN,
+        TALOS_DRAIN_PAUSED, TALOS_HOST_MOVE_PAUSED and TALOS_HOST_RETIRING."""
         now = now or utcnow()
         channel = getattr(self, '_channel', None)
         led = getattr(self, '_ledger', None)
@@ -1831,6 +1885,19 @@ class Module(orchestrator.Orchestrator, MgrModule):
                 'severity': 'warning', 'summary': 'a host address change is paused', 'count': len(moves),
                 'detail': ['the move of %s to %s paused: %s (ceph orch host set-addr %s %s resumes it)'
                            % (h, mv.get('to', ''), mv.get('error', ''), h, mv.get('to', '')) for h, mv in moves]}
+        retiring = []
+        for h, r in sorted(self._retiring_records().items()):
+            try:
+                late = now - ledger._parse_iso(r.get('since')) > HOST_RETIRING_AFTER
+            except (ValueError, TypeError):
+                late = True
+            if late:
+                retiring.append((h, r))
+        if retiring:
+            checks['TALOS_HOST_RETIRING'] = {
+                'severity': 'warning', 'summary': 'a removed host has not retired', 'count': len(retiring),
+                'detail': ['%s (%s) is retiring since %s, step %s: %s (cephadm-talos host forget %s takes its node over)'
+                           % (h, r.get('addr', ''), r.get('since', ''), r.get('step', ''), r.get('error') or 'in progress', h) for h, r in retiring]}
         self._set_health('lifecycle', checks)
 
     def _noout_loop(self) -> None:

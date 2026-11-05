@@ -46,6 +46,7 @@ func TestRecordsRoundTripWithoutLocalParts(t *testing.T) {
 	st.AgentUpgrade = &AgentUpgrade{Op: "op-2", From: "agent", Image: "agent2", Done: []string{"h1"}, Last: "h1", Paused: true}
 	st.Daemons = []Daemon{{Type: TypeMon, ID: "h1", Host: "h1"}}
 	st.Keys["client.admin"], st.Keys["mon."] = "adminkey", "monkey"
+	st.Retiring = map[string]*Retiring{"h2": {Op: "op-3", Addr: "10.0.0.2", AgentCert: "rc", AgentKeys: "op-4/b", EnrollCert: "ec", Step: RetireGrant, Attempt: 2, Sent: true}}
 
 	recs, err := st.Records()
 	if err != nil {
@@ -93,6 +94,17 @@ func TestRecordsRoundTripWithoutLocalParts(t *testing.T) {
 	if back.Agent.PreviousImage != "agent0" || h.AgentKeySecret(SecretAgentServer) != "issued/op-1/a/agent-server.key" ||
 		back.AgentUpgrade == nil || back.AgentUpgrade.Image != "agent2" || !back.AgentUpgrade.Paused || back.AgentUpgrade.Last != "h1" {
 		t.Errorf("round trip: %+v %+v", back.Agent, back.AgentUpgrade)
+	}
+
+	// a removed host's retirement (plan 04, step 6): published, not a member
+	r, ok := back.Retiring["h2"]
+	if rh, _, found := back.RetiringHost("h2"); !ok || r.Op != "op-3" || r.EnrollCert != "ec" || r.Step != RetireGrant || r.Attempt != 2 || !r.Sent ||
+		!found || rh.Addr != "10.0.0.2" || rh.AgentCert != "rc" || rh.AgentKeySecret(SecretAgentServer) != "issued/op-4/b/agent-server.key" {
+		t.Errorf("retiring: %+v", r)
+	}
+
+	if _, member := back.Host("h2"); member {
+		t.Error("a retiring host is a member")
 	}
 
 	if (Host{Name: "h2"}).AgentKeySecret(SecretAgentClient) != "host/h2/agent-client.key" {

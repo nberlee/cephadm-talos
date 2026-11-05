@@ -58,7 +58,8 @@ func (l *LeaderLoop) agentGrant(ctx context.Context, b *Bridge, js store.Backend
 		return false, false, err
 	}
 
-	h, ok := st.Host(host)
+	// a member, or a retiring host for its retirement grant (plan 04, step 6)
+	h, ok := l.contact(st, host)
 	if !ok {
 		return false, false, fmt.Errorf("no host %s in the cluster state", host)
 	}

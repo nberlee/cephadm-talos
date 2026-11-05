@@ -371,6 +371,48 @@ class MoveFoldTest(unittest.TestCase):
                 lg.check_entry(k, json.dumps(e))
 
 
+class RetiringFoldTest(unittest.TestCase):
+    """plan 04, step 6: a removed host retiring, from its retiring entry until
+    retire_host; it stays a host meanwhile, its agent keys are not released."""
+    INV = {'hosts': [{'name': 'h1', 'addr': '10.0.0.1'}, {'name': 'h2', 'addr': '10.0.0.2'}], 'daemons': []}
+    PEM = '-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----\n'
+
+    def test_retiring_until_retired(self):
+        op = 'op-%016x' % 1
+        rm = entry(5, 1, op, kind='remove_host', host='h1')
+        renew = entry(5, 2, 'op-%016x' % 2, kind='renew_agent', host='h1')
+        cert = entry(5, 3, 'm-%016x' % 3, kind='agent_cert', of='op-%016x' % 2, host='h1', attempt='ab' * 8)
+        start = entry(5, 4, 'm-%016x' % 4, kind='retiring', of=op, host='h1', enroll_cert=self.PEM, enroll_client_cert='')
+        done = entry(5, 5, 'm-%016x' % 5, kind='retire_host', of=op, host='h1')
+        for k, e in (rm, renew, cert, start, done):
+            lg.check_entry(k, json.dumps(e))
+        # the acceptance alone does not mark it: a removal the leader refuses leaves nothing
+        self.assertEqual(lg.Fold(self.INV, [rm]).retiring, {})
+        f = lg.Fold(self.INV, [rm, renew, cert])
+        self.assertTrue(f.agent_keys_allowed('op-%016x' % 2))
+        f = lg.Fold(self.INV, [rm, renew, cert, start])
+        self.assertEqual(f.retiring, {'h1': {'op': op, 'enroll_cert': self.PEM, 'enroll_client_cert': ''}})
+        self.assertIn('h1', f.hosts)
+        self.assertFalse(f.agent_keys_allowed('op-%016x' % 2))
+        # a second start changes nothing; the snapshot keeps it
+        again = entry(5, 6, 'm-%016x' % 6, kind='retiring', of='op-%016x' % 9, host='h1', enroll_cert='', enroll_client_cert='')
+        self.assertEqual(lg.Fold(self.INV, [rm, start, again]).retiring['h1']['op'], op)
+        st = lg.Fold(self.INV, [rm, start]).state(set())
+        self.assertEqual(lg.Fold(self.INV, [], {'state': st}).retiring, st['retiring'])
+        f = lg.Fold(self.INV, [rm, start, done])
+        self.assertEqual((f.retiring, 'h1' in f.hosts), ({}, False))
+        for bad in (dict(kind='retiring', of=op, host='h1'), dict(kind='retiring', of=op, host='h1', enroll_cert='x', enroll_client_cert=''),
+                    dict(kind='retiring', of=op, host='h1', enroll_cert='', enroll_client_cert='', daemon='mon.h1'),
+                    dict(kind='retiring', host='h1', enroll_cert='', enroll_client_cert='')):
+            k, e = entry(5, 9, 'm-%016x' % 9, **bad)
+            with self.assertRaises(lg.LedgerError, msg=bad):
+                lg.check_entry(k, json.dumps(e))
+        # a removal carries nothing else
+        k, e = entry(5, 9, 'op-%016x' % 9, kind='remove_host', host='h1', zap=True)
+        with self.assertRaises(lg.LedgerError):
+            lg.check_entry(k, json.dumps(e))
+
+
 class UpgradeFoldTest(unittest.TestCase):
     IMG = 'quay.io/ceph/ceph@sha256:' + 'cd' * 32
 

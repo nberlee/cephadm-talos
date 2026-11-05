@@ -55,6 +55,10 @@ var errOutcomePending = errors.New("still running")
 // output to give: an outcome all the same.
 var errBridgeRan = errors.New("bridge")
 
+// errBridgeBad marks a call the module refused with 400: not allowed for what
+// its ledger shows, as distinct from one to ask again (409, 429, 503).
+var errBridgeBad = errors.New("bridge")
+
 // BridgeResult is a mon command's result through the bridge.
 type BridgeResult struct {
 	R    int
@@ -98,7 +102,7 @@ var intentCalls = map[string]bool{
 	"confirm osd": true, "close create": true, "osd out": true, "drain": true, "mon rm": true,
 	"noout set": true, "noout unset": true, "maintained": true, "mgr fail": true, "upgrade done": true,
 	"upgrade refused": true, "rgw cert": true, "rgw cert done": true, "retire keepalived": true, "mgr cert done": true,
-	"agent cert": true, "agent cert done": true, "drain done": true,
+	"agent cert": true, "agent cert done": true, "drain done": true, "retire start": true, "retire done": true,
 }
 
 // intend records a call's intent before it is made.
@@ -294,6 +298,10 @@ func (b *Bridge) reply(resp *http.Response, call, dispatch string) (BridgeResult
 		return BridgeResult{}, fmt.Errorf("%w: %s", ErrDispatchUnknown, dispatch)
 	case resp.StatusCode != http.StatusOK:
 		// refused before anything was sent to the mons
+		if resp.StatusCode == http.StatusBadRequest {
+			return BridgeResult{}, fmt.Errorf("%w: %s refused: %d %s", errBridgeBad, call, resp.StatusCode, bytes.TrimSpace(raw))
+		}
+
 		return BridgeResult{}, fmt.Errorf("bridge: %s refused: %d %s", call, resp.StatusCode, bytes.TrimSpace(raw))
 	}
 
@@ -780,6 +788,43 @@ func (b *Bridge) RetireKeepalived(ctx context.Context, op, daemon string) error 
 // "retire" for a daemon (auth rm, its keys), "retire host" for a host.
 func (b *Bridge) Retire(ctx context.Context, call, op string) error {
 	_, err := b.do(ctx, call, map[string]any{"operation": op})
+
+	return err
+}
+
+// EnrollCerts are the certificates a host's enrollment record carries
+// (cephadm-talos/enroll/<host>), "" without one.
+type EnrollCerts struct {
+	AgentCert       string `json:"agent_cert"`
+	AgentClientCert string `json:"agent_client_cert"`
+}
+
+// RetireStart tells the module that an accepted host removal begins its
+// retirement (plan 04, step 6): the module marks the host retiring in its
+// fold, with the certificates its enrollment record carries now, and returns
+// them. Asked again, it returns the ones it recorded.
+func (b *Bridge) RetireStart(ctx context.Context, op string) (EnrollCerts, error) {
+	out, err := b.do(ctx, "retire start", map[string]any{"operation": op})
+	if err != nil {
+		return EnrollCerts{}, err
+	}
+
+	var c EnrollCerts
+	if err := json.Unmarshal([]byte(out), &c); err != nil {
+		return EnrollCerts{}, errors.New("bridge: retire start: malformed answer")
+	}
+
+	return c, nil
+}
+
+// RetireDone ends a host's retirement (plan 04, step 6): the module revokes
+// certs (the agent certificates the removal journaled), its enrollment
+// record's and every issuance of the host's agent before it deletes their
+// keys (the CLI's only if they match certs or the enrollment record's), the
+// enrollment record if it still carries the certificates recorded at the
+// start, then retires the host. Idempotent.
+func (b *Bridge) RetireDone(ctx context.Context, op string, certs []string) error {
+	_, err := b.do(ctx, "retire done", withCerts(map[string]any{"operation": op}, certs))
 
 	return err
 }

@@ -1612,6 +1612,98 @@ class Lifecycle(unittest.TestCase):
         self.assertEqual(mod._channel.calls, [('up', 'h1', None), ('keep', 'h2')])
 
 
+class Retirement(unittest.TestCase):
+    """plan 04, step 6: a removed host retiring takes no operation and its
+    name is not added again until its retirement ended; its removal stays
+    pinned; TALOS_HOST_RETIRING."""
+    CERT = '-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----\n'
+    Channel = Lifecycle.Channel
+
+    def inv(self):
+        inv = drain_inventory()
+        inv['hosts'].append({'name': 'h6', 'addr': '10.5.0.6'})
+        return inv
+
+    def module(self):
+        mod, entries = Lifecycle.module(self, self.inv())
+        rec = {'version': 1, 'name': 'h6', 'addr': '10.5.0.6', 'agent_cert': self.CERT, 'agent_client_cert': self.CERT}
+        mod.mon_command = lambda cmd: (0, json.dumps(rec), '') if cmd.get('key') == 'cephadm-talos/enroll/h6' else (-2, '', 'not found')
+        return mod, entries
+
+    def published(self, entries, retiring, **cluster):
+        inv = self.inv()
+        inv['hosts'] = [h for h in inv['hosts'] if h['name'] not in retiring]
+        entries.update(state_entries(inv, dict({'fsid': 'f', 'sealed': True, 'retiring': retiring}, **cluster), incarnation='20'))
+
+    def removed(self, mod, entries):
+        """h6 removed: accepted, its retirement started in the fold, the leader's record published."""
+        res = m.Module.remove_host(mod, 'h6')
+        self.assertEqual(res.exception_str, '')
+        op = res.result.split('operation ')[1].rstrip(')')
+        entries['talos/inc/20/journal/op/' + op] = json.dumps({'state': 'completed'})
+        mod._ledger.append({'id': 'm-%016x' % 1, 'kind': 'retiring', 'of': op, 'host': 'h6', 'enroll_cert': self.CERT, 'enroll_client_cert': self.CERT})
+        self.published(entries, {'h6': {'op': op, 'addr': '10.5.0.6', 'step': 'strip', 'since': '2026-11-04T10:00:00Z',
+                                        'error': 'the agent does not answer at 10.5.0.6'}})
+        return op
+
+    def test_a_retiring_host_takes_nothing(self):
+        from ceph.deployment.hostspec import HostSpec
+        mod, entries = self.module()
+        op = self.removed(mod, entries)
+        n = len(mod._ledger.executable())
+        for res in (m.Module.remove_host(mod, 'h6'), m.Module.add_daemon(mod, AddAndRemove.spec(self, 'mgr', 'h6')),
+                    m.Module.add_host(mod, HostSpec('h6', '10.5.0.6')), m.Module.drain_host(mod, 'h6')):
+            self.assertIn('being removed', res.exception_str)
+        # every admission path: an OSD creation, a drain's or a move's control (Codex round 1 of slice 2)
+        for accept in (lambda: m.Module._accept_create(mod, 'h6', '/dev/vdb'),
+                       lambda: m.Module._accept_control(mod, 'drain_stop', 'h6', drain='op-%016x' % 9)):
+            with self.assertRaisesRegex(m.OrchestratorError, 'being removed'):
+                accept()
+        self.assertEqual(len(mod._ledger.executable()), n)
+        # retired in the fold, the leader's record not cleared yet: still refused
+        mod._ledger.append({'id': 'm-%016x' % 2, 'kind': 'retire_host', 'of': op, 'host': 'h6'})
+        self.assertNotIn('h6', mod._authority()[1].hosts)
+        self.assertIn('being removed', m.Module.add_host(mod, HostSpec('h6', '10.5.0.6')).exception_str)
+        # cleared: the name can be added again
+        self.published(entries, {})
+        self.assertEqual(m.Module.add_host(mod, HostSpec('h6', '10.5.0.6')).exception_str, '')
+
+    def test_the_removal_stays_pinned(self):
+        from talos import ledger as lg
+        for fold, record, cut in ((True, True, False), (False, True, False), (False, False, True)):
+            mod, entries = self.module()
+            led = mod._ledger
+            op = 'op-%016x' % 1
+            led.append({'id': op, 'kind': 'remove_host', 'host': 'h6'})
+            if fold:
+                led.append({'id': 'm-%016x' % 1, 'kind': 'retiring', 'of': op, 'host': 'h6', 'enroll_cert': '', 'enroll_client_cert': ''})
+            for i in range(2, 6):
+                led.append({'id': 'op-%016x' % i, 'kind': 'restart', 'daemon': 'mon.h1', 'host': 'h1'})
+            for i in range(1, 6):
+                entries['talos/inc/20/journal/op/op-%016x' % i] = json.dumps({'state': 'completed'})
+            self.published(entries, {'h6': {'op': op, 'step': 'grant', 'since': '2026-11-04T10:00:00Z'}} if record else {},
+                           ledger_applied=max(led.entries))
+            old = lg.COMPACT_AFTER
+            lg.COMPACT_AFTER = 3
+            try:
+                m.Module._compact(mod, led, lambda: True, Compaction.NOW)
+            finally:
+                lg.COMPACT_AFTER = old
+            covered = led.snapshot is not None and lg.LEDGER_PREFIX + led.snapshot_key >= lg.entry_key(7, 1, op)
+            self.assertEqual(covered, cut, (fold, record))
+
+    def test_health(self):
+        mod, entries = self.module()
+        mod.get = lambda what: {'osds': []}
+        self.removed(mod, entries)
+        m.Module._noout_tick(mod, datetime.datetime(2026, 11, 4, 10, 9, tzinfo=datetime.timezone.utc))
+        self.assertNotIn('TALOS_HOST_RETIRING', self.health['checks'])
+        m.Module._noout_tick(mod, datetime.datetime(2026, 11, 4, 10, 11, tzinfo=datetime.timezone.utc))
+        detail = self.health['checks']['TALOS_HOST_RETIRING']['detail'][0]
+        self.assertIn('does not answer at 10.5.0.6', detail)
+        self.assertIn('host forget h6', detail)
+
+
 class Move(unittest.TestCase):
     """plan 04, step 5: `ceph orch host set-addr`."""
 

@@ -8,6 +8,7 @@ import os
 import ssl
 import tempfile
 import threading
+import types
 import unittest
 
 import test_talos  # noqa: F401  (stubs ceph_module before the talos package is imported)
@@ -530,6 +531,7 @@ class DeliveryTest(unittest.TestCase):
         mod = object.__new__(m.Module)
         mod._poller = m.Poller(lambda addr, refresh: {})
         self.addCleanup(mod._poller.shutdown)
+        mod.get_store_prefix = lambda prefix: {}
         number = (9 << 32) + 2
         mod._crl = (number, b'der')
         health = {}
@@ -547,6 +549,66 @@ class DeliveryTest(unittest.TestCase):
         self.assertEqual(sorted(n for n, _ in sent), ['h2', 'h3'])
         self.assertEqual(base64.b64decode(sent[0][1]['crl']), b'der')
         self.assertEqual(health['now']['TALOS_CRL_STALE']['detail'], ['the agent of h2'])
+
+    def test_to_hosts_still_to_retire(self):
+        """Codex round 4 of slice 2: a retiring host is out of the inventory; a
+        fail-closed agent that came back with a stale list needs a new one to
+        answer its retirement at all."""
+        mod = object.__new__(m.Module)
+        mod._poller = m.Poller(lambda addr, refresh: {})
+        self.addCleanup(mod._poller.shutdown)
+        mod._crl = (5, b'der')
+        mod.set_health_checks = lambda checks: None
+        mod._retiring_records = lambda: {
+            'h7': {'op': 'op-1', 'step': 'grant', 'addr': '10.0.0.7', 'agent_cert': 'pem7'},
+            'h8': {'op': 'op-2', 'step': 'end', 'addr': '10.0.0.8', 'agent_cert': 'pem8'},  # done with its agent
+            'h9': {'op': 'op-3', 'step': 'strip', 'addr': '10.0.0.9', 'agent_cert': ''},  # nothing to reach
+        }
+        sent = []
+        mod._send_crl = lambda fsid, h, body: sent.append(h)
+        m.Module._deliver_crl(mod, {'fsid': 'f1', 'hosts': []})
+        mod._poller.executor.shutdown(wait=True)
+        self.assertEqual(sent, [{'name': 'h7', 'addr': '10.0.0.7', 'agent_cert': 'pem7'}])
+
+    def test_a_retiring_host_is_pinned_to_its_journaled_certificate(self):
+        import test_bridge
+        files = test_bridge.pki()
+        with open(files['ca.crt'], 'rb') as f:
+            ca = f.read()
+        with open(files['ca.key'], 'rb') as f:
+            key = f.read()
+        old = b.issue_mgr_certs(ca, key, 'f1', 'h7', '10.0.0.7', 'agent')['server_cert']
+        new = b.issue_mgr_certs(ca, key, 'f1', 'h7', '10.0.0.7', 'agent')['server_cert']
+
+        def peer(pem):
+            c = x509.load_pem_x509_certificate(pem.encode())
+            return {'serialNumber': '%X' % c.serial_number, 'subjectAltName': (('URI', 'cephadm-talos://f1/agent/h7'),)}
+
+        mod = object.__new__(m.Module)
+        mod._logger = types.SimpleNamespace(info=lambda *a: None, warning=lambda *a: None)
+        seen = []
+
+        def post(addr, port, ctx, path, body, deadline, check):
+            seen.append(addr)
+            check(peer(self.serving))
+            seen.append('sent')
+            return 200, b''
+        real, tls = b.post_json, m.tls_context
+        b.post_json, m.tls_context = post, lambda: None
+        self.addCleanup(lambda: (setattr(b, 'post_json', real), setattr(m, 'tls_context', tls)))
+        h = {'name': 'h7', 'addr': '10.0.0.7', 'agent_cert': old}
+        self.serving = old
+        m.Module._send_crl(mod, 'f1', h, b'{}')
+        self.assertEqual(seen, ['10.0.0.7', 'sent'])
+        # another agent of that name at the address, a re-enrolled one: nothing is sent
+        seen.clear()
+        self.serving = new
+        m.Module._send_crl(mod, 'f1', h, b'{}')
+        self.assertEqual(seen, ['10.0.0.7'])
+        # a member keeps being checked by its identity alone
+        seen.clear()
+        m.Module._send_crl(mod, 'f1', {'name': 'h7', 'addr': '10.0.0.7'}, b'{}')
+        self.assertEqual(seen, ['10.0.0.7', 'sent'])
 
 
 if __name__ == '__main__':

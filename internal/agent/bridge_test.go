@@ -43,6 +43,8 @@ type fakeBridge struct {
 	hang string
 	// refuse makes the named call answer 400 without running it
 	refuse string
+	// refuseKey makes a config-key set of a key containing it answer 503
+	refuseKey string
 	// page is how many keys one listing returns
 	page int
 	// fsid is the cluster in the module's certificate; "" is f1
@@ -71,6 +73,8 @@ type fakeBridge struct {
 	activeAddr string
 	// certs are the certificates to revoke each call carried, by "<call> <operation>"
 	certs map[string][]string
+	// enroll answers retire start (JSON: the enrollment record's certificates)
+	enroll string
 }
 
 func (m *fakeBridge) run(req wire.BridgeRequest) map[string]any {
@@ -169,7 +173,14 @@ func (m *fakeBridge) run(req wire.BridgeRequest) map[string]any {
 		b, _ := json.Marshal(m.osds)
 
 		return map[string]any{"outcome": "done", "r": 0, "out": string(b)}
-	case "retire", "retire host", "mon rm", "ok to stop", "noout set", "noout unset", "maintained", "upgrade done", "upgrade refused", "ok to stop daemon", "retire keepalived", "mgr cert done", "agent cert done", "drain done",
+	case "retire start":
+		m.retired = append(m.retired, req.Call+" "+str("operation"))
+		if m.enroll == "" {
+			m.enroll = `{"agent_cert":"","agent_client_cert":""}`
+		}
+
+		return map[string]any{"outcome": "done", "r": 0, "out": m.enroll}
+	case "retire", "retire host", "retire done", "mon rm", "ok to stop", "noout set", "noout unset", "maintained", "upgrade done", "upgrade refused", "ok to stop daemon", "retire keepalived", "mgr cert done", "agent cert done", "drain done",
 		"addr moved", "addr set", "move addr":
 		if (req.Call == "retire" || req.Call == "mon rm" || req.Call == "move addr") && str("daemon") != "" {
 			m.retired = append(m.retired, req.Call+" "+str("operation")+" "+str("daemon"))
@@ -301,6 +312,12 @@ func (m *fakeBridge) serve(t *testing.T, ca testCA, mgr string) (host, port stri
 
 		if req.Call == m.refuse {
 			w.WriteHeader(http.StatusBadRequest)
+
+			return
+		}
+
+		if key, _ := req.Args["key"].(string); m.refuseKey != "" && req.Call == "config-key set" && strings.Contains(key, m.refuseKey) {
+			w.WriteHeader(http.StatusServiceUnavailable)
 
 			return
 		}

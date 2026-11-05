@@ -270,6 +270,8 @@ def _auth_get_or_create(args: Dict[str, Any]) -> Dict[str, Any]:
 # their own prefix: never the CA keys or the agents' keys. A host's mgr keys
 # only for a host the inventory places a mgr on (Channel.bridge).
 SECRET_PREFIX = 'cephadm-talos/secrets/'
+# the CLI's enrollment records (internal/orch EnrollPrefix), one per host
+ENROLL_PREFIX = 'cephadm-talos/enroll/'
 SECRET_RE = re.compile(r'\A(?:host/([A-Za-z0-9][A-Za-z0-9._-]{0,127})/mgr-(?:server|client)\.key|rgw/server\.key|rgw/vrrp'
                        r'|issued/(op-[0-9a-f]{16})/[0-9a-f]{16}/mgr-(?:server|client)\.key'
                        r'|(?:issued/op-[0-9a-f]{16}/[0-9a-f]{16}|user/op-[0-9a-f]{16})/rgw-server\.key'
@@ -390,7 +392,7 @@ READ_PREFIXES = {'auth get', 'config get', 'config-key get', 'config-key ls', 'm
 LOCAL = {'mgr cert', 'retire', 'retire host', 'bind disk', 'confirm osd', 'close create', 'osd out', 'drain', 'mon rm',
          'ok to stop', 'noout set', 'noout unset', 'maintained', 'mgr fail', 'ok to stop daemon', 'upgrade done', 'upgrade refused',
          'rgw cert', 'rgw cert done', 'retire keepalived', 'mgr cert done', 'agent cert', 'agent cert done', 'drain done',
-         'addr moved', 'addr set', 'move addr', 'clear osd addr'}
+         'addr moved', 'addr set', 'move addr', 'clear osd addr', 'retire start', 'retire done'}
 
 ALLOWLIST: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     'status': _no_args('status'),
@@ -438,6 +440,10 @@ ALLOWLIST: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     'move addr': _operation_with('daemon'),
     # a new OSD's id without address settings an earlier OSD of that id left
     'clear osd addr': _operation_with('osd'),
+    # a removed host's retirement (plan 04, step 6): its start, and its end
+    # with the agent certificates the removal journaled
+    'retire start': _operation,
+    'retire done': _operation_certs,
 }
 
 
@@ -805,6 +811,22 @@ def own_file(key: str, role: str) -> bool:
     return key.rsplit('/', 1)[-1].startswith(role + '-')
 
 
+def public_key_of(pem: Any) -> Optional[bytes]:
+    """The public key (DER) of a PEM certificate or private key, None if it
+    is neither."""
+    if not isinstance(pem, str):
+        return None
+    der = serialization.Encoding.DER
+    spki = serialization.PublicFormat.SubjectPublicKeyInfo
+    try:
+        if '-----BEGIN CERTIFICATE-----' in pem:
+            from cryptography import x509
+            return x509.load_pem_x509_certificate(pem.encode()).public_key().public_bytes(der, spki)
+        return serialization.load_pem_private_key(pem.encode(), None).public_key().public_bytes(der, spki)
+    except Exception:
+        return None
+
+
 def ambiguous(host: str) -> bool:
     """osd set-group resolves numbers (OSD ids), all and any before CRUSH bucket names."""
     return re.match(r'\A(osd\.)?[0-9]+\Z', host) is not None or host in ('all', 'any', '*')
@@ -1140,6 +1162,13 @@ class Channel:
                     return self._rgw_cert_done(led, fold, ops, op, (args or {}).get('keep'))
                 if call in ('bind disk', 'confirm osd', 'close create'):
                     return self._creation(call, led, fold, op, args or {})
+                if call == 'retire start':
+                    return self._retire_start(led, fold, ops, op)
+                if call == 'retire done':
+                    return self._retire_done(led, fold, ops, op, (args or {}).get('certs', []))
+                # a retiring host ends only through retire done, which revokes first
+                if op is not None and op['kind'] == 'remove_host' and op['host'] in fold.retiring:
+                    return 400, {'error': '%s is retiring: retire done ends it' % op['host']}
                 return self._retire_host(led, fold, ops, op)
             except Exception as e:  # a ledger entry without an answer, among others: asked again
                 return 503, {'error': '%s: %s' % (call, e.__class__.__name__)}
@@ -2110,6 +2139,135 @@ class Channel:
             if job is None or job.r not in (0, -2):
                 return 'config rm %s %s: no answer or refused; ask again' % (name, key)
         return None
+
+    # --- a removed host's retirement (plan 04, step 6) ------------------------
+
+    def _enrollment(self, host: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """(answered, record): the host's enrollment record, None without one
+        (or one that does not decode, which no deletion can match)."""
+        job = self._mon({'prefix': 'config-key get', 'key': ENROLL_PREFIX + host})
+        if job is None or job.too_large or job.r not in (0, -2):
+            return False, None
+        if job.r == -2:
+            return True, None
+        try:
+            rec = json.loads(job.outb)
+        except ValueError:
+            return True, None
+        return True, rec if isinstance(rec, dict) else None
+
+    def _retire_start(self, led: Any, fold: Any, ops: Dict[str, Dict[str, Any]], op: Optional[Dict[str, Any]]) -> Tuple[int, Dict[str, Any]]:
+        """A host removal's retirement begins: the fold marks the host retiring
+        (no operation on it, its name not added again) with the certificates
+        its enrollment record carries now, which are returned; asked again,
+        the ones recorded."""
+        if op is None or op['kind'] != 'remove_host':
+            return 400, {'error': 'no removal of a host'}
+        host = op['host']
+        mine = [e for e in ops.values() if e['kind'] == 'retiring' and e['of'] == op['id']]
+        if mine:
+            out = {'agent_cert': mine[0]['enroll_cert'], 'agent_client_cert': mine[0]['enroll_client_cert']}
+            return 200, {'outcome': 'done', 'r': 0, 'out': json.dumps(out), 'outs': ''}
+        if host not in fold.hosts:
+            return 400, {'error': '%s is not a host of the cluster' % host}
+        if host in fold.retiring:
+            return 400, {'error': '%s is retiring (operation %s)' % (host, fold.retiring[host]['op'])}
+        if any(h == host for h in fold.daemons.values()):
+            return 400, {'error': '%s still has daemons' % host}
+        ok, rec = self._enrollment(host)
+        if not ok:
+            return 503, {'error': 'cannot read the enrollment record of %s; ask again' % host}
+        out = {'agent_cert': '', 'agent_client_cert': ''}
+        if rec is not None and rec.get('name') == host:
+            for c in out:
+                v = rec.get(c)
+                if isinstance(v, str) and 0 < len(v) <= 8192 and v.startswith('-----BEGIN CERTIFICATE-----'):
+                    out[c] = v
+        led.append({'id': 'm-' + secrets.token_hex(8), 'kind': 'retiring', 'of': op['id'], 'host': host,
+                    'enroll_cert': out['agent_cert'], 'enroll_client_cert': out['agent_client_cert']})
+        return 200, {'outcome': 'done', 'r': 0, 'out': json.dumps(out), 'outs': ''}
+
+    def _retire_done(self, led: Any, fold: Any, ops: Dict[str, Dict[str, Any]], op: Optional[Dict[str, Any]],
+                     certs: List[str] = []) -> Tuple[int, Dict[str, Any]]:
+        """A host's retirement ends: its agent's certificates are revoked (the
+        ones the leader journaled, its enrollment record's and every issuance
+        of the fold for the host) before any key goes; then the issuances'
+        keys, the CLI's keys only if they are a journaled certificate's, and
+        the enrollment record only if it still carries the certificates the
+        start recorded; then the host retires as before. Idempotent."""
+        if op is None or op['kind'] != 'remove_host':
+            return 400, {'error': 'no removal of a host'}
+        host = op['host']
+        if any(e['kind'] == 'retire_host' and e['of'] == op['id'] for e in ops.values()):
+            return 200, {'outcome': 'done', 'r': 0, 'out': '', 'outs': ''}
+        rt = fold.retiring.get(host)
+        if rt is None or rt['op'] != op['id']:
+            return 400, {'error': 'no retirement of %s by %s' % (host, op['id'])}
+        if any(h == host for h in fold.daemons.values()):
+            return 400, {'error': '%s still has daemons' % host}
+        # every deletion an earlier call sent (tracked under the host's
+        # retirement, as a daemon's mutations are) is answered first: one that
+        # timed out may still land, and must not land after the retirement
+        # ended and a re-enrollment wrote the name's new keys or record
+        # (in memory: a new active mgr does not know its predecessor's. That mgr
+        # respawns once it sees the map without it, which drops what it had not
+        # had answered; until then a cut-off one may still resend: a residual,
+        # as for a daemon's tracked mutations)
+        fence = 'retire/' + host
+        if self._pending(fence):
+            return 409, {'error': 'deletions for the retirement of %s are not answered yet; ask again' % host}
+        # the enrollment record's certificates are revoked if they are this
+        # host's agent's (the record is the CLI's; one it never issued is skipped)
+        enrolled = []
+        for c in (rt['enroll_cert'], rt['enroll_client_cert']):
+            if not c:
+                continue
+            try:
+                revocation.check_cert(c, self.ca_cert, self.fsid, 'agent', host)
+            except ValueError:
+                continue
+            enrolled.append(c)
+        issued = ['%sissued/%s/' % (SECRET_PREFIX, o) for o in sorted(fold.agent_renewals.get(host, {}))]
+        refused = self._revoke(issued, 'agent', host, list(certs) + enrolled, None, 'removal %s' % op['id'])
+        if refused is not None:
+            return refused
+        # the CLI's keys, if they are the keys of a journaled certificate (a
+        # re-enrollment of the name that raced the removal keeps its own).
+        # config-key has no compare-and-set: the check and the deletion below
+        # are not atomic. The fence is the CLI's enrollment, which refuses a
+        # name that is a member or in the published State.Retiring before it
+        # writes any key or record; the leader clears that record only after
+        # retire done returned, so no enrollment of the name overlaps this call
+        journaled = set()
+        for c in list(certs) + enrolled:
+            pub = public_key_of(c)
+            if pub is not None:
+                journaled.add(pub)
+        cli = []
+        for role in ('server', 'client'):
+            name = 'host/%s/agent-%s.key' % (host, role)
+            ok, pem = self._secret_or_absent(name)
+            if not ok:
+                return 503, {'error': 'cannot read the key %s; ask again' % name}
+            if pem is not None and public_key_of(pem) in journaled:
+                cli.append(SECRET_PREFIX + name)
+        keys = self._mon({'prefix': 'config-key ls'}, None, lambda out: json.dumps([k for k in json.loads(out) if any(k.startswith(p) for p in issued)]))
+        if keys is None or keys.r != 0 or keys.too_large:
+            return 503, {'error': 'cannot list the secrets; ask again'}
+        for k in [k for k in json.loads(keys.outb) if any(k.startswith(p) for p in issued) and own_file(k, 'agent')] + cli:
+            rm = self._mon({'prefix': 'config-key rm', 'key': k}, fence)
+            if rm is None or rm.r not in (0, -2):
+                return 503, {'error': 'cannot remove a key of the agent of %s; ask again' % host}
+        # the enrollment record, if it is still the one of the removed agent
+        if rt['enroll_cert']:
+            ok, rec = self._enrollment(host)
+            if not ok:
+                return 503, {'error': 'cannot read the enrollment record of %s; ask again' % host}
+            if rec is not None and rec.get('agent_cert') == rt['enroll_cert'] and rec.get('agent_client_cert') == rt['enroll_client_cert']:
+                rm = self._mon({'prefix': 'config-key rm', 'key': ENROLL_PREFIX + host}, fence)
+                if rm is None or rm.r not in (0, -2):
+                    return 503, {'error': 'cannot remove the enrollment record of %s; ask again' % host}
+        return self._retire_host(led, fold, ops, op)
 
     def _retire_host(self, led: Any, fold: Any, ops: Dict[str, Dict[str, Any]], op: Optional[Dict[str, Any]]) -> Tuple[int, Dict[str, Any]]:
         if op is None or op['kind'] != 'remove_host':

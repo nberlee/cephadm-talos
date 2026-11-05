@@ -77,7 +77,9 @@ MODULE_KINDS = ('close', 'retire', 'retire_host', 'bind', 'confirm', 'close_crea
                 # a drain's end, and the noout ownership with the unplanned stops (plan 04, step 5)
                 'drain_done', 'noout_intent', 'noout', 'noout_keep', 'host_down', 'host_up',
                 # a move's confirmation at the new address and its end (plan 04, step 5)
-                'addr_moved', 'addr_set')
+                'addr_moved', 'addr_set',
+                # a removed host's retirement begins (plan 04, step 6); retire_host ends it
+                'retiring')
 # module entries without an operation (of absent), or with one if a leader's
 # operation caused them (maintenance's noout)
 NOOUT_KINDS = ('noout_intent', 'noout', 'noout_keep', 'host_down', 'host_up')
@@ -200,7 +202,11 @@ def check_entry(key: str, raw: str) -> Dict[str, Any]:
             raise LedgerError('agent_cert entry %s' % key)
         if kind == 'agent_cert_done' and not (isinstance(e.get('keep'), str) and OP_RE.match(e['keep'])):
             raise LedgerError('agent_cert_done entry %s' % key)
-        if kind in ('drain_done', 'addr_moved', 'addr_set') + NOOUT_KINDS and daemon is not None:
+        # a retirement's start: the certificates the host's enrollment record carried, '' without one
+        if kind == 'retiring' and not all(isinstance(e.get(c), str) and len(e[c]) <= 8192 and (e[c] == '' or e[c].startswith('-----BEGIN CERTIFICATE-----'))
+                                          for c in ('enroll_cert', 'enroll_client_cert')):
+            raise LedgerError('retiring entry %s' % key)
+        if kind in ('drain_done', 'addr_moved', 'addr_set', 'retiring') + NOOUT_KINDS and daemon is not None:
             raise LedgerError('%s entry %s' % (kind, key))
         if kind in ('noout_intent', 'noout') and not (isinstance(e.get('reason'), str) and REASON_RE.match(e['reason'])
                                                       and type(e.get('on')) is bool and (kind == 'noout' or type(e.get('prior')) is bool)):
@@ -287,7 +293,7 @@ def check_entry(key: str, raw: str) -> Dict[str, Any]:
             raise LedgerError('operation entry %s' % key)
         return e
     if kind in ('remove_host', 'exit_maintenance', 'powercycle_host'):
-        if daemon is not None or (kind != 'remove_host' and set(e) - {'version', 'id', 'kind', 'host', 'gid', 'epoch', 'seq', 'request', 'inputs'}):
+        if daemon is not None or set(e) - {'version', 'id', 'kind', 'host', 'gid', 'epoch', 'seq', 'request', 'inputs'}:
             raise LedgerError('operation entry %s' % key)
         return e
     if kind == 'enter_maintenance':
@@ -438,7 +444,7 @@ class Fold:
             'agent_renewals': self.agent_renewals, 'agent_retired': sorted(self.agent_retired), 'agent_upgrade': self.agent_upgrade,
             'cli_rgw': self.cli_rgw, 'vip': self.vip, 'ingress': self.ingress, 'vrrp_secret': self.vrrp_secret, 'rgw_port': self.rgw_port,
             'renewals_done': sorted(self.renewals_done), 'retired_by': sorted(self.retired_by),
-            'draining': self.draining, 'noout': self.noout, 'down': self.down, 'moving': self.moving,
+            'draining': self.draining, 'noout': self.noout, 'down': self.down, 'moving': self.moving, 'retiring': self.retiring,
             'positions': {o: n for o, n in self.positions.items() if o in keep}, 'count': self.count}))
 
     def _load(self, st: Dict[str, Any]) -> None:
@@ -452,6 +458,7 @@ class Fold:
         self.cli_rgw, self.vip, self.ingress, self.vrrp_secret, self.rgw_port = st['cli_rgw'], st['vip'], st['ingress'], st['vrrp_secret'], st['rgw_port']
         self.renewals_done, self.retired_by = set(st['renewals_done']), set(st['retired_by'])
         self.draining, self.noout, self.down, self.moving = st['draining'], st['noout'], st['down'], st['moving']
+        self.retiring = st.get('retiring', {})
         self.positions = st['positions']
         self.count = st['count']
 
@@ -519,6 +526,11 @@ class Fold:
         # host's address is the new one from its addr_moved entry (the leader
         # found the node has it), not before
         self.moving: Dict[str, Dict[str, Any]] = {}
+        # removed hosts retiring (plan 04, step 6): {'op', 'enroll_cert',
+        # 'enroll_client_cert'} from the retiring entry the leader's removal
+        # has the module write until retire_host; the host stays in hosts
+        # meanwhile, and takes no operation
+        self.retiring: Dict[str, Dict[str, Any]] = {}
         # each operation's place in the executable entries, and how many there were
         self.positions: Dict[str, int] = {}
         self.count: int = 0
@@ -557,8 +569,10 @@ class Fold:
         elif kind == 'retire_host' and not any(h == e['host'] for h in self.daemons.values()):
             self.hosts.pop(e['host'], None)
             self.maintenance.discard(e['host'])
-            for m in (self.draining, self.noout, self.down, self.moving):
+            for m in (self.draining, self.noout, self.down, self.moving, self.retiring):
                 m.pop(e['host'], None)
+        elif kind == 'retiring' and e['host'] in self.hosts and e['host'] not in self.retiring:
+            self.retiring[e['host']] = {'op': e['of'], 'enroll_cert': e['enroll_cert'], 'enroll_client_cert': e['enroll_client_cert']}
         elif kind == 'add_host' and e['host'] not in self.hosts:
             self.hosts[e['host']] = e['addr']
         elif kind in STOPS and e['host'] in self.hosts:
@@ -727,8 +741,8 @@ class Fold:
 
     def agent_keys_allowed(self, op: str) -> bool:
         """Whether an agent's issued keys of a renewal may be released: a renewal
-        of a host in the fold, issued, not retired."""
-        return op not in self.agent_retired and any(self.agent_renewals.get(h, {}).get(op) for h in self.hosts)
+        of a host in the fold and not retiring, issued, not retired."""
+        return op not in self.agent_retired and any(self.agent_renewals.get(h, {}).get(op) for h in self.hosts if h not in self.retiring)
 
     def secret_allowed(self, name: str, host: Optional[str]) -> bool:
         """Whether `secret get` may release a secret (host for a host's keys)."""

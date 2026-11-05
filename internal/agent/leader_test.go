@@ -34,6 +34,10 @@ type leaderSetup struct {
 	onRequest func(*http.Request)
 	// ca issued the module's, the leader's and the agent's certificates
 	ca testCA
+	// agentCert is the server certificate h1's agent serves
+	agentCert string
+	// agentSrv serves h1's agent
+	agentSrv *httptest.Server
 }
 
 func newLeaderSetup(t *testing.T) *leaderSetup {
@@ -64,7 +68,7 @@ func newLeaderSetup(t *testing.T) *leaderSetup {
 	srvTLS, err := TLSConfig([]byte(ca.cert), []byte(sc), []byte(sk))
 	must(t, err)
 
-	setup := &leaderSetup{agent: tg, ca: ca}
+	setup := &leaderSetup{agent: tg, ca: ca, agentCert: sc}
 	h := (&Agent{Granter: tg.Granter}).Handler()
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if setup.onRequest != nil {
@@ -76,6 +80,8 @@ func newLeaderSetup(t *testing.T) *leaderSetup {
 	srv.TLS = srvTLS
 	srv.StartTLS()
 	t.Cleanup(srv.Close)
+
+	setup.agentSrv = srv
 
 	l := &LeaderLoop{
 		Self: pki.Identity{FSID: testFSID, Role: pki.RoleAgent, Name: "h0"}, Channel: ch, ClientTLS: clientTLS,

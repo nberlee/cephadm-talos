@@ -124,6 +124,9 @@ type LeaderLoop struct {
 	CRL *crl.Holder
 	// Every is the tick; 0 is 5 seconds
 	Every time.Duration
+	// pins are the server certificates (PEM) the agents of retiring hosts
+	// must serve, by host (plan 04, step 6)
+	pins sync.Map
 
 	// bridgeAddr is where the module listens: this host's loopback
 	bridgeAddr string
@@ -420,15 +423,36 @@ func (l *LeaderLoop) takeover(ctx context.Context, b *Bridge, js store.Backend, 
 
 	changed := !found
 
-	for _, h := range st.Hosts {
+	// the members, then the retiring hosts (plan 04, step 6), these within
+	// retireProbe: one whose node is off must not stall every tick
+	hosts := slices.Clone(st.Hosts)
+	retiring := map[string]bool{}
+
+	for n := range st.Retiring {
+		if h, ok := l.contact(st, n); ok {
+			hosts = append(hosts, h)
+			retiring[n] = true
+		}
+	}
+
+	for _, h := range hosts {
 		if slices.Contains(to.Closed, h.Name) || !l.stillLeader(gid, epoch) {
 			continue
 		}
 
 		c := wire.Close{Version: wire.Version, FSID: l.Self.FSID, Host: h.Name, Mgr: l.Self.Name, MgrAddr: me.Addr, GID: gid, Epoch: epoch}
 
+		cctx, cancel := ctx, context.CancelFunc(func() {})
+		if retiring[h.Name] {
+			cctx, cancel = context.WithTimeout(ctx, retireProbe)
+		}
+
 		var res wire.CloseReply
-		if _, err := l.call(ctx, h, http.MethodPost, "/v1/close", c, &res); err != nil {
+
+		_, err := l.call(cctx, h, http.MethodPost, "/v1/close", c, &res)
+		cancel()
+
+		if err != nil {
 			l.log("closing earlier sessions on %s: %v", h.Name, err)
 
 			continue
@@ -691,6 +715,12 @@ func (l *LeaderLoop) request(ctx context.Context, b *Bridge, js store.Backend, g
 			return nil // done
 		}
 
+		// a retirement's step is resolved by the retirement, while its agent
+		// answers (plan 04, step 6)
+		if retireStepRe.MatchString(id) {
+			return nil
+		}
+
 		return l.resolve(ctx, b, js, gid, epoch, opKey, op, id)
 	}
 
@@ -880,6 +910,11 @@ func (l *LeaderLoop) agentClient(h state.Host) *http.Client {
 	// by its identity, not its address (plan 04, step 5)
 	cfg := WithPeer(l.ClientTLS, func(c *x509.Certificate) error {
 		if _, err := pki.Require(c, pki.Identity{FSID: l.Self.FSID, Role: pki.RoleAgent, Name: h.Name}); err != nil {
+			return err
+		}
+
+		// a retiring host's agent by its journaled certificate (plan 04, step 6)
+		if err := l.pinnedPeer(h.Name, c); err != nil {
 			return err
 		}
 
@@ -1090,7 +1125,14 @@ func (l *LeaderLoop) revision(ctx context.Context, b *Bridge, js store.Backend, 
 	op.Seq = seq
 
 	h, ok := st.Host(host)
-	if !ok || h.Name != host {
+	ok = ok && h.Name == host
+
+	// a strip also reaches a retiring host (plan 04, step 6)
+	if mode.strip {
+		h, ok = l.contact(st, host)
+	}
+
+	if !ok {
 		return fail(fmt.Errorf("no host %s in the cluster state", host))
 	}
 
@@ -1295,7 +1337,7 @@ func (l *LeaderLoop) resolve(ctx context.Context, b *Bridge, js store.Backend, g
 		return err
 	}
 
-	h, ok := st.Host(op.Host)
+	h, ok := l.contact(st, op.Host)
 	if !ok {
 		return fmt.Errorf("no host %s in the cluster state", op.Host)
 	}

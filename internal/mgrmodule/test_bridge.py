@@ -1122,6 +1122,132 @@ class RevocationCallsTest(LedgerCallsTest):
         self.assertFalse([k for k in self.mons.kv if k.startswith(b.SECRET_PREFIX + 'issued/')])
 
 
+class RetirementCallsTest(LedgerCallsTest):
+    """plan 04, step 6: a removed host's retirement starts in the fold, then
+    ends with every certificate of its agent revoked before any of its keys
+    or its enrollment record goes, those only if they are the removed
+    agent's."""
+
+    def prepare(self):
+        self.key = self.mons.kv[b.SECRET_PREFIX + 'agent-ca.key'].encode()
+        self.cli = b.issue_mgr_certs(self.ca, self.key, 'f1', 'h2', '10.0.0.2', 'agent')
+        for role in ('server', 'client'):
+            self.mons.kv[b.SECRET_PREFIX + 'host/h2/agent-%s.key' % role] = self.cli[role + '_key']
+        self.enroll(self.cli)
+        # a renewal that failed: the CLI's pair stays in use, its issuance stays
+        self.r1 = self.accept('renew_agent', None, 'h2')
+        self.issued = json.loads(self.call('agent cert', operation=self.r1)[1]['out'])
+        self.ops = []
+        ops = self.ops
+
+        class Logged(dict):
+            def __setitem__(self, k, v):
+                ops.append(('config-key set', k))
+                super().__setitem__(k, v)
+
+            def pop(self, k, *default):
+                ops.append(('config-key rm', k))
+                return super().pop(k, *default)
+        self.mons.kv = Logged(self.mons.kv)
+
+    revoked, serial, watch_appends = RevocationCallsTest.revoked, RevocationCallsTest.serial, RevocationCallsTest.watch_appends
+
+    def enroll(self, certs):
+        self.mons.kv[b.ENROLL_PREFIX + 'h2'] = json.dumps({'version': 1, 'name': 'h2', 'addr': '10.0.0.2',
+                                                           'agent_cert': certs['server_cert'], 'agent_client_cert': certs['client_cert']})
+
+    def fold(self):
+        return self.ch.authority()[1]
+
+    def test_a_retirement_revokes_before_it_deletes(self):
+        self.prepare()
+        rm = self.accept('remove_host', None, 'h2')
+        self.assertEqual(self.call('retire done', operation=rm)[0], 400)  # not started
+        code, reply = self.call('retire start', operation=rm)
+        self.assertEqual((code, json.loads(reply['out'])), (200, {'agent_cert': self.cli['server_cert'], 'agent_client_cert': self.cli['client_cert']}))
+        self.assertEqual(self.fold().retiring['h2']['op'], rm)
+        again = self.call('retire start', operation=rm)
+        self.assertEqual(json.loads(again[1].get('out', '{}')).get('agent_cert'), self.cli['server_cert'], again)
+        self.assertEqual(sum(e['kind'] == 'retiring' for _, e in self.led.executable()), 1)
+        # a retiring host's issued agent keys are no longer released
+        name = 'issued/%s/%s/agent-server.key' % (self.r1, self.issued['attempt'])
+        self.assertEqual(self.call('secret get', name=name)[0], 400)
+        # retire host does not end a retirement: it would not revoke
+        self.assertEqual(self.call('retire host', operation=rm)[0], 400)
+        seen = self.watch_appends()
+        self.ops.clear()
+        code, reply = self.call('retire done', operation=rm, certs=[self.cli['server_cert'], self.cli['client_cert']])
+        self.assertEqual((code, reply['outcome']), (200, 'done'), reply)
+        want = {self.serial(c) for c in (self.cli['server_cert'], self.cli['client_cert'], self.issued['server_cert'], self.issued['client_cert'])}
+        self.assertEqual(self.revoked(), want)
+        self.assertEqual(seen, [('retire_host', want)])
+        sets = [i for i, (p, k) in enumerate(self.ops) if p == 'config-key set']
+        rms = [i for i, (p, k) in enumerate(self.ops) if p == 'config-key rm']
+        self.assertTrue(sets and rms and max(sets) < min(rms), self.ops)
+        self.assertFalse([k for k in self.mons.kv if '/h2/' in k or self.r1 in k or k.startswith(b.ENROLL_PREFIX)])
+        self.assertNotIn('h2', self.fold().hosts)
+        self.assertNotIn('h2', self.fold().retiring)
+        self.assertEqual(self.call('retire done', operation=rm)[1]['outcome'], 'done')  # once
+
+    def test_unanswered_deletions_hold_the_end(self):
+        """Codex round 2 of slice 2: a deletion an earlier call sent and the
+        mons have not answered holds retire done until it is answered."""
+        self.prepare()
+        rm = self.accept('remove_host', None, 'h2')
+        self.call('retire start', operation=rm)
+        late = b.Job({'prefix': 'config-key rm', 'key': b.SECRET_PREFIX + 'host/h2/agent-server.key'})
+        self.ch._track('retire/h2', late)
+        tracked = []
+        track = self.ch._track
+        self.ch._track = lambda name, job: (tracked.append((name, job.cmd.get('key'))), track(name, job))
+        self.assertEqual(self.call('retire done', operation=rm, certs=[self.cli['server_cert']])[0], 409)
+        self.assertIn('h2', self.fold().retiring)
+        self.assertEqual(tracked, [])  # nothing sent
+        late.ev.set()
+        code, reply = self.call('retire done', operation=rm, certs=[self.cli['server_cert'], self.cli['client_cert']])
+        self.assertEqual((code, reply['outcome']), (200, 'done'), reply)
+        # every deletion it sent was tracked under the retirement
+        self.assertTrue(tracked and all(n == 'retire/h2' for n, _ in tracked), tracked)
+        self.assertIn(b.ENROLL_PREFIX + 'h2', [k for _, k in tracked])
+
+    def test_a_reenrollment_keeps_its_keys_and_record(self):
+        self.prepare()
+        rm = self.accept('remove_host', None, 'h2')
+        self.call('retire start', operation=rm)
+        # the name enrolled again meanwhile: new keys and a new record
+        new = b.issue_mgr_certs(self.ca, self.key, 'f1', 'h2', '10.0.0.2', 'agent')
+        for role in ('server', 'client'):
+            self.mons.kv[b.SECRET_PREFIX + 'host/h2/agent-%s.key' % role] = new[role + '_key']
+        self.enroll(new)
+        code, reply = self.call('retire done', operation=rm, certs=[self.cli['server_cert'], self.cli['client_cert']])
+        self.assertEqual((code, reply['outcome']), (200, 'done'), reply)
+        self.assertIn(self.serial(self.cli['server_cert']), self.revoked())
+        self.assertNotIn(self.serial(new['server_cert']), self.revoked())
+        self.assertEqual(self.mons.kv[b.SECRET_PREFIX + 'host/h2/agent-server.key'], new['server_key'])
+        self.assertEqual(json.loads(self.mons.kv[b.ENROLL_PREFIX + 'h2'])['agent_cert'], new['server_cert'])
+
+    def test_a_foreign_enrollment_certificate_is_skipped(self):
+        self.prepare()
+        other = b.issue_mgr_certs(self.ca, self.key, 'f1', 'h1', '10.0.0.1', 'agent')
+        self.enroll(other)
+        rm = self.accept('remove_host', None, 'h2')
+        self.call('retire start', operation=rm)
+        # without journaled certificates the CLI's keys are not known to be the removed agent's
+        self.assertEqual(self.call('retire done', operation=rm)[1]['outcome'], 'done')
+        self.assertNotIn(self.serial(other['server_cert']), self.revoked())
+        self.assertIn(b.SECRET_PREFIX + 'host/h2/agent-server.key', self.mons.kv)
+        # the record is the one recorded at the start: deleted
+        self.assertNotIn(b.ENROLL_PREFIX + 'h2', self.mons.kv)
+
+    def test_a_host_with_daemons_or_another_retirement_is_not_started(self):
+        self.prepare()
+        self.assertEqual(self.call('retire start', operation=self.accept('remove_host', None, 'h1'))[0], 400)
+        rm = self.accept('remove_host', None, 'h2')
+        self.call('retire start', operation=rm)
+        self.assertEqual(self.call('retire start', operation=self.accept('remove_host', None, 'h2'))[0], 400)
+        self.assertEqual(self.call('retire done', operation=self.accept('restart', 'mgr.h1', 'h1'))[0], 400)
+
+
 class ApprovalCallTest(unittest.TestCase):
     def test_the_newest_approval(self):
         ch, mons = BridgeTest.channel(self)

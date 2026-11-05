@@ -244,12 +244,13 @@ func (l *LeaderLoop) ledgerOps(ctx context.Context, b *Bridge, js store.Backend,
 				return err
 			}
 
-			// then a drain's and a move's (plan 04, step 5)
+			// then a drain's and a move's (plan 04, step 5), and the removed
+			// hosts' retirements (plan 04, step 6), which wait on nothing else
 			if err := l.drainStep(ctx, b, js, gid, epoch); err != nil {
-				return err
+				return errors.Join(err, l.retireSteps(ctx, b, js, gid, epoch))
 			}
 
-			return l.moveStep(ctx, b, js, gid, epoch)
+			return errors.Join(l.moveStep(ctx, b, js, gid, epoch), l.retireSteps(ctx, b, js, gid, epoch))
 		}
 	}
 }
@@ -1183,51 +1184,6 @@ func (l *LeaderLoop) removeDaemonAs(ctx context.Context, b *Bridge, js store.Bac
 	}
 
 	return r.finish(ctx, js, gid, wire.OpCompleted, nil)
-}
-
-// removeHost removes a host without daemons: every document its agent owns
-// off it, the host out of the state, then the module retires it. The agent and
-// its records stay: their documents are the CLI's.
-func (l *LeaderLoop) removeHost(ctx context.Context, b *Bridge, js store.Backend, gid, epoch int64, op LedgerOp) error {
-	st, _, err := l.clusterState(ctx, b)
-	if err != nil {
-		return err
-	}
-
-	if h, ok := st.Host(op.Host); ok && h.Name == op.Host {
-		for _, d := range st.Daemons {
-			if d.Host == op.Host {
-				return finish(ctx, js, gid, op, JournalFailed, fmt.Errorf("%s still has %s.%s", op.Host, d.Type, d.ID))
-			}
-		}
-
-		if op.Host == l.Self.Name {
-			return finish(ctx, js, gid, op, JournalFailed, fmt.Errorf("%s runs the leader", op.Host))
-		}
-
-		done, ok, err := l.step(ctx, b, js, gid, epoch, op.ID+".strip", op.Host, revisionMode{strip: true})
-		if err != nil || !done {
-			return err
-		}
-
-		if !ok {
-			return finish(ctx, js, gid, op, JournalFailed, fmt.Errorf("the documents of %s were not removed", op.Host))
-		}
-
-		if err := l.changeState(ctx, b, gid, func(st *state.State) error {
-			st.RemoveHost(op.Host)
-
-			return nil
-		}); err != nil {
-			return err
-		}
-	}
-
-	if err := b.Retire(ctx, "retire host", op.ID); err != nil {
-		return err
-	}
-
-	return finish(ctx, js, gid, op, wire.OpCompleted, nil)
 }
 
 // journalRecord is an operation's record in any incarnation's journal: a
